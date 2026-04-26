@@ -332,8 +332,17 @@ class OpenAIServingChat(OpenAIServing):
                     # non-reasoning outputs.
                     reasoning_ended = True
                 elif reasoning_parser:
-                    reasoning_ended = reasoning_parser.is_reasoning_end(
-                        prompt_token_ids or []
+                    # Only check the tail of the prompt to avoid false
+                    # positives from tool defs or prior-turn </think>.
+                    # Use fast single-token check when available, else
+                    # fall back to the parser's own method on the tail.
+                    reasoning_ended = (
+                        (reasoning_parser.end_token_id
+                         in (prompt_token_ids or [])[-10:])
+                        if hasattr(reasoning_parser, 'end_token_id')
+                        else reasoning_parser.is_reasoning_end(
+                            (prompt_token_ids or [])[-20:]
+                        )
                     )
                 else:
                     reasoning_ended = None

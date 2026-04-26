@@ -640,6 +640,16 @@ class DelegatingParser(Parser):
                 state.previous_token_ids = []
                 delta_text = current_text
                 delta_token_ids = current_token_ids
+
+                # If the model emitted bare <function=...> directly (no
+                # <tool_call> wrapper), inject the wrapper so tool parsers
+                # that key on <tool_call> can detect it. The Qwen3 reasoning
+                # parser's _function_prefix_ended flag triggers this handoff
+                # without producing the <tool_call> token in token_ids.
+                ct = current_text.lstrip()
+                if ct.startswith("<function=") and "<tool_call>" not in current_text:
+                    current_text = "<tool_call>\n" + ct
+                    delta_text = current_text
             # Preserve any reasoning text produced by extract_reasoning_streaming
             # in the same delta as the reasoning→tool-call transition.  Without
             # this, the assignment below would silently drop that last fragment.

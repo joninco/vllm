@@ -5,6 +5,7 @@ from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.logger import init_logger
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 from vllm.tool_parsers.utils import partial_tag_overlap
 
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
     from vllm.tokenizers import TokenizerLike
+
+logger = init_logger(__name__)
 
 
 class Qwen3ReasoningParser(BaseThinkingReasoningParser):
@@ -33,10 +36,19 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     This parser handles both styles: if <think> appears in the generated output
     it is stripped before extraction (non-streaming) or skipped (streaming).
 
-    NOTE: Qwen3.5 models may emit <tool_call> inside the thinking block
+    NOTE: Qwen3.5 models may emit tool call XML inside the thinking block
     without closing </think> first. <tool_call> is treated as an implicit
     end of reasoning, matching the approach in KimiK2ReasoningParser.
+    The same applies to bare <function= when the model omits the
+    <tool_call> wrapper.
     """
+
+    TOOL_CALL_TOKEN = "<tool_call>"
+    # The model sometimes emits <function=...> directly inside <think>
+    # without the <tool_call> wrapper.  Detect this as a secondary
+    # implicit end-of-reasoning boundary so the tool call isn't
+    # swallowed into reasoning content.
+    FUNCTION_PREFIX = "<function="
 
     def __init__(self, tokenizer: "TokenizerLike", *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
@@ -45,6 +57,14 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         # Qwen3 defaults to thinking enabled; only treat output as
         # pure content when the user explicitly disables it.
         self.thinking_enabled = chat_kwargs.get("enable_thinking", True)
+        self.tool_call_start_token_id: int | None = self.vocab.get(
+            self.TOOL_CALL_TOKEN
+        )
+        # Flag set by extract_reasoning_streaming when <function= is
+        # detected as an implicit boundary.  The serving layer checks
+        # this via is_reasoning_end() so it can transition to tool
+        # parsing even though <function= is not a single token ID.
+        self._function_prefix_ended: bool = False
 
         self._tool_call_tag = "<tool_call>"
         self._tool_call_token_id = self.vocab.get(self._tool_call_tag)
@@ -99,6 +119,9 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         return count
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        if self._function_prefix_ended:
+            return True
+
         start_token_id = self.start_token_id
         end_token_id = self.end_token_id
         tool_call_token_id = self._tool_call_token_id
@@ -126,6 +149,8 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:
+        if self._function_prefix_ended:
+            return True
         if super().is_reasoning_end_streaming(input_ids, delta_ids):
             return True
         if self._tool_call_token_id is not None:
@@ -136,10 +161,12 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         """
         Extract content token ids from the input_ids.
         """
+        if self._function_prefix_ended:
+            return input_ids
         result = super().extract_content_ids(input_ids)
         if result:
             return result
-        # Fall back: content starts at the FIRST <tool_call> 
+        # Fall back: content starts at the FIRST <tool_call>
         # (implicit reasoning end).
         if (
             self._tool_call_token_id is not None
@@ -166,6 +193,10 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         the output was truncated and everything is reasoning:
         returns (model_output, None).
 
+        If <tool_call> or <function= appears before </think>, it is
+        treated as an implicit end-of-reasoning boundary to avoid
+        swallowing tool calls into reasoning content.
+
         Returns:
             tuple[Optional[str], Optional[str]]: reasoning content and content
         """
@@ -184,15 +215,29 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             # Thinking explicitly disabled — treat everything as content.
             return None, model_output
 
-        # No </think> — check for implicit reasoning end via <tool_call>.
+        # No </think>: check for implicit reasoning end via <tool_call> or
+        # bare <function= (model omitted the wrapper). Pick the earliest.
         tool_call_index = model_output.find(self._tool_call_tag)
-        if tool_call_index != -1:
-            reasoning = model_output[:tool_call_index]
-            content = model_output[tool_call_index:]
-            return reasoning or None, content or None
-        # Thinking enabled but no </think>: output was truncated.
-        # Everything generated so far is reasoning.
-        return model_output, None
+        function_index = model_output.find(self.FUNCTION_PREFIX)
+        implicit_end = -1
+        for pos in (tool_call_index, function_index):
+            if pos != -1 and (implicit_end == -1 or pos < implicit_end):
+                implicit_end = pos
+
+        if implicit_end == -1:
+            # Thinking enabled but no </think> and no implicit boundary:
+            # output was truncated. Everything generated so far is reasoning.
+            return model_output, None
+
+        logger.warning(
+            "Model generated tool call XML before </think> — tool call was "
+            "inside the reasoning block. Treating position %d as implicit "
+            "end of reasoning to recover the tool call. model_output[:500]=%r",
+            implicit_end, model_output[:500],
+        )
+        reasoning = model_output[:implicit_end]
+        content = model_output[implicit_end:]
+        return reasoning or None, content or None
 
     def extract_reasoning_streaming(
         self,
@@ -251,16 +296,26 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         if not delta_text:
             # Nothing left after stripping start token.
             return None
-        
-        # If thinking already ended, everything is content.
-        if (self.end_token_id in previous_token_ids or 
-            (self._tool_call_token_id is not None and 
-             self._tool_call_token_id in previous_token_ids) or
-            (bool(self._tool_call_tag) and 
-             self._tool_call_tag in previous_text)):
+
+        # If thinking already ended (via </think>, <tool_call>, or bare
+        # <function= seen in a previous delta), everything is content.
+        if (
+            self._function_prefix_ended
+            or self.end_token_id in previous_token_ids
+            or (
+                self._tool_call_token_id is not None
+                and self._tool_call_token_id in previous_token_ids
+            )
+            or (bool(self._tool_call_tag) and self._tool_call_tag in previous_text)
+            or self.FUNCTION_PREFIX in previous_text
+        ):
             return DeltaMessage(content=delta_text)
 
-        # Implicit reasoning end via <tool_call>.
+        # Implicit reasoning end via <tool_call>.  Run BEFORE the <function=
+        # check so a delta that completes a fragmented <tool_call> tag
+        # (e.g. previous deltas had "<to" then "ol_", current has
+        # "call>\n<function=bash>") is recognized as the tag completion,
+        # not as a bare <function= boundary.
         has_tool_call_id = (
             self._tool_call_token_id is not None
             and self._tool_call_token_id in delta_token_ids
@@ -275,7 +330,7 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             if self._tool_call_tag and self._tool_call_tag in current_text:
                 tag_start_idx = current_text.find(self._tool_call_tag)
                 delta_start_idx = len(previous_text)
-                
+
                 if tag_start_idx >= delta_start_idx:
                     reasoning_len = tag_start_idx - delta_start_idx
                     reasoning = delta_text[:reasoning_len]
@@ -286,11 +341,30 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
                     # but we avoid emitting it as reasoning in this delta.
                     reasoning = None
                     content = current_text[tag_start_idx:]
-                
+
                 return DeltaMessage(
                     reasoning=reasoning if reasoning else None,
                     content=content if content else None,
                 )
+
+        # <function= as implicit end of reasoning (model skipped
+        # <tool_call> wrapper).  Text-level check since <function= is
+        # not a single special token.
+        if self.FUNCTION_PREFIX in delta_text:
+            func_idx = delta_text.find(self.FUNCTION_PREFIX)
+            logger.warning(
+                "Model generated <function= before </think> — tool call "
+                "was inside the reasoning block without <tool_call> "
+                "wrapper. Treating <function= as implicit end of "
+                "reasoning to recover the tool call."
+            )
+            self._function_prefix_ended = True
+            reasoning = delta_text[:func_idx]
+            content = delta_text[func_idx:]
+            return DeltaMessage(
+                reasoning=reasoning if reasoning else None,
+                content=content if content else None,
+            )
 
         # To avoid leaking fragments of <tool_call> into reasoning,
         # withhold any suffix of current_text that could grow into the
