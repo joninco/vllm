@@ -1049,7 +1049,10 @@ class StreamingXMLToolCallParser:
 
             # convert parameter value by param_type
             converted_value = self._convert_param_value(
-                self.current_param_value, param_type
+                self.current_param_value,
+                param_type,
+                self.current_param_name or "",
+                self.current_function_name or "",
             )
             output_data = self._convert_for_json_streaming(converted_value, param_type)
 
@@ -1245,7 +1248,12 @@ class StreamingXMLToolCallParser:
             param_type = self._get_param_type(param_name)
 
             # convert complete parameter value by param_type
-            converted_value = self._convert_param_value(param_value, param_type)
+            converted_value = self._convert_param_value(
+                param_value,
+                param_type,
+                param_name,
+                self.current_function_name or "",
+            )
 
             # Decide whether to add end quote based on parameter type
             if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
@@ -1457,11 +1465,19 @@ class StreamingXMLToolCallParser:
         else:
             return "string"
 
-    def _convert_param_value(self, param_value: str, param_type: str) -> Any:
+    def _convert_param_value(
+        self,
+        param_value: str,
+        param_type: str,
+        param_name: str = "",
+        func_name: str = "",
+    ) -> Any:
         """Convert value based on parameter type
         Args:
             param_value: Parameter value
             param_type: Parameter type
+            param_name: Parameter name (used for diagnostic logging)
+            func_name: Function/tool name (used for diagnostic logging)
 
         Returns:
             Converted value
@@ -1502,6 +1518,8 @@ class StreamingXMLToolCallParser:
                     "Parsed value '%s' is not an integer, "
                     "degenerating to string.",
                     param_value,
+                    param_name,
+                    func_name,
                 )
                 return param_value
         elif param_type.startswith("num") or param_type.startswith("float"):
@@ -1517,6 +1535,8 @@ class StreamingXMLToolCallParser:
                     "Parsed value '%s' is not a float, "
                     "degenerating to string.",
                     param_value,
+                    param_name,
+                    func_name,
                 )
                 return param_value
         elif param_type in ["boolean", "bool", "binary"]:
