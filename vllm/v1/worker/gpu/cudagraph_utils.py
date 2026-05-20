@@ -365,6 +365,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                     batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens,
                         uniform=desc.uniform_token_count == self.decode_query_len,
+                        has_lora=has_lora,
                     )
                 with set_forward_context(
                     attn_metadata,
