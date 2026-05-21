@@ -3,6 +3,7 @@
 /build
 dist
 vllm/*.so
+vllm/vllm-rs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -32,3 +33,4 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+rust/target/
