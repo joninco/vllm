@@ -612,6 +612,7 @@ class Indexer(nn.Module):
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
         prefix: str = "",
+        is_inplace_rope: bool = False,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -673,6 +674,8 @@ class Indexer(nn.Module):
             self.topk_indices_buffer,
         )
 
+        self.is_inplace_rope = is_inplace_rope
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -688,9 +691,13 @@ class Indexer(nn.Module):
             q = q_raw
         q = q.view(-1, self.n_head, self.head_dim)
 
-        if current_platform.is_rocm():
+        if current_platform.is_rocm() and self.is_inplace_rope:
             # This path should works on all platform, will remove extra
             # branches in the future
+            # This fast path relies on rotary_emb mutating q and k inplace.
+            # On ROCm, this is only valid for kernels used as custom ops.
+            # In pytorch-native rope for inductor fusion, rotated q/k tensors
+            # are not mutated inplace but returned as new tensors.
             # Fused wk + weights_proj: one GEMM, then split
             if kw is None:
                 kw, _ = self.wk_weights_proj(hidden_states)
@@ -1073,6 +1080,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 cache_config,
                 topk_indices_buffer,
                 f"{prefix}.indexer",
+                is_inplace_rope=self.indexer_rope_emb.enabled(),
             )
 
             layer_id = (
