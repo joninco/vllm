@@ -87,6 +87,12 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     ROCM_FLASHMLA_SPARSE_DSV4 = (
         "vllm.models.deepseek_v4.amd.rocm.DeepseekV4ROCMAiterMLASparseBackend"
     )
+    # Opt-in b12x unified sparse-MLA backend (SM120). Not in the platform
+    # auto-selection priority list; select it explicitly via
+    # VLLM_ATTENTION_BACKEND=B12X_MLA_SPARSE.
+    B12X_MLA_SPARSE = (
+        "vllm.v1.attention.backends.mla.b12x_mla_sparse.B12xMLASparseBackend"
+    )
     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
     NO_ATTENTION = "vllm.v1.attention.backends.no_attention.NoAttentionBackend"
     FLEX_ATTENTION = "vllm.v1.attention.backends.flex_attention.FlexAttentionBackend"
