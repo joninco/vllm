@@ -1084,7 +1084,14 @@ class DeepseekV2MLAAttention(nn.Module):
             layer_id = (
                 layer_idx if layer_idx is not None else extract_layer_index(prefix)
             )
-            _skip_topk = _should_skip_index_topk(config, layer_id)
+            # Honor an explicit index_topk_pattern whenever provided (GLM/Kimi
+            # set it via HF overrides); otherwise preserve main's
+            # use_index_cache opt-in for the frequency-based skip.
+            if (
+                getattr(config, "index_topk_pattern", None) is not None
+                or getattr(config, "use_index_cache", False)
+            ):
+                _skip_topk = _should_skip_index_topk(config, layer_id)
             if _skip_topk:
                 logger.info_once(
                     "Using index_topk_pattern/index_topk_freq to skip sparse MLA "

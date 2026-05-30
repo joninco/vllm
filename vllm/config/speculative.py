@@ -428,7 +428,11 @@ class SpeculativeConfig:
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]
-        if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "glm_moe_dsa"):
+        if hf_config.model_type in (
+            "deepseek_v3",
+            "deepseek_v32",
+            "glm_moe_dsa",
+        ):
             if hf_config.model_type == "glm_moe_dsa":
                 quant_config = getattr(hf_config, "quantization_config", None)
                 if isinstance(quant_config, dict):
