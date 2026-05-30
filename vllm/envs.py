@@ -60,7 +60,11 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_USE_B12X_SPARSE_INDEXER: bool = False
-    VLLM_B12X_FORCE_MOE_A16: bool = False
+    VLLM_USE_B12X_MHC: bool = False
+    VLLM_USE_B12X_FP8_GEMM: bool = False
+    VLLM_USE_B12X_WO_PROJECTION: bool = False
+    VLLM_USE_B12X_MOE: bool = False
+    VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -191,9 +195,10 @@ if TYPE_CHECKING:
         "latency"
     )
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
-    VLLM_FLASHINFER_AUTOTUNE_TOKEN_SIZES: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
+    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
+    VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "64KB"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -261,8 +266,6 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
-    VLLM_ENABLE_MLA_PREATTN_FANOUT: bool = False
-    BOB_ENABLE_EAGLE3_FANOUT: bool = False
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -999,11 +1002,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Use b12x for the DeepSeek V4 C4 sparse indexer and its top-k selection.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
     ),
-    "VLLM_B12X_FORCE_MOE_A16": lambda: bool(
-        int(os.getenv("VLLM_B12X_FORCE_MOE_A16", "0"))
+    # Use b12x for DeepSeek V4 mHC pre/post residual mixing.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_MHC": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_MHC", "0"))
+    ),
+    # Use b12x for block-scaled FP8 linear GEMMs.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_FP8_GEMM": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_FP8_GEMM", "0"))
+    ),
+    # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
+    # This is separate from the generic FP8 linear switch for perf isolation.
+    "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_WO_PROJECTION", "0"))
+    ),
+    # Use b12x for FP4 MoE experts.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_MOE": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_MOE", "0"))
+    ),
+    # Force DeepSeek V4 native MXFP4/E8M0 MoE weights through b12x's
+    # native/modelopt-layout W4A16 prep path.
+    "VLLM_B12X_MOE_FORCE_MODELOPT_PREP": lambda: bool(
+        int(os.getenv("VLLM_B12X_MOE_FORCE_MODELOPT_PREP", "0"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
@@ -1581,11 +1608,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
     ),
-    # Comma-separated exact num_tokens values to warm for FlashInfer autotune.
-    # Empty means use the vLLM default exact-token set from kernel_warmup.py.
-    "VLLM_FLASHINFER_AUTOTUNE_TOKEN_SIZES": lambda: os.getenv(
-        "VLLM_FLASHINFER_AUTOTUNE_TOKEN_SIZES", None
-    ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
@@ -1595,6 +1617,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to the b12x PCIe oneshot custom allreduce path on PCIe-only GPUs.
     "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
+    ),
+    "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
+        "VLLM_PCIE_ALLREDUCE_BACKEND",
+        "cpp",
+        ["b12x", "cpp"],
+    ),
+    "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB"
     ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
@@ -1686,7 +1716,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "flashinfer-cudnn": use flashinfer cudnn GEMM backend
     # - "flashinfer-trtllm": use flashinfer trtllm GEMM backend
     # - "flashinfer-cutlass": use flashinfer cutlass GEMM backend
-    # - "b12x": use b12x dense FP4 GEMM backend (SM120+)
     # - "marlin": use marlin GEMM backend (for GPUs without native FP4 support)
     # - "emulation":
     #     use BF16/FP16 GEMM, dequantizing weights and running QDQ on activations.
@@ -1707,7 +1736,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "flashinfer-trtllm",
                 "flashinfer-cutlass",
                 "cutlass",
-                "b12x",
                 "marlin",
                 "emulation",
             ],
@@ -1891,15 +1919,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TODO(alexm-redhat): Tune to be more dynamic based on GPU type
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
-    ),
-    # Enable sparse MLA pre-attention GEMM fan-out. The MLA layer auto-enables
-    # this for validated sparse MLA backends unless the env var is explicit.
-    "VLLM_ENABLE_MLA_PREATTN_FANOUT": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_MLA_PREATTN_FANOUT", "0"))
-    ),
-    # Optional dense MLA fan-out hook for draft models. Default off.
-    "BOB_ENABLE_EAGLE3_FANOUT": lambda: bool(
-        int(os.getenv("BOB_ENABLE_EAGLE3_FANOUT", "0"))
     ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
@@ -2131,7 +2150,6 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
-        "VLLM_FLASHINFER_AUTOTUNE_TOKEN_SIZES",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",

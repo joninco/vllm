@@ -76,6 +76,8 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     FLASHMLA_SPARSE = (
         "vllm.v1.attention.backends.mla.flashmla_sparse.FlashMLASparseBackend"
     )
+    # b12x unified sparse-MLA backend (SM120). Explicit selection also selects
+    # b12x's sparse indexer/top-k path.
     B12X_MLA_SPARSE = (
         "vllm.v1.attention.backends.mla.b12x_mla_sparse.B12xMLASparseBackend"
     )
