@@ -42,6 +42,7 @@ from vllm.entrypoints.openai.chat_completion.stream_harmony import (
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
+    DeltaToolCall,
     ErrorResponse,
     FunctionCall,
     PromptTokenUsageInfo,
@@ -1820,4 +1821,59 @@ class OpenAIServingChat(OpenAIServing):
             and self.tool_parser
             and self.enable_auto_tools
             and request.tool_choice in ["auto", None]
+        )
+
+    def _should_check_for_unstreamed_tool_arg_tokens(
+        self,
+        delta_message: DeltaMessage | None,
+        output: CompletionOutput,
+    ) -> bool:
+        """
+        Check to see if we should check for unstreamed tool arguments tokens.
+        This is only applicable when auto tool parsing is enabled, the delta
+        is a tool call with arguments.
+        """
+
+        return bool(
+            # if there is a delta message that includes tool calls which
+            # include a function that has arguments
+            output.finish_reason is not None
+            and self.enable_auto_tools
+            and self.tool_parser
+            and delta_message
+            and delta_message.tool_calls
+            and delta_message.tool_calls[0]
+            and delta_message.tool_calls[0].function
+            and delta_message.tool_calls[0].function.arguments is not None
+        )
+
+    @staticmethod
+    def _create_remaining_args_delta(
+        delta_message: DeltaMessage,
+        remaining_call: str,
+        index: int,
+    ) -> DeltaMessage:
+        """
+        Create a delta message for remaining tool arguments, preserving
+        id/type/name from the original delta.
+        """
+        original_tc = next(
+            (tc for tc in delta_message.tool_calls if tc.index == index),
+            None,
+        )
+        original_fn = original_tc.function if original_tc else None
+        tool_call_kwargs: dict[str, Any] = {"index": index}
+        if original_tc is not None:
+            if original_tc.id is not None:
+                tool_call_kwargs["id"] = original_tc.id
+            if original_tc.type is not None:
+                tool_call_kwargs["type"] = original_tc.type
+
+        function_kwargs = {"arguments": remaining_call}
+        if original_fn is not None and original_fn.name is not None:
+            function_kwargs["name"] = original_fn.name
+        tool_call_kwargs["function"] = DeltaFunctionCall(**function_kwargs)
+
+        return DeltaMessage(
+            tool_calls=[DeltaToolCall(**tool_call_kwargs)]
         )
