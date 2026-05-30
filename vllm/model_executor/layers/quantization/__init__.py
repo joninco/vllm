@@ -11,6 +11,9 @@ logger = init_logger(__name__)
 
 
 class MissingHummingConfig(QuantizationConfig):
+    """Placeholder for the optional ``humming`` backend when its Python
+    package is not installed; resolving it raises a clear ImportError."""
+
     @classmethod
     def get_name(cls) -> str:
         return "humming"
@@ -224,6 +227,8 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
 
+    # The `humming` backend is optional: import it on demand and degrade
+    # gracefully to a placeholder when the `humming` package is absent.
     if quantization == "humming" and quantization not in method_to_config:
         try:
             from .humming import HummingConfig
