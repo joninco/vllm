@@ -3,6 +3,8 @@
 
 import asyncio
 import io
+import json
+import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -38,6 +40,7 @@ from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     extract_harmony_streaming_delta,
 )
 from vllm.entrypoints.openai.engine.protocol import (
+    DeltaFunctionCall,
     DeltaMessage,
     ErrorResponse,
     FunctionCall,
@@ -78,6 +81,9 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+_TOOL_CALL_DIAGNOSTIC_TAIL_CHARS = 512
+_TOOL_CALL_DIAGNOSTIC_TAIL_TOKENS = 32
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -813,6 +819,85 @@ class OpenAIServingChat(OpenAIServing):
                         # finish_reason='error' indicates a retryable error
                         self._raise_if_error(output.finish_reason, request_id)
 
+                        # check to make sure we haven't "forgotten" to stream
+                        #   any tokens that were generated but previously
+                        #   matched by partial json parsing
+                        # only happens if we are NOT using structured outputs
+                        index = 0
+                        auto_tools_called = False
+                        if tool_parser:
+                            auto_tools_called = len(tool_parser.prev_tool_call_arr) > 0
+                            index = (
+                                len(tool_parser.prev_tool_call_arr) - 1
+                                if auto_tools_called
+                                else 0
+                            )
+                        should_check = (
+                            self._should_check_for_unstreamed_tool_arg_tokens(
+                                delta_message, output
+                            )
+                        )
+                        # only check if there are any tool calls
+                        # detected by partial parsing
+                        if should_check and tool_parser and auto_tools_called:
+                            latest_delta_len = 0
+                            if (
+                                isinstance(
+                                    delta_message.tool_calls[0].function,
+                                    DeltaFunctionCall,
+                                )
+                            ) and isinstance(
+                                delta_message.tool_calls[0].function.arguments, str
+                            ):
+                                latest_delta_len = len(
+                                    delta_message.tool_calls[0].function.arguments
+                                )
+
+                            # get the expected call based on partial JSON
+                            # parsing which "autocompletes" the JSON.
+                            # Tool parsers (e.g. Qwen3Coder) store
+                            # arguments as a JSON string in
+                            # prev_tool_call_arr. Calling json.dumps()
+                            # on an already-serialized string would
+                            # double-serialize it (e.g. '{"k":1}' becomes
+                            # '"{\\"k\\":1}"'), which then causes the
+                            # replace() below to fail and append the
+                            # entire double-serialized string as a
+                            # spurious final delta.
+                            args = tool_parser.prev_tool_call_arr[index].get(
+                                "arguments", {}
+                            )
+                            if isinstance(args, str):
+                                expected_call = args
+                            else:
+                                expected_call = json.dumps(args, ensure_ascii=False)
+
+                            # get what we've streamed so far for arguments
+                            # for the current tool
+                            actual_call = tool_parser.streamed_args_for_tool[index]
+                            if latest_delta_len > 0:
+                                actual_call = actual_call[:-latest_delta_len]
+
+                            # check to see if there's anything left to stream
+                            actual_matches_expected = (
+                                not actual_call or actual_call in expected_call
+                            )
+                            remaining_call = expected_call.replace(actual_call, "", 1)
+                            self._log_unstreamed_tool_arg_repair(
+                                request_id=request_id,
+                                choice_index=i,
+                                tool_call_index=index,
+                                expected_call=expected_call,
+                                actual_call=actual_call,
+                                latest_delta_len=latest_delta_len,
+                                remaining_call=remaining_call,
+                                actual_matches_expected=actual_matches_expected,
+                            )
+                            # set that as a delta message
+                            delta_message = self._create_remaining_args_delta(
+                                delta_message, remaining_call, index
+                            )
+
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
                         # finish_reason is:
@@ -842,6 +927,21 @@ class OpenAIServingChat(OpenAIServing):
                         finish_reason_sent[i] = True
 
                     choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
+                    if output.finish_reason is not None:
+                        self._log_streaming_tool_call_diagnostics(
+                            request_id=request_id,
+                            request=request,
+                            output=output,
+                            choice_data=choice_data,
+                            parser=parser,
+                            previous_text=previous_texts[i],
+                            delta_text=delta_text,
+                            generated_tokens=previous_num_tokens[i],
+                            prompt_tokens=num_prompt_tokens,
+                            tools_streamed=tools_streamed[i]
+                            or (self.use_harmony and harmony_tools_streamed[i]),
+                            auto_tools_called=auto_tools_called,
+                        )
                     chunk = ChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
@@ -1275,6 +1375,12 @@ class OpenAIServingChat(OpenAIServing):
                 routed_experts=routed_experts_b64,
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
+            self._log_full_tool_call_diagnostics(
+                request_id=request_id,
+                request=request,
+                output=output,
+                choice_data=choice_data,
+            )
 
             choices.append(choice_data)
 
@@ -1451,6 +1557,254 @@ class OpenAIServingChat(OpenAIServing):
                 )
 
         return ChatCompletionLogProbs(content=logprobs_content)
+
+    @staticmethod
+    def _tool_choice_for_log(request: ChatCompletionRequest) -> str:
+        tool_choice = request.tool_choice
+        if isinstance(tool_choice, ChatCompletionNamedToolChoiceParam):
+            return tool_choice.function.name
+        return str(tool_choice)
+
+    @staticmethod
+    def _tail_text(text: str | None) -> str:
+        if not text:
+            return ""
+        return text[-_TOOL_CALL_DIAGNOSTIC_TAIL_CHARS:]
+
+    @staticmethod
+    def _tail_token_ids(token_ids: GenericSequence[int] | None) -> list[int]:
+        if not token_ids:
+            return []
+        return list(token_ids)[-_TOOL_CALL_DIAGNOSTIC_TAIL_TOKENS:]
+
+    @staticmethod
+    def _delta_tool_call_arg_chars(delta_message: DeltaMessage | None) -> int:
+        if delta_message is None:
+            return 0
+        return sum(
+            len(tool_call.function.arguments or "")
+            for tool_call in delta_message.tool_calls
+            if tool_call.function is not None
+        )
+
+    @staticmethod
+    def _tool_call_arg_lengths(tool_calls: list[ToolCall] | None) -> list[int]:
+        if not tool_calls:
+            return []
+        return [
+            len(tool_call.function.arguments)
+            for tool_call in tool_calls
+            if tool_call.function is not None
+        ]
+
+    @staticmethod
+    def _tool_parser_state_for_log(tool_parser: Any) -> dict[str, Any]:
+        if tool_parser is None:
+            return {}
+
+        prev_tool_calls = getattr(tool_parser, "prev_tool_call_arr", None)
+        streamed_args = getattr(tool_parser, "streamed_args_for_tool", None)
+        state: dict[str, Any] = {"parser": type(tool_parser).__name__}
+
+        if prev_tool_calls is not None:
+            state["parsed_tool_calls"] = len(prev_tool_calls)
+            parsed_arg_chars = []
+            for tool_call in prev_tool_calls:
+                args = tool_call.get("arguments", "")
+                if isinstance(args, str):
+                    parsed_arg_chars.append(len(args))
+                else:
+                    try:
+                        parsed_arg_chars.append(
+                            len(json.dumps(args, ensure_ascii=False))
+                        )
+                    except TypeError:
+                        parsed_arg_chars.append(len(str(args)))
+            state["parsed_arg_chars"] = parsed_arg_chars
+
+        if streamed_args is not None:
+            state["streamed_arg_chars"] = [len(args) for args in streamed_args]
+
+        return state
+
+    @staticmethod
+    def _uses_tool_context(
+        request: ChatCompletionRequest,
+        *,
+        tool_activity: bool = False,
+    ) -> bool:
+        return bool(
+            request.tools or request.tool_choice not in (None, "none") or tool_activity
+        )
+
+    def _log_streaming_tool_call_diagnostics(
+        self,
+        *,
+        request_id: str,
+        request: ChatCompletionRequest,
+        output: CompletionOutput,
+        choice_data: ChatCompletionResponseStreamChoice,
+        parser: Parser | None,
+        previous_text: str,
+        delta_text: str,
+        generated_tokens: int,
+        prompt_tokens: int,
+        tools_streamed: bool,
+        auto_tools_called: bool,
+    ) -> None:
+        delta_tool_calls = choice_data.delta.tool_calls
+        tool_parser = parser.tool_parser if parser is not None else None
+        tool_activity = (
+            tools_streamed
+            or auto_tools_called
+            or bool(delta_tool_calls)
+        )
+        if not self._uses_tool_context(request, tool_activity=tool_activity):
+            return
+
+        parser_state = self._tool_parser_state_for_log(tool_parser)
+        level = logging.WARNING if output.finish_reason == "length" else logging.INFO
+        logger.log(
+            level,
+            "Chat completion stream finished with tool-call diagnostics: "
+            "request_id=%s, choice_index=%d, engine_finish_reason=%s, "
+            "emitted_finish_reason=%s, stop_reason=%r, tool_choice=%s, "
+            "generated_tokens=%d, prompt_tokens=%d, raw_text_chars=%d, "
+            "delta_text_chars=%d, delta_tool_calls=%d, delta_tool_arg_chars=%d, "
+            "tools_streamed=%s, auto_tools_called=%s, parser_state=%s.",
+            request_id,
+            output.index,
+            output.finish_reason,
+            choice_data.finish_reason,
+            output.stop_reason,
+            self._tool_choice_for_log(request),
+            generated_tokens,
+            prompt_tokens,
+            len(previous_text),
+            len(delta_text),
+            len(delta_tool_calls),
+            self._delta_tool_call_arg_chars(choice_data.delta),
+            tools_streamed,
+            auto_tools_called,
+            parser_state,
+        )
+        if output.finish_reason == "length":
+            logger.warning(
+                "Tool-call stream hit max tokens before a normal stop: "
+                "request_id=%s, choice_index=%d. Increase max_tokens or set "
+                "VLLM_LOGGING_LEVEL=DEBUG to inspect the raw output tail.",
+                request_id,
+                output.index,
+            )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Chat completion stream tool-call tails: request_id=%s, "
+                "choice_index=%d, raw_text_tail=%r, delta_text_tail=%r, "
+                "token_ids_tail=%s.",
+                request_id,
+                output.index,
+                self._tail_text(previous_text),
+                self._tail_text(delta_text),
+                self._tail_token_ids(output.token_ids),
+            )
+
+    def _log_full_tool_call_diagnostics(
+        self,
+        *,
+        request_id: str,
+        request: ChatCompletionRequest,
+        output: CompletionOutput,
+        choice_data: ChatCompletionResponseChoice,
+    ) -> None:
+        tool_calls = choice_data.message.tool_calls
+        tool_activity = bool(tool_calls)
+        if not self._uses_tool_context(request, tool_activity=tool_activity):
+            return
+
+        level = (
+            logging.WARNING if choice_data.finish_reason == "length" else logging.INFO
+        )
+        logger.log(
+            level,
+            "Chat completion finished with tool-call diagnostics: request_id=%s, "
+            "choice_index=%d, engine_finish_reason=%s, emitted_finish_reason=%s, "
+            "stop_reason=%r, tool_choice=%s, generated_tokens=%d, "
+            "raw_text_chars=%d, content_chars=%d, tool_calls=%d, "
+            "tool_arg_chars=%s.",
+            request_id,
+            output.index,
+            output.finish_reason,
+            choice_data.finish_reason,
+            output.stop_reason,
+            self._tool_choice_for_log(request),
+            len(output.token_ids),
+            len(output.text),
+            len(choice_data.message.content or ""),
+            len(tool_calls),
+            self._tool_call_arg_lengths(tool_calls),
+        )
+        if choice_data.finish_reason == "length":
+            logger.warning(
+                "Tool-call response hit max tokens before a normal stop: "
+                "request_id=%s, choice_index=%d. Increase max_tokens or set "
+                "VLLM_LOGGING_LEVEL=DEBUG to inspect the raw output tail.",
+                request_id,
+                output.index,
+            )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Chat completion tool-call tails: request_id=%s, choice_index=%d, "
+                "raw_text_tail=%r, content_tail=%r, token_ids_tail=%s.",
+                request_id,
+                output.index,
+                self._tail_text(output.text),
+                self._tail_text(choice_data.message.content),
+                self._tail_token_ids(output.token_ids),
+            )
+
+    def _log_unstreamed_tool_arg_repair(
+        self,
+        *,
+        request_id: str,
+        choice_index: int,
+        tool_call_index: int,
+        expected_call: str,
+        actual_call: str,
+        latest_delta_len: int,
+        remaining_call: str,
+        actual_matches_expected: bool,
+    ) -> None:
+        if actual_matches_expected and not remaining_call:
+            return
+
+        level = logging.WARNING if not actual_matches_expected else logging.INFO
+        logger.log(
+            level,
+            "Final streaming tool-call argument repair: request_id=%s, "
+            "choice_index=%d, tool_call_index=%d, expected_arg_chars=%d, "
+            "streamed_arg_chars=%d, latest_delta_chars=%d, remaining_arg_chars=%d, "
+            "streamed_args_match_expected=%s.",
+            request_id,
+            choice_index,
+            tool_call_index,
+            len(expected_call),
+            len(actual_call),
+            latest_delta_len,
+            len(remaining_call),
+            actual_matches_expected,
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Final streaming tool-call argument repair tails: request_id=%s, "
+                "choice_index=%d, tool_call_index=%d, expected_tail=%r, "
+                "streamed_tail=%r, remaining_tail=%r.",
+                request_id,
+                choice_index,
+                tool_call_index,
+                self._tail_text(expected_call),
+                self._tail_text(actual_call),
+                self._tail_text(remaining_call),
+            )
 
     def _should_stream_with_auto_tool_parsing(self, request: ChatCompletionRequest):
         """
