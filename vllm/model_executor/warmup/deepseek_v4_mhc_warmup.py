@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Warm up DeepSeek V4 mHC TileLang kernels before serving requests.
+"""Warm up DeepSeek V4 mHC kernels before serving requests.
 
 Gating is intrinsic: non-DSv4 models and layers without hc_* attributes
 return early, so the warmup is a no-op except where it's needed.
@@ -178,6 +178,12 @@ def deepseek_v4_mhc_warmup(
     if model_type is not None and model_type != "deepseek_v4":
         return
 
+    # Under VLLM_USE_B12X_MHC the fused post_pre is served by the b12x Gram
+    # kernel (captured by the normal graph warmup); the standalone hc_pre /
+    # hc_post boundaries (first / last layer) fall through to the TileLang
+    # kernels, so the generic mHC warmup below still warms exactly the shapes
+    # the b12x forward path uses.
+
     layer = _find_first_mhc_layer(model)
     if layer is None:
         return
@@ -196,7 +202,7 @@ def deepseek_v4_mhc_warmup(
 
     started = time.perf_counter()
     logger.info(
-        "Warming up DeepSeek V4 mHC TileLang kernels for token sizes: %s",
+        "Warming up DeepSeek V4 mHC kernels for token sizes: %s",
         token_sizes,
     )
     with torch.inference_mode():
@@ -205,6 +211,6 @@ def deepseek_v4_mhc_warmup(
             _warmup_hc_head(deepseek_model, token_sizes)
         torch.accelerator.synchronize()
     logger.info(
-        "DeepSeek V4 mHC TileLang warmup finished in %.2f seconds.",
+        "DeepSeek V4 mHC warmup finished in %.2f seconds.",
         time.perf_counter() - started,
     )
