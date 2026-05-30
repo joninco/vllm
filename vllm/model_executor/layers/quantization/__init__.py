@@ -9,6 +9,55 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
+
+class MissingHummingConfig(QuantizationConfig):
+    """Placeholder for the optional ``humming`` backend when its Python
+    package is not installed; resolving it raises a clear ImportError."""
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "humming"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list:
+        return []
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 75
+
+    @staticmethod
+    def get_config_filenames() -> list[str]:
+        return []
+
+    @classmethod
+    def from_config(cls, config: dict) -> "MissingHummingConfig":
+        raise ImportError(
+            "Humming quantization requires the optional `humming` "
+            "Python package to be installed."
+        )
+
+    @classmethod
+    def override_quantization_method(
+        cls,
+        hf_quant_cfg: dict,
+        user_quant: str | None,
+        hf_config=None,
+    ) -> str | None:
+        if user_quant == "humming":
+            raise ImportError(
+                "Humming quantization requires the optional `humming` "
+                "Python package to be installed."
+            )
+        return None
+
+    def get_quant_method(self, layer, prefix):
+        raise ImportError(
+            "Humming quantization requires the optional `humming` "
+            "Python package to be installed."
+        )
+
+
 QuantizationMethods = Literal[
     "awq",
     "fp8",
@@ -125,7 +174,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .fp8 import Fp8Config
     from .fp_quant import FPQuantConfig
     from .gguf import GGUFConfig
-    from .humming import HummingConfig
     from .inc import INCConfig
     from .modelopt import (
         ModelOptFp8Config,
@@ -163,7 +211,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp4": Mxfp4Config,
         "gpt_oss_mxfp4": GptOssMxfp4Config,
         "deepseek_v4_fp8": DeepseekV4FP8Config,
-        "humming": HummingConfig,
         "online": OnlineQuantizationConfig,
     }
 
@@ -179,6 +226,18 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
+
+    # The `humming` backend is optional: import it on demand and degrade
+    # gracefully to a placeholder when the `humming` package is absent.
+    if quantization == "humming" and quantization not in method_to_config:
+        try:
+            from .humming import HummingConfig
+        except ModuleNotFoundError as exc:
+            if exc.name == "humming":
+                return MissingHummingConfig
+            raise
+
+        return HummingConfig
 
     return method_to_config[quantization]
 
