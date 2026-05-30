@@ -90,6 +90,10 @@ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     return DeepseekV4FlashMLASparseImpl
 
 
+def get_deepseek_v4_padded_num_q_heads(num_heads: int) -> int:
+    return _select_v4_sparse_impl().get_padded_num_q_heads(num_heads)
+
+
 @dataclass
 class DeepseekV4MLAModules:
     """Modules used in DeepseekV4 MLA."""
