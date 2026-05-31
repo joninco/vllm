@@ -47,15 +47,30 @@ MXFP4_BLOCK_SIZE = 32
 
 
 def _b12x_sparse_indexer_requested(enabled: bool | None = None) -> bool:
-    return bool(envs.VLLM_USE_B12X_SPARSE_INDEXER if enabled is None else enabled)
+    if enabled is not None:
+        return bool(enabled)
+
+    if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+        return True
+
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return False
+
+    backend = vllm_config.attention_config.backend
+    if isinstance(backend, str):
+        return backend == "B12X_MLA_SPARSE"
+    return getattr(backend, "name", None) == "B12X_MLA_SPARSE"
 
 
 def _ensure_b12x_sparse_indexer_supported() -> None:
     if not current_platform.is_cuda():
-        raise RuntimeError("VLLM_USE_B12X_SPARSE_INDEXER requires CUDA.")
+        raise RuntimeError("B12X sparse indexer/top-k requires CUDA.")
     if not current_platform.is_device_capability_family(120):
         raise RuntimeError(
-            "VLLM_USE_B12X_SPARSE_INDEXER currently requires an SM120 GPU."
+            "B12X sparse indexer/top-k currently requires an SM120 GPU."
         )
 
 
@@ -64,6 +79,10 @@ def _use_b12x_sparse_indexer(enabled: bool | None = None) -> bool:
         return False
     _ensure_b12x_sparse_indexer_supported()
     return True
+
+
+def use_b12x_sparse_indexer(enabled: bool | None = None) -> bool:
+    return _use_b12x_sparse_indexer(enabled)
 
 
 def _gather_workspace_shapes(
@@ -124,7 +143,7 @@ def _normalize_prefill_topk_to_req_relative(
     topk_indices.copy_(torch.where(valid, normalized, topk_indices))
 
 
-def _flatten_b12x_compressed_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
+def _flatten_b12x_paged_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
     expected_shape_tail = (
         _B12X_COMPRESSED_INDEX_PAGE_SIZE,
         _B12X_COMPRESSED_INDEX_HEAD_DIM + _B12X_COMPRESSED_INDEX_SCALE_BYTES,
@@ -132,19 +151,19 @@ def _flatten_b12x_compressed_index_cache(kv_cache: torch.Tensor) -> torch.Tensor
 
     if kv_cache.ndim != 3 or kv_cache.dtype != torch.uint8:
         raise RuntimeError(
-            "b12x C4 compressed indexer cache must be rank-3 uint8 with "
+            "b12x paged indexer cache must be rank-3 uint8 with "
             f"shape [num_blocks, {expected_shape_tail[0]}, "
             f"{expected_shape_tail[1]}], got shape={tuple(kv_cache.shape)} "
             f"dtype={kv_cache.dtype}."
         )
     if tuple(kv_cache.shape[1:]) != expected_shape_tail:
         raise RuntimeError(
-            "b12x C4 compressed indexer cache has an unsupported shape, "
+            "b12x paged indexer cache has an unsupported shape, "
             f"got {tuple(kv_cache.shape)}; expected tail {expected_shape_tail}."
         )
     if kv_cache.stride(1) != expected_shape_tail[1] or kv_cache.stride(2) != 1:
         raise RuntimeError(
-            "b12x C4 compressed indexer cache has an unsupported layout, "
+            "b12x paged indexer cache has an unsupported layout, "
             f"shape={tuple(kv_cache.shape)} stride={tuple(kv_cache.stride())}; "
             f"expected inner strides ({expected_shape_tail[1]}, 1)."
         )
@@ -153,6 +172,52 @@ def _flatten_b12x_compressed_index_cache(kv_cache: torch.Tensor) -> torch.Tensor
         (int(kv_cache.shape[0]), _B12X_COMPRESSED_INDEX_PAGE_WIDTH),
         (int(kv_cache.stride(0)), 1),
     )
+
+
+def _run_b12x_decode_topk(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    kv_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    schedule_metadata: torch.Tensor | None,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> torch.Tensor:
+    from b12x.attention.indexer.tiled_topk import run_row_topk
+    from b12x.integration.indexer import (
+        IndexerPagedDecodeMetadata,
+        paged_decode_logits,
+    )
+
+    index_k_cache = _flatten_b12x_paged_index_cache(kv_cache)
+    metadata = IndexerPagedDecodeMetadata(
+        real_page_table=block_table,
+        cache_seqlens_int32=seq_lens,
+        paged_mqa_schedule_metadata=schedule_metadata,
+    )
+    logits = paged_decode_logits(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        metadata=metadata,
+        page_size=_B12X_COMPRESSED_INDEX_PAGE_SIZE,
+        preinitialize_invalid_logits=False,
+    )
+    topk_values = torch.empty(
+        (int(q_fp8.shape[0]), int(topk_tokens)),
+        dtype=torch.float32,
+        device=q_fp8.device,
+    )
+    _, result = run_row_topk(
+        row_logits=logits,
+        lengths=seq_lens,
+        topk=topk_tokens,
+        output_values=topk_values,
+        output_indices=topk_indices,
+    )
+    return result
 
 
 def _run_b12x_compressed_decode_topk(
@@ -180,7 +245,7 @@ def _run_b12x_compressed_decode_topk(
             f"{_B12X_COMPRESSED_INDEX_PAGE_SIZE}."
         )
 
-    index_k_cache = _flatten_b12x_compressed_index_cache(kv_cache)
+    index_k_cache = _flatten_b12x_paged_index_cache(kv_cache)
     expected_num_q_heads = int(q_fp8.shape[1])
     metadata = prepare_compressed_indexer_metadata(
         real_page_table=block_table,
@@ -519,7 +584,12 @@ def sparse_attn_indexer(
             seq_lens = b12x_seq_lens[:num_decode_tokens].contiguous()
             block_table = b12x_block_table[:num_decode_tokens].contiguous()
             topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
-            _run_b12x_compressed_decode_topk(
+            decode_fn = (
+                _run_b12x_compressed_decode_topk
+                if decode_metadata.compress_ratio > 1
+                else _run_b12x_decode_topk
+            )
+            decode_fn(
                 q_fp8=q_quant[:num_decode_tokens].contiguous(),
                 weights=weights[:num_decode_tokens].contiguous(),
                 kv_cache=kv_cache,
@@ -724,12 +794,11 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        self.use_b12x_sparse_indexer = bool(envs.VLLM_USE_B12X_SPARSE_INDEXER)
+        self.use_b12x_sparse_indexer = use_b12x_sparse_indexer()
         if self.use_b12x_sparse_indexer:
-            _ensure_b12x_sparse_indexer_supported()
             if self.use_fp4_cache:
                 raise RuntimeError(
-                    "VLLM_USE_B12X_SPARSE_INDEXER requires the FP8/C4 indexer "
+                    "B12X sparse indexer/top-k requires the FP8/C4 indexer "
                     "cache; disable use_fp4_indexer_cache."
                 )
         elif current_platform.is_cuda() and not has_deep_gemm():
