@@ -9,10 +9,6 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.deep_gemm import (
-    get_paged_mqa_logits_metadata,
-    has_deep_gemm,
-)
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backend import (
@@ -194,7 +190,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     seq_lens: torch.Tensor
     decode_lens: torch.Tensor
     requires_padding: bool
-    schedule_metadata: torch.Tensor
+    schedule_metadata: torch.Tensor | None
 
 
 @dataclass
@@ -343,6 +339,61 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+
+    def _maybe_build_b12x_schedule_metadata(
+        self,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        num_decode_tokens: int,
+        requires_padding: bool,
+    ) -> torch.Tensor | None:
+        if not envs.VLLM_USE_B12X_SPARSE_INDEXER or requires_padding:
+            return None
+
+        schedule_seq_lens = seq_lens
+        if schedule_seq_lens.dim() == 2:
+            batch_size, next_n = schedule_seq_lens.shape
+            if num_decode_tokens != int(batch_size * next_n):
+                return None
+            schedule_seq_lens = schedule_seq_lens.reshape(-1)
+        if schedule_seq_lens.dim() != 1:
+            return None
+
+        from b12x.integration.indexer import (
+            build_paged_mqa_schedule_metadata,
+            uses_paged_mqa_schedule,
+        )
+
+        if not uses_paged_mqa_schedule(
+            q_rows=int(schedule_seq_lens.shape[0]),
+            max_pages=int(block_table.shape[1]),
+        ):
+            return None
+
+        return build_paged_mqa_schedule_metadata(
+            schedule_seq_lens.contiguous(),
+            self.kv_cache_spec.storage_block_size,
+            self.num_sms,
+            out=self.scheduler_metadata_buffer,
+        )
+
+    def _maybe_build_deep_gemm_schedule_metadata(
+        self,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        if current_platform.is_cuda():
+            from vllm.utils.deep_gemm import (
+                get_paged_mqa_logits_metadata,
+                has_deep_gemm,
+            )
+
+            if has_deep_gemm():
+                self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
+                    seq_lens,
+                    self.kv_cache_spec.storage_block_size,
+                    self.num_sms,
+                )
+        return self.scheduler_metadata_buffer
 
     def _prepare_decode_tensors(
         self,
@@ -608,12 +659,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
-            if current_platform.is_cuda() and has_deep_gemm():
-                self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
+            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+                schedule_metadata = self._maybe_build_b12x_schedule_metadata(
                     seq_lens,
-                    self.kv_cache_spec.storage_block_size,
-                    self.num_sms,
+                    block_table,
+                    num_decode_tokens,
+                    requires_padding,
+                )
+            else:
+                # DeepGEMM is required for paged MQA logits on CUDA devices.
+                schedule_metadata = self._maybe_build_deep_gemm_schedule_metadata(
+                    seq_lens
                 )
 
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
@@ -621,7 +677,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
-                schedule_metadata=self.scheduler_metadata_buffer,
+                schedule_metadata=schedule_metadata,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(
