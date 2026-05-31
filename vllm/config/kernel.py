@@ -179,7 +179,7 @@ class KernelConfig:
     - "triton": Use Triton-based fused MoE kernels
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
-    - "b12x": Use B12X kernels for Blackwell MXFP4 MoE
+    - "b12x": Use B12X kernels for Blackwell FP4 MoE
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels

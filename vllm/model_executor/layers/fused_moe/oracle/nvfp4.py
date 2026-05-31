@@ -45,6 +45,7 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
     FLASHINFER_CUTEDSL_BATCHED = "FLASHINFER_CUTEDSL_BATCHED"
     FLASHINFER_B12X = "FLASHINFER_B12X"
+    B12X = "B12X"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     MARLIN = "MARLIN"
     EMULATION = "EMULATION"
@@ -121,6 +122,11 @@ def backend_to_kernel_cls(
 
         return [FlashInferB12xExperts]
 
+    elif backend == NvFp4MoeBackend.B12X:
+        from vllm.model_executor.layers.fused_moe.b12x_moe import B12xExperts
+
+        return [B12xExperts]
+
     elif backend == NvFp4MoeBackend.VLLM_CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
             CutlassExpertsFp4,
@@ -153,6 +159,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         "flashinfer_b12x": NvFp4MoeBackend.FLASHINFER_B12X,
+        "b12x": NvFp4MoeBackend.B12X,
         "marlin": NvFp4MoeBackend.MARLIN,
         "emulation": NvFp4MoeBackend.EMULATION,
     }
@@ -193,9 +200,14 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
     }
 
+    def _backend_supports_clamp(backend: NvFp4MoeBackend) -> bool:
+        if backend in NVFP4_BACKENDS_WITH_CLAMP:
+            return True
+        return backend == NvFp4MoeBackend.B12X and activation_key is None
+
     if config.swiglu_limit is not None:
         AVAILABLE_BACKENDS = [
-            b for b in AVAILABLE_BACKENDS if b in NVFP4_BACKENDS_WITH_CLAMP
+            b for b in AVAILABLE_BACKENDS if _backend_supports_clamp(b)
         ]
 
     use_batched = config.moe_parallel_config.use_batched_activation_format
@@ -253,7 +265,7 @@ def select_nvfp4_moe_backend(
             requested_backend = NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED
         if (
             config.swiglu_limit is not None
-            and requested_backend not in NVFP4_BACKENDS_WITH_CLAMP
+            and not _backend_supports_clamp(requested_backend)
         ):
             raise ValueError(
                 f"Model sets swiglu_limit={config.swiglu_limit}, but the "
@@ -263,6 +275,15 @@ def select_nvfp4_moe_backend(
             )
         return _return_or_raise(
             requested_backend, config, weight_key, activation_key, activation_format
+        )
+
+    if envs.VLLM_USE_B12X_MOE:
+        return _return_or_raise(
+            NvFp4MoeBackend.B12X,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
         )
 
     if envs.is_set("VLLM_USE_FLASHINFER_MOE_FP4"):
@@ -277,7 +298,7 @@ def select_nvfp4_moe_backend(
             backend = fi_2_vllm_backend_map[get_flashinfer_moe_backend()]
             if (
                 config.swiglu_limit is not None
-                and backend not in NVFP4_BACKENDS_WITH_CLAMP
+                and not _backend_supports_clamp(backend)
             ):
                 raise ValueError(
                     f"Model sets swiglu_limit={config.swiglu_limit}, but the "
@@ -292,7 +313,7 @@ def select_nvfp4_moe_backend(
             fi_backends = [
                 b
                 for b in FLASHINFER_NVFP4_MOE_BACKENDS
-                if config.swiglu_limit is None or b in NVFP4_BACKENDS_WITH_CLAMP
+                if config.swiglu_limit is None or _backend_supports_clamp(b)
             ]
             for backend in fi_backends:
                 for k_cls in backend_to_kernel_cls(backend):
@@ -363,7 +384,9 @@ def convert_to_nvfp4_moe_kernel_format(
     torch.Tensor,
     torch.Tensor,
 ]:
-    if nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
+    if nvfp4_backend == NvFp4MoeBackend.B12X:
+        pass
+    elif nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
         (
             w13,
             w13_scale,
@@ -474,6 +497,17 @@ def convert_to_nvfp4_moe_kernel_format(
     )
 
 
+def _first_modelopt_expert_scale(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dim() == 2:
+        if scale.size(1) not in (1, 2):
+            raise ValueError(
+                "expected ModelOpt expert scale second dimension to be 1 or 2, "
+                f"got {tuple(scale.shape)}"
+            )
+        scale = scale[:, 0]
+    return scale.contiguous()
+
+
 def make_nvfp4_moe_quant_config(
     backend: NvFp4MoeBackend,
     w13_scale: torch.Tensor,
@@ -483,14 +517,20 @@ def make_nvfp4_moe_quant_config(
     a13_scale: torch.Tensor,
     a2_scale: torch.Tensor,
     swiglu_limit: float | None = None,
+    use_a16: bool = False,
 ) -> FusedMoEQuantConfig:
-    if backend == NvFp4MoeBackend.MARLIN:
+    if backend == NvFp4MoeBackend.MARLIN or (
+        backend == NvFp4MoeBackend.B12X and use_a16
+    ):
         return nvfp4_w4a16_moe_quant_config(
             g1_alphas=w13_scale_2,
             g2_alphas=w2_scale_2,
             w1_scale=w13_scale,
             w2_scale=w2_scale,
         )
+    if backend == NvFp4MoeBackend.B12X:
+        a13_scale = _first_modelopt_expert_scale(a13_scale)
+        a2_scale = _first_modelopt_expert_scale(a2_scale)
     elif backend == NvFp4MoeBackend.EMULATION:
         return nvfp4_moe_quant_config(
             g1_alphas=w13_scale_2,
