@@ -467,6 +467,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.force_contiguous_mla_bmm_weight = getattr(
             self.impl, "force_contiguous_mla_bmm_weight", False
         )
+        self.force_contiguous_mla_bmm_output = getattr(
+            self.impl, "force_contiguous_mla_bmm_output", False
+        )
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
@@ -1003,7 +1006,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+            if self.force_contiguous_mla_bmm_input:
+                x = x.contiguous()
+            if self.force_contiguous_mla_bmm_output:
+                bmm_out = torch.empty(
+                    (self.num_heads, x.shape[1], self.v_head_dim),
+                    dtype=out.dtype,
+                    device=out.device,
+                )
+                torch.bmm(x, self.W_UV, out=bmm_out)
+                out.copy_(bmm_out.transpose(0, 1))
+            else:
+                torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
 
 
 def unified_mla_kv_cache_update(
