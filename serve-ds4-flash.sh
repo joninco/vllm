@@ -23,13 +23,7 @@ export B12X_MLA_SM120_UNIFIED=1
 export USES_B12X=True
 
 export B12X_DENSE_SPLITK_TURBO=1
-
-# High decode perf
-export B12X_W4A16_SMALL_M_DIRECT=1
-export VLLM_B12X_MOE_FORCE_MODELOPT_PREP=1
-
-# High prefill perf
-#export B12X_W4A16_TC_DECODE=1 
+export B12X_W4A16_TC_DECODE=1 
 
 profiler_args=()
 if [[ "${VLLM_ENABLE_TORCH_PROFILER:-0}" == "1" ]]; then

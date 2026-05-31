@@ -9,12 +9,7 @@ K2.5) -- but the decode/extend kernels come from b12x's unified SM120 backend
 via the ``b12x.integration.mla`` front door (``sparse_mla_decode_forward`` /
 ``sparse_mla_extend_forward``). On SM120+ CUDA those front-door functions route
 to ``b12x/attention/mla/unified_sm120`` automatically (GLM_NSA q_head_dim==576
-contract).
-
-This backend is **opt-in**: it is not in the platform auto-selection priority
-list, so it only runs when explicitly requested via
-``VLLM_ATTENTION_BACKEND=B12X_MLA_SPARSE``. The FlashInfer ``SPARSE_MLA_SM120``
-backend is left intact for A/B comparison.
+contract). Selecting this backend also selects b12x's sparse indexer/top-k path.
 
 Workspace philosophy (the idiomatic, no-arena path): b12x's kernels take a
 ``B12XAttentionWorkspace`` object, but they only read it as a bag of tensor
@@ -64,6 +59,7 @@ logger = init_logger(__name__)
 # mid_out/mid_lse scratch and the workspace ``max_chunks_per_row`` cap; b12x's
 # wave-balanced planner picks num_splits <= this cap.
 _DECODE_SPLIT_TILE = 64
+_PREFILL_HEADS_PER_BLOCK = 16
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -315,6 +311,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.v_head_dim: int = mla_args.get("v_head_dim", 512)
         # GLM_NSA contract: q_head_dim = kv_lora_rank (512) + qk_rope (64) = 576.
         self.q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        self.force_contiguous_mla_bmm_input = True
+        self.force_contiguous_mla_bmm_weight = True
 
         assert indexer is not None, (
             "B12X_MLA_SPARSE requires a sparse-MLA indexer (model with "
@@ -336,6 +334,16 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # Split-K cap: ceil(topk / tile). Bounds the borrowed mid_out/mid_lse
         # chunk dim and the workspace max_chunks_per_row.
         self._num_splits_cap = max(1, _cdiv(self.topk_tokens, _DECODE_SPLIT_TILE))
+        self._prefill_num_heads = (
+            _cdiv(self.num_heads, _PREFILL_HEADS_PER_BLOCK)
+            * _PREFILL_HEADS_PER_BLOCK
+        )
+        if self._prefill_num_heads != self.num_heads:
+            logger.info_once(
+                "Padding B12X_MLA_SPARSE prefill heads from %d to %d.",
+                self.num_heads,
+                self._prefill_num_heads,
+            )
 
         # Decode query rows per request (1, plus speculative draft tokens).
         q_per_req = 1
@@ -361,7 +369,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             (1,), dtype=torch.int32, device=self.device
         )
 
-        def _make_workspace(mode: str, max_total_q: int) -> Any:
+        def _make_workspace(
+            mode: str,
+            max_total_q: int,
+            num_q_heads: int,
+        ) -> Any:
             # Bare dataclass: __post_init__ only canonicalizes scalars (allocates
             # nothing). tmp_output/tmp_lse/output_buffer are assigned per-call
             # from the shared workspace manager / a fresh output, so b12x's
@@ -372,7 +384,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 device=self.device,
                 dtype=torch.bfloat16,
                 kv_dtype=torch.uint8,
-                num_q_heads=self.num_heads,
+                num_q_heads=num_q_heads,
                 head_dim=self.q_head_dim,
                 v_head_dim=self.kv_lora_rank,
                 topk=self.topk_tokens,
@@ -383,10 +395,14 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             )
             return ws
 
-        self._decode_workspace = _make_workspace("decode", self._decode_max_rows)
+        self._decode_workspace = _make_workspace(
+            "decode", self._decode_max_rows, self.num_heads
+        )
         self._decode_workspace.num_chunks_ptr = self._num_chunks_ptr
         self._decode_workspace.kv_chunk_size_ptr = self._kv_chunk_size_ptr
-        self._extend_workspace = _make_workspace("extend", max_batched)
+        self._extend_workspace = _make_workspace(
+            "extend", max_batched, self._prefill_num_heads
+        )
 
         # Pre-touch the shared decode scratch at the max decode batch so the
         # workspace manager grows during warmup, before lock_workspace() runs
@@ -467,12 +483,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         if not kv_cache.is_contiguous():
             kv_cache = kv_cache.contiguous()
 
-        output = q.new_empty(
-            (num_actual_toks, self.num_heads, self.kv_lora_rank), dtype=q.dtype
-        )
-
         is_decode = attn_metadata.max_query_len <= 1
         if is_decode:
+            output = q.new_empty(
+                (num_actual_toks, self.num_heads, self.kv_lora_rank), dtype=q.dtype
+            )
             mid_out, mid_lse = self._borrow_decode_scratch(num_actual_toks)
             ws = self._decode_workspace
             ws.tmp_output = mid_out
@@ -490,11 +505,25 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             )
         else:
             # Extend / prefill -> single-pass unified prefill (no split-K
-            # scratch needed; only output_buffer is read).
+            # scratch needed; only output_buffer is read). The b12x prefill
+            # kernel currently requires head blocks of 16, so high-TP shards
+            # with fewer local heads are padded and sliced back after launch.
+            if self._prefill_num_heads == self.num_heads:
+                prefill_q = q
+            else:
+                prefill_q = q.new_zeros(
+                    (num_actual_toks, self._prefill_num_heads, self.q_head_dim)
+                )
+                prefill_q[:, : self.num_heads, :].copy_(q)
+
+            output = q.new_empty(
+                (num_actual_toks, self._prefill_num_heads, self.kv_lora_rank),
+                dtype=q.dtype,
+            )
             ws = self._extend_workspace
             ws.output_buffer = output
             out = self._sparse_mla_extend_forward(
-                q_all=q,
+                q_all=prefill_q,
                 kv_cache=kv_cache,
                 selected_token_offsets=page_table_1,
                 cache_seqlens_int32=cache_seqlens,
@@ -503,4 +532,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 sm_scale=self.scale,
                 v_head_dim=self.kv_lora_rank,
             )
+            if self._prefill_num_heads != self.num_heads:
+                dense_out = q.new_empty(
+                    (num_actual_toks, self.num_heads, self.kv_lora_rank),
+                    dtype=q.dtype,
+                )
+                dense_out.copy_(out[:, : self.num_heads, :])
+                out = dense_out
         return out, None

@@ -1028,7 +1028,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_WO_PROJECTION", "0"))
     ),
-    # Use b12x for DeepSeek V4 MXFP4 MoE experts.
+    # Use b12x for FP4 MoE experts.
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_MOE": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_MOE", "0"))
