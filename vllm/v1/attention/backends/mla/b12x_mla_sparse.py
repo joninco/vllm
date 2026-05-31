@@ -48,6 +48,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.triton_utils import tl, triton
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -64,6 +65,96 @@ _PREFILL_HEADS_PER_BLOCK = 16
 
 def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
+
+
+@triton.jit
+def _mask_page_table_after_nsa_len_kernel(
+    page_table_ptr,
+    nsa_len_ptr,
+    page_stride0,
+    page_stride1,
+    width: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid = offs < width
+    nsa_len = tl.load(nsa_len_ptr + row)
+    tl.store(
+        page_table_ptr + row * page_stride0 + offs * page_stride1,
+        -1,
+        mask=valid & (offs >= nsa_len),
+    )
+
+
+def _mask_page_table_after_nsa_len(
+    page_table: torch.Tensor,
+    nsa_cache_seqlens: torch.Tensor,
+) -> None:
+    width = page_table.shape[1]
+    if width == 0 or page_table.shape[0] == 0:
+        return
+    block_n = 128
+    _mask_page_table_after_nsa_len_kernel[
+        (page_table.shape[0], triton.cdiv(width, block_n))
+    ](
+        page_table,
+        nsa_cache_seqlens,
+        page_table.stride(0),
+        page_table.stride(1),
+        width,
+        BLOCK_N=block_n,
+    )
+
+
+@triton.jit
+def _compact_page_table_valid_prefix_kernel(
+    page_table_ptr,
+    nsa_len_ptr,
+    page_stride0,
+    page_stride1,
+    width: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    valid_col = offs < width
+    vals = tl.load(
+        page_table_ptr + row * page_stride0 + offs * page_stride1,
+        mask=valid_col,
+        other=-1,
+    )
+    # B12X consumes page_table_1 as a dense prefix of length nsa_cache_seqlens.
+    is_valid = valid_col & (vals >= 0)
+    compact_pos = tl.cumsum(is_valid.to(tl.int32), 0) - 1
+    valid_count = tl.sum(is_valid.to(tl.int32), axis=0)
+    row_base = page_table_ptr + row * page_stride0
+    tl.store(row_base + compact_pos * page_stride1, vals, mask=is_valid)
+    tl.store(
+        row_base + offs * page_stride1,
+        -1,
+        mask=valid_col & (offs >= valid_count),
+    )
+    tl.store(nsa_len_ptr + row, valid_count)
+
+
+def _compact_page_table_valid_prefix(
+    page_table: torch.Tensor,
+    nsa_cache_seqlens: torch.Tensor,
+) -> None:
+    width = page_table.shape[1]
+    if width == 0 or page_table.shape[0] == 0:
+        return
+    block_n = triton.next_power_of_2(width)
+    _compact_page_table_valid_prefix_kernel[(page_table.shape[0],)](
+        page_table,
+        nsa_cache_seqlens,
+        page_table.stride(0),
+        page_table.stride(1),
+        width,
+        BLOCK_N=block_n,
+    )
 
 
 class B12xMLASparseBackend(AttentionBackend):
@@ -313,6 +404,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         self.force_contiguous_mla_bmm_input = True
         self.force_contiguous_mla_bmm_weight = True
+        self.force_contiguous_mla_bmm_output = True
 
         assert indexer is not None, (
             "B12X_MLA_SPARSE requires a sparse-MLA indexer (model with "
@@ -449,29 +541,33 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        # Per-request topk indices -> physical cache slot ids. Identical
-        # conversion to FlashMLASparseImpl / SparseMLASm120Impl.
-        page_table_1 = cast(
-            torch.Tensor,
+        # Per-request topk indices -> physical cache slot ids. B12X consumes the
+        # table as a dense prefix of length nsa_cache_seqlens, so preserve the
+        # converter's valid count and compact any holes before launching B12X.
+        page_table_1, nsa_cache_seqlens = cast(
+            tuple[torch.Tensor, torch.Tensor],
             triton_convert_req_index_to_global_index(
                 attn_metadata.req_id_per_token[:num_actual_toks],
                 attn_metadata.block_table,
                 topk_indices,
                 BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=True,
             ),
         )
         page_table_1 = page_table_1.to(torch.int32).contiguous()
+        nsa_cache_seqlens = nsa_cache_seqlens.to(torch.int32).contiguous()
+        _compact_page_table_valid_prefix(page_table_1, nsa_cache_seqlens)
         topk_width = page_table_1.shape[1]
 
-        # nsa_cache_seqlens: per-token count of KV rows to attend = min(causal
-        # KV length, topk). The indexer -1-pads beyond the valid prefix, so a
-        # short row's selected indices occupy [0, nsa) and the kernel masks the
-        # rest (per-token section length + idx<0).
+        # nsa_cache_seqlens: per-token count of selected KV rows to attend,
+        # additionally clamped to the causal KV length for prefill/verify rows.
         per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
-        nsa_cache_seqlens = (
-            torch.clamp(per_token_cache, max=topk_width).to(torch.int32).contiguous()
+        causal_nsa = torch.clamp(
+            per_token_cache.to(torch.int32), max=topk_width
         )
+        torch.minimum(nsa_cache_seqlens, causal_nsa, out=nsa_cache_seqlens)
+        _mask_page_table_after_nsa_len(page_table_1, nsa_cache_seqlens)
         # Per-request KV length (validated but unused by the unified kernels).
         cache_seqlens = attn_metadata.seq_lens.to(torch.int32).contiguous()
 
