@@ -39,6 +39,7 @@ logger = init_logger(__name__)
 
 
 class NvFp4MoeBackend(Enum):
+    B12X = "B12X"
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
@@ -75,6 +76,13 @@ def is_global_sf_supported_for_nvfp4_backend(backend: NvFp4MoeBackend) -> bool:
 def backend_to_kernel_cls(
     backend: NvFp4MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
+    if backend == NvFp4MoeBackend.B12X:
+        from vllm.model_executor.layers.fused_moe.b12x_moe import (
+            B12xExperts,
+        )
+
+        return [B12xExperts]
+
     if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
         from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
             TrtLlmNvFp4ExpertsModular,
@@ -141,6 +149,7 @@ def backend_to_kernel_cls(
 def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
     """Map user's MoEBackend to NvFp4MoeBackend."""
     mapping = {
+        "b12x": NvFp4MoeBackend.B12X,
         "cutlass": NvFp4MoeBackend.VLLM_CUTLASS,
         "flashinfer_trtllm": NvFp4MoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
@@ -171,6 +180,8 @@ def select_nvfp4_moe_backend(
     # FLASHINFER_B12X is intentionally excluded from auto-selection until
     # the upstream CUTLASS SM121 MMA op guard is resolved; use
     # moe_backend="flashinfer_b12x" to opt in explicitly.
+    # Native B12X is backed by Luke's b12x package and is opted into
+    # separately via moe_backend="b12x" or VLLM_USE_B12X_MOE=1.
     AVAILABLE_BACKENDS = [
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
@@ -255,6 +266,15 @@ def select_nvfp4_moe_backend(
             )
         return _return_or_raise(
             requested_backend, config, weight_key, activation_key, activation_format
+        )
+
+    if envs.VLLM_USE_B12X_MOE:
+        return _return_or_raise(
+            NvFp4MoeBackend.B12X,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
         )
 
     if envs.is_set("VLLM_USE_FLASHINFER_MOE_FP4"):
@@ -376,6 +396,10 @@ def convert_to_nvfp4_moe_kernel_format(
             w2_scale_2=w2_scale_2,
             a2_scale=a2_scale,
         )
+    elif nvfp4_backend == NvFp4MoeBackend.B12X:
+        # Native b12x consumes ModelOpt NVFP4 tensors/scales directly. Do not
+        # swizzle or fold activation scales as FlashInfer/CUTLASS paths do.
+        pass
     elif (
         nvfp4_backend in FLASHINFER_NVFP4_MOE_BACKENDS
         or nvfp4_backend == NvFp4MoeBackend.VLLM_CUTLASS
