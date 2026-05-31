@@ -32,7 +32,7 @@ logger = init_logger(__name__)
 
 
 def _get_pcie_allreduce_backend() -> str:
-    backend = os.getenv("VLLM_PCIE_ALLREDUCE_BACKEND", "cpp").lower()
+    backend = envs.VLLM_PCIE_ALLREDUCE_BACKEND.lower()
     if backend not in {"b12x", "cpp"}:
         raise ValueError(
             "Invalid VLLM_PCIE_ALLREDUCE_BACKEND: "
