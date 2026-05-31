@@ -87,6 +87,16 @@ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
         )
 
         return DeepseekV4ROCMAiterMLASparseImpl
+    # Consumer Blackwell (SM120 / SM121) drives sparse-MLA through b12x's
+    # unified compressed-MLA kernels (q_head_dim=512 DSV4 dual-cache); the
+    # Hopper FlashMLA sparse path (_flashmla_C) does not build for sm_120a.
+    cap = current_platform.get_device_capability()
+    if cap is not None and cap.major == 12:
+        from vllm.models.deepseek_v4.nvidia.b12x import (
+            DeepseekV4B12xMLASparseImpl,
+        )
+
+        return DeepseekV4B12xMLASparseImpl
     from vllm.models.deepseek_v4.nvidia.flashmla import (
         DeepseekV4FlashMLASparseImpl,
     )

@@ -16,11 +16,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import (
-    fp8_fp4_mqa_logits,
-    fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
-)
+from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -459,6 +455,8 @@ def sparse_attn_indexer(
                     chunk.cu_seqlen_ke,
                 )
             else:
+                from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
                     (k_quant_cast, k_scale_cast),
@@ -533,6 +531,14 @@ def sparse_attn_indexer(
             )
             return topk_indices_buffer
 
+        schedule_metadata = decode_metadata.schedule_metadata
+        if schedule_metadata is None:
+            raise RuntimeError(
+                "DeepGEMM/XPU sparse indexer decode requires schedule metadata; "
+                "enable VLLM_USE_B12X_SPARSE_INDEXER for the b12x path or check "
+                "the indexer metadata builder."
+            )
+
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
@@ -592,17 +598,19 @@ def sparse_attn_indexer(
                 weights[:num_padded_tokens],
                 seq_lens_xpu,
                 decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
+                schedule_metadata,
                 max_model_len,
             )
         else:
+            from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
                 weights[:num_padded_tokens],
                 seq_lens,
                 decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
+                schedule_metadata,
                 max_model_len=max_model_len,
                 clean_logits=False,
             )
