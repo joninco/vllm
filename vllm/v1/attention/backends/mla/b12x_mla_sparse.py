@@ -147,6 +147,7 @@ def _compact_page_table_valid_prefix_kernel(
         mask=valid_col,
         other=-1,
     )
+    # B12X consumes page_table_1 as a dense prefix of length nsa_cache_seqlens.
     is_valid = valid_col & (vals >= 0)
     compact_pos = tl.cumsum(is_valid.to(tl.int32), 0) - 1
     valid_count = tl.sum(is_valid.to(tl.int32), axis=0)
@@ -515,6 +516,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         self.force_contiguous_mla_bmm_input = True
         self.force_contiguous_mla_bmm_weight = True
+        self.force_contiguous_mla_bmm_output = True
 
         assert indexer is not None, (
             "B12X_MLA_SPARSE requires a sparse-MLA indexer (model with "
@@ -564,7 +566,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         if self._decode_max_rows < max_num_seqs:
             self._decode_max_rows = max_num_seqs
 
-        self._max_batched = max_batched
+        self._max_batched = int(max_batched)
 
         # Lazily import b12x only on this opt-in path.
         from b12x.integration.mla import (

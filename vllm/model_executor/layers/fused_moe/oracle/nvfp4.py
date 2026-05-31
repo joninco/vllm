@@ -377,7 +377,28 @@ def convert_to_nvfp4_moe_kernel_format(
     torch.Tensor,
 ]:
     if nvfp4_backend == NvFp4MoeBackend.B12X:
-        pass
+        (
+            w13,
+            w13_scale,
+            w13_scale_2,
+            a13_scale,
+            w2,
+            w2_scale,
+            w2_scale_2,
+            a2_scale,
+        ) = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+            backend=NvFp4MoeBackend.FLASHINFER_B12X,
+            layer=layer,
+            w13=w13,
+            w13_scale=w13_scale,
+            w13_scale_2=w13_scale_2,
+            a13_scale=a13_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+            w2_scale_2=w2_scale_2,
+            a2_scale=a2_scale,
+            is_act_and_mul=is_act_and_mul,
+        )
     elif nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
         (
             w13,
@@ -488,17 +509,6 @@ def convert_to_nvfp4_moe_kernel_format(
     )
 
 
-def _first_modelopt_expert_scale(scale: torch.Tensor) -> torch.Tensor:
-    if scale.dim() == 2:
-        if scale.size(1) not in (1, 2):
-            raise ValueError(
-                "expected ModelOpt expert scale second dimension to be 1 or 2, "
-                f"got {tuple(scale.shape)}"
-            )
-        scale = scale[:, 0]
-    return scale.contiguous()
-
-
 def make_nvfp4_moe_quant_config(
     backend: NvFp4MoeBackend,
     w13_scale: torch.Tensor,
@@ -519,10 +529,7 @@ def make_nvfp4_moe_quant_config(
             w1_scale=w13_scale,
             w2_scale=w2_scale,
         )
-    if backend == NvFp4MoeBackend.B12X:
-        a13_scale = _first_modelopt_expert_scale(a13_scale)
-        a2_scale = _first_modelopt_expert_scale(a2_scale)
-    elif backend == NvFp4MoeBackend.EMULATION:
+    if backend == NvFp4MoeBackend.EMULATION:
         return nvfp4_moe_quant_config(
             g1_alphas=w13_scale_2,
             g2_alphas=w2_scale_2,
