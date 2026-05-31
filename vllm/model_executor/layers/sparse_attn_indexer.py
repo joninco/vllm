@@ -41,9 +41,19 @@ _B12X_COMPRESSED_INDEX_PAGE_WIDTH = _B12X_COMPRESSED_INDEX_PAGE_SIZE * (
 _B12X_EXTEND_TOPK_SUPERTILE_K = int(
     os.getenv("VLLM_B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "32768")
 )
+_B12X_INDEXER_EXTEND_BLOCK_Q = 32
+_B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K = 256
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _ceil_div(x: int, y: int) -> int:
+    return (int(x) + int(y) - 1) // int(y)
+
+
+def _round_up_to_multiple(x: int, y: int) -> int:
+    return _ceil_div(x, y) * int(y)
 
 
 def _b12x_sparse_indexer_requested(enabled: bool | None = None) -> bool:
@@ -124,6 +134,93 @@ def kv_cache_as_quant_view(
             stride=(page_bytes, fp4_bytes, fp4_bytes, 1),
         )
     return kv_cache.unsqueeze(-2)
+
+
+def _get_b12x_indexer_extend_buffers(
+    *,
+    q_fp8: torch.Tensor,
+    topk_tokens: int,
+    total_seq_lens: int,
+    head_dim: int,
+    fp8_dtype: torch.dtype,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    from b12x.attention.indexer import resolve_extend_prefill_block_k
+
+    q_rows = max(1, int(q_fp8.shape[0]))
+    k_rows = max(1, int(total_seq_lens))
+    indexer_num_q_heads = int(q_fp8.shape[1])
+    prefill_block_k = resolve_extend_prefill_block_k(
+        valid_q_rows=q_rows,
+        k_rows=k_rows,
+        num_heads=indexer_num_q_heads,
+    )
+    if prefill_block_k is None:
+        prefill_block_k = _B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K
+    prefill_block_k = int(prefill_block_k)
+
+    num_q_tiles = _ceil_div(q_rows, _B12X_INDEXER_EXTEND_BLOCK_Q)
+    num_k_tiles = _ceil_div(k_rows, prefill_block_k)
+    supertile_k = _round_up_to_multiple(
+        max(int(_B12X_EXTEND_TOPK_SUPERTILE_K), prefill_block_k),
+        prefill_block_k,
+    )
+    supertile_tiles = max(1, supertile_k // prefill_block_k)
+    num_chunks = _ceil_div(num_k_tiles, supertile_tiles)
+    max_chunk_tiles = min(supertile_tiles, num_k_tiles)
+    tile_elements = max(
+        1,
+        num_q_tiles
+        * max_chunk_tiles
+        * _B12X_INDEXER_EXTEND_BLOCK_Q
+        * prefill_block_k,
+    )
+    topk_tokens = max(int(topk_tokens), 1)
+
+    values_spec, scales_spec = _gather_workspace_shapes(
+        k_rows, head_dim, fp8_dtype, use_fp4_cache=False
+    )
+    (
+        k_quant,
+        k_scale,
+        tile_logits,
+        lengths,
+        topk_values,
+        topk_indices,
+        candidate_values,
+        candidate_indices,
+        merge_positions,
+    ) = current_workspace_manager().get_simultaneous(
+        values_spec,
+        scales_spec,
+        ((tile_elements,), torch.float32),
+        ((q_rows,), torch.int32),
+        ((q_rows, topk_tokens), torch.float32),
+        ((q_rows, topk_tokens), torch.int32),
+        ((max(num_chunks, 1), q_rows, topk_tokens), torch.float32),
+        ((max(num_chunks, 1), q_rows, topk_tokens), torch.int32),
+        ((q_rows, topk_tokens), torch.int64),
+    )
+    return (
+        k_quant[:k_rows],
+        k_scale[:k_rows],
+        tile_logits[:tile_elements],
+        lengths[:q_rows],
+        topk_values[:q_rows, :topk_tokens],
+        topk_indices[:q_rows, :topk_tokens],
+        candidate_values[: max(num_chunks, 1), :q_rows, :topk_tokens],
+        candidate_indices[: max(num_chunks, 1), :q_rows, :topk_tokens],
+        merge_positions[:q_rows, :topk_tokens],
+    )
 
 
 def _normalize_prefill_topk_to_req_relative(
@@ -432,6 +529,9 @@ def sparse_attn_indexer(
                 topk_indices.fill_(-1)
                 continue
 
+            tile_logits = lengths = topk_values = None
+            candidate_values = candidate_indices = None
+            topk_indices_out = topk_indices
             if use_b12x_indexer:
                 row_has_no_kv = chunk.cu_seqlen_ke <= chunk.cu_seqlen_ks
                 b12x_cu_seqlen_ks = torch.where(
@@ -444,21 +544,22 @@ def sparse_attn_indexer(
                     torch.ones_like(chunk.cu_seqlen_ke),
                     chunk.cu_seqlen_ke,
                 )
-                values_spec, scales_spec = _gather_workspace_shapes(
-                    chunk.total_seq_lens,
-                    head_dim,
-                    fp8_dtype,
-                    use_fp4_cache=False,
-                )
-                k_quant = torch.empty(
-                    values_spec[0],
-                    dtype=values_spec[1],
-                    device=hidden_states.device,
-                )
-                k_scale = torch.empty(
-                    scales_spec[0],
-                    dtype=scales_spec[1],
-                    device=hidden_states.device,
+                (
+                    k_quant,
+                    k_scale,
+                    tile_logits,
+                    lengths,
+                    topk_values,
+                    topk_indices_out,
+                    candidate_values,
+                    candidate_indices,
+                    merge_positions,
+                ) = _get_b12x_indexer_extend_buffers(
+                    q_fp8=q_slice,
+                    topk_tokens=topk_tokens,
+                    total_seq_lens=chunk.total_seq_lens,
+                    head_dim=head_dim,
+                    fp8_dtype=fp8_dtype,
                 )
             else:
                 k_quant = k_quant_full[: chunk.total_seq_lens]
@@ -491,6 +592,15 @@ def sparse_attn_indexer(
                             k_end=b12x_cu_seqlen_ke,
                         ),
                         topk=topk_tokens,
+                        contract_phantoms=None,
+                        workspace=None,
+                        tile_logits=tile_logits,
+                        lengths=lengths,
+                        output_values=topk_values,
+                        output_indices=topk_indices_out,
+                        candidate_values=candidate_values,
+                        candidate_indices=candidate_indices,
+                        merge_positions=merge_positions,
                         supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
                     )
                 )
