@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_FP8_GEMM: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
+    VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -1023,6 +1024,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_MOE": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_MOE", "0"))
+    ),
+    # Force DeepSeek V4 native MXFP4/E8M0 MoE weights through b12x's
+    # native/modelopt-layout W4A16 prep path.
+    "VLLM_B12X_MOE_FORCE_MODELOPT_PREP": lambda: bool(
+        int(os.getenv("VLLM_B12X_MOE_FORCE_MODELOPT_PREP", "0"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
