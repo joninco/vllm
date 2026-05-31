@@ -6,6 +6,10 @@ cd "$(dirname "$0")"
 export CUTE_DSL_ARCH=sm_120a
 export NCCL_IB_DISABLE=1
 
+export VLLM_USE_AOT_COMPILE=1
+export VLLM_USE_BREAKABLE_CUDAGRAPH=0
+export VLLM_USE_MEGA_AOT_ARTIFACT=1
+export B12X_MHC_MAX_TOKENS=2048
 export VLLM_USE_FLASHINFER_SAMPLER=1
 export VLLM_USE_B12X_WO_PROJECTION=1
 export VLLM_USE_B12X_MHC=1
@@ -19,7 +23,13 @@ export B12X_MLA_SM120_UNIFIED=1
 export USES_B12X=True
 
 export B12X_DENSE_SPLITK_TURBO=1
-export B12X_W4A16_TC_DECODE=1
+
+# High decode perf
+export B12X_W4A16_SMALL_M_DIRECT=1
+export VLLM_B12X_MOE_FORCE_MODELOPT_PREP=1
+
+# High prefill perf
+#export B12X_W4A16_TC_DECODE=1 
 
 profiler_args=()
 if [[ "${VLLM_ENABLE_TORCH_PROFILER:-0}" == "1" ]]; then
@@ -53,7 +63,7 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --load-format fastsafetensors \
   --tensor-parallel-size 2 \
   --gpu-memory-utilization 0.88 \
-  --max-num-seqs 2 \
+  --max-num-seqs 8 \
   --async-scheduling \
   --max-num-batched-tokens 2048 \
   --max_cudagraph_capture_size 2048 \

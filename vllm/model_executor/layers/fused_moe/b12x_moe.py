@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -45,10 +46,17 @@ def _plan_b12x_moe_fp4_scratch(
     quant_mode: str,
     source_format: str,
     w13_layout: str,
+    prepared_w4a16: Any | None = None,
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
 ):
     from b12x.integration.tp_moe import TPMoEScratchCaps, plan_tp_moe_scratch
+
+    w4a16_weight_layout = None
+    w4a16_scale_format = None
+    if prepared_w4a16 is not None:
+        w4a16_weight_layout = getattr(prepared_w4a16, "weight_layout", None)
+        w4a16_scale_format = getattr(prepared_w4a16, "scale_format", None)
 
     return plan_tp_moe_scratch(
         TPMoEScratchCaps(
@@ -67,6 +75,8 @@ def _plan_b12x_moe_fp4_scratch(
             swiglu_limit=swiglu_limit,
             source_format=source_format,
             w13_layout=w13_layout,
+            w4a16_weight_layout=w4a16_weight_layout,
+            w4a16_scale_format=w4a16_scale_format,
             frozen=True,
         )
     )
@@ -166,9 +176,39 @@ def _b12x_activation_name(activation: MoEActivation) -> str:
     return activation.value
 
 
+def _prepare_b12x_e8m0_modelopt_moe_weights(**kwargs):
+    from b12x.integration import B12XPreparedFP4MoEWeights
+    from b12x.moe.fused.w4a16.prepare import prepare_w4a16_e8m0_native_weights
+
+    w13_layout = kwargs.get("w13_layout", "w13")
+    w4a16 = prepare_w4a16_e8m0_native_weights(
+        kwargs["w1_fp4"],
+        kwargs["w1_blockscale"],
+        kwargs["w1_global_scale"],
+        kwargs["w2_fp4"],
+        kwargs["w2_blockscale"],
+        kwargs["w2_global_scale"],
+        activation=kwargs["activation"],
+        params_dtype=kwargs["params_dtype"],
+        w13_layout=w13_layout,
+    )
+    return B12XPreparedFP4MoEWeights(
+        source_format=kwargs.get("source_format", "fp4_e8m0_k32"),
+        w13_layout=w13_layout,
+        w4a16=w4a16,
+    )
+
+
 def _prepare_b12x_fp4_moe_weights(**kwargs):
     from b12x.integration import prepare_b12x_fp4_moe_weights
 
+    if (
+        envs.VLLM_B12X_MOE_FORCE_MODELOPT_PREP
+        and kwargs.get("source_format") == "fp4_e8m0_k32"
+        and kwargs.get("prepare_w4a16", False)
+        and not kwargs.get("prepare_runtime_alphas", False)
+    ):
+        return _prepare_b12x_e8m0_modelopt_moe_weights(**kwargs)
     return prepare_b12x_fp4_moe_weights(**kwargs)
 
 
@@ -514,6 +554,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             quant_mode="w4a16",
             source_format=self._source_format(),
             w13_layout=self._w13_layout(),
+            prepared_w4a16=prepared_w4a16,
             swiglu_limit=getattr(self.quant_config, "gemm1_clamp_limit", None),
         )
         scratch_elements = max(
@@ -573,6 +614,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             quant_mode="w4a16",
             source_format=self._source_format(),
             w13_layout=self._w13_layout(),
+            prepared_w4a16=prepared_w4a16,
             apply_router_weight_on_input=(
                 apply_router_weight_on_input
                 if apply_router_weight_on_input is not None

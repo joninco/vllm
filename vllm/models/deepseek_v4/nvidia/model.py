@@ -69,7 +69,6 @@ from vllm.models.deepseek_v4.attention import (
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
@@ -195,16 +194,19 @@ def _b12x_mhc_max_tokens() -> int:
         ) from exc
 
 
-def _get_b12x_plan_scratch(
+def _empty_b12x_plan_scratch(
     plan: object,
+    device: torch.device,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     specs = plan.shapes_and_dtypes()
     if not specs:
         raise ValueError("b12x scratch plan did not provide any scratch specs")
-    buffers = current_workspace_manager().get_simultaneous(*specs)
+    buffers = tuple(
+        torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs
+    )
     if len(buffers) == 1:
         return buffers[0]
-    return tuple(buffers)
+    return buffers
 
 
 class DeepseekV4MLP(nn.Module):
@@ -1119,7 +1121,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 split_k=self._b12x_mhc_split_k,
             )
         )
-        scratch = _get_b12x_plan_scratch(plan)
+        scratch = _empty_b12x_plan_scratch(plan, x.device)
         return plan.bind(
             scratch=scratch,
             tokens=tokens,
@@ -1139,21 +1141,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from b12x.integration.residual import b12x_mhc_pre
-
-        if torch.compiler.is_compiling():
-            return b12x_mhc_pre(
-                residual,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                rms_eps=self.rms_norm_eps,
-                hc_eps=self.hc_eps,
-                sinkhorn_iters=self.hc_sinkhorn_iters,
-                norm_weight=norm_weight,
-                norm_eps=norm_eps,
-                split_k=self._b12x_mhc_split_k,
-                block_k=self._b12x_mhc_block_k,
-            )
 
         tokens, hc_mult, hidden_size = residual.shape
         layer_input = torch.empty(

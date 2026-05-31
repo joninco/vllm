@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+from typing import Any
 
 import torch
 
@@ -11,19 +12,28 @@ import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import direct_register_custom_op
 
 from .BlockScaledMMLinearKernel import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
 )
 
+_B12X_BLOCK_FP8: Any | None = None
+_B12X_BLOCK_FP8_MISSING = False
 
-def _import_b12x_block_fp8():
-    try:
-        return importlib.import_module("b12x.gemm.block_fp8_linear")
-    except ImportError:
+
+def _import_b12x_block_fp8() -> Any | None:
+    global _B12X_BLOCK_FP8, _B12X_BLOCK_FP8_MISSING
+    if _B12X_BLOCK_FP8 is not None:
+        return _B12X_BLOCK_FP8
+    if _B12X_BLOCK_FP8_MISSING:
         return None
+    try:
+        _B12X_BLOCK_FP8 = importlib.import_module("b12x.gemm.block_fp8_linear")
+    except ImportError:
+        _B12X_BLOCK_FP8_MISSING = True
+        return None
+    return _B12X_BLOCK_FP8
 
 
 def _current_linear_backend() -> str:
@@ -34,7 +44,7 @@ def _current_linear_backend() -> str:
 
 
 def _empty_plan_scratch(
-    plan,
+    plan: Any,
     device: torch.device,
 ) -> tuple[torch.Tensor, ...]:
     return tuple(
@@ -43,45 +53,20 @@ def _empty_plan_scratch(
     )
 
 
-def _b12x_fp8_block_scaled_linear_op(
+def _run_b12x_fp8_block_scaled_linear(
     input_2d: torch.Tensor,
-    weight_values: torch.Tensor,
-    weight_scale_rows: torch.Tensor,
-    weight_scale_mma: torch.Tensor,
+    packed_weight: Any,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Stateless block-FP8 linear via the b12x SM120 MXFP8 GEMM.
-
-    Takes the pre-packed weight tensors directly (no layer / prefix /
-    no_compile_layers lookup) and RETURNS the [tokens, out_features] result. It is
-    a functional op (no mutated args), like the other FP8 kernels and the WO op,
-    so it composes with torch.compile / piecewise cudagraphs without per-layer
-    registration and without an auto_functionalized re-inplacing pass.
-    out_features / in_features are derived from the weight shape [N, K].
-    """
     block_fp8 = _import_b12x_block_fp8()
     if block_fp8 is None:
         raise ImportError("b12x.gemm.block_fp8_linear is not importable")
 
     tokens = int(input_2d.shape[0])
-    out_features = int(weight_values.shape[0])
+    out_features = int(packed_weight.out_features)
     if tokens == 0:
-        # Empty batch: return an empty result here, in the op body (runtime,
-        # opaque to the tracer), instead of branching on the dynamic token dim in
-        # apply_weights -- a traced `shape[0] == 0` guard would force the batch
-        # symint to be a graph input and break the MTP/fullgraph compile.
         return input_2d.new_empty((0, out_features))
-    in_features = int(weight_values.shape[1])
-    packed_weight = block_fp8.BlockFP8LinearWeight(
-        weight=block_fp8.MXFP8Rows(
-            values=weight_values,
-            scale_rows=weight_scale_rows,
-            scale_mma=weight_scale_mma,
-        ),
-        in_features=in_features,
-        out_features=out_features,
-        block_size=(128, 128),
-    )
+    in_features = int(packed_weight.in_features)
     output = torch.empty(
         (tokens, out_features), dtype=input_2d.dtype, device=input_2d.device
     )
@@ -95,13 +80,6 @@ def _b12x_fp8_block_scaled_linear_op(
         )
     )
     scratch = _empty_plan_scratch(plan, input_2d.device)
-    # DeepGEMM-style regime hint: this binding is built per-forward / per-capture
-    # with the live token count, so declare it as expected_m -- the b12x tile
-    # selector then picks the decode tile (32x128) for wide-N (N>1536) FP8 linears
-    # at small M and the prefill tile (64x128) at large M (e.g. dense-MLP
-    # down-projections in DeepSeek-V4 decode). expected_m only selects the tile
-    # (not a compile-cache key), and each cudagraph-captured batch size warms its
-    # own tile, so this is safe (vLLM does not freeze b12x kernel resolution).
     binding = plan.bind(
         scratch=scratch,
         source=input_2d,
@@ -110,29 +88,7 @@ def _b12x_fp8_block_scaled_linear_op(
         bias=bias,
         expected_m=tokens,
     )
-    block_fp8.block_fp8_linear_mxfp8(binding=binding)
-    return output
-
-
-def _b12x_fp8_block_scaled_linear_op_fake(
-    input_2d: torch.Tensor,
-    weight_values: torch.Tensor,
-    weight_scale_rows: torch.Tensor,
-    weight_scale_mma: torch.Tensor,
-    bias: torch.Tensor | None,
-) -> torch.Tensor:
-    # Use the symbolic shapes directly -- do NOT int(input_2d.shape[0]); that
-    # specializes the dynamic token dim to the trace's example size (e.g. 2048)
-    # and violates dynamic-shape constraints. weight_values.shape[0] is the
-    # static out_features dim. (out_features, in_features) = weight_values.shape.
-    return input_2d.new_empty((input_2d.shape[0], weight_values.shape[0]))
-
-
-direct_register_custom_op(
-    op_name="b12x_fp8_block_scaled_linear",
-    op_func=_b12x_fp8_block_scaled_linear_op,
-    fake_impl=_b12x_fp8_block_scaled_linear_op_fake,
-)
+    return block_fp8.block_fp8_linear_mxfp8(binding=binding)
 
 
 class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
@@ -230,24 +186,14 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         out_features = int(packed_weight.out_features)
         input_2d = x.reshape(-1, x.shape[-1]).contiguous()
         output_shape = [*x.shape[:-1], out_features]
-        # NB: do NOT branch on input_2d.shape[0] here (the dynamic token dim) -- a
-        # traced `== 0` guard forces the batch symint to become a graph input and
-        # breaks the MTP/fullgraph compile (copy_misaligned_inputs: got int). The
-        # empty-batch case is handled inside the op body (runtime, untraced).
         if input_2d.dtype != self.config.out_dtype:
             raise RuntimeError(
                 "b12x FP8 linear currently expects input and output dtype to "
                 f"match, got input={input_2d.dtype}, output={self.config.out_dtype}"
             )
-        # Stateless functional op: pass the pre-packed weight tensors directly (no
-        # layer / prefix / no_compile_layers lookup) and get the result back,
-        # matching the other FP8 kernels and the WO op. Composes with
-        # torch.compile / piecewise cudagraphs as-is (no auto_functionalized).
-        output = torch.ops.vllm.b12x_fp8_block_scaled_linear(
+        output = _run_b12x_fp8_block_scaled_linear(
             input_2d,
-            packed_weight.weight.values,
-            packed_weight.weight.scale_rows,
-            packed_weight.weight.scale_mma,
+            packed_weight,
             bias,
         )
         return output.view(*output_shape)

@@ -6,9 +6,10 @@ The DSV4 sparse-MLA path uses global top-k slot ids from
 ``compute_global_topk_indices_and_lens``, a SWA + indexed dual cache, paged
 per-chunk prefill, and ``attn_sink``. The leaf call goes through b12x's
 ``compressed_mla_decode_forward`` binding API (``plan_compressed_mla_scratch``
--> fresh scratch -> ``plan.bind`` -> ``compressed_mla_decode_forward``), matching
-the plan/bind style used by the b12x WO-projection and mHC integrations in this
-tree. No persistent workspace object is held.
+-> fresh scratch -> ``plan.bind`` in ordinary Python, then one
+``compressed_mla_decode_forward`` leaf call), matching the plan/bind style used
+by the b12x WO-projection and mHC integrations in this tree. No persistent
+workspace object is held.
 
 DSV4 compressed-MLA contract (== upstream/DeepGEMM): q_head_dim = 448 NoPE +
 64 RoPE = 512, V = 512; the ``fp8_ds_mla`` 584 B/token page (448 NoPE fp8 +
@@ -31,7 +32,7 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
 
 if TYPE_CHECKING:
-    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MLAAttention
+    from vllm.models.deepseek_v4.attention import DeepseekV4MLAAttention
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 # DSV4 compressed-MLA dims (q_head_dim = 448 NoPE + 64 RoPE = 512; V = 512).
@@ -91,9 +92,10 @@ def _b12x_cache_page_view(
 
 def _run_compressed_mla(
     *,
-    layer: "DeepseekV4MLAAttention",
     q: torch.Tensor,
     output: torch.Tensor,
+    attn_sink: torch.Tensor,
+    scale: float,
     swa_k_cache: torch.Tensor,
     swa_indices: torch.Tensor,
     swa_lens: torch.Tensor,
@@ -104,13 +106,11 @@ def _run_compressed_mla(
     indexed_page_size: int | None,
     mode: Literal["decode", "extend"] = "decode",
 ) -> None:
-    """plan -> fresh scratch -> bind -> compressed_mla_decode_forward(binding=).
+    """Plan, bind, and call b12x compressed MLA in plain eager Python.
 
-    ``q`` / ``output`` are ``[tokens, padded_heads, 512]`` (heads pre-padded to
-    {16,32,64,128} by the outer wrapper). Indices are global slot ids
-    (``compute_global_topk_indices_and_lens`` for the indexed cache;
-    ``decode_swa_indices`` / ``prefill_swa_indices`` for SWA) -- so no
-    ``indexed_page_table`` (raw-slot-id addressing, matching upstream).
+    ``q`` is ``[tokens, padded_heads, 512]`` (heads pre-padded to
+    {16,32,64,128} by the outer wrapper). Indices are global slot ids, so no
+    indexed page table is needed.
     """
     from b12x.integration.compressed_scratch import (
         B12XCompressedMLAScratchCaps,
@@ -128,7 +128,7 @@ def _run_compressed_mla(
         indexed_lens = indexed_lens.contiguous()
 
     # b12x checks total_width = swa_width + indexed_width against scratch.topk,
-    # so the scratch must be planned for the COMBINED dual-cache width.
+    # so the scratch must be planned for the combined dual-cache width.
     width = int(swa_indices.shape[-1])
     if indexed_indices is not None:
         width += int(indexed_indices.shape[-1])
@@ -150,6 +150,7 @@ def _run_compressed_mla(
         torch.empty(shape, dtype=dtype, device=q.device)
         for shape, dtype in plan.shapes_and_dtypes()
     )
+
     binding = plan.bind(
         scratch=scratch,
         q=q,
@@ -159,16 +160,18 @@ def _run_compressed_mla(
         indexed_lengths=indexed_lens,
     )
     binding.scratch.mode = mode
+
+    # attn_sink is sized to the model's padded_heads (max(n_local,64)); b12x
+    # wants it at the real local head count (== q heads).
+    sink = attn_sink[:heads].contiguous()
     out = compressed_mla_decode_forward(
         binding=binding,
         swa_k_cache=swa_k_cache,
         swa_page_size=int(swa_page_size),
         indexed_k_cache=indexed_k_cache,
         indexed_page_size=indexed_page_size,
-        # layer.attn_sink is sized to the model's padded_heads (max(n_local,64));
-        # the b12x kernel wants it at the real local head count (== q heads).
-        attn_sink=layer.attn_sink[:heads].contiguous(),
-        sm_scale=layer.scale,
+        attn_sink=sink,
+        sm_scale=scale,
         expected_num_q_heads=heads,
     )
     output.copy_(out)
@@ -220,12 +223,22 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        del kv, positions
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
         )
         assert output.dtype == q.dtype, (
             f"output buffer dtype {output.dtype} must match q dtype {q.dtype}"
         )
+
+        prefix = layer.prefix
+        swa_cache_prefix = layer.swa_cache_layer.prefix
+        compress_ratio = layer.compress_ratio
+        compressed_kv_cache = layer.kv_cache
+        swa_kv_cache = layer.swa_cache_layer.kv_cache
+        topk_indices_buffer = layer.topk_indices_buffer
+        attn_sink = layer.attn_sink
+        scale = layer.scale
 
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -237,17 +250,16 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
 
         assert isinstance(attn_metadata, dict)
         flashmla_metadata = cast(
-            FlashMLASparseMetadata | None, attn_metadata.get(layer.prefix)
+            FlashMLASparseMetadata | None, attn_metadata.get(prefix)
         )
         swa_metadata = cast(
             "DeepseekSparseSWAMetadata | None",
-            attn_metadata.get(layer.swa_cache_layer.prefix),
+            attn_metadata.get(swa_cache_prefix),
         )
         assert swa_metadata is not None
 
-        swa_only = layer.compress_ratio <= 1
-        self_kv_cache = layer.kv_cache if not swa_only else None
-        swa_kv_cache = layer.swa_cache_layer.kv_cache
+        swa_only = compress_ratio <= 1
+        self_kv_cache = compressed_kv_cache if not swa_only else None
 
         num_decodes = swa_metadata.num_decodes
         num_prefills = swa_metadata.num_prefills
@@ -257,34 +269,45 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         if num_prefills > 0:
             prefill_end = num_decode_tokens + num_prefill_tokens
             cls._forward_prefill(
-                layer=layer,
                 q=q[num_decode_tokens:prefill_end],
                 compressed_k_cache=self_kv_cache,
                 swa_k_cache=swa_kv_cache,
                 output=output[num_decode_tokens:prefill_end],
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
+                compress_ratio=compress_ratio,
+                topk_indices_buffer=topk_indices_buffer,
+                attn_sink=attn_sink,
+                scale=scale,
             )
         if num_decodes > 0:
             cls._forward_decode(
-                layer=layer,
                 q=q[:num_decode_tokens],
                 kv_cache=self_kv_cache,
+                swa_kv_cache=swa_kv_cache,
                 swa_metadata=swa_metadata,
                 attn_metadata=flashmla_metadata,
                 swa_only=swa_only,
+                compress_ratio=compress_ratio,
+                topk_indices_buffer=topk_indices_buffer,
+                attn_sink=attn_sink,
+                scale=scale,
                 output=output[:num_decode_tokens],
             )
 
     @classmethod
     def _forward_decode(
         cls,
-        layer: "DeepseekV4MLAAttention",
         q: torch.Tensor,
         kv_cache: torch.Tensor | None,  # only used when compress_ratio > 1
+        swa_kv_cache: torch.Tensor,
         swa_metadata: "DeepseekSparseSWAMetadata",
         attn_metadata: FlashMLASparseMetadata | None,
         swa_only: bool,
+        compress_ratio: int,
+        topk_indices_buffer: torch.Tensor | None,
+        attn_sink: torch.Tensor,
+        scale: float,
         output: torch.Tensor,
     ) -> None:
         num_decodes = swa_metadata.num_decodes
@@ -299,12 +322,12 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             assert attn_metadata is not None
             assert kv_cache is not None
             assert swa_metadata.is_valid_token is not None
-            block_size = attn_metadata.block_size // layer.compress_ratio
+            block_size = attn_metadata.block_size // compress_ratio
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            if layer.compress_ratio == 4:
-                assert layer.topk_indices_buffer is not None
+            if compress_ratio == 4:
+                assert topk_indices_buffer is not None
                 topk_indices, topk_lens = compute_global_topk_indices_and_lens(
-                    layer.topk_indices_buffer[:num_decode_tokens],
+                    topk_indices_buffer[:num_decode_tokens],
                     swa_metadata.token_to_req_indices,
                     attn_metadata.block_table[:num_decodes],
                     block_size,
@@ -325,15 +348,16 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         assert swa_indices is not None
         assert swa_lens is not None
         swa_k_cache = _b12x_cache_page_view(
-            layer.swa_cache_layer.kv_cache,
+            swa_kv_cache,
             swa_metadata.block_size,
             "swa_k_cache",
         )
 
         _run_compressed_mla(
-            layer=layer,
             q=q,
             output=output,
+            attn_sink=attn_sink,
+            scale=scale,
             swa_k_cache=swa_k_cache,
             swa_indices=swa_indices,
             swa_lens=swa_lens,
@@ -348,15 +372,18 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
     @classmethod
     def _forward_prefill(
         cls,
-        layer: "DeepseekV4MLAAttention",
         q: torch.Tensor,
         compressed_k_cache: torch.Tensor | None,
         swa_k_cache: torch.Tensor,
         output: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
+        compress_ratio: int,
+        topk_indices_buffer: torch.Tensor | None,
+        attn_sink: torch.Tensor,
+        scale: float,
     ) -> None:
-        swa_only = layer.compress_ratio <= 1
+        swa_only = compress_ratio <= 1
         num_prefills = swa_metadata.num_prefills
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
@@ -374,9 +401,9 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         if not swa_only:
             assert attn_metadata is not None
             assert compressed_k_cache is not None
-            if layer.compress_ratio == 4:
-                assert layer.topk_indices_buffer is not None
-                local_topk_indices = layer.topk_indices_buffer[
+            if compress_ratio == 4:
+                assert topk_indices_buffer is not None
+                local_topk_indices = topk_indices_buffer[
                     num_decode_tokens : num_decode_tokens + num_prefill_tokens
                 ]
             else:
@@ -386,7 +413,7 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             prefill_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
-            block_size = attn_metadata.block_size // layer.compress_ratio
+            block_size = attn_metadata.block_size // compress_ratio
             extra_topk_indices, extra_topk_lens = compute_global_topk_indices_and_lens(
                 local_topk_indices,
                 swa_metadata.token_to_req_indices[prefill_slice],
@@ -433,9 +460,10 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 else None
             )
             _run_compressed_mla(
-                layer=layer,
                 q=q[query_start:query_end],
                 output=output[query_start:query_end],
+                attn_sink=attn_sink,
+                scale=scale,
                 swa_k_cache=swa_k_cache,
                 swa_indices=swa_metadata.prefill_swa_indices[query_start:query_end],
                 swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
