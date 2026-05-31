@@ -392,10 +392,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 num_heads=self.num_heads,
             )
 
-        # FlashMLA Sparse Attention fp8 backend uses "fp8_ds_mla" kv-cache format
-        # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
+        # FlashMLA/B12X sparse MLA fp8 backends use the fp8_ds_mla KV-cache
+        # format. Automatically convert the generic fp8 spelling.
+        sparse_ds_mla_backends = {"FLASHMLA_SPARSE", "B12X_MLA_SPARSE"}
         if (
-            self.attn_backend.get_name() == "FLASHMLA_SPARSE"
+            self.attn_backend.get_name() in sparse_ds_mla_backends
             and is_quantized_kv_cache(kv_cache_dtype)
             and kv_cache_dtype != "fp8_ds_mla"
         ):
@@ -403,9 +404,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             cache_config.cache_dtype = "fp8_ds_mla"
             kv_cache_dtype = "fp8_ds_mla"
             logger.info_once(
-                "Using DeepSeek's fp8_ds_mla KV cache format. To use standard "
-                "fp8 kv-cache format, please set `--attention-backend "
-                "FLASHINFER_MLA_SPARSE`"
+                "Using fp8_ds_mla KV cache format for %s.",
+                self.attn_backend.get_name(),
             )
 
         if (
@@ -461,6 +461,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             **extra_impl_args,
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
+        self.force_contiguous_mla_bmm_input = getattr(
+            self.impl, "force_contiguous_mla_bmm_input", False
+        )
+        self.force_contiguous_mla_bmm_weight = getattr(
+            self.impl, "force_contiguous_mla_bmm_weight", False
+        )
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
@@ -741,6 +747,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 N, B, P = mqa_q_nope.shape
                 _, _, L = self.W_UK_T.shape
 
+                if self.force_contiguous_mla_bmm_input:
+                    mqa_q_nope = mqa_q_nope.contiguous()
+
                 if self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
                     mqa_ql_nope.resize_((N, B, L))
@@ -920,6 +929,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.W_UV = W_UV.transpose(0, 1)
             # Convert from (L, N, P) to (N, P, L)
             self.W_UK_T = W_UK.permute(1, 2, 0)
+            if self.force_contiguous_mla_bmm_weight:
+                self.W_UV = self.W_UV.contiguous()
+                self.W_UK_T = self.W_UK_T.contiguous()
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]

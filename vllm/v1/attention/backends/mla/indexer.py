@@ -151,6 +151,12 @@ class DeepseekV32IndexerBackend(AttentionBackend):
         return (0, 1, 2)
 
 
+class B12xNonCompressedIndexerBackend(DeepseekV32IndexerBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "B12X_NON_COMPRESSED_INDEXER"
+
+
 class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     @staticmethod
     def get_name() -> str:
@@ -191,6 +197,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor | None
+    compress_ratio: int = 1
 
 
 @dataclass
@@ -678,6 +685,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
+                compress_ratio=self.compress_ratio,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(
