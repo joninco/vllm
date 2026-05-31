@@ -14,7 +14,6 @@ import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
@@ -41,7 +40,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -59,7 +58,6 @@ from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
@@ -461,24 +459,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             device=hidden_states.device,
         )
 
-        # @eager_break_during_capture: this is where the breakable
-        # cudagraph capture breaks (the attention op runs eagerly between
-        # captured graph segments).
-        deepseek_v4_attention(
-            hidden_states,
-            positions,
-            o_padded,
-            self.layer_name,
-        )
+        self.attention_impl(hidden_states, positions, o_padded)
         o = o_padded[:, : self.n_local_heads, :]
 
         if self._use_b12x_wo:
-            return torch.ops.vllm.deepseek_v4_b12x_wo_projection(
-                o,
-                positions,
-                self.layer_name,
-                self.hidden_size,
-            )
+            return self._apply_b12x_wo_projection(o, positions)
 
         # Keep ROCm on the BF16 reference wo_a path util kernel ready.
         if current_platform.is_rocm():
@@ -717,47 +702,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.eps,
             swa_metadata.block_size,
         )
-
-
-@eager_break_during_capture
-def deepseek_v4_attention(
-    hidden_states: torch.Tensor,
-    positions: torch.Tensor,
-    out: torch.Tensor,
-    layer_name: str,
-) -> None:
-    forward_context: ForwardContext = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]
-    self.attention_impl(hidden_states, positions, out)
-
-
-def deepseek_v4_b12x_wo_projection(
-    o: torch.Tensor,
-    positions: torch.Tensor,
-    layer_name: str,
-    hidden_size: int,
-) -> torch.Tensor:
-    del hidden_size
-    forward_context: ForwardContext = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]
-    return self._apply_b12x_wo_projection(o, positions)
-
-
-def deepseek_v4_b12x_wo_projection_fake(
-    o: torch.Tensor,
-    positions: torch.Tensor,
-    layer_name: str,
-    hidden_size: int,
-) -> torch.Tensor:
-    del positions, layer_name
-    return torch.empty((o.shape[0], hidden_size), dtype=o.dtype, device=o.device)
-
-
-direct_register_custom_op(
-    op_name="deepseek_v4_b12x_wo_projection",
-    op_func=deepseek_v4_b12x_wo_projection,
-    fake_impl=deepseek_v4_b12x_wo_projection_fake,
-)
 
 
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):

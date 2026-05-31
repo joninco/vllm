@@ -18,7 +18,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
@@ -65,7 +64,6 @@ from vllm.models.deepseek_v4.attention import (
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -496,71 +494,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
 
 DeepseekV4MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
-
-
-def _deepseek_v4_b12x_mhc_post_pre_op(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-    layer_name: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    self = get_forward_context().no_compile_layers[layer_name]
-    return _trace_b12x_mhc_call(
-        "post_pre",
-        layer_name,
-        int(residual.shape[0]),
-        lambda: self._run_b12x_mhc_post_pre(
-            x,
-            residual,
-            post,
-            comb,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            norm_weight,
-            norm_eps,
-        ),
-    )
-
-
-def _deepseek_v4_b12x_mhc_post_pre_op_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-    layer_name: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    del x, post, comb, hc_fn, hc_scale, hc_base, norm_weight, norm_eps, layer_name
-    tokens, hc_mult, hidden_size = residual.shape
-    residual_out = torch.empty_like(residual)
-    post_out = torch.empty(
-        (tokens, hc_mult), dtype=torch.float32, device=residual.device
-    )
-    comb_out = torch.empty(
-        (tokens, hc_mult, hc_mult), dtype=torch.float32, device=residual.device
-    )
-    y_out = torch.empty(
-        (tokens, hidden_size), dtype=residual.dtype, device=residual.device
-    )
-    return residual_out, post_out, comb_out, y_out
-
-
-direct_register_custom_op(
-    op_name="deepseek_v4_b12x_mhc_post_pre",
-    op_func=_deepseek_v4_b12x_mhc_post_pre_op,
-    fake_impl=_deepseek_v4_b12x_mhc_post_pre_op_fake,
-)
 
 
 class DeepseekV4MoE(nn.Module):
@@ -1108,7 +1041,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         if not self._use_b12x_mhc:
             return False
         max_tokens = self._b12x_mhc_max_tokens
-        return max_tokens <= 0 or int(tokens) <= max_tokens
+        tokens = int(tokens)
+        if max_tokens > 0 and tokens > max_tokens:
+            raise RuntimeError(
+                "VLLM_USE_B12X_MHC is enabled, but b12x mHC was asked to run "
+                f"{tokens} tokens with B12X_MHC_MAX_TOKENS={max_tokens}. "
+                "Refusing to fall back to tilelang while b12x mHC is enabled; "
+                "raise B12X_MHC_MAX_TOKENS or disable VLLM_USE_B12X_MHC."
+            )
+        return True
 
     def _get_b12x_mhc_binding(
         self,
@@ -1140,6 +1081,48 @@ class DeepseekV4DecoderLayer(nn.Module):
             out=out,
         )
 
+    def _run_b12x_mhc_pre(
+        self,
+        residual: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from b12x.integration.residual import b12x_mhc_pre
+
+        tokens, hc_mult, hidden_size = residual.shape
+        layer_input = torch.empty(
+            (tokens, hidden_size), dtype=residual.dtype, device=residual.device
+        )
+        post_mix = torch.empty(
+            (tokens, hc_mult), dtype=torch.float32, device=residual.device
+        )
+        res_mix = torch.empty(
+            (tokens, hc_mult, hc_mult),
+            dtype=torch.float32,
+            device=residual.device,
+        )
+        binding = self._get_b12x_mhc_binding(
+            residual,
+            y=layer_input,
+            post=post_mix,
+            comb=res_mix,
+        )
+        return b12x_mhc_pre(
+            residual,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_eps=self.rms_norm_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            binding=binding,
+            block_k=self._b12x_mhc_block_k,
+        )
 
     def _run_b12x_mhc_post_pre(
         self,
@@ -1199,6 +1182,21 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
     ):
+        if self._should_run_b12x_mhc(int(x.shape[0])):
+            return _trace_b12x_mhc_call(
+                "pre",
+                self.layer_name,
+                int(x.shape[0]),
+                lambda: self._run_b12x_mhc_pre(
+                    x,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    norm_weight,
+                    norm_eps,
+                ),
+            )
+
         post_mix, res_mix, layer_input = mhc_pre_tilelang(
             x,
             hc_fn,
@@ -1227,8 +1225,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm_eps: float = 1e-6,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._should_run_b12x_mhc(int(residual.shape[0])):
-            if not is_forward_context_available():
-                return self._run_b12x_mhc_post_pre(
+            return _trace_b12x_mhc_call(
+                "post_pre",
+                self.layer_name,
+                int(residual.shape[0]),
+                lambda: self._run_b12x_mhc_post_pre(
                     x,
                     residual,
                     post,
@@ -1238,18 +1239,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     hc_base,
                     norm_weight,
                     norm_eps,
-                )
-            return torch.ops.vllm.deepseek_v4_b12x_mhc_post_pre(
-                x,
-                residual,
-                post,
-                comb,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                norm_weight,
-                norm_eps,
-                self.layer_name,
+                ),
             )
 
         return mhc_fused_post_pre_tilelang(
