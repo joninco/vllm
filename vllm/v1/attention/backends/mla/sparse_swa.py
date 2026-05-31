@@ -158,6 +158,10 @@ class DeepseekSparseSWAMetadata:
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     decode_swa_indices: torch.Tensor | None = None  # [num_decode_tokens, window_size]
     decode_swa_lens: torch.Tensor | None = None  # [num_decode_tokens]
+    # Paged per-token SWA slot ids / window lengths for the prefill rows
+    # (b12x compressed-MLA prefill path; computed by the same kernel as decode).
+    prefill_swa_indices: torch.Tensor | None = None  # [num_prefill_tokens, 1, window]
+    prefill_swa_lens: torch.Tensor | None = None  # [num_prefill_tokens]
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -296,9 +300,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)
 
-        if num_decode_tokens > 0:
-            self.decode_swa_lens[num_decode_tokens:] = 0
-            _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
+        # Compute paged SWA slot ids for ALL actual tokens (decode + prefill);
+        # the b12x compressed-MLA prefill path consumes the prefill slice. The
+        # kernel keys on the global token index, so one launch covers both. The
+        # FlashMLA path only reads the decode slice, so this is additive.
+        num_actual_tokens = num_decode_tokens + num_prefill_tokens
+        if num_actual_tokens > 0:
+            self.decode_swa_lens[num_actual_tokens:] = 0
+            _compute_swa_indices_and_lens_kernel[(num_actual_tokens,)](
                 self.decode_swa_indices,
                 self.decode_swa_indices.stride(0),
                 self.decode_swa_lens,
@@ -337,6 +346,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             token_to_req_indices=token_to_req_indices,
             decode_swa_indices=self.decode_swa_indices[:num_decode_tokens],
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
+            prefill_swa_indices=self.decode_swa_indices[
+                num_decode_tokens : num_decode_tokens + num_prefill_tokens
+            ],
+            prefill_swa_lens=self.decode_swa_lens[
+                num_decode_tokens : num_decode_tokens + num_prefill_tokens
+            ],
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
@@ -371,6 +386,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens == 0
             or current_platform.is_rocm()
             or current_platform.is_xpu()
+            # SM120 (consumer Blackwell) drives DSV4 MLA through b12x, which
+            # does not use the FlashMLA tile scheduler; skip the planner (and
+            # its _flashmla_C dependency, which is not built for sm_120a).
+            or current_platform.is_device_capability_family(120)
         ):
             return out
         for layer_type in self._layer_types:
