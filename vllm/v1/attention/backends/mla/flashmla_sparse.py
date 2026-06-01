@@ -36,7 +36,6 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
-    split_decodes_and_prefills,
     split_prefill_chunks,
 )
 from vllm.v1.attention.ops.flashmla import (
@@ -258,6 +257,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         self.model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         self.device = device
+        self.storage_block_size = int(self.kv_cache_spec.storage_block_size)
 
         # Classify single-token queries (plus num_speculative_tokens via
         # supports_spec_as_decode=True) as decodes; longer queries go to
@@ -426,8 +426,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         num_tokens = common_attn_metadata.num_actual_tokens
 
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
+            common_attn_metadata.split_decodes_and_prefills(
                 decode_threshold=self.reorder_batch_threshold or 1,
                 require_uniform=True,
             )
@@ -457,6 +456,12 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             assert seq_lens_cpu is not None
             seq_lens = common_attn_metadata.seq_lens
             query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            if common_attn_metadata.batch_topology is not None:
+                query_start_loc_np = (
+                    common_attn_metadata.batch_topology.query_start_loc_np
+                )
+            else:
+                query_start_loc_np = query_start_loc_cpu.numpy()
 
             prefill_seq_lens_cpu = seq_lens_cpu[num_decodes:]
             prefill_seq_lens = seq_lens[num_decodes:]
@@ -471,8 +476,8 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             for req_idx in range(num_prefills):
                 # Get query token range for this prefill request
                 global_req_idx = num_decodes + req_idx
-                req_query_start = query_start_loc_cpu[global_req_idx]
-                req_query_end = query_start_loc_cpu[global_req_idx + 1]
+                req_query_start = int(query_start_loc_np[global_req_idx])
+                req_query_end = int(query_start_loc_np[global_req_idx + 1])
                 prefill_request_id[req_query_start:req_query_end] = req_idx
 
             # will be adjusted by chunk loop
@@ -509,8 +514,8 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
 
                 chunk_seq_lens = prefill_seq_lens[chunk_start:chunk_end]
                 chunk_tot_seqlen = prefill_seq_lens_cpu[chunk_start:chunk_end].sum()
-                token_start = query_start_loc_cpu[num_decodes + chunk_start].item()
-                token_end = query_start_loc_cpu[num_decodes + chunk_end].item()
+                token_start = int(query_start_loc_np[num_decodes + chunk_start])
+                token_end = int(query_start_loc_np[num_decodes + chunk_end])
                 tokens_slice = slice(token_start, token_end)
 
                 # Create chunk view of gpu tensor
@@ -543,8 +548,13 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
 
         if num_decodes > 0:
             # Compute decode_query_len for spec decode (uniform due to require_uniform)
-            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-            decode_query_len = (query_start_loc_cpu[1] - query_start_loc_cpu[0]).item()
+            if common_attn_metadata.batch_topology is not None:
+                query_start_loc_np = (
+                    common_attn_metadata.batch_topology.query_start_loc_np
+                )
+            else:
+                query_start_loc_np = common_attn_metadata.query_start_loc_cpu.numpy()
+            decode_query_len = int(query_start_loc_np[1] - query_start_loc_np[0])
 
             # Use padded head count since that's what the kernel will see
             scheduler_metadata, _ = get_mla_metadata()
@@ -570,11 +580,14 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
     ) -> FlashMLASparseMetadata:
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
-        starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-        seg_lengths = np.diff(starts)
-        req_id_per_token = np.repeat(
-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
-        )
+        if cm.batch_topology is not None:
+            req_id_per_token = cm.batch_topology.req_id_per_token_np
+        else:
+            starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
+            seg_lengths = np.diff(starts)
+            req_id_per_token = np.repeat(
+                np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
+            )
         # Zero-fill for cudagraphs
         self.req_id_per_token_buffer.fill_(0)
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
@@ -589,7 +602,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 common_attn_metadata.query_start_loc,
                 common_attn_metadata.seq_lens,
                 common_attn_metadata.block_table_tensor.clamp(min=0),
-                int(self.kv_cache_spec.storage_block_size),
+                self.storage_block_size,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -647,8 +660,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # `_forward_decode`. The per-token C128A kernel handles non-uniform
         # query lengths.
         (num_decodes, _, num_decode_tokens, num_prefill_tokens) = (
-            split_decodes_and_prefills(
-                cm,
+            cm.split_decodes_and_prefills(
                 decode_threshold=self.reorder_batch_threshold or 1,
             )
         )
