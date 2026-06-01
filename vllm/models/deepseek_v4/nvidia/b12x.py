@@ -116,7 +116,11 @@ def _run_compressed_mla(
         B12XCompressedMLAScratchCaps,
         plan_compressed_mla_scratch,
     )
+    from b12x.attention.mla.compressed_config import (
+        compressed_mla_split_config_for_contract,
+    )
     from b12x.integration.mla import compressed_mla_decode_forward
+    import os
 
     rows, heads = q.shape[0], q.shape[1]
     q = q.contiguous()
@@ -133,6 +137,15 @@ def _run_compressed_mla(
     if indexed_indices is not None:
         width += int(indexed_indices.shape[-1])
     num_splits_cap = max(1, _cdiv(width, _DECODE_SPLIT_TILE))
+    max_chunks_override = os.getenv("B12X_COMPRESSED_MLA_MAX_CHUNKS")
+    if max_chunks_override:
+        num_splits_cap = min(num_splits_cap, max(1, int(max_chunks_override)))
+    split_cfg = compressed_mla_split_config_for_contract(
+        rows=max(1, int(rows)),
+        width=max(1, int(width)),
+        max_chunks=num_splits_cap,
+    )
+    num_splits_cap = max(1, int(split_cfg.num_chunks))
 
     plan = plan_compressed_mla_scratch(
         B12XCompressedMLAScratchCaps(
