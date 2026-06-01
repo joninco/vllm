@@ -40,7 +40,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -728,7 +727,6 @@ direct_register_custom_op(
 )
 
 
-@eager_break_during_capture
 def deepseek_v4_attention(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
