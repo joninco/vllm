@@ -654,6 +654,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         q = q.contiguous()
 
         num_actual_toks = q.shape[0]
+        lse = None
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
