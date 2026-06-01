@@ -19,6 +19,8 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
+HAS_CUTEDSL = has_cutedsl()
+
 
 @triton.jit
 def quantize_and_insert_k_kernel(
@@ -364,7 +366,7 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
-    if has_cutedsl():
+    if HAS_CUTEDSL and not torch.compiler.is_compiling():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,

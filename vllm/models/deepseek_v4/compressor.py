@@ -335,7 +335,7 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
-        if current_platform.is_cuda():
+        if current_platform.is_cuda() and not torch.compiler.is_compiling():
             # NVIDIA GPUs.
             if self.head_dim == 512:
                 from .nvidia.ops.sparse_attn_compress_cutedsl import (

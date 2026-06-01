@@ -61,13 +61,6 @@ def _convert_req_index_to_global_index_kernel(
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
     is_invalid_tok |= ~valid_block
     base = tl.load(bt_ptr, mask=valid_block & ~is_prefill, other=0)
-    # DCP block tables may contain in-range but unmapped entries encoded as -1.
-    # Treat those as invalid selections too; otherwise valid_counts can report
-    # full top-k while page_table_1 contains negative physical KV offsets.
-    base_invalid = base < 0
-    if HAS_PREFILL:
-        base_invalid = base_invalid & ~is_prefill
-    is_invalid_tok |= base_invalid
     out_val = base * BLOCK_SIZE + inblock_off
 
     # Override with prefill output if prefill is enabled
@@ -151,22 +144,20 @@ def triton_convert_req_index_to_global_index(
         out = torch.empty_like(token_indices_c)
     else:
         assert out.dtype == torch.int32
+        assert out.shape == token_indices.shape
         assert out.device == token_indices.device
-        assert out.shape == token_indices_c.shape
-        out = out.contiguous()
 
     # Allocate valid count buffer if needed (must be zero-initialized for atomics)
     if return_valid_counts:
         if valid_counts is None:
-            valid_counts = torch.empty(
+            valid_counts = torch.zeros(
                 num_tokens, dtype=torch.int32, device=token_indices.device
             )
         else:
             assert valid_counts.dtype == torch.int32
-            assert valid_counts.device == token_indices.device
             assert valid_counts.shape == (num_tokens,)
-            valid_counts = valid_counts.contiguous()
-        valid_counts.zero_()
+            assert valid_counts.device == token_indices.device
+            valid_counts.zero_()
 
     # Strides in elements
     bt_stride0, bt_stride1 = block_table_c.stride()
