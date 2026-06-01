@@ -549,6 +549,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             curr_hit_length = hit_length
 
             for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
+                if idx in self.eagle_attn_group_indices:
+                    # EAGLE/MTP hidden-state cache groups are produced from target
+                    # hidden states and are not valid as a gating condition for
+                    # target KV prefix reuse. The target model still recomputes
+                    # the final cached block as needed for drafting state.
+                    for group_id in group_ids:
+                        hit_blocks_by_group[group_id] = []
+                    continue
+
                 cached_blocks = hit_blocks_by_group[group_ids[0]]
                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
                     # Full attention is downward-closed: we only need to look
