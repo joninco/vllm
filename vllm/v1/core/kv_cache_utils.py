@@ -1646,12 +1646,35 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
-    elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
+    # Hidden-state cache layers are used by EAGLE/MTP and must not be folded
+    # into the main DeepSeek V4 MLA group. HiddenStateCacheSpec subclasses
+    # MLAAttentionSpec, so filter it before the DeepSeek V4 grouping path.
+    hidden_specs_for_grouping = {
+        k: v for k, v in kv_cache_spec.items() if isinstance(v, HiddenStateCacheSpec)
+    }
+    grouping_spec = (
+        {k: v for k, v in kv_cache_spec.items() if k not in hidden_specs_for_grouping}
+        if hidden_specs_for_grouping
+        else kv_cache_spec
+    )
+
+    if grouped_specs := group_and_unify_kv_cache_specs(grouping_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        if hidden_specs_for_grouping:
+            common_page = get_uniform_page_size(
+                [g.kv_cache_spec for g in kv_cache_groups]
+            )
+            for name, spec in hidden_specs_for_grouping.items():
+                per_token = (
+                    spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
+                )
+                new_bs = max(common_page // per_token, 1)
+                aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
+                kv_cache_groups.append(KVCacheGroupSpec([name], aligned))
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 
