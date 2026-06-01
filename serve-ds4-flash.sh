@@ -64,6 +64,7 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --attention-backend B12X_MLA_SPARSE \
   --enable-chunked-prefill \
   --enable-prefix-caching \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x"}' \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \

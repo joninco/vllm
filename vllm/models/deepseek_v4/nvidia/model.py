@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -25,6 +26,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_post_tilelang,
     mhc_pre_tilelang,
 )
+from vllm.model_executor.kernels.mhc.triton import hc_head_fused_kernel_triton
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -937,7 +939,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 logger.info_once(
                     "DeepSeek V4 b12x mHC enabled for token counts <= %d; "
-                    "using TileLang mHC above that.",
+                    "refusing TileLang mHC fallback above that.",
                     self._b12x_mhc_max_tokens,
                 )
 
@@ -1092,6 +1094,20 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from b12x.integration.residual import b12x_mhc_pre
 
+        if torch.compiler.is_compiling():
+            return b12x_mhc_pre(
+                residual,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                block_k=self._b12x_mhc_block_k,
+            )
+
         tokens, hc_mult, hidden_size = residual.shape
         layer_input = torch.empty(
             (tokens, hidden_size), dtype=residual.dtype, device=residual.device
@@ -1137,6 +1153,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         from b12x.integration.residual import b12x_mhc_post_pre
+
+        if torch.compiler.is_compiling():
+            return b12x_mhc_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                block_k=self._b12x_mhc_block_k,
+            )
 
         tokens, hc_mult, hidden_size = residual.shape
         residual_out = torch.empty_like(residual)
@@ -1382,6 +1415,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class DeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1531,9 +1572,22 @@ class DeepseekV4Model(nn.Module):
                 residual,
             )
         if layer is not None:
-            hidden_states = mhc_post_tilelang(
-                hidden_states, residual, post_mix, res_mix
-            )
+            assert residual is not None
+            assert post_mix is not None
+            assert res_mix is not None
+            if layer._should_run_b12x_mhc(int(hidden_states.shape[0])):
+                from b12x.integration.residual import b12x_mhc_post
+
+                hidden_states = b12x_mhc_post(
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                )
+            else:
+                hidden_states = mhc_post_tilelang(
+                    hidden_states, residual, post_mix, res_mix
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -1542,14 +1596,27 @@ class DeepseekV4Model(nn.Module):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = hc_head_fused_kernel_tilelang(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
+        if torch.compiler.is_compiling() or (
+            layer is not None
+            and layer._should_run_b12x_mhc(int(hidden_states.shape[0]))
+        ):
+            hidden_states = hc_head_fused_kernel_triton(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+        else:
+            hidden_states = hc_head_fused_kernel_tilelang(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
         hidden_states = self.norm(hidden_states)
         return hidden_states
 

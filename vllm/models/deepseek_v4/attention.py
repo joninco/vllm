@@ -385,6 +385,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         o: torch.Tensor,
         positions: torch.Tensor,
         weights: Any,
+        *,
+        o_storage: torch.Tensor | None = None,
+        o_storage_offset: int = 0,
+        o_stride_0: int = 0,
+        o_stride_1: int = 0,
+        o_stride_2: int = 0,
     ) -> Any:
         from b12x.gemm.wo_projection import (
             WOProjectionScratchCaps,
@@ -392,10 +398,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         groups, group_width, rank, hidden = self._validate_wo_projection_tensors()
+        num_tokens = int(o.shape[0])
         plan = plan_wo_projection_scratch(
             WOProjectionScratchCaps(
                 device=o.device,
-                max_tokens=max(1, int(o.shape[0])),
+                max_tokens=max(1, num_tokens),
                 groups=groups,
                 group_width=group_width,
                 rank=rank,
@@ -416,10 +423,23 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             heads_per_group=self.n_local_heads // self.n_local_groups,
             nope_dim=self.nope_head_dim,
             rope_dim=self.rope_head_dim,
+            o_storage=o_storage,
+            o_storage_offset=o_storage_offset,
+            o_stride_0=o_stride_0,
+            o_stride_1=o_stride_1,
+            o_stride_2=o_stride_2,
         )
 
     def _apply_b12x_wo_projection(
-        self, o: torch.Tensor, positions: torch.Tensor
+        self,
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        o_storage: torch.Tensor | None = None,
+        o_storage_offset: int = 0,
+        o_stride_0: int = 0,
+        o_stride_1: int = 0,
+        o_stride_2: int = 0,
     ) -> torch.Tensor:
         num_tokens = int(o.shape[0])
         if num_tokens == 0:
@@ -435,7 +455,16 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         if weights is None:
             raise RuntimeError("DeepSeek V4 b12x WO weights were not packed")
 
-        binding = self._get_b12x_wo_projection_binding(o, positions, weights)
+        binding = self._get_b12x_wo_projection_binding(
+            o,
+            positions,
+            weights,
+            o_storage=o_storage,
+            o_storage_offset=o_storage_offset,
+            o_stride_0=o_stride_0,
+            o_stride_1=o_stride_1,
+            o_stride_2=o_stride_2,
+        )
 
         from b12x.gemm.wo_projection import wo_projection_inv_rope_mxfp8
 
@@ -463,7 +492,15 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         o = o_padded[:, : self.n_local_heads, :]
 
         if self._use_b12x_wo:
-            return self._apply_b12x_wo_projection(o, positions)
+            return self._apply_b12x_wo_projection(
+                o,
+                positions,
+                o_storage=o_padded,
+                o_storage_offset=0,
+                o_stride_0=self.padded_heads * self.head_dim,
+                o_stride_1=self.head_dim,
+                o_stride_2=1,
+            )
 
         # Keep ROCm on the BF16 reference wo_a path util kernel ready.
         if current_platform.is_rocm():

@@ -93,6 +93,8 @@ def triton_convert_req_index_to_global_index(
     prefill_workspace_request_ids: torch.Tensor | None = None,
     prefill_workspace_starts: torch.Tensor | None = None,
     return_valid_counts: bool = False,
+    out: torch.Tensor | None = None,
+    valid_counts: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     out[token_id, indice_id] =
@@ -138,14 +140,24 @@ def triton_convert_req_index_to_global_index(
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
-    out = torch.empty_like(token_indices_c)
+    if out is None:
+        out = torch.empty_like(token_indices_c)
+    else:
+        assert out.dtype == torch.int32
+        assert out.shape == token_indices.shape
+        assert out.device == token_indices.device
 
     # Allocate valid count buffer if needed (must be zero-initialized for atomics)
-    valid_counts: torch.Tensor | None = None
     if return_valid_counts:
-        valid_counts = torch.zeros(
-            num_tokens, dtype=torch.int32, device=token_indices.device
-        )
+        if valid_counts is None:
+            valid_counts = torch.zeros(
+                num_tokens, dtype=torch.int32, device=token_indices.device
+            )
+        else:
+            assert valid_counts.dtype == torch.int32
+            assert valid_counts.shape == (num_tokens,)
+            assert valid_counts.device == token_indices.device
+            valid_counts.zero_()
 
     # Strides in elements
     bt_stride0, bt_stride1 = block_table_c.stride()
