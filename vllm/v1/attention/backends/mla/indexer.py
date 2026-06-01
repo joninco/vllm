@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+import os
 
 import torch
 
@@ -28,6 +29,26 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
+_B12X_MLA_DEBUG = os.getenv("VLLM_B12X_MLA_DEBUG", "0") == "1"
+_B12X_MLA_DEBUG_LIMIT = int(os.getenv("VLLM_B12X_MLA_DEBUG_LIMIT", "32"))
+_B12X_MLA_DEBUG_FILE = os.getenv(
+    "VLLM_B12X_MLA_DEBUG_FILE", "/tmp/vllm_b12x_mla_debug.log"
+)
+
+
+def _debug_int_tensor(t: torch.Tensor, limit: int = 8) -> list[int]:
+    if t.numel() == 0:
+        return []
+    return t.detach().flatten()[:limit].to("cpu").tolist()
+
+
+def _debug_can_sync_cuda() -> bool:
+    if not torch.cuda.is_available():
+        return True
+    try:
+        return not torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
 
 
 @triton.jit
@@ -741,26 +762,47 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         prefill_metadata = None
         if num_prefills > 0:
-            # This CPU value is an upper bound for async-spec extend rows.  It
-            # is safe for chunking/allocation because CUDA metadata below is
-            # built from exact device seq_lens and gather ignores the tail.
-            global_seq_lens_cpu = (
-                common_attn_metadata._seq_lens_cpu
-                if common_attn_metadata._seq_lens_cpu is not None
-                else common_attn_metadata.seq_lens_cpu_upper_bound
-            )
-            assert global_seq_lens_cpu is not None
-            indexer_seq_lens_cpu = (
-                common_attn_metadata.dcp_local_seq_lens_cpu
-                if common_attn_metadata.dcp_local_seq_lens_cpu is not None
-                else global_seq_lens_cpu
-            )
+            # Prefill sparse-indexer chunks need exact lengths. Upper-bound
+            # lengths are only safe for allocation; using them for DCP spans can
+            # select future/non-local KV rows in long-context requests.
+            global_seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+            has_dcp_local_seq_lens = self.dcp_world_size > 1
+            if has_dcp_local_seq_lens:
+                indexer_seq_lens_cpu = common_attn_metadata.dcp_local_seq_lens_cpu
+                if indexer_seq_lens_cpu is None:
+                    indexer_seq_lens_cpu = get_dcp_local_seq_lens(
+                        global_seq_lens_cpu.to(torch.int32),
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    )
+            else:
+                indexer_seq_lens_cpu = global_seq_lens_cpu
             seq_lens_cpu = global_seq_lens_cpu
             compressed_seq_lens_cpu = (
                 indexer_seq_lens_cpu // self.compress_ratio
                 if self.compress_ratio > 1
                 else indexer_seq_lens_cpu
             )
+            if _B12X_MLA_DEBUG and _debug_can_sync_cuda():
+                debug_count = getattr(self, "_debug_prefill_build_count", 0)
+                if debug_count < _B12X_MLA_DEBUG_LIMIT:
+                    try:
+                        payload = (
+                            f"kind=indexer_prefill_build count={debug_count} "
+                            f"dcp_world={self.dcp_world_size} "
+                            f"dcp_rank={self.dcp_rank} "
+                            f"has_cm_dcp={common_attn_metadata.dcp_local_seq_lens is not None} "
+                            f"has_cm_dcp_cpu={common_attn_metadata.dcp_local_seq_lens_cpu is not None} "
+                            f"global={_debug_int_tensor(global_seq_lens_cpu)} "
+                            f"indexer={_debug_int_tensor(indexer_seq_lens_cpu)}"
+                        )
+                        logger.warning("B12X_MLA_DEBUG %s", payload)
+                        with open(_B12X_MLA_DEBUG_FILE, "a", encoding="utf-8") as f:
+                            f.write(payload + "\n")
+                    except Exception:
+                        logger.exception("Failed to write B12X indexer build debug")
+                    setattr(self, "_debug_prefill_build_count", debug_count + 1)
             prefill_query_lens_cpu = torch.diff(
                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
             )
@@ -775,7 +817,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             chunks = []
             for req_slice, query_slice in chunk_specs:
-                if common_attn_metadata.dcp_local_seq_lens_cpu is not None:
+                if has_dcp_local_seq_lens:
                     if self.compress_ratio != 1:
                         raise RuntimeError(
                             "DCP sparse indexer prefill with compressed MLA KV "
@@ -951,6 +993,34 @@ def build_dcp_prefill_chunk_metadata(
         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         global_seq_len_per_batch=global_lens,
     )
+
+    if _B12X_MLA_DEBUG and _debug_can_sync_cuda():
+        debug_count = getattr(build_dcp_prefill_chunk_metadata, "_debug_count", 0)
+        if debug_count < _B12X_MLA_DEBUG_LIMIT:
+            try:
+                payload = (
+                    f"kind=indexer_dcp_prefill count={debug_count} "
+                    f"reqs={num_reqs} req_slice={start_idx}:{end_idx} "
+                    f"query_slice={query_slice.start if query_slice else 0}:"
+                    f"{query_slice.stop if query_slice else int(prefill_query_start_loc[-1].item())} "
+                    f"total_local={total_seq_lens} "
+                    f"local={_debug_int_tensor(local_lens)} "
+                    f"global={_debug_int_tensor(global_lens)} "
+                    f"qsl={_debug_int_tensor(prefill_query_start_loc)} "
+                    f"ks_min={int(cu_seqlen_ks.min().item()) if cu_seqlen_ks.numel() else -1} "
+                    f"ks_max={int(cu_seqlen_ks.max().item()) if cu_seqlen_ks.numel() else -1} "
+                    f"ke_min={int(cu_seqlen_ke.min().item()) if cu_seqlen_ke.numel() else -1} "
+                    f"ke_max={int(cu_seqlen_ke.max().item()) if cu_seqlen_ke.numel() else -1} "
+                    f"empty_rows={int((cu_seqlen_ke <= cu_seqlen_ks).sum().item()) if cu_seqlen_ke.numel() else 0} "
+                    f"ks={_debug_int_tensor(cu_seqlen_ks)} "
+                    f"ke={_debug_int_tensor(cu_seqlen_ke)}"
+                )
+                logger.warning("B12X_MLA_DEBUG %s", payload)
+                with open(_B12X_MLA_DEBUG_FILE, "a", encoding="utf-8") as f:
+                    f.write(payload + "\n")
+            except Exception:
+                logger.exception("Failed to write B12X indexer debug payload")
+            setattr(build_dcp_prefill_chunk_metadata, "_debug_count", debug_count + 1)
 
     if num_reqs == 1:
         token_to_seq = torch.zeros(total_seq_lens, dtype=torch.int32, device=device)

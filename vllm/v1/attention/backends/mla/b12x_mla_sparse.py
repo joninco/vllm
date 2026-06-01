@@ -55,6 +55,13 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 logger = init_logger(__name__)
+_B12X_MLA_DEBUG = os.getenv("VLLM_B12X_MLA_DEBUG", "0") == "1"
+_B12X_MLA_DEBUG_LIMIT = int(os.getenv("VLLM_B12X_MLA_DEBUG_LIMIT", "32"))
+_B12X_MLA_DEBUG_MAX_REQS = int(os.getenv("VLLM_B12X_MLA_DEBUG_MAX_REQS", "4"))
+_B12X_MLA_DEBUG_FILE = os.getenv(
+    "VLLM_B12X_MLA_DEBUG_FILE", "/tmp/vllm_b12x_mla_debug.log"
+)
+_B12X_MLA_DEBUG_COUNT = 0
 
 # Split-K tile width. Mirrors SparseMLASm120's _DECODE_SPLIT_TILE: the number of
 # split-K chunks is ceil(topk / tile). This bounds the chunk dim of the borrowed
@@ -66,6 +73,21 @@ _PREFILL_HEADS_PER_BLOCK = 16
 
 def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
+
+
+def _debug_int_tensor(t: torch.Tensor, limit: int = 8) -> list[int]:
+    if t.numel() == 0:
+        return []
+    return t.detach().flatten()[:limit].to("cpu").tolist()
+
+
+def _debug_can_sync_cuda() -> bool:
+    if not torch.cuda.is_available():
+        return True
+    try:
+        return not torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
 
 
 def _env_int(name: str, default: int) -> int:
@@ -380,6 +402,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         )
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        max_seqs = vllm_config.scheduler_config.max_num_seqs
         # Max-batched-token scratch buffers so cudagraph capture sees stable
         # allocations (sliced per build()).
         self.req_id_per_token_buffer = torch.empty(
@@ -388,6 +411,10 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         self.cache_seq_lens_per_token_buffer = torch.empty(
             (max_tokens,), dtype=torch.int32, device=device
         )
+        self.cache_seq_lens_per_req_buffer = torch.empty(
+            (max_seqs,), dtype=torch.int32, device=device
+        )
+        self.req_ids_arange = torch.arange(max_tokens, dtype=torch.int32, device=device)
 
     def build(
         self,
@@ -395,52 +422,91 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> B12xMLASparseMetadata:
+        del common_prefix_len, fast_build
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
 
-        starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-        seg_lengths = np.diff(starts)
-        req_id_per_token = np.repeat(
-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
-        )
-
-        self.req_id_per_token_buffer.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
-            torch.from_numpy(req_id_per_token), non_blocking=True
-        )
-        req_id_per_token_tensor = self.req_id_per_token_buffer[:num_tokens]
-
-        # Per-token causal KV length. Hot path (pure decode, one token per req):
-        # the per-token length is just the per-request seq_len -- no expansion.
         seq_lens_for_req = (
             cm.dcp_local_seq_lens
             if cm.dcp_local_seq_lens is not None
             else cm.seq_lens
         )
+
+        # Pure decode is the hot path. Keep it device-only and reuse stable
+        # buffers so CUDA graph capture sees fixed tensor addresses.
         if cm.max_query_len <= 1 and num_tokens == cm.num_reqs:
-            cache_seq_lens_per_token = seq_lens_for_req[:num_tokens]
-        else:
-            # Prefill / mixed: token at within-query offset i in a request with
-            # ``num_computed`` already-cached tokens has causal KV length
-            # ``num_computed + i + 1``. Computed entirely on device (no H<->D
-            # sync); prefill is not cudagraph-captured but this is capture-safe
-            # regardless.
-            num_computed = cm.compute_num_computed_tokens()  # (num_reqs,) device
-            req = req_id_per_token_tensor.to(torch.long)
-            arange = torch.arange(num_tokens, device=self.device, dtype=torch.int32)
-            within = arange - cm.query_start_loc[:-1].to(torch.int32)[req]
-            per_token = num_computed.to(torch.int32)[req] + within + 1
-            if cm.dcp_local_seq_lens is not None:
-                per_token = get_dcp_local_seq_lens(
-                    per_token,
-                    self.dcp_world_size,
-                    self.dcp_rank,
-                    self.cp_kv_cache_interleave_size,
-                )
-            self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
-                per_token, non_blocking=True
+            self.req_id_per_token_buffer[:num_tokens].copy_(
+                self.req_ids_arange[:num_tokens]
             )
-            cache_seq_lens_per_token = self.cache_seq_lens_per_token_buffer[:num_tokens]
+            self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
+                seq_lens_for_req[:num_tokens], non_blocking=True
+            )
+            self.cache_seq_lens_per_req_buffer[: cm.num_reqs].copy_(
+                seq_lens_for_req[: cm.num_reqs], non_blocking=True
+            )
+        else:
+            starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
+            query_lens = np.diff(starts)
+            num_query_tokens = int(starts[-1])
+            if num_query_tokens > num_tokens:
+                raise RuntimeError(
+                    "B12X sparse MLA metadata received query_start_loc with "
+                    f"{num_query_tokens} tokens, exceeding padded capacity "
+                    f"{num_tokens}"
+                )
+
+            req_ids = np.zeros((num_tokens,), dtype=np.int32)
+            if num_query_tokens:
+                req_ids[:num_query_tokens] = np.repeat(
+                    np.arange(cm.num_reqs, dtype=np.int32), query_lens
+                )
+
+            # Prefill/extend rows need exact lengths. The upper-bound CPU
+            # tensor can include optimistic/padded lengths, which corrupts DCP
+            # long-context causal limits and sparse-indexer physical slots.
+            seq_lens_cpu = cm.seq_lens_cpu
+            seq_lens_cpu_np = seq_lens_cpu.numpy().astype(np.int32, copy=False)
+
+            # The sparse indexer emits request-local token indices. For DCP the
+            # B12X kernels need the local causal cache length for each real query
+            # row; padded CUDA-graph rows stay zero-length.
+            per_token_lens = np.zeros((num_tokens,), dtype=np.int32)
+            for req_id, q_len in enumerate(query_lens):
+                if q_len <= 0:
+                    continue
+                start = int(starts[req_id])
+                end = int(starts[req_id + 1])
+                context_len = int(seq_lens_cpu_np[req_id]) - int(q_len)
+                global_per_token_lens = torch.arange(
+                    context_len + 1,
+                    context_len + int(q_len) + 1,
+                    dtype=torch.int32,
+                )
+                if cm.dcp_local_seq_lens is not None:
+                    per_token_lens[start:end] = get_dcp_local_seq_lens(
+                        global_per_token_lens,
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    ).numpy()
+                else:
+                    per_token_lens[start:end] = global_per_token_lens.numpy()
+
+            req_ids_t = torch.from_numpy(req_ids)
+            per_token_lens_t = torch.from_numpy(per_token_lens)
+            if req_ids_t.device.type == "cpu":
+                req_ids_t = req_ids_t.pin_memory()
+            if per_token_lens_t.device.type == "cpu":
+                per_token_lens_t = per_token_lens_t.pin_memory()
+            self.req_id_per_token_buffer[:num_tokens].copy_(
+                req_ids_t, non_blocking=True
+            )
+            self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
+                per_token_lens_t, non_blocking=True
+            )
+            self.cache_seq_lens_per_req_buffer[: cm.num_reqs].copy_(
+                seq_lens_for_req[: cm.num_reqs], non_blocking=True
+            )
 
         return B12xMLASparseMetadata(
             num_reqs=cm.num_reqs,
@@ -450,9 +516,9 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             query_start_loc=cm.query_start_loc,
             slot_mapping=cm.slot_mapping,
             block_table=cm.block_table_tensor,
-            req_id_per_token=req_id_per_token_tensor,
-            seq_lens=seq_lens_for_req,
-            cache_seq_lens_per_token=cache_seq_lens_per_token,
+            req_id_per_token=self.req_id_per_token_buffer[:num_tokens],
+            seq_lens=self.cache_seq_lens_per_req_buffer[: cm.num_reqs],
+            cache_seq_lens_per_token=self.cache_seq_lens_per_token_buffer[:num_tokens],
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
         )
@@ -658,10 +724,18 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+        per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
+        causal_lens = per_token_cache
+        if causal_lens.dtype != torch.int32:
+            causal_lens = causal_lens.to(torch.int32)
+        causal_lens = causal_lens.contiguous()
 
         # Per-request topk indices -> physical cache slot ids. B12X consumes the
         # table as a dense prefix of length nsa_cache_seqlens, so preserve the
         # converter's valid count and compact any holes before launching B12X.
+        # Causal filtering must happen before compact/count: DCP prefill top-k
+        # rows can contain later local tokens that would otherwise survive a
+        # count-only clamp after compaction.
         page_table_1, nsa_cache_seqlens = cast(
             tuple[torch.Tensor, torch.Tensor],
             triton_convert_req_index_to_global_index(
@@ -671,6 +745,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
+                causal_lens=causal_lens,
             ),
         )
         page_table_1 = page_table_1.to(torch.int32).contiguous()
@@ -680,14 +755,76 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         # nsa_cache_seqlens: per-token count of selected KV rows to attend,
         # additionally clamped to the causal KV length for prefill/verify rows.
-        per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
-        causal_nsa = torch.clamp(
-            per_token_cache.to(torch.int32), max=topk_width
-        )
+        causal_nsa = torch.clamp(causal_lens, max=topk_width)
         torch.minimum(nsa_cache_seqlens, causal_nsa, out=nsa_cache_seqlens)
         _mask_page_table_after_nsa_len(page_table_1, nsa_cache_seqlens)
         # Per-request KV length (validated but unused by the unified kernels).
         cache_seqlens = attn_metadata.seq_lens.to(torch.int32).contiguous()
+
+        if (
+            _B12X_MLA_DEBUG
+            and self.dcp_world_size > 1
+            and _debug_can_sync_cuda()
+        ):
+            global _B12X_MLA_DEBUG_COUNT
+            debug_count = _B12X_MLA_DEBUG_COUNT
+            should_debug = (
+                int(cache_seqlens.max().item()) >= 1024
+                or int(attn_metadata.max_query_len) >= 1024
+            )
+            if should_debug and debug_count < _B12X_MLA_DEBUG_LIMIT:
+                try:
+                    rows = min(_B12X_MLA_DEBUG_MAX_REQS, num_actual_toks)
+                    cols = min(16, topk_indices.shape[1])
+                    valid_counts = (page_table_1 >= 0).sum(dim=1)
+                    prefix_invalid = page_table_1 < 0
+                    prefix_counts = torch.argmax(prefix_invalid.to(torch.int32), dim=1)
+                    prefix_counts = torch.where(
+                        prefix_invalid.any(dim=1),
+                        prefix_counts,
+                        torch.full_like(prefix_counts, page_table_1.shape[1]),
+                    )
+                    kv_rows = int(kv_c_and_k_pe_cache.shape[0]) * int(
+                        kv_c_and_k_pe_cache.shape[1]
+                    )
+                    payload = (
+                        f"kind=mla layer={getattr(layer, 'layer_name', '')} "
+                        f"count={debug_count} dcp={self.dcp_world_size} "
+                        f"max_q={attn_metadata.max_query_len} "
+                        f"max_seq={attn_metadata.max_seq_len} "
+                        f"num_reqs={attn_metadata.num_reqs} "
+                        f"num_toks={num_actual_toks} heads={int(q.shape[1])} "
+                        f"kv_rows={kv_rows} "
+                        f"topk_min={int(topk_indices.min().item())} "
+                        f"topk_max={int(topk_indices.max().item())} "
+                        f"causal_min={int(causal_lens.min().item())} "
+                        f"causal_max={int(causal_lens.max().item())} "
+                        f"page_min={int(page_table_1.min().item())} "
+                        f"page_max={int(page_table_1.max().item())} "
+                        f"nsa_min={int(nsa_cache_seqlens.min().item())} "
+                        f"nsa_max={int(nsa_cache_seqlens.max().item())} "
+                        f"valid_min={int(valid_counts.min().item())} "
+                        f"valid_max={int(valid_counts.max().item())} "
+                        f"prefix_min={int(prefix_counts.min().item())} "
+                        f"prefix_max={int(prefix_counts.max().item())} "
+                        f"bad_valid={int((valid_counts < nsa_cache_seqlens).sum().item())} "
+                        f"bad_prefix={int((prefix_counts < nsa_cache_seqlens).sum().item())} "
+                        f"oob={int((page_table_1 >= kv_rows).sum().item())} "
+                        f"neg={int((page_table_1 < 0).sum().item())} "
+                        f"cache={_debug_int_tensor(cache_seqlens[:rows])} "
+                        f"causal={_debug_int_tensor(causal_lens[:rows])} "
+                        f"nsa={_debug_int_tensor(nsa_cache_seqlens[:rows])} "
+                        f"valid={_debug_int_tensor(valid_counts[:rows])} "
+                        f"prefix={_debug_int_tensor(prefix_counts[:rows])} "
+                        f"topk0={_debug_int_tensor(topk_indices[:1, :cols])} "
+                        f"page0={_debug_int_tensor(page_table_1[:1, :cols])}"
+                    )
+                    logger.warning("B12X_MLA_DEBUG %s", payload)
+                    with open(_B12X_MLA_DEBUG_FILE, "a", encoding="utf-8") as f:
+                        f.write(payload + "\n")
+                except Exception:
+                    logger.exception("Failed to write B12X MLA debug payload")
+                _B12X_MLA_DEBUG_COUNT = debug_count + 1
 
         # KV cache -> flat (num_slots, 1, nbytes) uint8 (b12x requires rank-3
         # uint8; page_size tells it the per-block stride). page_table_1 are

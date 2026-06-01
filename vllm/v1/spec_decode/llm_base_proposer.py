@@ -13,7 +13,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -27,6 +27,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -71,6 +72,13 @@ class SpecDecodeBaseProposer:
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.dcp_rank = (
+            get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        )
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
         # We need to get the hidden size from the draft model config because
@@ -289,6 +297,52 @@ class SpecDecodeBaseProposer:
             rocm_types.append(FlexAttentionMetadata)
 
             self.allowed_attn_types = tuple(rocm_types)
+
+    def _get_dcp_local_seq_lens_for_spec(
+        self,
+        seq_lens_cpu: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.dcp_world_size <= 1:
+            return None, None
+        dcp_local_seq_lens_cpu = get_dcp_local_seq_lens(
+            seq_lens_cpu,
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
+        )
+        if is_pin_memory_available() and dcp_local_seq_lens_cpu.device.type == "cpu":
+            dcp_local_seq_lens_cpu = dcp_local_seq_lens_cpu.pin_memory()
+        return (
+            dcp_local_seq_lens_cpu.to(device, non_blocking=True),
+            dcp_local_seq_lens_cpu,
+        )
+
+    def _refresh_dcp_local_seq_lens(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> CommonAttentionMetadata:
+        if self.dcp_world_size <= 1:
+            return common_attn_metadata
+
+        # Spec decode mutates seq_lens after rejection correction. Recompute DCP
+        # local lengths from the current device source of truth so sparse MLA and
+        # draft attention do not use stale optimistic lengths after long prefills.
+        dcp_local_seq_lens = get_dcp_local_seq_lens(
+            common_attn_metadata.seq_lens,
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
+        )
+        dcp_local_seq_lens_cpu = None
+        if common_attn_metadata.max_query_len > 1:
+            dcp_local_seq_lens_cpu = dcp_local_seq_lens.cpu()
+            if is_pin_memory_available():
+                dcp_local_seq_lens_cpu = dcp_local_seq_lens_cpu.pin_memory()
+
+        return common_attn_metadata.replace(
+            dcp_local_seq_lens=dcp_local_seq_lens,
+            dcp_local_seq_lens_cpu=dcp_local_seq_lens_cpu,
+        )
 
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
@@ -863,6 +917,7 @@ class SpecDecodeBaseProposer:
     def build_per_group_and_layer_attn_metadata(
         self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
+        common_attn_metadata = self._refresh_dcp_local_seq_lens(common_attn_metadata)
         per_group_attn_metadata: list[object] = []
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
@@ -1016,6 +1071,7 @@ class SpecDecodeBaseProposer:
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+            dcp_local_seq_lens_cpu=common_attn_metadata.dcp_local_seq_lens_cpu,
         )
 
         return (
@@ -1060,10 +1116,19 @@ class SpecDecodeBaseProposer:
 
         device = common_attn_metadata.query_start_loc.device
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        # upper_bound - rejected = actual post-rejection seq_lens (no D2H sync).
-        assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
-        new_seq_lens_cpu = (
-            common_attn_metadata.seq_lens_cpu_upper_bound - num_rejected_tokens
+        seq_lens_cpu = (
+            common_attn_metadata._seq_lens_cpu
+            if common_attn_metadata._seq_lens_cpu is not None
+            else common_attn_metadata.seq_lens_cpu_upper_bound
+        )
+        if seq_lens_cpu is None:
+            raise RuntimeError(
+                "Speculative target verify requires CPU seq_lens shadow "
+                "or seq_lens_cpu_upper_bound to avoid D2H sync."
+            )
+        new_seq_lens_cpu = seq_lens_cpu - num_rejected_tokens
+        dcp_local_seq_lens, dcp_local_seq_lens_cpu = (
+            self._get_dcp_local_seq_lens_for_spec(new_seq_lens_cpu, device)
         )
 
         # [0, q1, q1 + q2, q1 + q2 + q3] -> [q1, q2, q3]
@@ -1126,7 +1191,8 @@ class SpecDecodeBaseProposer:
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
             causal=True,
-            dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+            dcp_local_seq_lens=dcp_local_seq_lens,
+            dcp_local_seq_lens_cpu=dcp_local_seq_lens_cpu,
         )
 
         return spec_common_attn_metadata, token_indices

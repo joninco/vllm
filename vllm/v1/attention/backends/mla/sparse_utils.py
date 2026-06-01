@@ -13,6 +13,7 @@ def _convert_req_index_to_global_index_kernel(
     req_id_ptr,  # int32 [num_tokens]
     block_table_ptr,  # int32 [num_requests, max_num_blocks_per_req]
     token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    causal_lens_ptr,  # int32 [num_tokens] or nullptr
     out_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     valid_count_ptr,  # int32 [num_tokens] - output valid count per row
     prefill_request_id_ptr,  # int32 [num_tokens], -1 for decode, >=0 for prefill
@@ -22,6 +23,7 @@ def _convert_req_index_to_global_index_kernel(
     BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     HAS_PREFILL: tl.constexpr,
+    HAS_CAUSAL_LENS: tl.constexpr,
     COUNT_VALID: tl.constexpr,  # whether to count valid indices
     # strides (in elements)
     bt_stride0,
@@ -48,6 +50,12 @@ def _convert_req_index_to_global_index_kernel(
 
     # Only token == -1 should propagate as -1
     is_invalid_tok = tok < 0
+    if HAS_CAUSAL_LENS:
+        causal_len = tl.load(causal_lens_ptr + token_id)
+        # Sparse indexer rows are request-local token indices. For DCP prefill,
+        # top-k can contain later local tokens unless we explicitly enforce the
+        # per-row causal KV length before compacting/counting the valid prefix.
+        is_invalid_tok |= tok >= causal_len
     is_prefill = False
     if HAS_PREFILL:
         prefill_req_id = tl.load(prefill_request_id_ptr + token_id)
@@ -100,6 +108,7 @@ def triton_convert_req_index_to_global_index(
     prefill_workspace_request_ids: torch.Tensor | None = None,
     prefill_workspace_starts: torch.Tensor | None = None,
     return_valid_counts: bool = False,
+    causal_lens: torch.Tensor | None = None,  # int32 [num_tokens]
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     out[token_id, indice_id] =
@@ -126,6 +135,9 @@ def triton_convert_req_index_to_global_index(
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
+    if causal_lens is not None:
+        assert causal_lens.dtype == torch.int32
+        assert causal_lens.shape[0] == token_indices.shape[0]
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
         f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
@@ -145,6 +157,7 @@ def triton_convert_req_index_to_global_index(
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
+    causal_lens_c = causal_lens.contiguous() if causal_lens is not None else None
     out = torch.empty_like(token_indices_c)
 
     # Allocate valid count buffer if needed (must be zero-initialized for atomics)
@@ -173,6 +186,7 @@ def triton_convert_req_index_to_global_index(
         req_id_c,
         block_table_c,
         token_indices_c,
+        causal_lens_c,
         out,
         valid_counts,
         prefill_workspace_request_ids,
@@ -182,6 +196,7 @@ def triton_convert_req_index_to_global_index(
         BLOCK_SIZE,
         BLOCK_N,
         HAS_PREFILL_WORKSPACE,
+        causal_lens_c is not None,
         return_valid_counts,
         # strides
         bt_stride0,

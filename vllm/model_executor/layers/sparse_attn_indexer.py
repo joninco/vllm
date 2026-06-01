@@ -30,6 +30,11 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+_B12X_MLA_DEBUG = os.getenv("VLLM_B12X_MLA_DEBUG", "0") == "1"
+_B12X_MLA_DEBUG_LIMIT = int(os.getenv("VLLM_B12X_MLA_DEBUG_LIMIT", "32"))
+_B12X_MLA_DEBUG_FILE = os.getenv(
+    "VLLM_B12X_MLA_DEBUG_FILE", "/tmp/vllm_b12x_mla_debug.log"
+)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 _B12X_COMPRESSED_INDEX_PAGE_SIZE = 64
@@ -238,6 +243,49 @@ def _normalize_prefill_topk_to_req_relative(
     seq_starts = cu_seq_lens[seq_ids]
     normalized = topk_indices - seq_starts
     topk_indices.copy_(torch.where(valid, normalized, topk_indices))
+
+
+def _debug_int_tensor(t: torch.Tensor, limit: int = 8) -> list[int]:
+    if t.numel() == 0:
+        return []
+    return t.detach().flatten()[:limit].to("cpu").tolist()
+
+
+def _debug_b12x_indexer_chunk(
+    *,
+    chunk: object,
+    q_slice: torch.Tensor,
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+    row_has_no_kv: torch.Tensor,
+) -> None:
+    if not _B12X_MLA_DEBUG:
+        return
+    debug_count = getattr(_debug_b12x_indexer_chunk, "_debug_count", 0)
+    if debug_count >= _B12X_MLA_DEBUG_LIMIT:
+        return
+    try:
+        payload = (
+            f"kind=sparse_indexer_b12x_prefill count={debug_count} "
+            f"token={getattr(chunk, 'token_start', -1)}:"
+            f"{getattr(chunk, 'token_end', -1)} "
+            f"total_seq={getattr(chunk, 'total_seq_lens', -1)} "
+            f"skip_kv={getattr(chunk, 'skip_kv_gather', False)} "
+            f"q_rows={int(q_slice.shape[0])} "
+            f"ks_min={int(k_start.min().item()) if k_start.numel() else -1} "
+            f"ks_max={int(k_start.max().item()) if k_start.numel() else -1} "
+            f"ke_min={int(k_end.min().item()) if k_end.numel() else -1} "
+            f"ke_max={int(k_end.max().item()) if k_end.numel() else -1} "
+            f"empty={int(row_has_no_kv.sum().item()) if row_has_no_kv.numel() else 0} "
+            f"ks={_debug_int_tensor(k_start)} "
+            f"ke={_debug_int_tensor(k_end)}"
+        )
+        logger.warning("B12X_MLA_DEBUG %s", payload)
+        with open(_B12X_MLA_DEBUG_FILE, "a", encoding="utf-8") as f:
+            f.write(payload + "\n")
+    except Exception:
+        logger.exception("Failed to write B12X sparse indexer debug payload")
+    setattr(_debug_b12x_indexer_chunk, "_debug_count", debug_count + 1)
 
 
 def _flatten_b12x_paged_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
@@ -581,6 +629,13 @@ def sparse_attn_indexer(
                     k_quant.view(torch.float8_e4m3fn)
                     if k_quant.dtype == torch.uint8
                     else k_quant
+                )
+                _debug_b12x_indexer_chunk(
+                    chunk=chunk,
+                    q_slice=q_slice,
+                    k_start=b12x_cu_seqlen_ks,
+                    k_end=b12x_cu_seqlen_ke,
+                    row_has_no_kv=row_has_no_kv,
                 )
                 topk_indices.copy_(
                     b12x_indexer.extend_tiled_topk(
