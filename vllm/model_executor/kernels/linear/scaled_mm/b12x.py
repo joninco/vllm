@@ -43,16 +43,6 @@ def _current_linear_backend() -> str:
     return str(getattr(vllm_config.kernel_config, "linear_backend", "auto")).lower()
 
 
-def _empty_plan_scratch(
-    plan: Any,
-    device: torch.device,
-) -> tuple[torch.Tensor, ...]:
-    return tuple(
-        torch.empty(shape, dtype=dtype, device=device)
-        for shape, dtype in plan.shapes_and_dtypes()
-    )
-
-
 def _run_b12x_fp8_block_scaled_linear(
     input_2d: torch.Tensor,
     packed_weight: Any,
@@ -66,29 +56,16 @@ def _run_b12x_fp8_block_scaled_linear(
     out_features = int(packed_weight.out_features)
     if tokens == 0:
         return input_2d.new_empty((0, out_features))
-    in_features = int(packed_weight.in_features)
-    output = torch.empty(
-        (tokens, out_features), dtype=input_2d.dtype, device=input_2d.device
-    )
-    plan = block_fp8.plan_block_fp8_linear_scratch(
-        block_fp8.BlockFP8LinearScratchCaps(
-            device=input_2d.device,
-            max_tokens=tokens,
-            in_features=in_features,
-            out_features=out_features,
-            output_dtype=input_2d.dtype,
-        )
-    )
-    scratch = _empty_plan_scratch(plan, input_2d.device)
-    binding = plan.bind(
-        scratch=scratch,
+    # Functional call: block_fp8_linear_mxfp8 allocates + returns its own output,
+    # so no caller-owned view is mutated by a custom op in the compile graph
+    # (which inductor's decompose_auto_functionalized pass cannot remove). No
+    # plan/scratch/binding needed.
+    return block_fp8.block_fp8_linear_mxfp8(
         source=input_2d,
         packed_weight=packed_weight,
-        output=output.view(tokens, out_features, 1),
         bias=bias,
         expected_m=tokens,
     )
-    return block_fp8.block_fp8_linear_mxfp8(binding=binding)
 
 
 class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
