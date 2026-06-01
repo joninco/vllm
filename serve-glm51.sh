@@ -67,7 +67,16 @@ if [[ -z "${MAX_CUDAGRAPH_CAPTURE_SIZE+x}" ]]; then
   case "${VLLM_USE_B12X_MOE,,}" in
     1|true|yes|on)
       # Native B12X MoE is currently capture-safe for decode-size graphs only.
-      MAX_CUDAGRAPH_CAPTURE_SIZE=1
+      # With MTP on, the uniform decode graph spans (num_speculative_tokens + 1)
+      # query tokens per sequence, and vLLM rounds every cudagraph capture size up
+      # to a multiple of that (compilation.py:adjust_cudagraph_sizes_for_spec_decode);
+      # a hardcoded 1 yields zero valid sizes and aborts engine init. Size up to the
+      # smallest valid decode graph = num_speculative_tokens + 1 (1 when MTP off).
+      if [[ "${GLM51_DISABLE_MTP:-0}" != "1" ]]; then
+        MAX_CUDAGRAPH_CAPTURE_SIZE=$(( ${NUM_SPECULATIVE_TOKENS:-3} + 1 ))
+      else
+        MAX_CUDAGRAPH_CAPTURE_SIZE=1
+      fi
       ;;
     *)
       MAX_CUDAGRAPH_CAPTURE_SIZE=64

@@ -8,7 +8,7 @@ export NCCL_IB_DISABLE=1
 
 export VLLM_USE_AOT_COMPILE=1
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0
-export VLLM_USE_MEGA_AOT_ARTIFACT=1
+export VLLM_USE_MEGA_AOT_ARTIFACT=${VLLM_USE_MEGA_AOT_ARTIFACT:-1}
 export B12X_MHC_MAX_TOKENS=2048
 export VLLM_USE_FLASHINFER_SAMPLER=1
 export VLLM_USE_B12X_WO_PROJECTION=1
@@ -47,6 +47,11 @@ if [[ "${VLLM_ENABLE_TORCH_PROFILER:-0}" == "1" ]]; then
   echo "Torch profiler enabled: dir=${profile_dir} delay_iterations=${profile_delay_iterations} max_iterations=${profile_max_iterations}"
 fi
 
+spec_args=()
+if [[ "${VLLM_ENABLE_MTP:-0}" == "1" ]]; then
+  spec_args=('--speculative-config' '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x"}')
+fi
+
 exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   deepseek-ai/DeepSeek-V4-Flash \
   --host 0.0.0.0 \
@@ -54,7 +59,7 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --kv-cache-dtype fp8 \
   --block-size 256 \
   --max-model-len 65536 \
-  --load-format fastsafetensors \
+  --load-format instanttensor \
   --tensor-parallel-size 2 \
   --gpu-memory-utilization 0.88 \
   --max-num-seqs 8 \
@@ -64,11 +69,11 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --attention-backend B12X_MLA_SPARSE \
   --enable-chunked-prefill \
   --enable-prefix-caching \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x"}' \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"inductor_compile_config":{"triton.autotune_at_compile_time":false}}' \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \
   --reasoning-parser deepseek_v4 \
   "${profiler_args[@]}" \
+  "${spec_args[@]}" \
   "$@"
