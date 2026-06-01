@@ -61,6 +61,13 @@ def _convert_req_index_to_global_index_kernel(
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
     is_invalid_tok |= ~valid_block
     base = tl.load(bt_ptr, mask=valid_block & ~is_prefill, other=0)
+    # DCP block tables can contain in-range but unmapped entries encoded as -1.
+    # Treat those as invalid; otherwise page_table_1 can contain negative
+    # physical KV offsets that are later counted as valid selections.
+    base_invalid = base < 0
+    if HAS_PREFILL:
+        base_invalid = base_invalid & ~is_prefill
+    is_invalid_tok |= base_invalid
     out_val = base * BLOCK_SIZE + inblock_off
 
     # Override with prefill output if prefill is enabled
