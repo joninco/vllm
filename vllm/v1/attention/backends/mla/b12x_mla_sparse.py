@@ -20,6 +20,7 @@ per call and backs it with tensors borrowed from vLLM's shared
 """
 
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import numpy as np
@@ -27,6 +28,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.platforms.interface import DeviceCapability
@@ -41,6 +43,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     SparseMLAAttentionImpl,
 )
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
@@ -63,6 +66,21 @@ _PREFILL_HEADS_PER_BLOCK = 16
 
 def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %d", name, value, default)
+        return default
+    if parsed <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using %d", name, value, default)
+        return default
+    return parsed
 
 
 @dataclass
@@ -353,6 +371,13 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = vllm_config.model_config.hf_config.index_topk
+        self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.dcp_rank = (
+            get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        )
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         # Max-batched-token scratch buffers so cudagraph capture sees stable
@@ -387,8 +412,13 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
         # Per-token causal KV length. Hot path (pure decode, one token per req):
         # the per-token length is just the per-request seq_len -- no expansion.
+        seq_lens_for_req = (
+            cm.dcp_local_seq_lens
+            if cm.dcp_local_seq_lens is not None
+            else cm.seq_lens
+        )
         if cm.max_query_len <= 1 and num_tokens == cm.num_reqs:
-            cache_seq_lens_per_token = cm.seq_lens[:num_tokens]
+            cache_seq_lens_per_token = seq_lens_for_req[:num_tokens]
         else:
             # Prefill / mixed: token at within-query offset i in a request with
             # ``num_computed`` already-cached tokens has causal KV length
@@ -400,6 +430,13 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             arange = torch.arange(num_tokens, device=self.device, dtype=torch.int32)
             within = arange - cm.query_start_loc[:-1].to(torch.int32)[req]
             per_token = num_computed.to(torch.int32)[req] + within + 1
+            if cm.dcp_local_seq_lens is not None:
+                per_token = get_dcp_local_seq_lens(
+                    per_token,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
+                )
             self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
                 per_token, non_blocking=True
             )
@@ -414,7 +451,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             slot_mapping=cm.slot_mapping,
             block_table=cm.block_table_tensor,
             req_id_per_token=req_id_per_token_tensor,
-            seq_lens=cm.seq_lens,
+            seq_lens=seq_lens_for_req,
             cache_seq_lens_per_token=cache_seq_lens_per_token,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
@@ -423,6 +460,9 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
 class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
     """b12x unified sparse-MLA implementation (decode + extend/prefill)."""
+
+    can_return_lse_for_decode: bool = True
+    supports_dcp_with_fp8_kvcache: bool = True
 
     def __init__(
         self,
@@ -498,12 +538,28 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 self._prefill_num_heads,
             )
 
-        # Decode query rows per request (1, plus speculative draft tokens).
-        q_per_req = 1
+        # Decode query rows per request. Short speculative verify batches can
+        # use the decode kernel instead of the heavier extend kernel.
         spec = getattr(vllm_config, "speculative_config", None)
+        num_speculative_tokens = 0
         if spec is not None and getattr(spec, "num_speculative_tokens", None):
-            q_per_req = 1 + int(spec.num_speculative_tokens)
+            num_speculative_tokens = int(spec.num_speculative_tokens)
+        self._spec_extend_as_decode = (
+            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "1") != "0"
+        )
+        self._spec_decode_max_q = _env_int(
+            "VLLM_B12X_MLA_SPEC_DECODE_MAX_Q",
+            max(1 + num_speculative_tokens, 8),
+        )
+        q_per_req = max(
+            1,
+            1 + num_speculative_tokens,
+            self._spec_decode_max_q if self._spec_extend_as_decode else 1,
+        )
         self._decode_max_rows = min(max_num_seqs * q_per_req, max_batched)
+        self._decode_num_heads_cap = max(
+            int(self.num_heads), int(self.num_heads) * max(1, int(self.dcp_world_size))
+        )
 
         self._max_num_seqs = int(max_num_seqs)
         self._max_batched = int(max_batched)
@@ -520,27 +576,31 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # Pre-touch the shared decode scratch at the max decode batch so the
         # workspace manager grows during warmup, before lock_workspace() runs
         # post-cudagraph-capture. Mirrors SparseMLASm120Impl.__init__.
-        self._borrow_decode_scratch(self._decode_max_rows)
+        self._borrow_decode_scratch(
+            self._decode_max_rows, num_q_heads=self._decode_num_heads_cap
+        )
 
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
 
     def _borrow_decode_scratch(
-        self, num_tokens: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, num_tokens: int, *, num_q_heads: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Borrow split-K scratch/control tensors from vLLM's workspace manager."""
+        num_q_heads = int(num_q_heads or self.num_heads)
         return tuple(  # type: ignore[return-value]
             current_workspace_manager().get_simultaneous(
                 (
                     (
                         num_tokens,
-                        self.num_heads,
+                        num_q_heads,
                         self._num_splits_cap,
                         self.kv_lora_rank,
                     ),
                     torch.bfloat16,
                 ),
-                ((num_tokens, self.num_heads, self._num_splits_cap), torch.float32),
+                ((num_tokens, num_q_heads, self._num_splits_cap), torch.float32),
+                ((num_tokens, num_q_heads), torch.float32),
                 ((1,), torch.int32),
                 ((1,), torch.int32),
             )
@@ -555,6 +615,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         output_buffer: torch.Tensor,
         tmp_output: torch.Tensor | None = None,
         tmp_lse: torch.Tensor | None = None,
+        final_lse: torch.Tensor | None = None,
         kv_chunk_size_ptr: torch.Tensor | None = None,
         num_chunks_ptr: torch.Tensor | None = None,
     ) -> _B12XMLAScratchViews:
@@ -568,12 +629,13 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             v_head_dim=self.kv_lora_rank,
             topk=self.topk_tokens,
             max_total_q=max_total_q,
-            max_batch=self._max_num_seqs,
+            max_batch=max_total_q if mode == "decode" else self._max_num_seqs,
             page_size=self.block_size,
             max_chunks_per_row=self._num_splits_cap,
             tmp_output=tmp_output,
             tmp_lse=tmp_lse,
             output_buffer=output_buffer,
+            final_lse=final_lse,
             kv_chunk_size_ptr=kv_chunk_size_ptr,
             num_chunks_ptr=num_chunks_ptr,
         )
@@ -635,23 +697,51 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             kv_cache = kv_cache.contiguous()
 
         is_decode = attn_metadata.max_query_len <= 1
-        if is_decode:
+        use_decode_kernel = is_decode or (
+            self._spec_extend_as_decode
+            and attn_metadata.max_query_len <= self._spec_decode_max_q
+            and num_actual_toks
+            <= attn_metadata.num_reqs * self._spec_decode_max_q
+        )
+        if use_decode_kernel:
+            num_q_heads = int(q.shape[1])
             output = q.new_empty(
-                (num_actual_toks, self.num_heads, self.kv_lora_rank), dtype=q.dtype
+                (num_actual_toks, num_q_heads, self.kv_lora_rank), dtype=q.dtype
             )
-            mid_out, mid_lse, kv_chunk_size_ptr, num_chunks_ptr = (
-                self._borrow_decode_scratch(num_actual_toks)
+            mid_out, mid_lse, final_lse, kv_chunk_size_ptr, num_chunks_ptr = (
+                self._borrow_decode_scratch(num_actual_toks, num_q_heads=num_q_heads)
             )
             ws = self._make_scratch_views(
                 mode="decode",
                 max_total_q=self._decode_max_rows,
-                num_q_heads=self.num_heads,
+                num_q_heads=num_q_heads,
                 output_buffer=output,
                 tmp_output=mid_out,
                 tmp_lse=mid_lse,
+                final_lse=final_lse,
                 kv_chunk_size_ptr=kv_chunk_size_ptr,
                 num_chunks_ptr=num_chunks_ptr,
             )
+            cache_seqlens = (
+                attn_metadata.seq_lens
+                if is_decode
+                else attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
+            )
+            cache_seqlens = cache_seqlens.to(torch.int32).contiguous()
+            if self.need_to_return_lse_for_decode:
+                out, lse = self._sparse_mla_decode_forward(
+                    q_all=q,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    cache_seqlens_int32=cache_seqlens,
+                    nsa_cache_seqlens_int32=nsa_cache_seqlens,
+                    workspace=ws,
+                    sm_scale=self.scale,
+                    v_head_dim=self.kv_lora_rank,
+                    return_lse=True,
+                    lse_scale="natural",
+                )
+                return out, lse
             out = self._sparse_mla_decode_forward(
                 q_all=q,
                 kv_cache=kv_cache,
@@ -667,39 +757,61 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             # scratch needed; only output_buffer is read). The b12x prefill
             # kernel currently requires head blocks of 16, so high-TP shards
             # with fewer local heads are padded and sliced back after launch.
-            if self._prefill_num_heads == self.num_heads:
+            num_q_heads = int(q.shape[1])
+            prefill_num_heads = (
+                _cdiv(num_q_heads, _PREFILL_HEADS_PER_BLOCK)
+                * _PREFILL_HEADS_PER_BLOCK
+            )
+            if prefill_num_heads == num_q_heads:
                 prefill_q = q
             else:
                 prefill_q = q.new_zeros(
-                    (num_actual_toks, self._prefill_num_heads, self.q_head_dim)
+                    (num_actual_toks, prefill_num_heads, self.q_head_dim)
                 )
-                prefill_q[:, : self.num_heads, :].copy_(q)
+                prefill_q[:, :num_q_heads, :].copy_(q)
 
             output = q.new_empty(
-                (num_actual_toks, self._prefill_num_heads, self.kv_lora_rank),
+                (num_actual_toks, prefill_num_heads, self.kv_lora_rank),
                 dtype=q.dtype,
             )
             ws = self._make_scratch_views(
                 mode="extend",
                 max_total_q=self._max_batched,
-                num_q_heads=self._prefill_num_heads,
+                num_q_heads=prefill_num_heads,
                 output_buffer=output,
             )
-            out = self._sparse_mla_extend_forward(
-                q_all=prefill_q,
-                kv_cache=kv_cache,
-                selected_token_offsets=page_table_1,
-                cache_seqlens_int32=cache_seqlens,
-                nsa_cache_seqlens_int32=nsa_cache_seqlens,
-                workspace=ws,
-                sm_scale=self.scale,
-                v_head_dim=self.kv_lora_rank,
-            )
-            if self._prefill_num_heads != self.num_heads:
+            if self.need_to_return_lse_for_decode:
+                out, lse = self._sparse_mla_extend_forward(
+                    q_all=prefill_q,
+                    kv_cache=kv_cache,
+                    selected_token_offsets=page_table_1,
+                    cache_seqlens_int32=cache_seqlens,
+                    nsa_cache_seqlens_int32=nsa_cache_seqlens,
+                    workspace=ws,
+                    sm_scale=self.scale,
+                    v_head_dim=self.kv_lora_rank,
+                    return_lse=True,
+                    lse_scale="natural",
+                )
+            else:
+                out = self._sparse_mla_extend_forward(
+                    q_all=prefill_q,
+                    kv_cache=kv_cache,
+                    selected_token_offsets=page_table_1,
+                    cache_seqlens_int32=cache_seqlens,
+                    nsa_cache_seqlens_int32=nsa_cache_seqlens,
+                    workspace=ws,
+                    sm_scale=self.scale,
+                    v_head_dim=self.kv_lora_rank,
+                )
+                lse = None
+            if prefill_num_heads != num_q_heads:
                 dense_out = q.new_empty(
-                    (num_actual_toks, self.num_heads, self.kv_lora_rank),
+                    (num_actual_toks, num_q_heads, self.kv_lora_rank),
                     dtype=q.dtype,
                 )
-                dense_out.copy_(out[:, : self.num_heads, :])
+                dense_out.copy_(out[:, :num_q_heads, :])
                 out = dense_out
-        return out, None
+                if lse is not None:
+                    lse = lse[:, :num_q_heads].contiguous()
+        return out, lse
