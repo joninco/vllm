@@ -453,7 +453,15 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         o = o_padded[:, : self.n_local_heads, :]
 
         if self._use_b12x_wo:
-            return self._apply_b12x_wo_projection(o, positions)
+            return self._apply_b12x_wo_projection(
+                o,
+                positions,
+                o_storage=o_padded,
+                o_storage_offset=0,
+                o_stride_0=self.padded_heads * self.head_dim,
+                o_stride_1=self.head_dim,
+                o_stride_2=1,
+            )
 
         # Keep ROCm on the BF16 reference wo_a path util kernel ready.
         if current_platform.is_rocm():

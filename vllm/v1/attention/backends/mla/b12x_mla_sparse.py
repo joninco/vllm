@@ -11,27 +11,34 @@ via the ``b12x.integration.mla`` front door (``sparse_mla_decode_forward`` /
 to ``b12x/attention/mla/unified_sm120`` automatically (GLM_NSA q_head_dim==576
 contract). Selecting this backend also selects b12x's sparse indexer/top-k path.
 
-Workspace philosophy (the idiomatic, no-arena path): b12x's kernels take a
-``B12XAttentionWorkspace`` object, but they only read it as a bag of tensor
-attributes (``tmp_output`` / ``tmp_lse`` / ``output_buffer`` + control pointers)
-plus ``set_split_chunk_config``. We therefore construct a bare workspace
-dataclass (which allocates nothing) and back its split-K scratch with tensors
-borrowed per-call from vLLM's shared ``current_workspace_manager()`` -- exactly
-how ``SparseMLASm120Impl`` borrows ``mid_out``/``mid_lse``. No per-layer b12x
-arena is allocated.
+Scratch philosophy (eager PLAN -> BIND -> KERNEL; no workspace/arena, ever):
+b12x workspaces/arenas are sglang-only and forbidden here. We build a caller-
+owned-scratch ``plan_sparse_mla_scratch`` PLAN once per mode (decode / extend),
+and each forward maps a vLLM ``current_workspace_manager()`` scratch tensor into
+a plain ``B12XSparseMLAScratch`` views CONTAINER via ``plan.bind(...)`` -- a pure
+narrow()+view() mapping that allocates nothing and constructs no workspace. The
+binding holds views (never a ``B12XAttentionWorkspace``); the unified SM120
+sparse-MLA decode/extend kernels duck-type the container's
+``tmp_output`` / ``tmp_lse`` / ``output_buffer`` / ``final_lse`` /
+``num_chunks_ptr`` / ``set_split_chunk_config`` fields, so the binding is a
+drop-in with no kernel-signature change. q-concat and the scratch are borrowed in
+ONE ``get_simultaneous`` call so they never alias.
 """
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.platforms.interface import DeviceCapability
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -46,6 +53,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -64,6 +72,110 @@ _PREFILL_HEADS_PER_BLOCK = 16
 
 def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %d", name, value, default)
+        return default
+    if parsed <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using %d", name, value, default)
+        return default
+    return parsed
+
+
+@triton.jit
+def _mask_page_table_after_nsa_len_kernel(
+    page_table_ptr,
+    nsa_len_ptr,
+    page_stride0,
+    page_stride1,
+    width: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid = offs < width
+    nsa_len = tl.load(nsa_len_ptr + row)
+    tl.store(
+        page_table_ptr + row * page_stride0 + offs * page_stride1,
+        -1,
+        mask=valid & (offs >= nsa_len),
+    )
+
+
+def _mask_page_table_after_nsa_len(
+    page_table: torch.Tensor,
+    nsa_cache_seqlens: torch.Tensor,
+) -> None:
+    width = page_table.shape[1]
+    if width == 0 or page_table.shape[0] == 0:
+        return
+    block_n = 128
+    _mask_page_table_after_nsa_len_kernel[
+        (page_table.shape[0], triton.cdiv(width, block_n))
+    ](
+        page_table,
+        nsa_cache_seqlens,
+        page_table.stride(0),
+        page_table.stride(1),
+        width,
+        BLOCK_N=block_n,
+    )
+
+
+@triton.jit
+def _compact_page_table_valid_prefix_kernel(
+    page_table_ptr,
+    nsa_len_ptr,
+    page_stride0,
+    page_stride1,
+    width: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    valid_col = offs < width
+    vals = tl.load(
+        page_table_ptr + row * page_stride0 + offs * page_stride1,
+        mask=valid_col,
+        other=-1,
+    )
+    is_valid = valid_col & (vals >= 0)
+    compact_pos = tl.cumsum(is_valid.to(tl.int32), 0) - 1
+    valid_count = tl.sum(is_valid.to(tl.int32), axis=0)
+    row_base = page_table_ptr + row * page_stride0
+    tl.store(row_base + compact_pos * page_stride1, vals, mask=is_valid)
+    tl.store(
+        row_base + offs * page_stride1,
+        -1,
+        mask=valid_col & (offs >= valid_count),
+    )
+    tl.store(nsa_len_ptr + row, valid_count)
+
+
+def _compact_page_table_valid_prefix(
+    page_table: torch.Tensor,
+    nsa_cache_seqlens: torch.Tensor,
+) -> None:
+    width = page_table.shape[1]
+    if width == 0 or page_table.shape[0] == 0:
+        return
+    block_n = triton.next_power_of_2(width)
+    _compact_page_table_valid_prefix_kernel[(page_table.shape[0],)](
+        page_table,
+        nsa_cache_seqlens,
+        page_table.stride(0),
+        page_table.stride(1),
+        width,
+        BLOCK_N=block_n,
+    )
 
 
 class B12xMLASparseBackend(AttentionBackend):
@@ -173,9 +285,12 @@ class B12xMLASparseMetadata(AttentionMetadata):
     req_id_per_token: torch.Tensor
     # Per-request computed KV length (decode cache_seqlens_int32).
     seq_lens: torch.Tensor
+    cache_seq_lens_per_req: torch.Tensor
     # Per-token causal KV length; clamped to topk to form nsa_cache_seqlens.
     # For pure decode this equals ``seq_lens`` (one token per request).
     cache_seq_lens_per_token: torch.Tensor
+    page_table_1: torch.Tensor
+    nsa_cache_seqlens: torch.Tensor
 
     block_size: int = 64
     topk_tokens: int = 2048
@@ -201,8 +316,18 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = vllm_config.model_config.hf_config.index_topk
+        self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.dcp_rank = 0
+        if self.dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        max_seqs = vllm_config.scheduler_config.max_num_seqs
         # Max-batched-token scratch buffers so cudagraph capture sees stable
         # allocations (sliced per build()).
         self.req_id_per_token_buffer = torch.empty(
@@ -210,6 +335,18 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         )
         self.cache_seq_lens_per_token_buffer = torch.empty(
             (max_tokens,), dtype=torch.int32, device=device
+        )
+        self.cache_seq_lens_per_req_buffer = torch.empty(
+            (max_seqs,), dtype=torch.int32, device=device
+        )
+        self.page_table_1_buffer = torch.empty(
+            (max_tokens, self.topk_tokens), dtype=torch.int32, device=device
+        )
+        self.nsa_cache_seqlens_buffer = torch.empty(
+            (max_tokens,), dtype=torch.int32, device=device
+        )
+        self.req_ids_arange = torch.arange(
+            max_tokens, dtype=torch.int32, device=device
         )
 
     def build(
@@ -221,37 +358,97 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
 
-        starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-        seg_lengths = np.diff(starts)
-        req_id_per_token = np.repeat(
-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
+        seq_lens_for_req = (
+            cm.dcp_local_seq_lens
+            if cm.dcp_local_seq_lens is not None
+            else cm.seq_lens
         )
 
-        self.req_id_per_token_buffer.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
-            torch.from_numpy(req_id_per_token), non_blocking=True
-        )
-        req_id_per_token_tensor = self.req_id_per_token_buffer[:num_tokens]
-
-        # Per-token causal KV length. Hot path (pure decode, one token per req):
-        # the per-token length is just the per-request seq_len -- no expansion.
+        # Per-token causal KV length. Hot path (pure decode, one token per req)
+        # stays entirely on device and uses stable preallocated buffers.
         if cm.max_query_len <= 1 and num_tokens == cm.num_reqs:
-            cache_seq_lens_per_token = cm.seq_lens[:num_tokens]
-        else:
-            # Prefill / mixed: token at within-query offset i in a request with
-            # ``num_computed`` already-cached tokens has causal KV length
-            # ``num_computed + i + 1``. Computed entirely on device (no H<->D
-            # sync); prefill is not cudagraph-captured but this is capture-safe
-            # regardless.
-            num_computed = cm.compute_num_computed_tokens()  # (num_reqs,) device
-            req = req_id_per_token_tensor.to(torch.long)
-            arange = torch.arange(num_tokens, device=self.device, dtype=torch.int32)
-            within = arange - cm.query_start_loc[:-1].to(torch.int32)[req]
-            per_token = num_computed.to(torch.int32)[req] + within + 1
-            self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
-                per_token, non_blocking=True
+            self.req_id_per_token_buffer[:num_tokens].copy_(
+                self.req_ids_arange[:num_tokens]
             )
-            cache_seq_lens_per_token = self.cache_seq_lens_per_token_buffer[:num_tokens]
+            self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
+                seq_lens_for_req[:num_tokens], non_blocking=True
+            )
+            self.cache_seq_lens_per_req_buffer[: cm.num_reqs].copy_(
+                seq_lens_for_req[: cm.num_reqs], non_blocking=True
+            )
+        else:
+            starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
+            query_lens = np.diff(starts)
+            num_query_tokens = int(starts[-1])
+            if num_query_tokens > num_tokens:
+                raise RuntimeError(
+                    "B12X sparse MLA metadata received query_start_loc with "
+                    f"{num_query_tokens} tokens, exceeding padded capacity "
+                    f"{num_tokens}"
+                )
+
+            req_ids = np.zeros((num_tokens,), dtype=np.int32)
+            if num_query_tokens:
+                req_ids[:num_query_tokens] = np.repeat(
+                    np.arange(cm.num_reqs, dtype=np.int32), query_lens
+                )
+
+            # Avoid the blocking seq_lens device->host sync. cm.seq_lens_cpu is a
+            # lazy `.to("cpu")`; under --async-scheduling the runner keeps the GPU
+            # tensor authoritative (_seq_lens_cpu=None), so reading it here forces a
+            # full D2H copy every (MTP) decode step and serializes the pipeline that
+            # async scheduling exists to overlap. The indexer that selects the
+            # top-k for this same step already reads seq_lens_cpu_upper_bound; mirror
+            # it. The per-token context length only feeds cache_seq_lens_per_token,
+            # which forward_mqa clamps via torch.minimum(nsa, per_token_cache) and
+            # the kernel masks past nsa_len, so an optimistic (>=) bound is safe.
+            seq_lens_cpu_src = (
+                cm.seq_lens_cpu_upper_bound
+                if cm.seq_lens_cpu_upper_bound is not None
+                else cm.seq_lens_cpu
+            )
+            seq_lens_cpu = seq_lens_cpu_src.numpy().astype(np.int32, copy=False)
+            per_token_lens = np.zeros((num_tokens,), dtype=np.int32)
+            for req_id, q_len in enumerate(query_lens):
+                if q_len <= 0:
+                    continue
+                start = int(starts[req_id])
+                end = int(starts[req_id + 1])
+                context_len = int(seq_lens_cpu[req_id]) - int(q_len)
+                global_per_token_lens = torch.arange(
+                    context_len + 1,
+                    context_len + int(q_len) + 1,
+                    dtype=torch.int32,
+                )
+                if cm.dcp_local_seq_lens is not None:
+                    per_token_lens[start:end] = get_dcp_local_seq_lens(
+                        global_per_token_lens,
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    ).numpy()
+                else:
+                    per_token_lens[start:end] = global_per_token_lens.numpy()
+
+            req_ids_t = torch.from_numpy(req_ids)
+            per_token_lens_t = torch.from_numpy(per_token_lens)
+            if req_ids_t.device.type == "cpu":
+                req_ids_t = req_ids_t.pin_memory()
+            if per_token_lens_t.device.type == "cpu":
+                per_token_lens_t = per_token_lens_t.pin_memory()
+            self.req_id_per_token_buffer[:num_tokens].copy_(
+                req_ids_t, non_blocking=True
+            )
+            self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
+                per_token_lens_t, non_blocking=True
+            )
+            self.cache_seq_lens_per_req_buffer[: cm.num_reqs].copy_(
+                seq_lens_for_req[: cm.num_reqs], non_blocking=True
+            )
+
+        req_id_per_token_tensor = self.req_id_per_token_buffer[:num_tokens]
+        cache_seq_lens_per_token = self.cache_seq_lens_per_token_buffer[:num_tokens]
+        cache_seq_lens_per_req = self.cache_seq_lens_per_req_buffer[: cm.num_reqs]
 
         return B12xMLASparseMetadata(
             num_reqs=cm.num_reqs,
@@ -262,8 +459,11 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             slot_mapping=cm.slot_mapping,
             block_table=cm.block_table_tensor,
             req_id_per_token=req_id_per_token_tensor,
-            seq_lens=cm.seq_lens,
+            seq_lens=cache_seq_lens_per_req,
+            cache_seq_lens_per_req=cache_seq_lens_per_req,
             cache_seq_lens_per_token=cache_seq_lens_per_token,
+            page_table_1=self.page_table_1_buffer[:num_tokens],
+            nsa_cache_seqlens=self.nsa_cache_seqlens_buffer[:num_tokens],
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
         )
@@ -271,6 +471,8 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
 class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
     """b12x unified sparse-MLA implementation (decode + extend/prefill)."""
+
+    can_return_lse_for_decode: bool = True
 
     def __init__(
         self,
@@ -330,106 +532,113 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         max_batched = int(scheduler_config.max_num_batched_tokens)
         max_num_seqs = int(scheduler_config.max_num_seqs)
         self.block_size = 64
+        self._workspace_num_heads = self.num_heads * max(1, self.dcp_world_size)
 
         # Split-K cap: ceil(topk / tile). Bounds the borrowed mid_out/mid_lse
         # chunk dim and the workspace max_chunks_per_row.
         self._num_splits_cap = max(1, _cdiv(self.topk_tokens, _DECODE_SPLIT_TILE))
         self._prefill_num_heads = (
-            _cdiv(self.num_heads, _PREFILL_HEADS_PER_BLOCK)
+            _cdiv(self._workspace_num_heads, _PREFILL_HEADS_PER_BLOCK)
             * _PREFILL_HEADS_PER_BLOCK
         )
-        if self._prefill_num_heads != self.num_heads:
+        if self._prefill_num_heads != self._workspace_num_heads:
             logger.info_once(
                 "Padding B12X_MLA_SPARSE prefill heads from %d to %d.",
-                self.num_heads,
+                self._workspace_num_heads,
                 self._prefill_num_heads,
             )
+
+        self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
+        self.spec_extend_as_decode = (
+            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "1") != "0"
+        )
 
         # Decode query rows per request (1, plus speculative draft tokens).
         q_per_req = 1
         spec = getattr(vllm_config, "speculative_config", None)
         if spec is not None and getattr(spec, "num_speculative_tokens", None):
             q_per_req = 1 + int(spec.num_speculative_tokens)
+        if self.spec_extend_as_decode:
+            q_per_req = max(q_per_req, self.spec_decode_max_q)
         self._decode_max_rows = min(max_num_seqs * q_per_req, max_batched)
+        if self._decode_max_rows < max_num_seqs:
+            self._decode_max_rows = max_num_seqs
+
+        self._max_batched = max_batched
 
         # Lazily import b12x only on this opt-in path.
-        from b12x.attention.workspace import B12XAttentionWorkspace
         from b12x.integration.mla import (
             sparse_mla_decode_forward,
             sparse_mla_extend_forward,
+        )
+        from b12x.integration.sparse_mla_scratch import (
+            B12XSparseMLAScratchCaps,
+            plan_sparse_mla_scratch,
         )
 
         self._sparse_mla_decode_forward = sparse_mla_decode_forward
         self._sparse_mla_extend_forward = sparse_mla_extend_forward
 
-        # Persistent (1,) int32 split-K control pointers, shared by every decode
-        # call on this layer (filled by workspace.set_split_chunk_config).
-        self._num_chunks_ptr = torch.empty((1,), dtype=torch.int32, device=self.device)
-        self._kv_chunk_size_ptr = torch.empty(
-            (1,), dtype=torch.int32, device=self.device
-        )
-
-        def _make_workspace(
-            mode: str,
-            max_total_q: int,
-            num_q_heads: int,
+        # Eager PLAN -> BIND -> KERNEL (no b12x workspace/arena, ever). We build a
+        # caller-owned-scratch PLAN once per mode; each forward maps a vLLM
+        # workspace-manager scratch tensor into a plain B12XSparseMLAScratch views
+        # CONTAINER via plan.bind(). The unified SM120 sparse-MLA decode/extend
+        # kernels duck-type the container's tmp_output/tmp_lse/output_buffer/
+        # final_lse/num_chunks_ptr/set_split_chunk_config fields, so no kernel
+        # signature change is needed. The container also pre-seeds a stable,
+        # width-derived split count (so the merge's num_chunks is well-defined and
+        # CUDA-graph-stable; run_unified_decode pins the same value via
+        # forced_num_splits below) and pre-materializes final_lse as a view (so the
+        # legacy lazy torch.empty(final_lse) never fires inside a captured graph).
+        def _make_plan(
+            mode: str, max_q_rows: int, num_q_heads: int, max_batch: int
         ) -> Any:
-            # Bare dataclass: __post_init__ only canonicalizes scalars (allocates
-            # nothing). tmp_output/tmp_lse/output_buffer are assigned per-call
-            # from the shared workspace manager / a fresh output, so b12x's
-            # _allocate_split_buffers (called by set_split_chunk_config) is a
-            # no-op (it only fills None fields).
-            ws = B12XAttentionWorkspace(
-                mode=mode,
-                device=self.device,
-                dtype=torch.bfloat16,
-                kv_dtype=torch.uint8,
-                num_q_heads=num_q_heads,
-                head_dim=self.q_head_dim,
-                v_head_dim=self.kv_lora_rank,
-                topk=self.topk_tokens,
-                max_total_q=int(max_total_q),
-                max_batch=max_num_seqs,
-                page_size=self.block_size,
-                max_chunks_per_row=self._num_splits_cap,
+            return plan_sparse_mla_scratch(
+                B12XSparseMLAScratchCaps(
+                    device=self.device,
+                    num_q_heads=int(num_q_heads),
+                    max_q_rows=int(max_q_rows),
+                    max_width=self.topk_tokens,
+                    dtype=torch.bfloat16,
+                    kv_dtype=torch.uint8,
+                    head_dim=self.q_head_dim,
+                    v_head_dim=self.kv_lora_rank,
+                    mode=mode,
+                    max_batch=int(max_batch),
+                    max_chunks_per_row=self._num_splits_cap,
+                    page_size=self.block_size,
+                )
             )
-            return ws
 
-        self._decode_workspace = _make_workspace(
-            "decode", self._decode_max_rows, self.num_heads
+        self._decode_plan = _make_plan(
+            "decode",
+            self._decode_max_rows,
+            self._workspace_num_heads,
+            self._decode_max_rows,
         )
-        self._decode_workspace.num_chunks_ptr = self._num_chunks_ptr
-        self._decode_workspace.kv_chunk_size_ptr = self._kv_chunk_size_ptr
-        self._extend_workspace = _make_workspace(
-            "extend", max_batched, self._prefill_num_heads
+        self._extend_plan = _make_plan(
+            "extend", max_batched, self._prefill_num_heads, max_num_seqs
+        )
+        # One caller-owned uint8 scratch tensor covers either path (the larger
+        # layout); the per-mode materializer carves its views from the prefix.
+        self._scratch_nbytes = max(
+            int(self._decode_plan.layout.nbytes),
+            int(self._extend_plan.layout.nbytes),
         )
 
-        # Pre-touch the shared decode scratch at the max decode batch so the
-        # workspace manager grows during warmup, before lock_workspace() runs
-        # post-cudagraph-capture. Mirrors SparseMLASm120Impl.__init__.
-        self._borrow_decode_scratch(self._decode_max_rows)
+        # Pre-touch q-concat + the attention scratch TOGETHER so the workspace
+        # manager grows during warmup (before lock_workspace() runs
+        # post-cudagraph-capture) and so the two always come from ONE
+        # get_simultaneous call -> distinct, non-overlapping offsets. The manager
+        # packs every call from offset 0, so borrowing q and the scratch the kernel
+        # writes in separate calls would alias them.
+        current_workspace_manager().get_simultaneous(
+            ((max_batched, self.num_heads, self.q_head_dim), torch.bfloat16),
+            ((self._scratch_nbytes,), torch.uint8),
+        )
 
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
-
-    def _borrow_decode_scratch(
-        self, num_tokens: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Borrow split-K mid_out / mid_lse from the shared workspace manager."""
-        return tuple(  # type: ignore[return-value]
-            current_workspace_manager().get_simultaneous(
-                (
-                    (
-                        num_tokens,
-                        self.num_heads,
-                        self._num_splits_cap,
-                        self.kv_lora_rank,
-                    ),
-                    torch.bfloat16,
-                ),
-                ((num_tokens, self.num_heads, self._num_splits_cap), torch.float32),
-            )
-        )
 
     def forward_mqa(
         self,
@@ -440,40 +649,61 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # q arrives as (mqa_ql_nope[T, H, kv_lora_rank], mqa_q_pe[T, H, rope]);
         # b12x's GLM_NSA contract wants a single contiguous [T, H, 576] tensor.
+        # Co-allocate the q-concat buffer and the per-call attention scratch in ONE
+        # get_simultaneous call so they receive distinct, non-overlapping offsets:
+        # the kernel reads q while writing the scratch (tmp_output/output), and the
+        # manager packs every call from offset 0, so separate calls would alias q
+        # with the scratch and corrupt the result.
+        manager = current_workspace_manager()
         if isinstance(q, tuple):
-            q = torch.cat(q, dim=-1)
-        q = q.contiguous()
+            ql_nope, q_pe = q
+            num_actual_toks = ql_nope.shape[0]
+            q_concat, scratch_storage = manager.get_simultaneous(
+                (
+                    (self._max_batched, self.num_heads, self.q_head_dim),
+                    torch.bfloat16,
+                ),
+                ((self._scratch_nbytes,), torch.uint8),
+            )
+            q_all = q_concat[:num_actual_toks]
+            ops.concat_mla_q(ql_nope, q_pe, q_all)
+        else:
+            q_all = q.contiguous()
+            num_actual_toks = q_all.shape[0]
+            (scratch_storage,) = manager.get_simultaneous(
+                ((self._scratch_nbytes,), torch.uint8),
+            )
 
-        num_actual_toks = q.shape[0]
+        num_actual_heads = q_all.shape[1]
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        # Per-request topk indices -> physical cache slot ids. Identical
-        # conversion to FlashMLASparseImpl / SparseMLASm120Impl.
-        page_table_1 = cast(
-            torch.Tensor,
-            triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-            ),
+        # Per-request topk indices -> physical cache slot ids. B12X consumes the
+        # selected KV rows as a dense valid prefix of length nsa_cache_seqlens, so
+        # reuse graph-stable metadata buffers and compact holes before launch.
+        page_table_1 = attn_metadata.page_table_1[
+            :num_actual_toks, : topk_indices.shape[1]
+        ]
+        nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[:num_actual_toks]
+        triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token[:num_actual_toks],
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
+            out=page_table_1,
+            valid_counts=nsa_cache_seqlens,
         )
-        page_table_1 = page_table_1.to(torch.int32).contiguous()
-        topk_width = page_table_1.shape[1]
-
-        # nsa_cache_seqlens: per-token count of KV rows to attend = min(causal
-        # KV length, topk). The indexer -1-pads beyond the valid prefix, so a
-        # short row's selected indices occupy [0, nsa) and the kernel masks the
-        # rest (per-token section length + idx<0).
+        _compact_page_table_valid_prefix(page_table_1, nsa_cache_seqlens)
         per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
-        nsa_cache_seqlens = (
-            torch.clamp(per_token_cache, max=topk_width).to(torch.int32).contiguous()
+        torch.minimum(
+            nsa_cache_seqlens,
+            per_token_cache,
+            out=nsa_cache_seqlens,
         )
-        # Per-request KV length (validated but unused by the unified kernels).
-        cache_seqlens = attn_metadata.seq_lens.to(torch.int32).contiguous()
+        _mask_page_table_after_nsa_len(page_table_1, nsa_cache_seqlens)
 
         # KV cache -> flat (num_slots, 1, nbytes) uint8 (b12x requires rank-3
         # uint8; page_size tells it the per-block stride). page_table_1 are
@@ -483,60 +713,110 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         if not kv_cache.is_contiguous():
             kv_cache = kv_cache.contiguous()
 
-        is_decode = attn_metadata.max_query_len <= 1
-        if is_decode:
-            output = q.new_empty(
-                (num_actual_toks, self.num_heads, self.kv_lora_rank), dtype=q.dtype
+        use_decode_kernel = attn_metadata.max_query_len <= 1 or (
+            self.spec_extend_as_decode
+            and attn_metadata.max_query_len <= self.spec_decode_max_q
+            and num_actual_toks <= attn_metadata.num_reqs * self.spec_decode_max_q
+            and num_actual_toks <= self._decode_max_rows
+        )
+        if use_decode_kernel:
+            cache_seqlens = (
+                attn_metadata.cache_seq_lens_per_req
+                if attn_metadata.max_query_len <= 1
+                else attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
             )
-            mid_out, mid_lse = self._borrow_decode_scratch(num_actual_toks)
-            ws = self._decode_workspace
-            ws.tmp_output = mid_out
-            ws.tmp_lse = mid_lse
-            ws.output_buffer = output
-            out = self._sparse_mla_decode_forward(
-                q_all=q,
-                kv_cache=kv_cache,
-                page_table_1=page_table_1,
+            # Eager bind: map the caller scratch into a views container (no
+            # workspace) and call the kernel with binding=. forced_num_splits pins
+            # a stable, width-derived split count so the merge's num_chunks matches
+            # across every captured graph (the container seeds the same value).
+            binding = self._decode_plan.bind(
+                scratch=scratch_storage,
+                q=q_all,
+                selected_indices=page_table_1,
                 cache_seqlens_int32=cache_seqlens,
                 nsa_cache_seqlens_int32=nsa_cache_seqlens,
-                workspace=ws,
-                sm_scale=self.scale,
-                v_head_dim=self.kv_lora_rank,
             )
+            if self.need_to_return_lse_for_decode:
+                return cast(
+                    tuple[torch.Tensor, torch.Tensor],
+                    self._sparse_mla_decode_forward(
+                        binding=binding,
+                        kv_cache=kv_cache,
+                        sm_scale=self.scale,
+                        v_head_dim=self.kv_lora_rank,
+                        forced_num_splits=self._num_splits_cap,
+                        return_lse=True,
+                        lse_scale="natural",
+                    ),
+                )
+            out = cast(
+                torch.Tensor,
+                self._sparse_mla_decode_forward(
+                    binding=binding,
+                    kv_cache=kv_cache,
+                    sm_scale=self.scale,
+                    v_head_dim=self.kv_lora_rank,
+                    forced_num_splits=self._num_splits_cap,
+                ),
+            )
+            return out, None
         else:
             # Extend / prefill -> single-pass unified prefill (no split-K
             # scratch needed; only output_buffer is read). The b12x prefill
             # kernel currently requires head blocks of 16, so high-TP shards
             # with fewer local heads are padded and sliced back after launch.
-            if self._prefill_num_heads == self.num_heads:
-                prefill_q = q
-            else:
-                prefill_q = q.new_zeros(
-                    (num_actual_toks, self._prefill_num_heads, self.q_head_dim)
-                )
-                prefill_q[:, : self.num_heads, :].copy_(q)
-
-            output = q.new_empty(
-                (num_actual_toks, self._prefill_num_heads, self.kv_lora_rank),
-                dtype=q.dtype,
+            cache_seqlens = attn_metadata.cache_seq_lens_per_req
+            prefill_num_heads = (
+                _cdiv(num_actual_heads, _PREFILL_HEADS_PER_BLOCK)
+                * _PREFILL_HEADS_PER_BLOCK
             )
-            ws = self._extend_workspace
-            ws.output_buffer = output
-            out = self._sparse_mla_extend_forward(
-                q_all=prefill_q,
-                kv_cache=kv_cache,
-                selected_token_offsets=page_table_1,
+            if prefill_num_heads == num_actual_heads:
+                prefill_q = q_all
+            else:
+                prefill_q = q_all.new_zeros(
+                    (num_actual_toks, prefill_num_heads, self.q_head_dim)
+                )
+                prefill_q[:, :num_actual_heads, :].copy_(q_all)
+
+            # Eager bind into the extend views container (single-pass prefill;
+            # no split-K, output_buffer is the only scratch the kernel writes).
+            binding = self._extend_plan.bind(
+                scratch=scratch_storage,
+                q=prefill_q,
+                selected_indices=page_table_1,
                 cache_seqlens_int32=cache_seqlens,
                 nsa_cache_seqlens_int32=nsa_cache_seqlens,
-                workspace=ws,
-                sm_scale=self.scale,
-                v_head_dim=self.kv_lora_rank,
             )
-            if self._prefill_num_heads != self.num_heads:
-                dense_out = q.new_empty(
-                    (num_actual_toks, self.num_heads, self.kv_lora_rank),
-                    dtype=q.dtype,
+            lse = None
+            if self.need_to_return_lse_for_decode:
+                out, lse = cast(
+                    tuple[torch.Tensor, torch.Tensor],
+                    self._sparse_mla_extend_forward(
+                        binding=binding,
+                        kv_cache=kv_cache,
+                        sm_scale=self.scale,
+                        v_head_dim=self.kv_lora_rank,
+                        return_lse=True,
+                        lse_scale="natural",
+                    ),
                 )
-                dense_out.copy_(out[:, : self.num_heads, :])
+            else:
+                out = cast(
+                    torch.Tensor,
+                    self._sparse_mla_extend_forward(
+                        binding=binding,
+                        kv_cache=kv_cache,
+                        sm_scale=self.scale,
+                        v_head_dim=self.kv_lora_rank,
+                    ),
+                )
+            if prefill_num_heads != num_actual_heads:
+                dense_out = q_all.new_empty(
+                    (num_actual_toks, num_actual_heads, self.kv_lora_rank),
+                    dtype=q_all.dtype,
+                )
+                dense_out.copy_(out[:, :num_actual_heads, :])
                 out = dense_out
-        return out, None
+                if lse is not None:
+                    lse = lse[:, :num_actual_heads].contiguous()
+        return out, lse
