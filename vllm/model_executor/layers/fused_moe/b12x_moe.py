@@ -28,7 +28,7 @@ from vllm.platforms import current_platform
 
 
 def _dtype_element_size(dtype: torch.dtype) -> int:
-    return torch.empty((), dtype=dtype).element_size()
+    return dtype.itemsize
 
 
 def _ceil_div(a: int, b: int) -> int:
