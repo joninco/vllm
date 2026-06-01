@@ -1448,7 +1448,9 @@ class DeepseekV4Model(nn.Module):
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
-        # kv_score). fused_wqa_wkv stays on the default stream.
+        # kv_score). fused_wqa_wkv stays on the default stream. The overlap (and
+        # its CUDA events) lives inside the opaque `deepseek_v4_attention` custom
+        # op, so it never enters the compiled graph.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
