@@ -40,6 +40,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -58,6 +59,7 @@ from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
@@ -453,15 +455,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         o = o_padded[:, : self.n_local_heads, :]
 
         if self._use_b12x_wo:
-            return self._apply_b12x_wo_projection(
-                o,
-                positions,
-                o_storage=o_padded,
-                o_storage_offset=0,
-                o_stride_0=self.padded_heads * self.head_dim,
-                o_stride_1=self.head_dim,
-                o_stride_2=1,
-            )
+            return self._apply_b12x_wo_projection(o, positions)
 
         # Keep ROCm on the BF16 reference wo_a path util kernel ready.
         if current_platform.is_rocm():
@@ -701,6 +695,40 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             swa_metadata.block_size,
         )
 
+def deepseek_v4_attention(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    # Opaque wrapper around the whole MLA attention. `out` is mutated in place;
+    # the layer is recovered from the forward context by name so the op stays a
+    # plain (non-method) custom op. See the call site in
+    # DeepseekV4MultiHeadLatentAttentionWrapper.forward for why this boundary is
+    # required for torch.compile + AOT piecewise correctness.
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    self.attention_impl(hidden_states, positions, out)
+
+
+def deepseek_v4_attention_fake(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_attention",
+    op_func=deepseek_v4_attention,
+    mutates_args=["out"],
+    fake_impl=deepseek_v4_attention_fake,
+)
+
+
+@eager_break_during_capture
 def deepseek_v4_attention(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
