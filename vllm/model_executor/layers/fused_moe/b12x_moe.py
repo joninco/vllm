@@ -341,9 +341,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         return "fp4_e8m0_k32"
 
     def _w13_layout(self) -> str:
-        # B12X native NVFP4 uses the same prepared physical order as the
-        # FlashInfer B12X path: [w3/up, w1/gate].
-        return "up_gate"
+        # vLLM fused MoE loading stores fused W13 as [w1/gate, w3/up], which is
+        # the row order consumed by b12x for the runtime SwiGLU path. Declaring
+        # "up_gate" here swaps gate/up in every expert -> corrupted MoE output.
+        return "w31"
 
     def _unit_expert_scale(
         self, device: torch.device, num_experts: int
