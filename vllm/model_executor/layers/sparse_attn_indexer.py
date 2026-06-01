@@ -691,8 +691,11 @@ def sparse_attn_indexer(
             )
 
         if b12x_decode_supported:
-            seq_lens = b12x_seq_lens[:num_decode_tokens].contiguous()
-            block_table = b12x_block_table[:num_decode_tokens].contiguous()
+            # Prefix slice of an already-contiguous buffer stays contiguous
+            # (b12x_seq_lens/b12x_block_table are normalized contiguous upstream),
+            # so .contiguous() here was a guaranteed no-op per decoded token.
+            seq_lens = b12x_seq_lens[:num_decode_tokens]
+            block_table = b12x_block_table[:num_decode_tokens]
             topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
             decode_fn = (
                 _run_b12x_compressed_decode_topk
