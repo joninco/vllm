@@ -40,6 +40,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -58,6 +59,7 @@ from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
@@ -380,66 +382,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
         )
 
-    def _get_b12x_wo_projection_binding(
-        self,
-        o: torch.Tensor,
-        positions: torch.Tensor,
-        weights: Any,
-        *,
-        o_storage: torch.Tensor | None = None,
-        o_storage_offset: int = 0,
-        o_stride_0: int = 0,
-        o_stride_1: int = 0,
-        o_stride_2: int = 0,
-    ) -> Any:
-        from b12x.gemm.wo_projection import (
-            WOProjectionScratchCaps,
-            plan_wo_projection_scratch,
-        )
-
-        groups, group_width, rank, hidden = self._validate_wo_projection_tensors()
-        num_tokens = int(o.shape[0])
-        plan = plan_wo_projection_scratch(
-            WOProjectionScratchCaps(
-                device=o.device,
-                max_tokens=max(1, num_tokens),
-                groups=groups,
-                group_width=group_width,
-                rank=rank,
-                hidden=hidden,
-                dtype=o.dtype,
-            )
-        )
-        scratch = tuple(
-            torch.empty(shape, dtype=dtype, device=o.device)
-            for shape, dtype in plan.shapes_and_dtypes()
-        )
-        return plan.bind_inv_rope(
-            scratch=scratch,
-            o=o,
-            positions=positions,
-            cos_sin_cache=self.rotary_emb.cos_sin_cache,
-            weights=weights,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-            o_storage=o_storage,
-            o_storage_offset=o_storage_offset,
-            o_stride_0=o_stride_0,
-            o_stride_1=o_stride_1,
-            o_stride_2=o_stride_2,
-        )
-
     def _apply_b12x_wo_projection(
         self,
         o: torch.Tensor,
         positions: torch.Tensor,
-        *,
-        o_storage: torch.Tensor | None = None,
-        o_storage_offset: int = 0,
-        o_stride_0: int = 0,
-        o_stride_1: int = 0,
-        o_stride_2: int = 0,
     ) -> torch.Tensor:
         num_tokens = int(o.shape[0])
         if num_tokens == 0:
@@ -455,20 +401,20 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         if weights is None:
             raise RuntimeError("DeepSeek V4 b12x WO weights were not packed")
 
-        binding = self._get_b12x_wo_projection_binding(
-            o,
-            positions,
-            weights,
-            o_storage=o_storage,
-            o_storage_offset=o_storage_offset,
-            o_stride_0=o_stride_0,
-            o_stride_1=o_stride_1,
-            o_stride_2=o_stride_2,
-        )
-
         from b12x.gemm.wo_projection import wo_projection_inv_rope_mxfp8
 
-        out = wo_projection_inv_rope_mxfp8(binding=binding)
+        # Functional chain: each step allocates + returns its own output, so no
+        # caller-owned scratch / bind is needed (and none can be mutated in the
+        # traced graph). Pass the runtime tensors directly.
+        out = wo_projection_inv_rope_mxfp8(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            weights,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+        )
         if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
             out = tensor_model_parallel_all_reduce(out)
         return out
@@ -488,19 +434,28 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             device=hidden_states.device,
         )
 
-        self.attention_impl(hidden_states, positions, o_padded)
+        # Attention runs inside a single `out`-mutating custom op (the
+        # torch.compile / breakable-cudagraph boundary). This is load-bearing:
+        # without it, `attention_impl` is traced inline and the o_padded buffer
+        # is threaded around the internal graph breaks (indexer / kv-cache
+        # update) as TWO aliasing outputs of its producer piece. The AOT
+        # piecewise runtime then merges that aliased pair into a single flat
+        # 1-D synthetic base (torch.empty((0,)).set_(storage)), so the WO
+        # consumer's assert_size_stride(o_padded, (tokens, heads, dim)) fails
+        # with "wrong number of dimensions". Wrapping the whole attention as one
+        # op makes o_padded the op's single mutated output, threaded cleanly
+        # across the boundary, and keeps the attention's internal CUDA streams /
+        # events out of the compiled artifact (so it stays serializable).
+        torch.ops.vllm.deepseek_v4_attention(
+            hidden_states,
+            positions,
+            o_padded,
+            self.layer_name,
+        )
         o = o_padded[:, : self.n_local_heads, :]
 
         if self._use_b12x_wo:
-            return self._apply_b12x_wo_projection(
-                o,
-                positions,
-                o_storage=o_padded,
-                o_storage_offset=0,
-                o_stride_0=self.padded_heads * self.head_dim,
-                o_stride_1=self.head_dim,
-                o_stride_2=1,
-            )
+            return self._apply_b12x_wo_projection(o, positions)
 
         # Keep ROCm on the BF16 reference wo_a path util kernel ready.
         if current_platform.is_rocm():
@@ -739,6 +694,40 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.eps,
             swa_metadata.block_size,
         )
+
+
+@eager_break_during_capture
+def deepseek_v4_attention(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    # Opaque wrapper around the whole MLA attention. `out` is mutated in place;
+    # the layer is recovered from the forward context by name so the op stays a
+    # plain (non-method) custom op. See the call site in
+    # DeepseekV4MultiHeadLatentAttentionWrapper.forward for why this boundary is
+    # required for torch.compile + AOT piecewise correctness.
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    self.attention_impl(hidden_states, positions, out)
+
+
+def deepseek_v4_attention_fake(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_attention",
+    op_func=deepseek_v4_attention,
+    mutates_args=["out"],
+    fake_impl=deepseek_v4_attention_fake,
+)
 
 
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
