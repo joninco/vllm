@@ -16,7 +16,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -230,6 +229,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.decode_threshold = (
             self.reorder_batch_threshold + self.num_speculative_tokens
         )
+        self._skip_tile_scheduler_platform = (
+            current_platform.is_rocm()
+            or current_platform.is_xpu()
+            or current_platform.is_device_capability_family(120)
+        )
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
@@ -290,15 +294,20 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
-            split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.decode_threshold
+            common_attn_metadata.split_decodes_and_prefills(
+                decode_threshold=self.decode_threshold
             )
         )
 
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
-        query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+        if common_attn_metadata.batch_topology is not None:
+            x = torch.from_numpy(
+                common_attn_metadata.batch_topology.req_id_per_token_np
+            ).pin_memory()
+        else:
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
         token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
         token_to_req_indices.copy_(x, non_blocking=True)
 
@@ -387,15 +396,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
         }
-        if (
-            num_decode_tokens == 0
-            or current_platform.is_rocm()
-            or current_platform.is_xpu()
-            # SM120 (consumer Blackwell) drives DSV4 MLA through b12x, which
-            # does not use the FlashMLA tile scheduler; skip the planner (and
-            # its _flashmla_C dependency, which is not built for sm_120a).
-            or current_platform.is_device_capability_family(120)
-        ):
+        # SM120 (consumer Blackwell) drives DSV4 MLA through b12x, which does not
+        # use the FlashMLA tile scheduler; skip the planner (and its _flashmla_C
+        # dependency, which is not built for sm_120a).
+        if num_decode_tokens == 0 or self._skip_tile_scheduler_platform:
             return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that
