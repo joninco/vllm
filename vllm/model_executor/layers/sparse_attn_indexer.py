@@ -408,20 +408,12 @@ def sparse_attn_indexer(
         )
         if _b12x_sparse_indexer_requested(use_b12x_sparse_indexer):
             _ensure_b12x_sparse_indexer_supported()
-            _ = torch.empty(
-                values_spec[0],
-                dtype=values_spec[1],
-                device=hidden_states.device,
-            )
-            _ = torch.empty(
-                scales_spec[0],
-                dtype=scales_spec[1],
-                device=hidden_states.device,
-            )
-            _ = torch.empty(
-                (RADIX_TOPK_WORKSPACE_SIZE,),
-                dtype=torch.uint8,
-                device=hidden_states.device,
+            _get_b12x_indexer_extend_buffers(
+                q_fp8=q_quant,
+                topk_tokens=topk_tokens,
+                total_seq_lens=total_seq_lens,
+                head_dim=head_dim,
+                fp8_dtype=fp8_dtype,
             )
         else:
             # Reserve workspace for indexer during profiling run.

@@ -103,6 +103,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.workspace import lock_workspace
 
 logger = init_logger(__name__)
 
@@ -656,6 +657,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        lock_workspace()
         # This usually takes 5~20 seconds.
         logger.info(
             "Graph capturing finished in %.0f secs, took %.2f GiB",
