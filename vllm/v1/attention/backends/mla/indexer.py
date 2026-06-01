@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 import vllm.envs as envs
@@ -19,9 +20,6 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
-from vllm.v1.attention.backends.utils import (
-    split_decodes_and_prefills,
-)
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
@@ -63,8 +61,8 @@ def _prepare_uniform_decode_kernel(
 
 
 def split_indexer_prefill_chunks(
-    seq_lens_cpu: torch.Tensor,
-    query_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor | np.ndarray,
+    query_lens_cpu: torch.Tensor | np.ndarray,
     workspace_size: int,
     max_logits_bytes: int,
     request_offset: int = 0,
@@ -79,6 +77,11 @@ def split_indexer_prefill_chunks(
 
     Returns list of (req_slice, query_slice) tuples.
     """
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        seq_lens_cpu = seq_lens_cpu.numpy()
+    if isinstance(query_lens_cpu, torch.Tensor):
+        query_lens_cpu = query_lens_cpu.numpy()
+
     chunks: list[tuple[slice, slice]] = []
     n = len(seq_lens_cpu)
     max_logits_elems = max_logits_bytes // 4
@@ -88,7 +91,7 @@ def split_indexer_prefill_chunks(
         start, chunk_m, chunk_n = end, 0, 0
 
         while end < n:
-            q, s = query_lens_cpu[end].item(), seq_lens_cpu[end].item()
+            q, s = int(query_lens_cpu[end]), int(seq_lens_cpu[end])
             new_m, new_n = chunk_m + q, chunk_n + s
             if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
                 chunk_m, chunk_n = new_m, new_n
@@ -99,7 +102,7 @@ def split_indexer_prefill_chunks(
         # A single request can exceed the budget, requiring sub-chunking
         # on the query dimension.
         if end == start:
-            chunk_m, chunk_n = query_lens_cpu[end].item(), seq_lens_cpu[end].item()
+            chunk_m, chunk_n = int(query_lens_cpu[end]), int(seq_lens_cpu[end])
             end += 1
 
         req_slice = slice(start + request_offset, end + request_offset)
@@ -247,6 +250,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.storage_block_size = int(self.kv_cache_spec.storage_block_size)
         scheduler_config = self.vllm_config.scheduler_config
         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
@@ -379,7 +383,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         return build_paged_mqa_schedule_metadata(
             schedule_seq_lens.contiguous(),
-            self.kv_cache_spec.storage_block_size,
+            self.storage_block_size,
             self.num_sms,
             out=self.scheduler_metadata_buffer,
         )
@@ -397,7 +401,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if has_deep_gemm():
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
-                    self.kv_cache_spec.storage_block_size,
+                    self.storage_block_size,
                     self.num_sms,
                 )
         return self.scheduler_metadata_buffer
@@ -407,7 +411,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         seq_lens: torch.Tensor,
         block_table: torch.Tensor,
         decode_lens: torch.Tensor,
-        decode_lens_cpu: torch.Tensor,
+        decode_lens_np: np.ndarray,
         query_start_loc: torch.Tensor,
         num_decodes: int,
         num_decode_tokens: int,
@@ -428,7 +432,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         seq_lens is 1D (batch_size,) for flatten/plain, 2D (B, max_decode_len)
         for native MTP.
         """
-        min_decode_len = int(decode_lens_cpu.min().item())
+        min_decode_len = int(decode_lens_np.min())
         if not use_native and max_decode_len > 1:
             assert self.decode_seq_lens_buffer.dim() == 1
             if min_decode_len == max_decode_len:
@@ -458,7 +462,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # [10-3, 7-1, 12-4, 0-0] = [7, 6, 8, 0].
 
                 # 3 + 1 + 4 + 0 = 8
-                actual_expanded = int(decode_lens_cpu.sum().item())
+                actual_expanded = int(decode_lens_np.sum())
 
                 # Fuse expanded_base and expanded_starts into a single
                 # repeat_interleave:
@@ -532,13 +536,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         num_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        if common_attn_metadata.batch_topology is not None:
+            query_start_loc_np = common_attn_metadata.batch_topology.query_start_loc_np[
+                : num_reqs + 1
+            ]
+            query_lens_np = common_attn_metadata.batch_topology.query_lens_np
+        else:
+            query_start_loc_np = query_start_loc_cpu.numpy()
+            query_lens_np = np.diff(query_start_loc_np)
         seq_lens = common_attn_metadata.seq_lens
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
+            common_attn_metadata.split_decodes_and_prefills(
                 decode_threshold=self.reorder_batch_threshold,
                 require_uniform=not self.use_flattening,
             )
@@ -555,7 +566,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 query_start_loc,
                 seq_lens,
                 block_table,
-                self.kv_cache_spec.storage_block_size,
+                self.storage_block_size,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -573,16 +584,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 if self.compress_ratio > 1
                 else seq_lens_cpu
             )
-            prefill_query_lens_cpu = torch.diff(
-                query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
-            )
+            compressed_seq_lens_cpu_np = compressed_seq_lens_cpu.numpy()
+            prefill_query_lens_cpu = query_lens_np[
+                num_decodes : num_decodes + num_prefills
+            ]
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-            # Upper bound is exact for prefill rows (the `[num_decodes:]`
-            # slice below).
-            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
-            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             chunk_specs = split_indexer_prefill_chunks(
-                compressed_seq_lens_cpu[num_decodes:],
+                compressed_seq_lens_cpu_np[num_decodes:],
                 prefill_query_lens_cpu,
                 self.max_prefill_buffer_size,
                 max_logits_bytes,
@@ -602,6 +610,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     common_attn_metadata.block_table_tensor,
                     self.compress_ratio,
                     query_slice=query_slice,
+                    query_start_loc_np=query_start_loc_np,
+                    compressed_seq_lens_np=compressed_seq_lens_cpu_np,
                     skip_kv_gather=query_slice.start > 0,
                 )
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
@@ -616,14 +626,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 out=self.decode_lens_buffer[:num_decodes],
             )
             decode_lens = self.decode_lens_buffer[:num_decodes]
-            decode_lens_cpu = torch.diff(
-                common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
-            )
+            decode_lens_np = query_lens_np[:num_decodes]
 
             seq_lens = common_attn_metadata.seq_lens[:num_decodes]
             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
 
-            max_decode_len = int(decode_lens_cpu.max().item())
+            max_decode_len = int(decode_lens_np.max())
             next_n = 1 + self.num_speculative_tokens
             use_native = not self.use_flattening and max_decode_len <= next_n
 
@@ -632,7 +640,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     seq_lens=seq_lens,
                     block_table=block_table,
                     decode_lens=decode_lens,
-                    decode_lens_cpu=decode_lens_cpu,
+                    decode_lens_np=decode_lens_np,
                     query_start_loc=common_attn_metadata.query_start_loc[:num_decodes],
                     num_decodes=num_decodes,
                     num_decode_tokens=num_decode_tokens,
@@ -714,9 +722,14 @@ def build_prefill_chunk_metadata(
     block_table: torch.Tensor,
     compress_ratio: int,
     query_slice: slice | None = None,
+    query_start_loc_np: np.ndarray | None = None,
+    compressed_seq_lens_np: np.ndarray | None = None,
     skip_kv_gather: bool = False,
 ) -> DeepseekV32IndexerPrefillChunkMetadata | None:
-    total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
+    if compressed_seq_lens_np is not None:
+        total_seq_lens = int(compressed_seq_lens_np[start_idx:end_idx].sum())
+    else:
+        total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
     if total_seq_lens == 0:
         return None
 
@@ -733,9 +746,14 @@ def build_prefill_chunk_metadata(
         query_start_loc[start_idx : end_idx + 1] - query_start_loc[start_idx]
     )
 
-    total_query_len = int(
-        (query_start_loc_cpu[end_idx] - query_start_loc_cpu[start_idx]).item()
-    )
+    if query_start_loc_np is not None:
+        total_query_len = int(
+            query_start_loc_np[end_idx] - query_start_loc_np[start_idx]
+        )
+    else:
+        total_query_len = int(
+            (query_start_loc_cpu[end_idx] - query_start_loc_cpu[start_idx]).item()
+        )
     if query_slice is not None:
         qs_start = query_slice.start
         qs_stop = query_slice.stop
@@ -760,13 +778,21 @@ def build_prefill_chunk_metadata(
         COMPRESS_RATIO=compress_ratio,
     )
 
-    token_start = query_start_loc_cpu[start_idx].item()
+    token_start = (
+        int(query_start_loc_np[start_idx])
+        if query_start_loc_np is not None
+        else query_start_loc_cpu[start_idx].item()
+    )
     if query_slice is not None:
         token_end = token_start + qs_stop
         token_start = token_start + qs_start
         skip_kv_gather = skip_kv_gather or qs_start > 0
     else:
-        token_end = query_start_loc_cpu[end_idx].item()
+        token_end = (
+            int(query_start_loc_np[end_idx])
+            if query_start_loc_np is not None
+            else query_start_loc_cpu[end_idx].item()
+        )
 
     return DeepseekV32IndexerPrefillChunkMetadata(
         cu_seqlen_ks=cu_seq_len_ks,

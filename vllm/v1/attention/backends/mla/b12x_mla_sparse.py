@@ -378,8 +378,16 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 seq_lens_for_req[: cm.num_reqs], non_blocking=True
             )
         else:
-            starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-            query_lens = np.diff(starts)
+            if cm.batch_topology is not None:
+                starts = cm.batch_topology.query_start_loc_np[: cm.num_reqs + 1]
+                query_lens = cm.batch_topology.query_lens_np
+                req_id_per_token_np = cm.batch_topology.req_id_per_token_np
+            else:
+                starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
+                query_lens = np.diff(starts)
+                req_id_per_token_np = np.repeat(
+                    np.arange(cm.num_reqs, dtype=np.int32), query_lens
+                )
             num_query_tokens = int(starts[-1])
             if num_query_tokens > num_tokens:
                 raise RuntimeError(
@@ -390,9 +398,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
             req_ids = np.zeros((num_tokens,), dtype=np.int32)
             if num_query_tokens:
-                req_ids[:num_query_tokens] = np.repeat(
-                    np.arange(cm.num_reqs, dtype=np.int32), query_lens
-                )
+                req_ids[:num_query_tokens] = req_id_per_token_np
 
             # Avoid the blocking seq_lens device->host sync. cm.seq_lens_cpu is a
             # lazy `.to("cpu")`; under --async-scheduling the runner keeps the GPU
@@ -416,12 +422,12 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 start = int(starts[req_id])
                 end = int(starts[req_id + 1])
                 context_len = int(seq_lens_cpu[req_id]) - int(q_len)
-                global_per_token_lens = torch.arange(
-                    context_len + 1,
-                    context_len + int(q_len) + 1,
-                    dtype=torch.int32,
-                )
                 if cm.dcp_local_seq_lens is not None:
+                    global_per_token_lens = torch.arange(
+                        context_len + 1,
+                        context_len + int(q_len) + 1,
+                        dtype=torch.int32,
+                    )
                     per_token_lens[start:end] = get_dcp_local_seq_lens(
                         global_per_token_lens,
                         self.dcp_world_size,
@@ -429,7 +435,11 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                         self.cp_kv_cache_interleave_size,
                     ).numpy()
                 else:
-                    per_token_lens[start:end] = global_per_token_lens.numpy()
+                    per_token_lens[start:end] = np.arange(
+                        context_len + 1,
+                        context_len + int(q_len) + 1,
+                        dtype=np.int32,
+                    )
 
             req_ids_t = torch.from_numpy(req_ids)
             per_token_lens_t = torch.from_numpy(per_token_lens)

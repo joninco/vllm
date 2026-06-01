@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar
 
@@ -357,6 +357,111 @@ T = TypeVar("T", bound=AttentionMetadata)
 
 
 @dataclass
+class CommonAttentionBatchTopology:
+    """Per-forward batch-shape data shared across KV-cache groups."""
+
+    query_start_loc_np: np.ndarray
+    num_reqs: int
+    max_query_len: int
+    max_seq_len_upper_bound: int
+
+    _query_lens_np: np.ndarray | None = None
+    _req_id_per_token_np: np.ndarray | None = None
+    _split_decodes_and_prefills_cache: dict[
+        tuple[int, bool, bool, int], tuple[int, int, int, int]
+    ] = field(default_factory=dict)
+
+    @property
+    def query_lens_np(self) -> np.ndarray:
+        if self._query_lens_np is None:
+            starts = self.query_start_loc_np[: self.num_reqs + 1]
+            self._query_lens_np = np.diff(starts)
+        return self._query_lens_np
+
+    @property
+    def req_id_per_token_np(self) -> np.ndarray:
+        if self._req_id_per_token_np is None:
+            self._req_id_per_token_np = np.repeat(
+                np.arange(self.num_reqs, dtype=np.int32), self.query_lens_np
+            )
+        return self._req_id_per_token_np
+
+    def split_decodes_and_prefills(
+        self,
+        common_attn_metadata: "CommonAttentionMetadata",
+        decode_threshold: int = 1,
+        require_uniform: bool = False,
+        treat_short_extends_as_decodes: bool = True,
+    ) -> tuple[int, int, int, int]:
+        is_prefilling_key = (
+            0
+            if treat_short_extends_as_decodes
+            else id(common_attn_metadata.is_prefilling)
+        )
+        key = (
+            decode_threshold,
+            require_uniform,
+            treat_short_extends_as_decodes,
+            is_prefilling_key,
+        )
+        if key not in self._split_decodes_and_prefills_cache:
+            if treat_short_extends_as_decodes:
+                self._split_decodes_and_prefills_cache[key] = (
+                    self._split_decodes_and_prefills_from_numpy(
+                        common_attn_metadata.num_actual_tokens,
+                        decode_threshold,
+                        require_uniform,
+                    )
+                )
+            else:
+                from vllm.v1.attention.backends.utils import (
+                    split_decodes_and_prefills,
+                )
+
+                self._split_decodes_and_prefills_cache[key] = (
+                    split_decodes_and_prefills(
+                        common_attn_metadata,
+                        decode_threshold=decode_threshold,
+                        require_uniform=require_uniform,
+                        treat_short_extends_as_decodes=treat_short_extends_as_decodes,
+                    )
+                )
+        return self._split_decodes_and_prefills_cache[key]
+
+    def _split_decodes_and_prefills_from_numpy(
+        self,
+        num_tokens: int,
+        decode_threshold: int,
+        require_uniform: bool,
+    ) -> tuple[int, int, int, int]:
+        if self.max_query_len <= decode_threshold and (
+            not require_uniform or decode_threshold <= 1
+        ):
+            return self.num_reqs, 0, num_tokens, 0
+
+        query_lens = self.query_lens_np
+        if int(query_lens[0]) > decode_threshold:
+            return 0, self.num_reqs, 0, num_tokens
+
+        if require_uniform:
+            if bool(np.all((query_lens == query_lens[0]) | (query_lens == 0))):
+                return self.num_reqs, 0, num_tokens, 0
+            is_prefill = query_lens != query_lens[0]
+        else:
+            is_prefill = query_lens > decode_threshold
+
+        if not bool(np.any(is_prefill)):
+            return self.num_reqs, 0, num_tokens, 0
+
+        first_prefill = int(np.argmax(is_prefill))
+        num_decodes = first_prefill
+        num_prefills = self.num_reqs - num_decodes
+        num_decode_tokens = int(self.query_start_loc_np[first_prefill])
+        num_prefill_tokens = num_tokens - num_decode_tokens
+        return num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens
+
+
+@dataclass
 class CommonAttentionMetadata:
     """
     Per-batch attention metadata, shared across layers and backends.
@@ -415,6 +520,8 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    batch_topology: CommonAttentionBatchTopology | None = None
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
@@ -429,6 +536,19 @@ class CommonAttentionMetadata:
         return self.query_start_loc[1:] - self.query_start_loc[:-1]
 
     def replace(self, **kwargs) -> "CommonAttentionMetadata":
+        if "batch_topology" not in kwargs and any(
+            field_name in kwargs
+            for field_name in (
+                "query_start_loc",
+                "query_start_loc_cpu",
+                "num_reqs",
+                "num_actual_tokens",
+                "max_query_len",
+                "max_seq_len",
+                "is_prefilling",
+            )
+        ):
+            kwargs["batch_topology"] = None
         return replace(self, **kwargs)
 
     @property
@@ -467,6 +587,29 @@ class CommonAttentionMetadata:
             query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
             self._num_computed_tokens_cache = self.seq_lens - query_lens
         return self._num_computed_tokens_cache
+
+    def split_decodes_and_prefills(
+        self,
+        decode_threshold: int = 1,
+        require_uniform: bool = False,
+        treat_short_extends_as_decodes: bool = True,
+    ) -> tuple[int, int, int, int]:
+        if self.batch_topology is not None:
+            return self.batch_topology.split_decodes_and_prefills(
+                self,
+                decode_threshold=decode_threshold,
+                require_uniform=require_uniform,
+                treat_short_extends_as_decodes=treat_short_extends_as_decodes,
+            )
+
+        from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+
+        return split_decodes_and_prefills(
+            self,
+            decode_threshold=decode_threshold,
+            require_uniform=require_uniform,
+            treat_short_extends_as_decodes=treat_short_extends_as_decodes,
+        )
 
     # TODO(lucas): remove once we have FULL-CG spec-decode support
     def unpadded(
