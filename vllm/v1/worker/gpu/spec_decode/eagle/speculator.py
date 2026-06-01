@@ -64,6 +64,10 @@ class EagleSpeculator:
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
+        self.use_local_argmax_reduction = (
+            self.speculative_config.use_local_argmax_reduction
+            and self.speculative_config.draft_sample_method == "greedy"
+        )
 
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -165,6 +169,17 @@ class EagleSpeculator:
         self.draft_attn_layer_names = set(all_attn_layers) - set(
             target_attn_layer_names
         )
+        if self.use_local_argmax_reduction:
+            if not hasattr(self.model, "get_top_tokens"):
+                raise ValueError(
+                    "use_local_argmax_reduction is enabled but draft model "
+                    f"{self.model.__class__.__name__} does not implement "
+                    "get_top_tokens()."
+                )
+            logger.info(
+                "Using local argmax reduction for Eagle/MTP draft token "
+                "generation (communication: O(2*tp_size) vs O(vocab_size))."
+            )
 
     def set_attn(
         self,
@@ -255,6 +270,19 @@ class EagleSpeculator:
         else:
             return logits.argmax(dim=-1)
 
+    def _select_draft_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        pos: torch.Tensor,
+        draft_step: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.use_local_argmax_reduction and draft_logits is None:
+            return self.model.get_top_tokens(hidden_states)
+        logits = self.model.compute_logits(hidden_states)
+        return self._sample_draft(logits, idx_mapping, pos, draft_step, draft_logits)
+
     def prefill(
         self,
         num_reqs: int,
@@ -278,10 +306,8 @@ class EagleSpeculator:
             mm_inputs=mm_inputs,
         )
         sample_hidden_states = last_hidden_states[last_token_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
-
-        self.draft_tokens[:num_reqs, 0] = self._sample_draft(
-            logits,
+        self.draft_tokens[:num_reqs, 0] = self._select_draft_tokens(
+            sample_hidden_states,
             idx_mapping,
             pos,
             self.current_draft_step,
@@ -363,9 +389,8 @@ class EagleSpeculator:
         last_hidden_states = last_hidden_states[:num_reqs]
 
         # Sample the draft tokens.
-        logits = self.model.compute_logits(last_hidden_states)
-        draft_tokens = self._sample_draft(
-            logits,
+        draft_tokens = self._select_draft_tokens(
+            last_hidden_states,
             idx_mapping,
             positions,
             self.current_draft_step,
