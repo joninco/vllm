@@ -2200,6 +2200,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         fp8_config: ModelOptFp8Config,
         nvfp4_config: ModelOptNvFp4Config,
         w4a16_nvfp4_config: ModelOptNvFp4Config,
+        mxfp8_config: ModelOptMxFp8Config | None = None,
     ) -> None:
         super().__init__(exclude_modules)
         self.kv_cache_quant_method = kv_cache_quant_method
@@ -2207,6 +2208,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
+        # Optional sibling config for layers that declare quant_algo: "MXFP8".
+        # Kept optional/default-constructed so existing callers (and tests) that
+        # predate mixed MXFP8 support don't break; the dispatch below only ever
+        # uses it when a layer actually resolves to MXFP8.
+        self.mxfp8_config = mxfp8_config or ModelOptMxFp8Config(
+            is_checkpoint_mxfp8_serialized=True,
+            kv_cache_quant_algo=kv_cache_quant_method,
+            exclude_modules=[],
+        )
 
     def get_name(self) -> QuantizationMethods:
         return "modelopt_mixed"
@@ -2396,6 +2406,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
+            if quant_algo == "MXFP8":
+                return ModelOptMxFp8LinearMethod(self.mxfp8_config)
             # Layer not in quantized_layers — leave unquantized
             return UnquantizedLinearMethod()
 
@@ -2413,6 +2425,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.w4a16_nvfp4_config,
+                    moe_config=layer.moe_config,
+                )
+            if quant_algo == "MXFP8":
+                return ModelOptMxFp8FusedMoE(
+                    quant_config=self.mxfp8_config,
                     moe_config=layer.moe_config,
                 )
             return None
