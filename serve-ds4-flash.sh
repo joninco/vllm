@@ -30,7 +30,7 @@ if [[ "${VLLM_ENABLE_TORCH_PROFILER:-0}" == "1" ]]; then
   profile_dir="${VLLM_TORCH_PROFILER_DIR:-/tmp/vllm-ds4-decode}"
   profile_delay_iterations="${VLLM_TORCH_PROFILER_DELAY_ITERATIONS:-0}"
   profile_max_iterations="${VLLM_TORCH_PROFILER_MAX_ITERATIONS:-4}"
-  profile_with_stack="${VLLM_TORCH_PROFILER_WITH_STACK:-false}"
+  profile_with_stack="${VLLM_TORCH_PROFILER_WITH_STACK:-true}"
   profile_record_shapes="${VLLM_TORCH_PROFILER_RECORD_SHAPES:-false}"
   profile_with_memory="${VLLM_TORCH_PROFILER_WITH_MEMORY:-false}"
   profile_use_gzip="${VLLM_TORCH_PROFILER_USE_GZIP:-true}"
@@ -58,11 +58,11 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --port ${PORT:-8000} \
   --kv-cache-dtype fp8 \
   --block-size 256 \
-  --max-model-len 65536 \
+  --max-model-len 150000 \
   --load-format instanttensor \
   --tensor-parallel-size 2 \
-  --gpu-memory-utilization 0.88 \
-  --max-num-seqs 8 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-seqs 6 \
   --async-scheduling \
   --max-num-batched-tokens 2048 \
   --max_cudagraph_capture_size 2048 \
