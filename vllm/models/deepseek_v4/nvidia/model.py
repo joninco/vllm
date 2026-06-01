@@ -1142,6 +1142,21 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from b12x.integration.residual import b12x_mhc_pre
 
+        if torch.compiler.is_compiling():
+            return b12x_mhc_pre(
+                residual,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                split_k=self._b12x_mhc_split_k,
+                block_k=self._b12x_mhc_block_k,
+            )
+
         tokens, hc_mult, hidden_size = residual.shape
         layer_input = torch.empty(
             (tokens, hidden_size), dtype=residual.dtype, device=residual.device

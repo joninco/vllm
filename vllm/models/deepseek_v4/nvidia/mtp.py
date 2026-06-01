@@ -28,6 +28,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_post_tilelang,
 )
+from vllm.model_executor.kernels.mhc.triton import hc_head_fused_kernel_triton
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -156,7 +157,19 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        if self.mtp_block._should_run_b12x_mhc(int(hidden_states.shape[0])):
+            from b12x.integration.residual import b12x_mhc_post
+
+            hidden_states = b12x_mhc_post(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+            )
+        else:
+            hidden_states = mhc_post_tilelang(
+                hidden_states, residual, post_mix, res_mix
+            )
         # Return the flat pre-hc_head residual so it can be re-fed as the
         # next spec step's `previous_hidden_states` when
         # num_speculative_tokens > 1. hc_head is deferred to compute_logits.
@@ -236,14 +249,26 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         hidden_states = hidden_states.view(
             -1, mtp_layer.hc_mult, mtp_layer.config.hidden_size
         )
-        hidden_states = hc_head_fused_kernel_tilelang(
-            hidden_states,
-            mtp_layer.hc_head_fn,
-            mtp_layer.hc_head_scale,
-            mtp_layer.hc_head_base,
-            mtp_layer.rms_norm_eps,
-            mtp_layer.hc_eps,
-        )
+        if torch.compiler.is_compiling() or (
+            mtp_layer.mtp_block._should_run_b12x_mhc(int(hidden_states.shape[0]))
+        ):
+            hidden_states = hc_head_fused_kernel_triton(
+                hidden_states,
+                mtp_layer.hc_head_fn,
+                mtp_layer.hc_head_scale,
+                mtp_layer.hc_head_base,
+                mtp_layer.rms_norm_eps,
+                mtp_layer.hc_eps,
+            )
+        else:
+            hidden_states = hc_head_fused_kernel_tilelang(
+                hidden_states,
+                mtp_layer.hc_head_fn,
+                mtp_layer.hc_head_scale,
+                mtp_layer.hc_head_base,
+                mtp_layer.rms_norm_eps,
+                mtp_layer.hc_eps,
+            )
         hidden_states = mtp_shared_head_rmsnorm(
             hidden_states,
             mtp_layer.shared_head.norm.weight.data,
