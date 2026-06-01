@@ -11,18 +11,16 @@ via the ``b12x.integration.mla`` front door (``sparse_mla_decode_forward`` /
 to ``b12x/attention/mla/unified_sm120`` automatically (GLM_NSA q_head_dim==576
 contract). Selecting this backend also selects b12x's sparse indexer/top-k path.
 
-Workspace philosophy (the idiomatic, no-arena path): b12x's kernels take a
-``B12XAttentionWorkspace`` object, but they only read it as a bag of tensor
-attributes (``tmp_output`` / ``tmp_lse`` / ``output_buffer`` + control pointers)
-plus ``set_split_chunk_config``. We therefore construct a bare workspace
-dataclass (which allocates nothing) and back its split-K scratch with tensors
-borrowed per-call from vLLM's shared ``current_workspace_manager()`` -- exactly
-how ``SparseMLASm120Impl`` borrows ``mid_out``/``mid_lse``. No per-layer b12x
-arena is allocated.
+Workspace philosophy (vLLM eager path): b12x's kernels duck-type their scratch
+object as a bag of attributes (``tmp_output`` / ``tmp_lse`` / ``output_buffer``
++ control pointers) plus ``set_split_chunk_config``. vLLM must not construct or
+own a b12x workspace/arena, so this backend builds a fresh plain views container
+per call and backs it with tensors borrowed from vLLM's shared
+``current_workspace_manager()``.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import numpy as np
 import torch
@@ -65,6 +63,69 @@ _PREFILL_HEADS_PER_BLOCK = 16
 
 def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
+
+
+@dataclass
+class _B12XMLAScratchViews:
+    """Plain vLLM-owned scratch views consumed by b12x MLA kernels."""
+
+    mode: str
+    device: torch.device
+    dtype: torch.dtype
+    kv_dtype: torch.dtype
+    num_q_heads: int
+    head_dim: int
+    v_head_dim: int
+    topk: int
+    max_total_q: int
+    max_batch: int
+    page_size: int
+    max_chunks_per_row: int
+    tmp_output: torch.Tensor | None = None
+    tmp_lse: torch.Tensor | None = None
+    output_buffer: torch.Tensor | None = None
+    kv_chunk_size_ptr: torch.Tensor | None = None
+    num_chunks_ptr: torch.Tensor | None = None
+    kv_chunk_size_value: int | None = None
+    num_chunks_value: int | None = None
+    fixed_capacity: bool = False
+    use_cuda_graph: bool = False
+    final_lse: torch.Tensor | None = None
+    sm_scale_tensor: torch.Tensor | None = None
+    sm_scale_value: float | None = None
+
+    def __post_init__(self) -> None:
+        self.device = torch.device(self.device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.num_q_heads = int(self.num_q_heads)
+        self.head_dim = int(self.head_dim)
+        self.v_head_dim = int(self.v_head_dim)
+        self.topk = int(self.topk)
+        self.max_total_q = int(self.max_total_q)
+        self.max_batch = int(self.max_batch)
+        self.page_size = int(self.page_size)
+        self.max_chunks_per_row = int(self.max_chunks_per_row)
+
+    def set_split_chunk_config(self, *, kv_chunk_size: int, num_chunks: int) -> None:
+        kv_chunk_size = int(kv_chunk_size)
+        num_chunks = int(num_chunks)
+        if kv_chunk_size <= 0:
+            raise ValueError(f"kv_chunk_size must be positive, got {kv_chunk_size}")
+        if num_chunks <= 0 or num_chunks > self.max_chunks_per_row:
+            raise ValueError(
+                "num_chunks must be in "
+                f"[1, {self.max_chunks_per_row}], got {num_chunks}"
+            )
+        if self.kv_chunk_size_ptr is None or self.num_chunks_ptr is None:
+            raise RuntimeError("split MLA control pointers are missing")
+
+        if self.kv_chunk_size_value != kv_chunk_size:
+            self.kv_chunk_size_ptr.fill_(kv_chunk_size)
+            self.kv_chunk_size_value = kv_chunk_size
+        if self.num_chunks_value != num_chunks:
+            self.num_chunks_ptr.fill_(num_chunks)
+            self.num_chunks_value = num_chunks
 
 
 @triton.jit
@@ -444,8 +505,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             q_per_req = 1 + int(spec.num_speculative_tokens)
         self._decode_max_rows = min(max_num_seqs * q_per_req, max_batched)
 
+        self._max_num_seqs = int(max_num_seqs)
+        self._max_batched = int(max_batched)
+
         # Lazily import b12x only on this opt-in path.
-        from b12x.attention.workspace import B12XAttentionWorkspace
         from b12x.integration.mla import (
             sparse_mla_decode_forward,
             sparse_mla_extend_forward,
@@ -453,48 +516,6 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         self._sparse_mla_decode_forward = sparse_mla_decode_forward
         self._sparse_mla_extend_forward = sparse_mla_extend_forward
-
-        # Persistent (1,) int32 split-K control pointers, shared by every decode
-        # call on this layer (filled by workspace.set_split_chunk_config).
-        self._num_chunks_ptr = torch.empty((1,), dtype=torch.int32, device=self.device)
-        self._kv_chunk_size_ptr = torch.empty(
-            (1,), dtype=torch.int32, device=self.device
-        )
-
-        def _make_workspace(
-            mode: str,
-            max_total_q: int,
-            num_q_heads: int,
-        ) -> Any:
-            # Bare dataclass: __post_init__ only canonicalizes scalars (allocates
-            # nothing). tmp_output/tmp_lse/output_buffer are assigned per-call
-            # from the shared workspace manager / a fresh output, so b12x's
-            # _allocate_split_buffers (called by set_split_chunk_config) is a
-            # no-op (it only fills None fields).
-            ws = B12XAttentionWorkspace(
-                mode=mode,
-                device=self.device,
-                dtype=torch.bfloat16,
-                kv_dtype=torch.uint8,
-                num_q_heads=num_q_heads,
-                head_dim=self.q_head_dim,
-                v_head_dim=self.kv_lora_rank,
-                topk=self.topk_tokens,
-                max_total_q=int(max_total_q),
-                max_batch=max_num_seqs,
-                page_size=self.block_size,
-                max_chunks_per_row=self._num_splits_cap,
-            )
-            return ws
-
-        self._decode_workspace = _make_workspace(
-            "decode", self._decode_max_rows, self.num_heads
-        )
-        self._decode_workspace.num_chunks_ptr = self._num_chunks_ptr
-        self._decode_workspace.kv_chunk_size_ptr = self._kv_chunk_size_ptr
-        self._extend_workspace = _make_workspace(
-            "extend", max_batched, self._prefill_num_heads
-        )
 
         # Pre-touch the shared decode scratch at the max decode batch so the
         # workspace manager grows during warmup, before lock_workspace() runs
@@ -506,8 +527,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
     def _borrow_decode_scratch(
         self, num_tokens: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Borrow split-K mid_out / mid_lse from the shared workspace manager."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Borrow split-K scratch/control tensors from vLLM's workspace manager."""
         return tuple(  # type: ignore[return-value]
             current_workspace_manager().get_simultaneous(
                 (
@@ -520,7 +541,41 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     torch.bfloat16,
                 ),
                 ((num_tokens, self.num_heads, self._num_splits_cap), torch.float32),
+                ((1,), torch.int32),
+                ((1,), torch.int32),
             )
+        )
+
+    def _make_scratch_views(
+        self,
+        *,
+        mode: str,
+        max_total_q: int,
+        num_q_heads: int,
+        output_buffer: torch.Tensor,
+        tmp_output: torch.Tensor | None = None,
+        tmp_lse: torch.Tensor | None = None,
+        kv_chunk_size_ptr: torch.Tensor | None = None,
+        num_chunks_ptr: torch.Tensor | None = None,
+    ) -> _B12XMLAScratchViews:
+        return _B12XMLAScratchViews(
+            mode=mode,
+            device=self.device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=num_q_heads,
+            head_dim=self.q_head_dim,
+            v_head_dim=self.kv_lora_rank,
+            topk=self.topk_tokens,
+            max_total_q=max_total_q,
+            max_batch=self._max_num_seqs,
+            page_size=self.block_size,
+            max_chunks_per_row=self._num_splits_cap,
+            tmp_output=tmp_output,
+            tmp_lse=tmp_lse,
+            output_buffer=output_buffer,
+            kv_chunk_size_ptr=kv_chunk_size_ptr,
+            num_chunks_ptr=num_chunks_ptr,
         )
 
     def forward_mqa(
@@ -584,11 +639,19 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             output = q.new_empty(
                 (num_actual_toks, self.num_heads, self.kv_lora_rank), dtype=q.dtype
             )
-            mid_out, mid_lse = self._borrow_decode_scratch(num_actual_toks)
-            ws = self._decode_workspace
-            ws.tmp_output = mid_out
-            ws.tmp_lse = mid_lse
-            ws.output_buffer = output
+            mid_out, mid_lse, kv_chunk_size_ptr, num_chunks_ptr = (
+                self._borrow_decode_scratch(num_actual_toks)
+            )
+            ws = self._make_scratch_views(
+                mode="decode",
+                max_total_q=self._decode_max_rows,
+                num_q_heads=self.num_heads,
+                output_buffer=output,
+                tmp_output=mid_out,
+                tmp_lse=mid_lse,
+                kv_chunk_size_ptr=kv_chunk_size_ptr,
+                num_chunks_ptr=num_chunks_ptr,
+            )
             out = self._sparse_mla_decode_forward(
                 q_all=q,
                 kv_cache=kv_cache,
@@ -616,8 +679,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 (num_actual_toks, self._prefill_num_heads, self.kv_lora_rank),
                 dtype=q.dtype,
             )
-            ws = self._extend_workspace
-            ws.output_buffer = output
+            ws = self._make_scratch_views(
+                mode="extend",
+                max_total_q=self._max_batched,
+                num_q_heads=self._prefill_num_heads,
+                output_buffer=output,
+            )
             out = self._sparse_mla_extend_forward(
                 q_all=prefill_q,
                 kv_cache=kv_cache,
