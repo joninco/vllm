@@ -12,6 +12,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
+    CommonAttentionBatchTopology,
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import (
@@ -393,6 +394,7 @@ def build_attn_metadata(
     slot_mappings: torch.Tensor,
     kv_cache_config: KVCacheConfig,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    max_seq_len_upper_bound: int | None = None,
     dcp_local_seq_lens: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
@@ -406,6 +408,14 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    batch_topology = CommonAttentionBatchTopology(
+        query_start_loc_np=query_start_loc_cpu.numpy(),
+        num_reqs=num_reqs,
+        max_query_len=max_query_len,
+        max_seq_len_upper_bound=(
+            max_seq_len if max_seq_len_upper_bound is None else max_seq_len_upper_bound
+        ),
+    )
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -429,6 +439,7 @@ def build_attn_metadata(
             causal=True,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
+            batch_topology=batch_topology,
             **common_attn_metadata_extra_kwargs,
         )
 
