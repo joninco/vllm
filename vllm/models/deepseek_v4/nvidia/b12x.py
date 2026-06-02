@@ -116,9 +116,12 @@ def _run_compressed_mla(
         B12XCompressedMLAScratchCaps,
         plan_compressed_mla_scratch,
     )
-    from b12x.integration.mla import compressed_mla_decode_forward
+    from b12x.integration.mla import (
+        compressed_mla_decode_forward,
+        compressed_mla_split_chunks_for_contract,
+    )
 
-    rows, heads = q.shape[0], q.shape[1]
+    rows, heads = int(q.shape[0]), int(q.shape[1])
     q = q.contiguous()
     swa_indices = swa_indices.contiguous()
     swa_lens = swa_lens.contiguous()
@@ -132,7 +135,14 @@ def _run_compressed_mla(
     width = int(swa_indices.shape[-1])
     if indexed_indices is not None:
         width += int(indexed_indices.shape[-1])
-    num_splits_cap = max(1, _cdiv(width, _DECODE_SPLIT_TILE))
+    decode_split_cap = max(1, _cdiv(width, _DECODE_SPLIT_TILE))
+    # Keep the legacy 64-wide split cap for decode, but let the b12x contract
+    # select the smaller batched-prefill split count when rows > decode max.
+    num_splits_cap = compressed_mla_split_chunks_for_contract(
+        rows=max(1, rows),
+        width=width,
+        max_chunks=decode_split_cap,
+    )
 
     plan = plan_compressed_mla_scratch(
         B12XCompressedMLAScratchCaps(

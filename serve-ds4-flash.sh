@@ -9,7 +9,8 @@ export NCCL_IB_DISABLE=1
 export VLLM_USE_AOT_COMPILE=1
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0
 export VLLM_USE_MEGA_AOT_ARTIFACT=${VLLM_USE_MEGA_AOT_ARTIFACT:-1}
-export B12X_MHC_MAX_TOKENS=2048
+export VLLM_MEMORY_PROFILE_INCLUDE_ATTN=1
+export B12X_MHC_MAX_TOKENS=16384
 export VLLM_USE_FLASHINFER_SAMPLER=1
 export VLLM_USE_B12X_WO_PROJECTION=1
 export VLLM_USE_B12X_MHC=1
@@ -48,8 +49,8 @@ if [[ "${VLLM_ENABLE_TORCH_PROFILER:-0}" == "1" ]]; then
 fi
 
 spec_args=()
-if [[ "${VLLM_ENABLE_MTP:-0}" == "1" ]]; then
-  spec_args=('--speculative-config' '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x"}')
+if [[ "${VLLM_ENABLE_MTP:-1}" == "1" ]]; then
+  spec_args=('--speculative-config' '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":true}')
 fi
 
 exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
@@ -58,18 +59,19 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --port ${PORT:-8000} \
   --kv-cache-dtype fp8 \
   --block-size 256 \
-  --max-model-len 150000 \
   --load-format instanttensor \
-  --tensor-parallel-size 2 \
-  --gpu-memory-utilization 0.90 \
-  --max-num-seqs 6 \
+  --tensor-parallel-size 4 \
+  --gpu-memory-utilization 0.85 \
+  --max-num-seqs 16 \
   --async-scheduling \
-  --max-num-batched-tokens 2048 \
-  --max_cudagraph_capture_size 2048 \
+  --no-scheduler-reserve-full-isl \
+  --max-num-batched-tokens 4096 \
+  --max_cudagraph_capture_size 4096 \
   --attention-backend B12X_MLA_SPARSE \
   --enable-chunked-prefill \
   --enable-prefix-caching \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"inductor_compile_config":{"triton.autotune_at_compile_time":false}}' \
+  --enable-flashinfer-autotune \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \
