@@ -152,16 +152,15 @@ def _b12x_mhc_max_tokens() -> int:
         ) from exc
 
 
-def _empty_b12x_plan_scratch(
+def _get_b12x_plan_scratch(
     plan: object,
-    device: torch.device,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     specs = plan.shapes_and_dtypes()
     if not specs:
         raise ValueError("b12x scratch plan did not provide any scratch specs")
-    buffers = tuple(
-        torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs
-    )
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    buffers = current_workspace_manager().get_simultaneous(*specs)
     if len(buffers) == 1:
         return buffers[0]
     return buffers
@@ -1073,7 +1072,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 split_k=self._b12x_mhc_split_k,
             )
         )
-        scratch = _empty_b12x_plan_scratch(plan, x.device)
+        scratch = _get_b12x_plan_scratch(plan)
         return plan.bind(
             scratch=scratch,
             tokens=tokens,
