@@ -39,9 +39,9 @@ model_path="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Pro}"
 served_model_name="${SERVED_MODEL_NAME:-DeepSeek-V4-Pro}"
 tp_size="${TP_SIZE:-10}"
 dcp_size="${DCP_SIZE:-1}"
-dcp_comm_backend="${DCP_COMM_BACKEND:-a2a}"
+dcp_comm_backend="${DCP_COMM_BACKEND:-ag_rs}"
 port="${PORT:-8000}"
-gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.94}"
+gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.92}"
 max_model_len="${MAX_MODEL_LEN:-65536}"
 max_num_seqs="${MAX_NUM_SEQS:-1}"
 max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-512}"
@@ -83,6 +83,11 @@ else
   autotune_args+=(--no-enable-flashinfer-autotune)
 fi
 
+dcp_args=(--decode-context-parallel-size "${dcp_size}")
+if (( dcp_size > 1 )); then
+  dcp_args+=(--dcp-comm-backend "${dcp_comm_backend}")
+fi
+
 exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   "${model_path}" \
   --served-model-name "${served_model_name}" \
@@ -92,9 +97,9 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --block-size 256 \
   --load-format "${load_format}" \
   --tensor-parallel-size "${tp_size}" \
-  --decode-context-parallel-size "${dcp_size}" \
+  "${dcp_args[@]}" \
   --virtual-tp-sharding b12x-padded \
-  --b12x-virtual-tp-moe-intermediate-alignment 16 \
+  --b12x-virtual-tp-moe-intermediate-alignment 32 \
   --moe-backend b12x \
   --linear-backend b12x \
   --gpu-memory-utilization "${gpu_memory_utilization}" \
