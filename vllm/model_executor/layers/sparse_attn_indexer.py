@@ -328,11 +328,11 @@ def _run_b12x_compressed_decode_topk(
     topk_indices: torch.Tensor,
     topk_tokens: int,
 ) -> torch.Tensor:
-    from b12x.attention.indexer.tiled_topk import run_row_topk
     from b12x.integration.compressed_indexer import (
         COMPRESSED_INDEX_PAGE_SIZE,
-        compressed_index_decode_logits_fp8,
-        prepare_compressed_indexer_metadata,
+        B12XCompressedIndexerScratchCaps,
+        compressed_index_decode_supertile_fp8,
+        plan_compressed_indexer_scratch,
     )
 
     if int(COMPRESSED_INDEX_PAGE_SIZE) != _B12X_COMPRESSED_INDEX_PAGE_SIZE:
@@ -344,36 +344,35 @@ def _run_b12x_compressed_decode_topk(
 
     index_k_cache = _flatten_b12x_paged_index_cache(kv_cache)
     expected_num_q_heads = int(q_fp8.shape[1])
-    metadata = prepare_compressed_indexer_metadata(
+    plan = plan_compressed_indexer_scratch(
+        B12XCompressedIndexerScratchCaps(
+            device=q_fp8.device,
+            num_q_heads=expected_num_q_heads,
+            max_q_rows=int(q_fp8.shape[0]),
+            max_page_table_width=int(block_table.shape[1]),
+            topk=int(topk_tokens),
+            reserve_paged_logits=False,
+        )
+    )
+    scratch = current_workspace_manager().get_simultaneous(
+        *plan.shapes_and_dtypes()
+    )
+    binding = plan.bind(
+        scratch=scratch,
         real_page_table=block_table,
         cache_seqlens_int32=seq_lens,
-        page_size=COMPRESSED_INDEX_PAGE_SIZE,
-        expected_num_q_heads=expected_num_q_heads,
         schedule_metadata=schedule_metadata,
-        validate_raw_lengths=False,
+        expected_num_q_heads=expected_num_q_heads,
     )
-    logits = compressed_index_decode_logits_fp8(
+    return compressed_index_decode_supertile_fp8(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
-        metadata=metadata,
+        binding=binding,
         page_size=COMPRESSED_INDEX_PAGE_SIZE,
         expected_num_q_heads=expected_num_q_heads,
-        preinitialize_invalid_logits=False,
+        out_indices=topk_indices,
     )
-    topk_values = torch.empty(
-        (int(q_fp8.shape[0]), int(topk_tokens)),
-        dtype=torch.float32,
-        device=q_fp8.device,
-    )
-    _, result = run_row_topk(
-        row_logits=logits,
-        lengths=metadata.cache_seqlens_int32,
-        topk=topk_tokens,
-        output_values=topk_values,
-        output_indices=topk_indices,
-    )
-    return result
 
 
 @eager_break_during_capture
