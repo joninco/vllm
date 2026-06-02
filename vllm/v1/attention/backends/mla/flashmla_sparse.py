@@ -258,6 +258,19 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         parallel_config = vllm_config.parallel_config
         self.device = device
         self.storage_block_size = int(self.kv_cache_spec.storage_block_size)
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.pcp_world_size = parallel_config.prefill_context_parallel_size
+        self.cp_kv_cache_interleave_size = (
+            parallel_config.cp_kv_cache_interleave_size
+        )
+        self.dcp_rank = 0
+        if self.dcp_world_size > 1:
+            assert self.pcp_world_size == 1, (
+                "FlashMLASparseMetadataBuilder supports DCP but not PCP."
+            )
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
 
         # Classify single-token queries (plus num_speculative_tokens via
         # supports_spec_as_decode=True) as decodes; longer queries go to
@@ -605,6 +618,9 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 self.storage_block_size,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
+                dcp_world_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
 
         fp8_extra_metadata: (
@@ -685,6 +701,9 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             self.c128a_decode_lens_buffer,
             self.c128a_prefill_buffer,
             max_compressed_tokens=self.c128a_max_compressed,
+            dcp_world_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
         )
 
         result: dict[str, torch.Tensor | None] = {}
@@ -1053,6 +1072,9 @@ def build_c128a_topk_metadata(
     decode_lens_buffer: torch.Tensor,
     prefill_buffer: torch.Tensor,
     max_compressed_tokens: int = 8192,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single kernel for all C128A tokens (decode + prefill).
 
@@ -1087,6 +1109,9 @@ def build_c128a_topk_metadata(
         block_table.stride(0),
         block_size,
         slot_mapping,
+        DCP_WORLD_SIZE=dcp_world_size,
+        DCP_RANK=dcp_rank,
+        CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,
         BLOCK_SIZE=1024,
     )
     return global_decode, decode_lens, prefill_local
@@ -1111,6 +1136,9 @@ def _build_c128a_topk_metadata_kernel(
     block_table_stride,
     block_size,
     slot_mapping_ptr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -1124,25 +1152,50 @@ def _build_c128a_topk_metadata_kernel(
         is_valid_token = tl.load(slot_mapping_ptr + token_idx) >= 0
         req_idx = tl.load(token_to_req_indices_ptr + token_idx)
         count = tl.zeros((), dtype=tl.int32)
+        virtual_block_size = block_size * DCP_WORLD_SIZE
         for i in range(0, max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
             mask = offset < max_compressed_tokens
             is_valid = offset < num_compressed
 
-            block_indices = offset // block_size
-            block_numbers = tl.load(
-                block_table_ptr + req_idx * block_table_stride + block_indices,
-                mask=mask & is_valid,
-            )
-            block_offsets = offset % block_size
-            slot_ids = block_numbers * block_size + block_offsets
-            slot_ids = tl.where(is_valid, slot_ids, -1)
-            tl.store(
-                global_decode_ptr + token_idx * global_decode_stride + offset,
-                slot_ids,
-                mask=mask,
-            )
-            count += tl.sum(is_valid.to(tl.int32), axis=0)
+            if DCP_WORLD_SIZE == 1:
+                block_indices = offset // block_size
+                block_numbers = tl.load(
+                    block_table_ptr + req_idx * block_table_stride + block_indices,
+                    mask=mask & is_valid,
+                )
+                block_offsets = offset % block_size
+                slot_ids = block_numbers * block_size + block_offsets
+                slot_ids = tl.where(is_valid, slot_ids, -1)
+                tl.store(
+                    global_decode_ptr + token_idx * global_decode_stride + offset,
+                    slot_ids,
+                    mask=mask,
+                )
+                count += tl.sum(is_valid.to(tl.int32), axis=0)
+            else:
+                block_indices = offset // virtual_block_size
+                block_numbers = tl.load(
+                    block_table_ptr + req_idx * block_table_stride + block_indices,
+                    mask=mask & is_valid,
+                ).to(tl.int64)
+                virtual_block_offsets = offset - block_indices * virtual_block_size
+                is_local = (
+                    virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+                ) % DCP_WORLD_SIZE == DCP_RANK
+                local_block_offsets = (
+                    virtual_block_offsets
+                    // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+                ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+                    virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+                )
+                slot_ids = block_numbers * block_size + local_block_offsets
+                valid = mask & is_valid & is_local & is_valid_token
+                compact_pos = count + tl.cumsum(valid.to(tl.int32), 0) - 1
+                row_base = global_decode_ptr + token_idx * global_decode_stride
+                tl.store(row_base + offset, -1, mask=mask)
+                tl.store(row_base + compact_pos, slot_ids, mask=valid)
+                count += tl.sum(valid.to(tl.int32), axis=0)
 
         tl.store(
             decode_lens_ptr + token_idx,
