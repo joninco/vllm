@@ -49,6 +49,21 @@ def get_virtual_tp_axis_shard_size(axis_name: str, param_axis_size: int) -> int:
     return min(virtual_local_size, param_axis_size)
 
 
+def get_virtual_tp_vocab_padding_size(default: int) -> int:
+    plan = get_current_virtual_tp_plan()
+    if plan is None:
+        return default
+
+    axis = plan.get("vocab_size")
+    if not isinstance(axis, dict):
+        return default
+
+    padding_size = axis.get("padding_size")
+    if padding_size is None:
+        return default
+    return int(padding_size)
+
+
 def pad_or_narrow_weight(
     loaded_weight: torch.Tensor,
     dim: int,

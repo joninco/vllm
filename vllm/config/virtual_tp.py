@@ -14,6 +14,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
     from vllm.config.model import ModelConfig
+    from vllm.config.parallel import ParallelConfig
     from vllm.config.vllm import VllmConfig
 
 logger = init_logger(__name__)
@@ -28,13 +29,14 @@ _VOCAB_GLOBAL_ALIGNMENT = 64
 
 
 def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
-    """Pad DeepSeek V4 config dimensions for B12X virtual TP sharding.
+    """Pad config dimensions for B12X virtual TP sharding.
 
-    Some DeepSeek V4 Pro dimensions are not divisible by TP=10.  Native B12X
-    kernels can run a larger logical per-rank shape as long as checkpoint tails
-    are zero-filled during loading.  This mutates the HuggingFace configs before
-    vLLM's normal parallel-config verification and stores the original sizes in
-    ``VIRTUAL_TP_PLAN_ATTR`` for weight loaders.
+    Some B12X target models have dimensions that are not divisible by an
+    otherwise useful TP size.  Native B12X kernels can run a larger logical
+    per-rank shape as long as checkpoint tails are zero-filled during loading.
+    This mutates the HuggingFace configs before vLLM's normal parallel-config
+    verification and stores the original sizes in ``VIRTUAL_TP_PLAN_ATTR`` for
+    weight loaders.
     """
     parallel_config = vllm_config.parallel_config
     if parallel_config.virtual_tp_sharding == VIRTUAL_TP_SHARDING_OFF:
@@ -50,11 +52,32 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
     if model_config is None:
         return
 
-    text_config = model_config.hf_text_config
-    if getattr(text_config, VIRTUAL_TP_PLAN_ATTR, None) is not None:
+    plan_config = _get_plan_config(model_config)
+    if getattr(plan_config, VIRTUAL_TP_PLAN_ATTR, None) is not None:
         return
 
     _validate_b12x_virtual_tp_config(vllm_config)
+
+    apply_b12x_virtual_tp_padding_to_model_config(model_config, parallel_config)
+
+
+def apply_b12x_virtual_tp_padding_to_model_config(
+    model_config: ModelConfig,
+    parallel_config: ParallelConfig,
+) -> None:
+    """Pad model dimensions for a validated B12X virtual TP configuration."""
+    if parallel_config.virtual_tp_sharding == VIRTUAL_TP_SHARDING_OFF:
+        return
+
+    if parallel_config.virtual_tp_sharding != VIRTUAL_TP_SHARDING_B12X_PADDED:
+        raise ValueError(
+            "Unsupported virtual TP sharding mode "
+            f"{parallel_config.virtual_tp_sharding!r}."
+        )
+
+    plan_config = _get_plan_config(model_config)
+    if getattr(plan_config, VIRTUAL_TP_PLAN_ATTR, None) is not None:
+        return
 
     attention_tp_size = parallel_config.tensor_parallel_size
     moe_tp_size = (
@@ -63,19 +86,38 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
         * parallel_config.prefill_context_parallel_size
     )
 
+    configs = tuple(_iter_virtual_tp_configs(model_config))
+    text_config = model_config.hf_text_config
+    is_deepseek_v4 = _is_deepseek_v4_config(model_config)
+
     original_attention_heads = _require_int_attr(text_config, "num_attention_heads")
-    original_output_groups = _require_int_attr(text_config, "o_groups")
-    attention_axis = _make_virtual_axis(
-        original_attention_heads,
-        attention_tp_size,
-        parallel_config.b12x_virtual_tp_attention_head_alignment,
+    if is_deepseek_v4:
+        attention_axis = _make_virtual_axis(
+            original_attention_heads,
+            attention_tp_size,
+            parallel_config.b12x_virtual_tp_attention_head_alignment,
+        )
+        original_output_groups = _require_int_attr(text_config, "o_groups")
+        output_group_axis = _make_virtual_output_group_axis(
+            original_output_groups,
+            original_attention_heads,
+            attention_axis["padded_size"],
+            attention_tp_size,
+        )
+    else:
+        # Sparse MLA/DSA only needs the total query-head count to be divisible by
+        # the effective attention TP size.  The B12X sparse-MLA backend already
+        # pads local head blocks internally where its kernels need larger tiles.
+        attention_axis = _make_virtual_axis(original_attention_heads, attention_tp_size)
+        output_group_axis = None
+
+    _set_all_config_attr(
+        configs, "original_num_attention_heads", original_attention_heads
     )
-    output_group_axis = _make_virtual_output_group_axis(
-        original_output_groups,
-        original_attention_heads,
-        attention_axis["padded_size"],
-        attention_tp_size,
+    _set_existing_config_attr(
+        configs, "num_attention_heads", attention_axis["padded_size"]
     )
+
     moe_original_size = _require_int_attr(text_config, "moe_intermediate_size")
     moe_axis = _make_virtual_axis(
         moe_original_size,
@@ -84,7 +126,7 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
     )
     shared_expert_axis = None
     n_shared_experts = getattr(text_config, "n_shared_experts", None)
-    if n_shared_experts is not None:
+    if is_deepseek_v4 and n_shared_experts is not None:
         shared_expert_axis = _make_virtual_axis(
             moe_original_size * int(n_shared_experts),
             attention_tp_size,
@@ -95,22 +137,22 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
         attention_tp_size,
     )
 
-    configs = tuple(
-        _unique_configs((model_config.hf_config, model_config.hf_text_config))
-    )
-    _set_existing_config_attr(
-        configs, "num_attention_heads", attention_axis["padded_size"]
-    )
-    _set_existing_config_attr(configs, "o_groups", output_group_axis["padded_size"])
+    if output_group_axis is not None:
+        _set_all_config_attr(
+            configs, "original_o_groups", output_group_axis["original_size"]
+        )
+        _set_existing_config_attr(configs, "o_groups", output_group_axis["padded_size"])
+    _set_all_config_attr(configs, "original_moe_intermediate_size", moe_original_size)
     _set_existing_config_attr(configs, "moe_intermediate_size", moe_axis["padded_size"])
 
     plan = {
         "sharding": VIRTUAL_TP_SHARDING_B12X_PADDED,
         "attention_heads": attention_axis,
-        "output_groups": output_group_axis,
         "moe_intermediate_size": moe_axis,
         "vocab_size": vocab_axis,
     }
+    if output_group_axis is not None:
+        plan["output_groups"] = output_group_axis
     if shared_expert_axis is not None:
         plan["shared_expert_intermediate_size"] = shared_expert_axis
 
@@ -119,19 +161,31 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
 
     model_config.model_arch_config = model_config.get_model_arch_config()
 
-    logger.info(
-        "Enabled B12X virtual TP padding: attention heads %d -> %d, "
-        "output groups %d -> %d, MoE intermediate size %d -> %d, "
-        "vocab size %d -> %d.",
-        attention_axis["original_size"],
-        attention_axis["padded_size"],
-        output_group_axis["original_size"],
-        output_group_axis["padded_size"],
-        moe_axis["original_size"],
-        moe_axis["padded_size"],
-        vocab_axis["original_size"],
-        vocab_axis["padded_size"],
-    )
+    if output_group_axis is None:
+        logger.info(
+            "Enabled B12X virtual TP padding: attention heads %d -> %d, "
+            "MoE intermediate size %d -> %d, vocab size %d -> %d.",
+            attention_axis["original_size"],
+            attention_axis["padded_size"],
+            moe_axis["original_size"],
+            moe_axis["padded_size"],
+            vocab_axis["original_size"],
+            vocab_axis["padded_size"],
+        )
+    else:
+        logger.info(
+            "Enabled B12X virtual TP padding: attention heads %d -> %d, "
+            "output groups %d -> %d, MoE intermediate size %d -> %d, "
+            "vocab size %d -> %d.",
+            attention_axis["original_size"],
+            attention_axis["padded_size"],
+            output_group_axis["original_size"],
+            output_group_axis["padded_size"],
+            moe_axis["original_size"],
+            moe_axis["padded_size"],
+            vocab_axis["original_size"],
+            vocab_axis["padded_size"],
+        )
     if shared_expert_axis is not None:
         logger.info(
             "Enabled B12X virtual TP padding for shared experts: "
@@ -146,10 +200,10 @@ def _validate_b12x_virtual_tp_config(vllm_config: VllmConfig) -> None:
     model_config = vllm_config.model_config
     assert model_config is not None
 
-    if not _is_deepseek_v4_config(model_config):
+    if not _is_supported_b12x_virtual_tp_config(model_config):
         raise ValueError(
-            "--virtual-tp-sharding=b12x-padded is currently supported only "
-            "for DeepSeek V4 models."
+            "--virtual-tp-sharding=b12x-padded is currently supported only for "
+            "DeepSeek V4 and sparse MLA/DSA models."
         )
 
     if parallel_config.enable_expert_parallel:
@@ -182,17 +236,37 @@ def _validate_b12x_virtual_tp_config(vllm_config: VllmConfig) -> None:
 
 
 def _is_deepseek_v4_config(model_config: ModelConfig) -> bool:
-    hf_config = model_config.hf_config
+    for config in _iter_virtual_tp_configs(model_config):
+        if getattr(config, "model_type", None) == "deepseek_v4":
+            return True
+        architectures = getattr(config, "architectures", None) or ()
+        if (
+            "DeepseekV4ForCausalLM" in architectures
+            or "DeepseekV4ForCausalLMNextN" in architectures
+        ):
+            return True
+
     text_config = model_config.hf_text_config
     return (
-        getattr(hf_config, "model_type", None) == "deepseek_v4"
-        or getattr(text_config, "model_type", None) == "deepseek_v4"
-        or (
-            hasattr(text_config, "o_groups")
-            and hasattr(text_config, "moe_intermediate_size")
-            and hasattr(text_config, "n_routed_experts")
-        )
+        hasattr(text_config, "o_groups")
+        and hasattr(text_config, "moe_intermediate_size")
+        and hasattr(text_config, "n_routed_experts")
     )
+
+
+def _is_sparse_mla_config(model_config: ModelConfig) -> bool:
+    for config in _iter_virtual_tp_configs(model_config):
+        if (
+            getattr(config, "kv_lora_rank", None) is not None
+            and getattr(config, "qk_rope_head_dim", None) is not None
+            and _positive_int_attr(config, "index_topk")
+        ):
+            return True
+    return False
+
+
+def _is_supported_b12x_virtual_tp_config(model_config: ModelConfig) -> bool:
+    return _is_deepseek_v4_config(model_config) or _is_sparse_mla_config(model_config)
 
 
 def _uses_native_b12x_moe(vllm_config: VllmConfig) -> bool:
@@ -208,7 +282,7 @@ def _uses_b12x_attention(vllm_config: VllmConfig) -> bool:
     model_config = vllm_config.model_config
     return (
         model_config is not None
-        and _is_deepseek_v4_config(model_config)
+        and _is_supported_b12x_virtual_tp_config(model_config)
         and current_platform.is_cuda()
         and current_platform.has_device_capability(120)
     )
@@ -284,15 +358,42 @@ def _require_int_attr(config: Any, attr: str) -> int:
     value = getattr(config, attr, None)
     if value is None:
         raise ValueError(
-            "--virtual-tp-sharding=b12x-padded requires DeepSeek V4 config "
-            f"attribute {attr!r}."
+            "--virtual-tp-sharding=b12x-padded requires config attribute "
+            f"{attr!r}."
         )
     return int(value)
+
+
+def _positive_int_attr(config: Any, attr: str) -> bool:
+    value = getattr(config, attr, None)
+    if value is None:
+        return False
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _get_plan_config(model_config: ModelConfig) -> Any:
+    return model_config.hf_text_config or model_config.hf_config
+
+
+def _iter_virtual_tp_configs(model_config: ModelConfig) -> Iterable[Any]:
+    hf_config = model_config.hf_config
+    yield from _unique_configs(
+        (
+            hf_config,
+            model_config.hf_text_config,
+            getattr(hf_config, "text_config", None),
+        )
+    )
 
 
 def _unique_configs(configs: Iterable[Any]) -> Iterable[Any]:
     seen: set[int] = set()
     for config in configs:
+        if config is None:
+            continue
         config_id = id(config)
         if config_id in seen:
             continue
@@ -304,3 +405,8 @@ def _set_existing_config_attr(configs: Iterable[Any], attr: str, value: int) -> 
     for config in configs:
         if hasattr(config, attr):
             setattr(config, attr, value)
+
+
+def _set_all_config_attr(configs: Iterable[Any], attr: str, value: int) -> None:
+    for config in configs:
+        setattr(config, attr, value)
