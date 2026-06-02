@@ -10,7 +10,7 @@ export VLLM_USE_AOT_COMPILE=1
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0
 export VLLM_USE_MEGA_AOT_ARTIFACT=${VLLM_USE_MEGA_AOT_ARTIFACT:-1}
 export VLLM_MEMORY_PROFILE_INCLUDE_ATTN=1
-export B12X_MHC_MAX_TOKENS=16384
+export B12X_MHC_MAX_TOKENS=${B12X_MHC_MAX_TOKENS:-16384}
 export VLLM_USE_FLASHINFER_SAMPLER=1
 export VLLM_USE_B12X_WO_PROJECTION=1
 export VLLM_USE_B12X_MHC=1
@@ -24,7 +24,31 @@ export B12X_MLA_SM120_UNIFIED=1
 export USES_B12X=True
 
 export B12X_DENSE_SPLITK_TURBO=1
-export B12X_W4A16_TC_DECODE=1 
+export B12X_W4A16_TC_DECODE=1
+
+if [[ -z "${HF_HOME:-}" && -L "${HOME}/.cache/huggingface" && ! -e "${HOME}/.cache/huggingface" ]]; then
+  if [[ -d /data && -w /data ]]; then
+    export HF_HOME="${VLLM_HF_HOME:-/data/vllm-huggingface}"
+  else
+    export HF_HOME="${VLLM_HF_HOME:-${HOME}/.cache/vllm-huggingface}"
+  fi
+  mkdir -p "${HF_HOME}"
+fi
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+model_path="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
+served_model_name="${SERVED_MODEL_NAME:-DeepSeek-V4-Flash}"
+tp_size="${TP_SIZE:-4}"
+dcp_size="${DCP_SIZE:-1}"
+dcp_comm_backend="${DCP_COMM_BACKEND:-a2a}"
+port="${PORT:-8000}"
+gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.85}"
+max_model_len="${MAX_MODEL_LEN:-65536}"
+max_num_seqs="${MAX_NUM_SEQS:-16}"
+max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-4096}"
+max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-4096}"
+load_format="${LOAD_FORMAT:-instanttensor}"
+enable_flashinfer_autotune="${ENABLE_FLASHINFER_AUTOTUNE:-1}"
 
 profiler_args=()
 if [[ "${VLLM_ENABLE_TORCH_PROFILER:-0}" == "1" ]]; then
@@ -49,33 +73,45 @@ if [[ "${VLLM_ENABLE_TORCH_PROFILER:-0}" == "1" ]]; then
 fi
 
 spec_args=()
-if [[ "${VLLM_ENABLE_MTP:-1}" == "1" ]]; then
+if [[ "${VLLM_ENABLE_MTP:-0}" == "1" ]]; then
   spec_args=('--speculative-config' '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":true}')
 fi
 
+autotune_args=()
+if [[ "${enable_flashinfer_autotune}" == "1" ]]; then
+  autotune_args+=(--enable-flashinfer-autotune)
+else
+  autotune_args+=(--no-enable-flashinfer-autotune)
+fi
+
 exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
-  deepseek-ai/DeepSeek-V4-Flash \
+  "${model_path}" \
+  --served-model-name "${served_model_name}" \
   --host 0.0.0.0 \
-  --port ${PORT:-8000} \
+  --port "${port}" \
   --kv-cache-dtype fp8 \
   --block-size 256 \
-  --load-format instanttensor \
-  --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.85 \
-  --max-num-seqs 16 \
+  --load-format "${load_format}" \
+  --tensor-parallel-size "${tp_size}" \
+  --b12x-virtual-tp-moe-intermediate-alignment 32 \
+  --moe-backend b12x \
+  --linear-backend b12x \
+  --gpu-memory-utilization "${gpu_memory_utilization}" \
+  --max-model-len "${max_model_len}" \
+  --max-num-seqs "${max_num_seqs}" \
   --async-scheduling \
   --no-scheduler-reserve-full-isl \
-  --max-num-batched-tokens 4096 \
-  --max_cudagraph_capture_size 4096 \
+  --max-num-batched-tokens "${max_num_batched_tokens}" \
+  --max_cudagraph_capture_size "${max_cudagraph_capture_size}" \
   --attention-backend B12X_MLA_SPARSE \
   --enable-chunked-prefill \
   --enable-prefix-caching \
-  --enable-flashinfer-autotune \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \
   --reasoning-parser deepseek_v4 \
+  "${autotune_args[@]}" \
   "${profiler_args[@]}" \
   "${spec_args[@]}" \
   "$@"
