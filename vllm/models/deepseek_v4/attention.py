@@ -786,6 +786,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         # Get vllm config for cache setup
         vllm_config = get_current_vllm_config()
+        self.vllm_config = vllm_config
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
