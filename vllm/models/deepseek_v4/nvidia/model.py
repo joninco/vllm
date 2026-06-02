@@ -13,6 +13,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -78,6 +79,23 @@ def _env_flag(*names: str) -> bool:
 
 
 _B12X_MHC_TRACE = _env_flag("B12X_TRACE_MHC", "VLLM_TRACE_B12X_MHC")
+
+
+def _get_virtual_tp_axis_padded_size(config, axis_name: str, default: int) -> int:
+    plan = getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
+    if not isinstance(plan, dict):
+        return default
+
+    axis = plan.get(axis_name)
+    if not isinstance(axis, dict):
+        return default
+
+    padded_size = axis.get("padded_size")
+    if padded_size is None:
+        return default
+    return int(padded_size)
+
+
 _B12X_MHC_TRACE_LIMIT = int(
     os.environ.get(
         "B12X_TRACE_MHC_LIMIT",
@@ -575,6 +593,9 @@ class DeepseekV4MoE(nn.Module):
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            intermediate_size = _get_virtual_tp_axis_padded_size(
+                config, "shared_expert_intermediate_size", intermediate_size
+            )
 
             self.shared_experts = DeepseekV4MLP(
                 hidden_size=config.hidden_size,
@@ -624,11 +645,6 @@ class DeepseekV4MoE(nn.Module):
         prefix: str,
     ) -> None:
         self.tp_rank = get_tensor_model_parallel_rank()
-        assert config.n_routed_experts % self.tp_size == 0
-
-        self.n_local_experts = config.n_routed_experts // self.tp_size
-        self.experts_start_idx = self.tp_rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
         self.experts = FusedMoE(
             shared_experts=self.shared_experts,
@@ -647,6 +663,9 @@ class DeepseekV4MoE(nn.Module):
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
         )
+        self.n_local_experts = self.experts.local_num_experts
+        self.experts_start_idx = 0
+        self.experts_end_idx = self.n_local_experts
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -921,9 +940,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_config
         self.layer_name = prefix
         self._use_b12x_mhc = _use_b12x_mhc()
-        self._b12x_mhc_max_tokens = (
-            _b12x_mhc_max_tokens() if self._use_b12x_mhc else 0
-        )
+        self._b12x_mhc_max_tokens = _b12x_mhc_max_tokens() if self._use_b12x_mhc else 0
         if self._use_b12x_mhc:
             if not prefix:
                 raise RuntimeError("DeepSeek V4 b12x mHC decoder layer needs a prefix")
@@ -933,9 +950,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             compilation_config.static_forward_context[prefix] = self
 
             if self._b12x_mhc_max_tokens <= 0:
-                logger.info_once(
-                    "DeepSeek V4 b12x mHC enabled for all token counts."
-                )
+                logger.info_once("DeepSeek V4 b12x mHC enabled for all token counts.")
             else:
                 logger.info_once(
                     "DeepSeek V4 b12x mHC enabled for token counts <= %d; "
@@ -1008,8 +1023,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self._use_b12x_mhc:
             from b12x.integration.residual import (
                 MHC_DEFAULT_BLOCK_K,
-                MHC_DEFAULT_SPLIT_K,
+                MHC_GRAM_BLOCK_H,
                 MHC_MULT,
+                MHC_SOURCE_TILE_H,
+                MHC_SUPPORTED_HIDDEN_SIZES,
             )
 
             if self.hc_mult != MHC_MULT:
@@ -1017,10 +1034,22 @@ class DeepseekV4DecoderLayer(nn.Module):
                     f"DeepSeek V4 b12x mHC requires hc_mult={MHC_MULT}, "
                     f"got {self.hc_mult}."
                 )
-            if self.hidden_size != 4096:
+            if self.hidden_size not in MHC_SUPPORTED_HIDDEN_SIZES:
                 raise NotImplementedError(
-                    "DeepSeek V4 b12x mHC currently requires hidden_size=4096, "
-                    f"got {self.hidden_size}."
+                    "DeepSeek V4 b12x mHC supports hidden sizes "
+                    f"{MHC_SUPPORTED_HIDDEN_SIZES}, got {self.hidden_size}."
+                )
+            if self.hidden_size % MHC_SOURCE_TILE_H != 0:
+                raise ValueError(
+                    "DeepSeek V4 b12x mHC requires hidden_size to be "
+                    f"divisible by source tile {MHC_SOURCE_TILE_H}, got "
+                    f"{self.hidden_size}."
+                )
+            if self.hidden_size % MHC_GRAM_BLOCK_H != 0:
+                raise ValueError(
+                    "DeepSeek V4 b12x mHC requires hidden_size to be "
+                    f"divisible by finalize block {MHC_GRAM_BLOCK_H}, got "
+                    f"{self.hidden_size}."
                 )
             self._b12x_mhc_block_k = int(MHC_DEFAULT_BLOCK_K)
             total_k = self.hc_mult * self.hidden_size
@@ -1030,11 +1059,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     f"be divisible by block_k={self._b12x_mhc_block_k}, got {total_k}."
                 )
             self._b12x_mhc_split_k = total_k // self._b12x_mhc_block_k
-            if self._b12x_mhc_split_k != MHC_DEFAULT_SPLIT_K:
-                raise NotImplementedError(
-                    "DeepSeek V4 b12x mHC currently requires "
-                    f"split_k={MHC_DEFAULT_SPLIT_K}, got {self._b12x_mhc_split_k}."
-                )
         else:
             self._b12x_mhc_block_k = 0
             self._b12x_mhc_split_k = 0
@@ -1105,6 +1129,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sinkhorn_iters=self.hc_sinkhorn_iters,
                 norm_weight=norm_weight,
                 norm_eps=norm_eps,
+                split_k=self._b12x_mhc_split_k,
                 block_k=self._b12x_mhc_block_k,
             )
 
@@ -1168,6 +1193,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sinkhorn_iters=self.hc_sinkhorn_iters,
                 norm_weight=norm_weight,
                 norm_eps=norm_eps,
+                split_k=self._b12x_mhc_split_k,
                 block_k=self._b12x_mhc_block_k,
             )
 

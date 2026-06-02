@@ -67,6 +67,7 @@ except ImportError:
     SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
+from vllm.model_executor.virtual_tp import pad_or_narrow_weight
 
 logger = init_logger(__name__)
 
@@ -1412,7 +1413,9 @@ def row_parallel_weight_loader(
     if shard_dim is not None:
         shard_size = param.data.shape[shard_dim]
         start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
+        loaded_weight = pad_or_narrow_weight(
+            loaded_weight, shard_dim, start_idx, shard_size
+        )
 
     return default_weight_loader(param, loaded_weight)
 
@@ -1428,7 +1431,9 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
+        loaded_weight = pad_or_narrow_weight(
+            loaded_weight, shard_axis, start_idx, shard_size
+        )
 
         return default_weight_loader(param, loaded_weight)
 

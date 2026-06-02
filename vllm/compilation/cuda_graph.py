@@ -12,6 +12,10 @@ from unittest.mock import patch
 import torch
 
 import vllm.envs as envs
+from vllm.compilation.b12x_capture import (
+    b12x_cuda_graph_prewarm_enabled,
+    guard_b12x_kernel_resolution,
+)
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -309,8 +313,20 @@ class CUDAGraphWrapper:
                 # Ensure any pre-capture prefetches from offloader are complete.
                 get_offloader().sync_prev_onload()
 
+                if b12x_cuda_graph_prewarm_enabled():
+                    # Resolve exact B12X CuTe launcher contracts before CUDA
+                    # graph capture. CUDAGraphWrapper captures the first call
+                    # for a descriptor, so B12X kernels in the runnable would
+                    # otherwise see their first exact launch during capture.
+                    prewarm_output = self.runnable(*args, **kwargs)
+                    get_offloader().join_after_forward()
+                    del prewarm_output
+                    get_offloader().sync_prev_onload()
+
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(
+                with guard_b12x_kernel_resolution(
+                    "vLLM CUDAGraphWrapper capture after B12X warmup"
+                ), torch.cuda.graph(
                     cudagraph,
                     pool=self.graph_pool,
                     stream=current_stream(),

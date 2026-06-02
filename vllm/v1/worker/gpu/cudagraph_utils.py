@@ -9,6 +9,10 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+from vllm.compilation.b12x_capture import (
+    b12x_cuda_graph_prewarm_enabled,
+    guard_b12x_kernel_resolution,
+)
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -237,11 +241,19 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
+                        if b12x_cuda_graph_prewarm_enabled():
+                            # B12X kernels use caller-owned scratch views in
+                            # the CuTe launcher contract. Re-warm the exact
+                            # fresh state that FULL capture will use, so CUDA
+                            # graph capture only records resolved launches.
+                            forward_fn(CUDAGraphMode.NONE)
                         graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
-                        with torch.cuda.graph(graph, self.pool):
+                        with guard_b12x_kernel_resolution(
+                            "vLLM full CUDA graph capture after B12X warmup"
+                        ), torch.cuda.graph(graph, self.pool):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
