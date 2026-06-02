@@ -249,9 +249,19 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         hidden_states = hidden_states.view(
             -1, mtp_layer.hc_mult, mtp_layer.config.hidden_size
         )
-        if torch.compiler.is_compiling() or (
-            mtp_layer.mtp_block._should_run_b12x_mhc(int(hidden_states.shape[0]))
-        ):
+        use_b12x_mhc = mtp_layer.mtp_block._should_run_b12x_mhc(
+            int(hidden_states.shape[0])
+        )
+        if use_b12x_mhc:
+            hidden_states = torch.ops.vllm.hc_head_fused_kernel_tilelang(
+                hidden_states,
+                mtp_layer.hc_head_fn,
+                mtp_layer.hc_head_scale,
+                mtp_layer.hc_head_base,
+                mtp_layer.rms_norm_eps,
+                mtp_layer.hc_eps,
+            )
+        elif torch.compiler.is_compiling():
             hidden_states = hc_head_fused_kernel_triton(
                 hidden_states,
                 mtp_layer.hc_head_fn,

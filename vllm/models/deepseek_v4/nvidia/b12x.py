@@ -6,16 +6,19 @@ The DSV4 sparse-MLA path uses global top-k slot ids from
 ``compute_global_topk_indices_and_lens``, a SWA + indexed dual cache, paged
 per-chunk prefill, and ``attn_sink``. The leaf call goes through b12x's
 ``compressed_mla_decode_forward`` binding API (``plan_compressed_mla_scratch``
--> fresh scratch -> ``plan.bind`` in ordinary Python, then one
-``compressed_mla_decode_forward`` leaf call), matching the plan/bind style used
-by the b12x WO-projection and mHC integrations in this tree. No persistent
-workspace object is held.
+-> caller-owned vLLM workspace-manager scratch -> ``plan.bind`` in ordinary
+Python, then one ``compressed_mla_decode_forward`` leaf call), matching the
+plan/bind style used by the b12x WO-projection and mHC integrations in this
+tree. No persistent b12x workspace object is held.
 
 DSV4 compressed-MLA contract (== upstream/DeepGEMM): q_head_dim = 448 NoPE +
 64 RoPE = 512, V = 512; the ``fp8_ds_mla`` 584 B/token page (448 NoPE fp8 +
 128 RoPE bf16 + 8-byte UE8M0 footer) is read directly.
 """
 
+import logging
+import os
+import time
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import torch
@@ -30,6 +33,7 @@ from vllm.models.deepseek_v4.nvidia.flashmla import (
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
+from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.models.deepseek_v4.attention import DeepseekV4MLAAttention
@@ -40,10 +44,252 @@ _DSV4_HEAD_DIM = 512
 _DSV4_V_HEAD_DIM = 512
 _DSV4_CACHE_BYTES_PER_TOKEN = 584
 _DECODE_SPLIT_TILE = 64
+_LOGGER = logging.getLogger(__name__)
+_B12X_MLA_TIMING = os.getenv("VLLM_DSV4_B12X_MLA_TIMING", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_B12X_MLA_TIMING_LIMIT = int(os.getenv("VLLM_DSV4_B12X_MLA_TIMING_LIMIT", "24"))
+_B12X_MLA_TIMING_MIN_MS = float(os.getenv("VLLM_DSV4_B12X_MLA_TIMING_MIN_MS", "0"))
+_B12X_PREFILL_TRIM_WIDTH = os.getenv(
+    "VLLM_DSV4_B12X_PREFILL_TRIM_WIDTH", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+_B12X_PREFILL_TRIM_ALIGNMENT = max(
+    1, int(os.getenv("VLLM_DSV4_B12X_PREFILL_TRIM_ALIGNMENT", "64"))
+)
+_B12X_PREFILL_TOKEN_CHUNK_SIZE = int(
+    os.getenv("VLLM_DSV4_B12X_PREFILL_TOKEN_CHUNK_SIZE", "0")
+)
+_b12x_mla_timing_count = 0
+_b12x_topk_timing_count = 0
+_b12x_trim_timing_count = 0
+
+
+def _timing_enabled(q: torch.Tensor) -> bool:
+    return (
+        _B12X_MLA_TIMING
+        and q.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _sync_now(q: torch.Tensor) -> float:
+    torch.cuda.synchronize(q.device)
+    return time.perf_counter()
+
+
+def _log_mla_timing(
+    *,
+    q: torch.Tensor,
+    mode: str,
+    rows: int,
+    heads: int,
+    width: int,
+    scratch_nbytes: int,
+    splits_cap: int,
+    t0: float,
+    t_contig: float,
+    t_plan: float,
+    t_scratch: float,
+    t_bind: float,
+    t_kernel: float,
+    t_copy: float,
+) -> None:
+    global _b12x_mla_timing_count
+    if _b12x_mla_timing_count >= _B12X_MLA_TIMING_LIMIT:
+        return
+    total_ms = (t_copy - t0) * 1000.0
+    if total_ms < _B12X_MLA_TIMING_MIN_MS:
+        return
+    _b12x_mla_timing_count += 1
+    _LOGGER.info(
+        "B12X compressed MLA timing mode=%s rows=%d heads=%d width=%d "
+        "scratch=%.2fMiB splits_cap=%d total=%.3fms contig=%.3fms "
+        "plan=%.3fms scratch=%.3fms bind=%.3fms kernel=%.3fms copy=%.3fms",
+        mode,
+        rows,
+        heads,
+        width,
+        scratch_nbytes / (1024.0 * 1024.0),
+        splits_cap,
+        total_ms,
+        (t_contig - t0) * 1000.0,
+        (t_plan - t_contig) * 1000.0,
+        (t_scratch - t_plan) * 1000.0,
+        (t_bind - t_scratch) * 1000.0,
+        (t_kernel - t_bind) * 1000.0,
+        (t_copy - t_kernel) * 1000.0,
+    )
+
+
+def _log_topk_timing(
+    *,
+    q: torch.Tensor,
+    phase: str,
+    rows: int,
+    width: int,
+    block_size: int,
+    t0: float,
+    t1: float,
+) -> None:
+    global _b12x_topk_timing_count
+    if _b12x_topk_timing_count >= _B12X_MLA_TIMING_LIMIT:
+        return
+    total_ms = (t1 - t0) * 1000.0
+    if total_ms < _B12X_MLA_TIMING_MIN_MS:
+        return
+    _b12x_topk_timing_count += 1
+    _LOGGER.info(
+        "B12X compressed MLA topk timing phase=%s rows=%d width=%d "
+        "block_size=%d total=%.3fms",
+        phase,
+        rows,
+        width,
+        block_size,
+        total_ms,
+    )
+
+
+def _log_prefill_trim(
+    *,
+    section: str,
+    rows: int,
+    active_width: int,
+    original_width: int,
+    trimmed_width: int,
+) -> None:
+    global _b12x_trim_timing_count
+    if not _B12X_MLA_TIMING:
+        return
+    if active_width <= 0:
+        return
+    if _b12x_trim_timing_count >= _B12X_MLA_TIMING_LIMIT:
+        return
+    _b12x_trim_timing_count += 1
+    _LOGGER.info(
+        "B12X compressed MLA prefill trim section=%s rows=%d "
+        "active_width=%d original_width=%d trimmed_width=%d",
+        section,
+        rows,
+        active_width,
+        original_width,
+        trimmed_width,
+    )
 
 
 def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
+
+
+def _align_up(x: int, alignment: int) -> int:
+    return _cdiv(x, alignment) * alignment
+
+
+def _maybe_trim_prefill_indices(
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    *,
+    section: str,
+    width_hint: int | None = None,
+) -> torch.Tensor:
+    """Trim padded prefill top-k columns before b12x plans compile-time tiles."""
+    if not _B12X_PREFILL_TRIM_WIDTH:
+        return indices
+    if indices.ndim < 2 or lengths.numel() == 0:
+        return indices
+    if indices.is_cuda and torch.cuda.is_current_stream_capturing():
+        return indices
+
+    original_width = int(indices.shape[-1])
+    if original_width <= 1:
+        return indices
+
+    if width_hint is None:
+        active_width = int(lengths.max().item())
+    else:
+        active_width = int(width_hint)
+    active_width = max(0, min(active_width, original_width))
+    trimmed_width = max(
+        1,
+        min(
+            original_width,
+            _align_up(active_width, _B12X_PREFILL_TRIM_ALIGNMENT),
+        ),
+    )
+    _log_prefill_trim(
+        section=section,
+        rows=int(indices.shape[0]),
+        active_width=active_width,
+        original_width=original_width,
+        trimmed_width=trimmed_width,
+    )
+    if trimmed_width >= original_width:
+        return indices
+    return indices[..., :trimmed_width]
+
+
+def _plan_compressed_mla_scratch_for_shape(
+    *,
+    device: torch.device,
+    rows: int,
+    heads: int,
+    width: int,
+    page_size: int,
+):
+    from b12x.integration.compressed_scratch import (
+        B12XCompressedMLAScratchCaps,
+        plan_compressed_mla_scratch,
+    )
+    from b12x.integration.mla import compressed_mla_split_chunks_for_contract
+
+    rows = max(1, int(rows))
+    width = max(1, int(width))
+    decode_split_cap = max(1, _cdiv(width, _DECODE_SPLIT_TILE))
+    # Keep the legacy 64-wide split cap for decode, but let the b12x contract
+    # select the smaller batched-prefill split count when rows > decode max.
+    num_splits_cap = compressed_mla_split_chunks_for_contract(
+        rows=rows,
+        width=width,
+        max_chunks=decode_split_cap,
+    )
+    return plan_compressed_mla_scratch(
+        B12XCompressedMLAScratchCaps(
+            device=device,
+            num_q_heads=max(1, int(heads)),
+            max_q_rows=rows,
+            max_width=width,
+            head_dim=_DSV4_HEAD_DIM,
+            v_head_dim=_DSV4_V_HEAD_DIM,
+            page_size=max(1, int(page_size)),
+            max_chunks_per_row=num_splits_cap,
+        )
+    )
+
+
+def _max_compressed_mla_width_for_layer(layer: "DeepseekV4MLAAttention") -> int:
+    width = int(layer.window_size)
+    if layer.compress_ratio > 1 and layer.topk_indices_buffer is not None:
+        width += int(layer.topk_indices_buffer.shape[-1])
+    return max(1, width)
+
+
+def _reserve_profile_compressed_mla_scratch(
+    layer: "DeepseekV4MLAAttention",
+    q: torch.Tensor,
+) -> None:
+    """Reserve max compressed-MLA scratch during vLLM's dummy/profile pass."""
+    plan = _plan_compressed_mla_scratch_for_shape(
+        device=q.device,
+        rows=max(int(q.shape[0]), int(layer.max_num_batched_tokens)),
+        heads=max(int(q.shape[1]), int(layer.padded_heads)),
+        width=_max_compressed_mla_width_for_layer(layer),
+        page_size=int(layer.swa_cache_layer.block_size),
+    )
+    current_workspace_manager().get_simultaneous(
+        ((int(plan.layout.nbytes),), torch.uint8),
+    )
 
 
 def _b12x_cache_page_view(
@@ -105,6 +351,8 @@ def _run_compressed_mla(
     indexed_lens: torch.Tensor | None,
     indexed_page_size: int | None,
     mode: Literal["decode", "extend"] = "decode",
+    swa_width_hint: int | None = None,
+    indexed_width_hint: int | None = None,
 ) -> None:
     """Plan, bind, and call b12x compressed MLA in plain eager Python.
 
@@ -112,16 +360,25 @@ def _run_compressed_mla(
     {16,32,64,128} by the outer wrapper). Indices are global slot ids, so no
     indexed page table is needed.
     """
-    from b12x.integration.compressed_scratch import (
-        B12XCompressedMLAScratchCaps,
-        plan_compressed_mla_scratch,
-    )
-    from b12x.integration.mla import (
-        compressed_mla_decode_forward,
-        compressed_mla_split_chunks_for_contract,
-    )
+    from b12x.integration.mla import compressed_mla_decode_forward
 
     rows, heads = int(q.shape[0]), int(q.shape[1])
+    timing = _timing_enabled(q)
+    t0 = _sync_now(q) if timing else 0.0
+    if mode == "extend":
+        swa_indices = _maybe_trim_prefill_indices(
+            swa_indices,
+            swa_lens,
+            section="swa",
+            width_hint=swa_width_hint,
+        )
+        if indexed_indices is not None and indexed_lens is not None:
+            indexed_indices = _maybe_trim_prefill_indices(
+                indexed_indices,
+                indexed_lens,
+                section="indexed",
+                width_hint=indexed_width_hint,
+            )
     q = q.contiguous()
     swa_indices = swa_indices.contiguous()
     swa_lens = swa_lens.contiguous()
@@ -129,40 +386,30 @@ def _run_compressed_mla(
         indexed_indices = indexed_indices.contiguous()
     if indexed_lens is not None:
         indexed_lens = indexed_lens.contiguous()
+    t_contig = _sync_now(q) if timing else 0.0
 
     # b12x checks total_width = swa_width + indexed_width against scratch.topk,
     # so the scratch must be planned for the combined dual-cache width.
     width = int(swa_indices.shape[-1])
     if indexed_indices is not None:
         width += int(indexed_indices.shape[-1])
-    decode_split_cap = max(1, _cdiv(width, _DECODE_SPLIT_TILE))
-    # Keep the legacy 64-wide split cap for decode, but let the b12x contract
-    # select the smaller batched-prefill split count when rows > decode max.
-    num_splits_cap = compressed_mla_split_chunks_for_contract(
-        rows=max(1, rows),
+    splits_cap = 0
+    plan = _plan_compressed_mla_scratch_for_shape(
+        device=q.device,
+        rows=rows,
+        heads=heads,
         width=width,
-        max_chunks=decode_split_cap,
+        page_size=int(swa_page_size),
     )
-
-    plan = plan_compressed_mla_scratch(
-        B12XCompressedMLAScratchCaps(
-            device=q.device,
-            num_q_heads=heads,
-            max_q_rows=max(1, rows),
-            max_width=width,
-            head_dim=_DSV4_HEAD_DIM,
-            v_head_dim=_DSV4_V_HEAD_DIM,
-            page_size=int(swa_page_size),
-            max_chunks_per_row=num_splits_cap,
-        )
+    splits_cap = int(plan.caps.max_chunks_per_row)
+    t_plan = _sync_now(q) if timing else 0.0
+    (scratch_storage,) = current_workspace_manager().get_simultaneous(
+        ((int(plan.layout.nbytes),), torch.uint8),
     )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=q.device)
-        for shape, dtype in plan.shapes_and_dtypes()
-    )
+    t_scratch = _sync_now(q) if timing else 0.0
 
     binding = plan.bind(
-        scratch=scratch,
+        scratch=scratch_storage,
         q=q,
         swa_indices=swa_indices,
         swa_lengths=swa_lens,
@@ -170,6 +417,7 @@ def _run_compressed_mla(
         indexed_lengths=indexed_lens,
     )
     binding.scratch.mode = mode
+    t_bind = _sync_now(q) if timing else 0.0
 
     # attn_sink is sized to the model's padded_heads (max(n_local,64)); b12x
     # wants it at the real local head count (== q heads).
@@ -184,7 +432,26 @@ def _run_compressed_mla(
         sm_scale=scale,
         expected_num_q_heads=heads,
     )
+    t_kernel = _sync_now(q) if timing else 0.0
     output.copy_(out)
+    if timing:
+        t_copy = _sync_now(q)
+        _log_mla_timing(
+            q=q,
+            mode=mode,
+            rows=rows,
+            heads=heads,
+            width=width,
+            scratch_nbytes=int(plan.layout.nbytes),
+            splits_cap=splits_cap,
+            t0=t0,
+            t_contig=t_contig,
+            t_plan=t_plan,
+            t_scratch=t_scratch,
+            t_bind=t_bind,
+            t_kernel=t_kernel,
+            t_copy=t_copy,
+        )
 
 
 class DeepseekV4B12xMLASparseBackend(DeepseekV4FlashMLASparseBackend):
@@ -233,7 +500,6 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         positions: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        del kv, positions
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
         )
@@ -253,8 +519,10 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            # Warmup dummy run: no metadata; the per-call binding allocates its
-            # own scratch, so nothing to pre-reserve. Zero and return.
+            # Warmup/profile dummy run: no real metadata, but compressed MLA
+            # scratch must be visible to vLLM's memory profiler before KV cache
+            # sizing. The binding itself is still built fresh only on real calls.
+            _reserve_profile_compressed_mla_scratch(layer, q)
             output.zero_()
             return
 
@@ -424,6 +692,8 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
             block_size = attn_metadata.block_size // compress_ratio
+            timing = _timing_enabled(q)
+            t_topk0 = _sync_now(q) if timing else 0.0
             extra_topk_indices, extra_topk_lens = compute_global_topk_indices_and_lens(
                 local_topk_indices,
                 swa_metadata.token_to_req_indices[prefill_slice],
@@ -431,6 +701,17 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 block_size,
                 swa_metadata.is_valid_token[prefill_slice],
             )
+            if timing:
+                t_topk1 = _sync_now(q)
+                _log_topk_timing(
+                    q=q,
+                    phase="prefill",
+                    rows=int(local_topk_indices.shape[0]),
+                    width=int(local_topk_indices.shape[-1]),
+                    block_size=int(block_size),
+                    t0=t_topk0,
+                    t1=t_topk1,
+                )
             indexed_page_size = block_size
             indexed_k_cache = _b12x_cache_page_view(
                 compressed_k_cache,
@@ -446,41 +727,72 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             "swa_k_cache",
         )
 
-        num_chunks = (
-            num_prefills + cls.PREFILL_CHUNK_SIZE - 1
-        ) // cls.PREFILL_CHUNK_SIZE
-        for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * cls.PREFILL_CHUNK_SIZE
-            chunk_end = min(chunk_start + cls.PREFILL_CHUNK_SIZE, num_prefills)
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
-            )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
-            )
+        prefill_seq_lens_cpu = getattr(swa_metadata, "prefill_seq_lens_cpu", None)
+        swa_width = int(swa_metadata.prefill_swa_indices.shape[-1])
 
-            idx_chunk = (
-                extra_topk_indices[query_start:query_end]
-                if extra_topk_indices is not None
-                else None
+        for req_idx in range(num_prefills):
+            req_start = int(
+                query_start_loc_cpu[num_decodes + req_idx] - prefill_token_base
             )
-            idx_lens_chunk = (
-                extra_topk_lens[query_start:query_end]
-                if extra_topk_lens is not None
-                else None
+            req_end = int(
+                query_start_loc_cpu[num_decodes + req_idx + 1] - prefill_token_base
             )
-            _run_compressed_mla(
-                q=q[query_start:query_end],
-                output=output[query_start:query_end],
-                attn_sink=attn_sink,
-                scale=scale,
-                swa_k_cache=swa_k_cache,
-                swa_indices=swa_metadata.prefill_swa_indices[query_start:query_end],
-                swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
-                swa_page_size=swa_metadata.block_size,
-                indexed_k_cache=indexed_k_cache,
-                indexed_indices=idx_chunk,
-                indexed_lens=idx_lens_chunk,
-                indexed_page_size=indexed_page_size,
-                mode="extend",
+            req_query_len = req_end - req_start
+            if req_query_len <= 0:
+                continue
+
+            context_len = None
+            if prefill_seq_lens_cpu is not None:
+                context_len = max(
+                    0,
+                    int(prefill_seq_lens_cpu[req_idx]) - req_query_len,
+                )
+
+            token_chunk_size = (
+                req_query_len
+                if _B12X_PREFILL_TOKEN_CHUNK_SIZE <= 0
+                else min(_B12X_PREFILL_TOKEN_CHUNK_SIZE, req_query_len)
             )
+            for query_start in range(req_start, req_end, token_chunk_size):
+                query_end = min(
+                    query_start + _B12X_PREFILL_TOKEN_CHUNK_SIZE,
+                    req_end,
+                )
+                local_token_end = query_end - req_start
+                swa_width_hint = None
+                indexed_width_hint = None
+                if context_len is not None:
+                    causal_len_hint = context_len + local_token_end
+                    swa_width_hint = min(swa_width, causal_len_hint)
+                    if extra_topk_indices is not None:
+                        indexed_width_hint = _cdiv(causal_len_hint, compress_ratio)
+
+                idx_chunk = (
+                    extra_topk_indices[query_start:query_end]
+                    if extra_topk_indices is not None
+                    else None
+                )
+                idx_lens_chunk = (
+                    extra_topk_lens[query_start:query_end]
+                    if extra_topk_lens is not None
+                    else None
+                )
+                _run_compressed_mla(
+                    q=q[query_start:query_end],
+                    output=output[query_start:query_end],
+                    attn_sink=attn_sink,
+                    scale=scale,
+                    swa_k_cache=swa_k_cache,
+                    swa_indices=swa_metadata.prefill_swa_indices[
+                        query_start:query_end
+                    ],
+                    swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
+                    swa_page_size=swa_metadata.block_size,
+                    indexed_k_cache=indexed_k_cache,
+                    indexed_indices=idx_chunk,
+                    indexed_lens=idx_lens_chunk,
+                    indexed_page_size=indexed_page_size,
+                    mode="extend",
+                    swa_width_hint=swa_width_hint,
+                    indexed_width_hint=indexed_width_hint,
+                )

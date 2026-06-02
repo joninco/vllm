@@ -1598,10 +1598,19 @@ class DeepseekV4Model(nn.Module):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        if torch.compiler.is_compiling() or (
-            layer is not None
-            and layer._should_run_b12x_mhc(int(hidden_states.shape[0]))
-        ):
+        use_b12x_mhc = layer is not None and layer._should_run_b12x_mhc(
+            int(hidden_states.shape[0])
+        )
+        if use_b12x_mhc:
+            hidden_states = torch.ops.vllm.hc_head_fused_kernel_tilelang(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+        elif torch.compiler.is_compiling():
             hidden_states = hc_head_fused_kernel_triton(
                 hidden_states,
                 self.hc_head_fn,
