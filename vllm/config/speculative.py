@@ -1103,6 +1103,13 @@ class SpeculativeConfig:
         draft_parallel_config = ParallelConfig(
             pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
+            virtual_tp_sharding=target_parallel_config.virtual_tp_sharding,
+            b12x_virtual_tp_attention_head_alignment=(
+                target_parallel_config.b12x_virtual_tp_attention_head_alignment
+            ),
+            b12x_virtual_tp_moe_intermediate_alignment=(
+                target_parallel_config.b12x_virtual_tp_moe_intermediate_alignment
+            ),
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
             disable_custom_all_reduce=target_parallel_config.disable_custom_all_reduce,
@@ -1112,6 +1119,33 @@ class SpeculativeConfig:
         )
 
         return draft_parallel_config
+
+    def _maybe_apply_virtual_tp_to_draft(self) -> None:
+        if (
+            self.method != "mtp"
+            or self.draft_model_config is None
+            or self.draft_parallel_config is None
+            or self.draft_model_config is self.target_model_config
+        ):
+            return
+
+        from vllm.config.virtual_tp import (
+            apply_b12x_virtual_tp_padding_to_model_config,
+        )
+
+        apply_b12x_virtual_tp_padding_to_model_config(
+            self.draft_model_config,
+            self.draft_parallel_config,
+        )
+
+    @field_validator("attention_backend", mode="before")
+    @classmethod
+    def _parse_attention_backend(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            if value.lower() == "auto":
+                return None
+            return AttentionBackendEnum[value.upper()]
+        return value
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
@@ -1154,6 +1188,7 @@ class SpeculativeConfig:
             )
 
         if self.draft_model_config:
+            self._maybe_apply_virtual_tp_to_draft()
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config
             )
