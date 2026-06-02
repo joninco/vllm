@@ -234,6 +234,20 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
         )
+        parallel_config = self.vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.pcp_world_size = parallel_config.prefill_context_parallel_size
+        self.cp_kv_cache_interleave_size = (
+            parallel_config.cp_kv_cache_interleave_size
+        )
+        self.dcp_rank = 0
+        if self.dcp_world_size > 1:
+            assert self.pcp_world_size == 1, (
+                "DeepseekSparseSWA metadata supports DCP but not PCP."
+            )
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
@@ -321,20 +335,39 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         num_actual_tokens = num_decode_tokens + num_prefill_tokens
         if num_actual_tokens > 0:
             self.decode_swa_lens[num_actual_tokens:] = 0
-            _compute_swa_indices_and_lens_kernel[(num_actual_tokens,)](
-                self.decode_swa_indices,
-                self.decode_swa_indices.stride(0),
-                self.decode_swa_lens,
-                self.window_size,
-                query_start_loc,
-                seq_lens,
-                token_to_req_indices,
-                is_valid_token,
-                block_table,
-                block_table.stride(0),
-                self.block_size,
-                TRITON_BLOCK_SIZE=1024,
-            )
+            if self.dcp_world_size > 1:
+                _compute_dcp_swa_indices_and_lens_kernel[(num_actual_tokens,)](
+                    self.decode_swa_indices,
+                    self.decode_swa_indices.stride(0),
+                    self.decode_swa_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    DCP_WORLD_SIZE=self.dcp_world_size,
+                    DCP_RANK=self.dcp_rank,
+                    CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+                    TRITON_BLOCK_SIZE=1024,
+                )
+            else:
+                _compute_swa_indices_and_lens_kernel[(num_actual_tokens,)](
+                    self.decode_swa_indices,
+                    self.decode_swa_indices.stride(0),
+                    self.decode_swa_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    TRITON_BLOCK_SIZE=1024,
+                )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
@@ -529,3 +562,76 @@ def _compute_swa_indices_and_lens_kernel(
             slot_ids,
             mask=offset < window_size,
         )
+
+
+@triton.jit
+def _compute_dcp_swa_indices_and_lens_kernel(
+    swa_indices_ptr,
+    swa_indices_stride,
+    swa_lens_ptr,
+    window_size,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    is_valid_token_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    is_valid_token = tl.load(is_valid_token_ptr + token_idx)
+    if not is_valid_token:
+        tl.store(swa_lens_ptr + token_idx, 0)
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    prefix_len = seq_len - query_len
+
+    pos = prefix_len + token_idx - query_start
+    start_pos = tl.maximum(pos - window_size + 1, 0)
+    end_pos = pos + 1
+
+    count = tl.zeros((), dtype=tl.int32)
+    virtual_block_size = block_size * DCP_WORLD_SIZE
+    for i in range(0, window_size, TRITON_BLOCK_SIZE):
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+        offset_mask = offset < window_size
+
+        pos_offset = start_pos + offset
+        in_window = pos_offset < end_pos
+        block_indices = pos_offset // virtual_block_size
+        block_numbers = tl.load(
+            block_table_ptr + req_idx * block_table_stride + block_indices,
+            mask=offset_mask & in_window,
+        ).to(tl.int64)
+
+        virtual_block_offsets = pos_offset - block_indices * virtual_block_size
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % DCP_WORLD_SIZE == DCP_RANK
+        local_block_offsets = (
+            virtual_block_offsets
+            // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+
+        slot_ids = block_numbers * block_size + local_block_offsets
+        valid = offset_mask & in_window & is_local
+        compact_pos = count + tl.cumsum(valid.to(tl.int32), 0) - 1
+        row_base = swa_indices_ptr + token_idx * swa_indices_stride
+        tl.store(row_base + offset, -1, mask=offset_mask)
+        tl.store(row_base + compact_pos, slot_ids, mask=valid)
+        count += tl.sum(valid.to(tl.int32), axis=0)
+
+    tl.store(swa_lens_ptr + token_idx, count)
