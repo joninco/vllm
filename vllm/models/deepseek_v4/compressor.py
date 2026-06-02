@@ -193,6 +193,7 @@ class DeepseekCompressor(nn.Module):
         use_fp4_cache: bool = False,
     ):
         super().__init__()
+        self.vllm_config = vllm_config
         self.compress_ratio = compress_ratio
         self.hidden_size = hidden_size
         self.head_dim = head_dim
@@ -294,6 +295,13 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
+        parallel_config = self.vllm_config.parallel_config
+        dcp_world_size = parallel_config.decode_context_parallel_size
+        dcp_rank = 0
+        if dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            dcp_rank = get_dcp_group().rank_in_group
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
@@ -337,7 +345,8 @@ class DeepseekCompressor(nn.Module):
 
         if current_platform.is_cuda() and not torch.compiler.is_compiling():
             # NVIDIA GPUs.
-            if self.head_dim == 512:
+            use_triton_compressor = self.head_dim != 512 or dcp_world_size > 1
+            if not use_triton_compressor:
                 from .nvidia.ops.sparse_attn_compress_cutedsl import (
                     compress_norm_rope_store_cutedsl,
                 )
@@ -346,14 +355,26 @@ class DeepseekCompressor(nn.Module):
                 # Use a cutedsl kernel for better performance.
                 compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
             else:
-                # Indexer path (head_dim == 128).
-                # Use a triton kernel.
+                # Indexer path (head_dim == 128), and the DCP main-compressor
+                # path where the CuTe kernel's raw state lookup is not valid.
                 compress_norm_rope_store_fn = compress_norm_rope_store_triton
         else:
             # AMD GPUs.
             # Always use a triton kernel.
+            use_triton_compressor = True
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
 
+        triton_dcp_kwargs = (
+            {
+                "dcp_world_size": dcp_world_size,
+                "dcp_rank": dcp_rank,
+                "cp_kv_cache_interleave_size": (
+                    parallel_config.cp_kv_cache_interleave_size
+                ),
+            }
+            if use_triton_compressor
+            else {}
+        )
         compress_norm_rope_store_fn(
             state_cache=state_cache,
             num_actual=num_actual,
@@ -377,4 +398,5 @@ class DeepseekCompressor(nn.Module):
             quant_block=self._quant_block,
             token_stride=self._token_stride,
             scale_dim=self._scale_dim,
+            **triton_dcp_kwargs,
         )

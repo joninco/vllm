@@ -530,6 +530,27 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             * get_dtype_size(self.dtype)
         )
 
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        hf_config = vllm_config.model_config.hf_config
+        is_deepseek_v4_model = getattr(hf_config, "model_type", None) == "deepseek_v4"
+        if (
+            dcp_world_size > 1
+            and pcp_world_size == 1
+            and (self.model_version == "deepseek_v4" or is_deepseek_v4_model)
+        ):
+            max_model_len = vllm_config.model_config.max_model_len
+            max_num_batched_tokens = (
+                vllm_config.scheduler_config.max_num_batched_tokens
+            )
+            max_blocks = self.max_admission_blocks_per_request(
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_model_len=max_model_len,
+            )
+            return max_blocks * self.page_size_bytes
+        return super().max_memory_usage_bytes(vllm_config)
+
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(spec, SlidingWindowMLASpec) for spec in specs), (

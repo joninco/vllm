@@ -3,6 +3,7 @@
 
 from .cache_utils import (
     combine_topk_swa_indices,
+    compute_dcp_global_topk_indices_and_lens,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
@@ -16,6 +17,7 @@ from .save_partial_states import save_partial_states
 __all__ = [
     "MXFP4_BLOCK_SIZE",
     "combine_topk_swa_indices",
+    "compute_dcp_global_topk_indices_and_lens",
     "compute_global_topk_indices_and_lens",
     "dequantize_and_gather_k_cache",
     "fused_indexer_q_rope_quant",
