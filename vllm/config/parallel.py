@@ -123,7 +123,7 @@ class ParallelConfig:
     zero-filling checkpoint tails during weight loading."""
     b12x_virtual_tp_attention_head_alignment: int = Field(default=16, ge=1)
     """Local attention-head alignment for ``virtual_tp_sharding=b12x-padded``."""
-    b12x_virtual_tp_moe_intermediate_alignment: int = Field(default=16, ge=1)
+    b12x_virtual_tp_moe_intermediate_alignment: int = Field(default=32, ge=1)
     """Local MoE intermediate-size alignment for
     ``virtual_tp_sharding=b12x-padded``."""
     prefill_context_parallel_size: int = 1

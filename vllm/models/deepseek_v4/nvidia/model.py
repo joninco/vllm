@@ -5,6 +5,7 @@ import time
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+from math import lcm
 
 import regex as re
 import torch
@@ -44,6 +45,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
@@ -94,6 +96,28 @@ def _get_virtual_tp_axis_padded_size(config, axis_name: str, default: int) -> in
     if padded_size is None:
         return default
     return int(padded_size)
+
+
+def _get_virtual_tp_vocab_padding_size(
+    config,
+    default: int = DEFAULT_VOCAB_PADDING_SIZE,
+) -> int:
+    plan = getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
+    if not isinstance(plan, dict):
+        return default
+
+    axis = plan.get("vocab_size")
+    if not isinstance(axis, dict):
+        return default
+
+    padding_size = axis.get("padding_size")
+    if padding_size is not None:
+        return int(padding_size)
+
+    tp_size = axis.get("tp_size")
+    if tp_size is None:
+        tp_size = get_tensor_model_parallel_world_size()
+    return lcm(default, int(tp_size))
 
 
 _B12X_MHC_TRACE_LIMIT = int(
@@ -1485,11 +1509,13 @@ class DeepseekV4Model(nn.Module):
             config.index_topk,
             dtype=torch.int32,
         )
+        vocab_padding_size = _get_virtual_tp_vocab_padding_size(config)
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                padding_size=vocab_padding_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.embed_tokens",
             )
@@ -1829,10 +1855,12 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        vocab_padding_size = _get_virtual_tp_vocab_padding_size(config)
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
+                padding_size=vocab_padding_size,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:

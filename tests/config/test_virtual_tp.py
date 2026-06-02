@@ -30,6 +30,7 @@ class FakeModelConfig:
             moe_intermediate_size=3072,
             n_routed_experts=384,
             n_shared_experts=1,
+            vocab_size=129280,
         )
         self.hf_config = self.hf_text_config
         self.model_arch_config = self.get_model_arch_config()
@@ -67,6 +68,7 @@ def test_b12x_virtual_tp_padding_deepseek_v4_pro_tp10():
     assert text_config.num_attention_heads == 160
     assert text_config.o_groups == 20
     assert text_config.moe_intermediate_size == 3200
+    assert text_config.vocab_size == 129280
     assert vllm_config.model_config.model_arch_config.total_num_attention_heads == 160
 
     plan = getattr(text_config, VIRTUAL_TP_PLAN_ATTR)
@@ -81,6 +83,7 @@ def test_b12x_virtual_tp_padding_deepseek_v4_pro_tp10():
         "padded_size": 20,
         "tp_size": 10,
         "local_size": 2,
+        "heads_per_group": 8,
     }
     assert plan["moe_intermediate_size"] == {
         "original_size": 3072,
@@ -88,11 +91,62 @@ def test_b12x_virtual_tp_padding_deepseek_v4_pro_tp10():
         "tp_size": 10,
         "local_size": 320,
     }
+    assert plan["moe_intermediate_size"]["local_size"] % 32 == 0
     assert plan["shared_expert_intermediate_size"] == {
         "original_size": 3072,
         "padded_size": 3840,
         "tp_size": 10,
         "local_size": 384,
+    }
+    assert plan["vocab_size"] == {
+        "original_size": 129280,
+        "padded_size": 129280,
+        "tp_size": 10,
+        "local_size": 12928,
+        "padding_size": 320,
+    }
+
+
+def test_b12x_virtual_tp_vocab_padding_deepseek_v4_pro_tp3():
+    vllm_config = _fake_vllm_config(tensor_parallel_size=3)
+
+    maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
+
+    text_config = vllm_config.model_config.hf_text_config
+    assert text_config.vocab_size == 129280
+
+    plan = getattr(text_config, VIRTUAL_TP_PLAN_ATTR)
+    assert plan["vocab_size"] == {
+        "original_size": 129280,
+        "padded_size": 129408,
+        "tp_size": 3,
+        "local_size": 43136,
+        "padding_size": 192,
+    }
+    assert plan["output_groups"] == {
+        "original_size": 16,
+        "padded_size": 18,
+        "tp_size": 3,
+        "local_size": 6,
+        "heads_per_group": 8,
+    }
+
+
+def test_b12x_virtual_tp_moe_padding_deepseek_v4_flash_tp3():
+    vllm_config = _fake_vllm_config(tensor_parallel_size=3)
+    vllm_config.model_config.hf_text_config.moe_intermediate_size = 2048
+
+    maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
+
+    text_config = vllm_config.model_config.hf_text_config
+    assert text_config.moe_intermediate_size == 2112
+
+    plan = getattr(text_config, VIRTUAL_TP_PLAN_ATTR)
+    assert plan["moe_intermediate_size"] == {
+        "original_size": 2048,
+        "padded_size": 2112,
+        "tp_size": 3,
+        "local_size": 704,
     }
 
 
