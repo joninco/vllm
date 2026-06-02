@@ -24,6 +24,7 @@ VIRTUAL_TP_SHARDING_OFF: VirtualTPSharding = "off"
 VIRTUAL_TP_SHARDING_B12X_PADDED: VirtualTPSharding = "b12x-padded"
 VIRTUAL_TP_PLAN_ATTR = "vllm_virtual_tp_plan"
 _SHARED_EXPERT_FP8_LOCAL_ALIGNMENT = 128
+_VOCAB_GLOBAL_ALIGNMENT = 64
 
 
 def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
@@ -62,13 +63,17 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
         * parallel_config.prefill_context_parallel_size
     )
 
+    original_attention_heads = _require_int_attr(text_config, "num_attention_heads")
+    original_output_groups = _require_int_attr(text_config, "o_groups")
     attention_axis = _make_virtual_axis(
-        _require_int_attr(text_config, "num_attention_heads"),
+        original_attention_heads,
         attention_tp_size,
         parallel_config.b12x_virtual_tp_attention_head_alignment,
     )
-    output_group_axis = _make_virtual_axis(
-        _require_int_attr(text_config, "o_groups"),
+    output_group_axis = _make_virtual_output_group_axis(
+        original_output_groups,
+        original_attention_heads,
+        attention_axis["padded_size"],
         attention_tp_size,
     )
     moe_original_size = _require_int_attr(text_config, "moe_intermediate_size")
@@ -85,6 +90,10 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
             attention_tp_size,
             _SHARED_EXPERT_FP8_LOCAL_ALIGNMENT,
         )
+    vocab_axis = _make_virtual_vocab_axis(
+        _require_int_attr(text_config, "vocab_size"),
+        attention_tp_size,
+    )
 
     configs = tuple(
         _unique_configs((model_config.hf_config, model_config.hf_text_config))
@@ -100,6 +109,7 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
         "attention_heads": attention_axis,
         "output_groups": output_group_axis,
         "moe_intermediate_size": moe_axis,
+        "vocab_size": vocab_axis,
     }
     if shared_expert_axis is not None:
         plan["shared_expert_intermediate_size"] = shared_expert_axis
@@ -111,13 +121,16 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
 
     logger.info(
         "Enabled B12X virtual TP padding: attention heads %d -> %d, "
-        "output groups %d -> %d, MoE intermediate size %d -> %d.",
+        "output groups %d -> %d, MoE intermediate size %d -> %d, "
+        "vocab size %d -> %d.",
         attention_axis["original_size"],
         attention_axis["padded_size"],
         output_group_axis["original_size"],
         output_group_axis["padded_size"],
         moe_axis["original_size"],
         moe_axis["padded_size"],
+        vocab_axis["original_size"],
+        vocab_axis["padded_size"],
     )
     if shared_expert_axis is not None:
         logger.info(
@@ -213,6 +226,57 @@ def _make_virtual_axis(
         "padded_size": local_size * tp_size,
         "tp_size": tp_size,
         "local_size": local_size,
+    }
+
+
+def _make_virtual_vocab_axis(
+    original_size: int,
+    tp_size: int,
+) -> dict[str, int]:
+    padding_size = math.lcm(_VOCAB_GLOBAL_ALIGNMENT, tp_size)
+    padded_size = math.ceil(original_size / padding_size) * padding_size
+    assert padded_size % tp_size == 0
+    return {
+        "original_size": original_size,
+        "padded_size": padded_size,
+        "tp_size": tp_size,
+        "local_size": padded_size // tp_size,
+        "padding_size": padding_size,
+    }
+
+
+def _make_virtual_output_group_axis(
+    original_size: int,
+    original_attention_heads: int,
+    padded_attention_heads: int,
+    tp_size: int,
+) -> dict[str, int]:
+    if original_attention_heads % original_size != 0:
+        raise ValueError(
+            "DeepSeek V4 virtual TP padding requires num_attention_heads to "
+            "be divisible by o_groups."
+        )
+
+    heads_per_group = original_attention_heads // original_size
+    if padded_attention_heads % heads_per_group != 0:
+        raise ValueError(
+            "DeepSeek V4 virtual TP padding produced attention heads that do "
+            "not preserve the original heads-per-output-group ratio."
+        )
+
+    padded_size = padded_attention_heads // heads_per_group
+    if padded_size % tp_size != 0:
+        raise ValueError(
+            "DeepSeek V4 virtual TP padding produced output groups that are "
+            "not divisible by tensor parallel size."
+        )
+
+    return {
+        "original_size": original_size,
+        "padded_size": padded_size,
+        "tp_size": tp_size,
+        "local_size": padded_size // tp_size,
+        "heads_per_group": heads_per_group,
     }
 
 
