@@ -4,6 +4,7 @@ import torch
 
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import next_power_of_2
 
 
 @triton.jit
@@ -20,6 +21,7 @@ def _correct_attn_cp_out_kernel(
     lses_stride_H,
     lse_idx,
     HEAD_DIM: tl.constexpr,
+    N: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     IS_BASE_E: tl.constexpr,
 ):
@@ -42,6 +44,7 @@ def _correct_attn_cp_out_kernel(
     head_idx = tl.program_id(axis=1).to(tl.int64)
     d_offsets = tl.arange(0, HEAD_DIM)
     num_n_offsets = tl.arange(0, N_ROUNDED)
+    valid_n_offsets = num_n_offsets < N
 
     # shape = [N]
     lse_offsets = (
@@ -51,7 +54,11 @@ def _correct_attn_cp_out_kernel(
     )
 
     # calc final lse
-    lse = tl.load(lses_ptr + lse_offsets)
+    lse = tl.load(
+        lses_ptr + lse_offsets,
+        mask=valid_n_offsets,
+        other=-float("inf"),
+    )
     lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -173,7 +180,12 @@ def correct_attn_out(
         l_sH,
         cp_rank,
     )
-    const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "IS_BASE_E": is_lse_base_on_e}
+    const_args = {
+        "HEAD_DIM": D,
+        "N": N,
+        "N_ROUNDED": next_power_of_2(N),
+        "IS_BASE_E": is_lse_base_on_e,
+    }
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return out, lse
 
