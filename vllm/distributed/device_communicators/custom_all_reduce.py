@@ -41,6 +41,13 @@ def _get_pcie_allreduce_backend() -> str:
     return backend
 
 
+def _b12x_pcie_allreduce_requested() -> bool:
+    return (
+        envs.VLLM_ENABLE_PCIE_ALLREDUCE
+        and _get_pcie_allreduce_backend() == "b12x"
+    )
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -262,7 +269,11 @@ class CustomAllreduce:
             # No need to initialize custom allreduce for single GPU case.
             return
 
-        if world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
+        b12x_pcie_requested = _b12x_pcie_allreduce_requested()
+        if (
+            world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES
+            and not b12x_pcie_requested
+        ):
             logger.warning(
                 "Custom allreduce is disabled due to an unsupported world"
                 " size: %d. Supported world sizes: %s. To silence this "
@@ -311,18 +322,25 @@ class CustomAllreduce:
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
         use_pcie_oneshot = False
-        if not fully_connected:
+        if b12x_pcie_requested:
+            if not current_platform.is_cuda():
+                logger.warning(
+                    "Custom allreduce is disabled because b12x PCIe oneshot "
+                    "allreduce requires CUDA."
+                )
+                return
+            logger.info(
+                "b12x PCIe oneshot allreduce requested "
+                "(world_size=%d, physical_device_ids=%s, fully_connected=%s).",
+                world_size,
+                physical_device_ids,
+                fully_connected,
+            )
+            use_pcie_oneshot = True
+        elif not fully_connected:
             if envs.VLLM_ENABLE_PCIE_ALLREDUCE:
                 pcie_backend = _get_pcie_allreduce_backend()
-                if pcie_backend == "b12x":
-                    logger.info(
-                        "b12x PCIe oneshot allreduce requested for PCIe-only "
-                        "topology (world_size=%d, physical_device_ids=%s).",
-                        world_size,
-                        physical_device_ids,
-                    )
-                    use_pcie_oneshot = current_platform.is_cuda()
-                elif world_size > 2:
+                if pcie_backend == "cpp" and world_size > 2:
                     logger.info(
                         "PCIe custom allreduce enabled via "
                         "VLLM_ENABLE_PCIE_ALLREDUCE=1 "
@@ -379,6 +397,9 @@ class CustomAllreduce:
                     os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB")
                 ),
             )
+            pcie_single_channel = _env_flag(
+                "VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", default=True
+            )
             if self.nccl_group is None:
                 logger.warning(
                     "Custom allreduce is disabled because b12x PCIe oneshot "
@@ -389,12 +410,42 @@ class CustomAllreduce:
             self.rank = rank
             self.world_size = world_size
             self.fully_connected = False
-            self._pcie_runtime = pool_cls.from_exchange_group(
-                exchange_group=self.nccl_group,
-                device=self.device,
-                eager_buffer_bytes=pcie_max_size,
-                max_size=pcie_max_size,
+            pcie_runtime = None
+            pcie_init_error: Exception | None = None
+            try:
+                pcie_runtime = pool_cls.from_exchange_group(
+                    exchange_group=self.nccl_group,
+                    device=self.device,
+                    eager_buffer_bytes=pcie_max_size,
+                    max_size=pcie_max_size,
+                    single_channel=pcie_single_channel,
+                )
+                pcie_runtime.for_stream()
+            except Exception as exc:
+                pcie_init_error = exc
+
+            pcie_failed = torch.tensor(
+                [int(pcie_init_error is not None)], dtype=torch.int, device="cpu"
             )
+            dist.all_reduce(pcie_failed, op=dist.ReduceOp.MAX, group=self.group)
+            if int(pcie_failed.item()) != 0:
+                if pcie_runtime is not None:
+                    pcie_runtime.close()
+                if pcie_init_error is not None:
+                    logger.warning(
+                        "b12x PCIe oneshot allreduce initialization failed on "
+                        "rank %d: %s. Falling back to PyNCCL allreduce.",
+                        rank,
+                        pcie_init_error,
+                    )
+                else:
+                    logger.warning(
+                        "b12x PCIe oneshot allreduce initialization failed on "
+                        "another TP rank. Falling back to PyNCCL allreduce."
+                    )
+                return
+            assert pcie_runtime is not None
+            self._pcie_runtime = pcie_runtime
             if _env_flag("VLLM_PCIE_ONESHOT_AUTOTUNE"):
                 autotune_kwargs = {}
                 ceiling = os.getenv("VLLM_PCIE_ONESHOT_AUTOTUNE_CEILING")
@@ -428,9 +479,10 @@ class CustomAllreduce:
             self.disabled = False
             logger.info(
                 "Using b12x PCIe oneshot allreduce backend "
-                "(world_size=%d, max_size=%d).",
+                "(world_size=%d, max_size=%d, single_channel=%s).",
                 world_size,
                 self.max_size,
+                pcie_single_channel,
             )
             return
 
