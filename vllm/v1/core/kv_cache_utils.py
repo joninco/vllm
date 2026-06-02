@@ -595,7 +595,12 @@ def resolve_kv_cache_block_sizes(
         bs = cache_config.block_size * dcp * pcp
         return bs, bs
 
+    is_deepseek_v4_dcp = is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
     if dcp != 1 or pcp != 1:
+        if is_deepseek_v4_dcp and dcp > 1 and pcp == 1:
+            group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+            scheduler_block_size = math.lcm(*group_block_sizes) * dcp
+            return scheduler_block_size, scheduler_block_size
         raise ValueError(
             "Hybrid KV cache groups with multiple block sizes do not "
             "support context parallelism (dcp_world_size/pcp_world_size > 1)."
@@ -632,6 +637,36 @@ def resolve_kv_cache_block_sizes(
             f"Got group block sizes={group_block_sizes}."
         )
     return scheduler_block_size, hash_block_size
+
+
+def is_deepseek_v4_hybrid_kv_cache_config(
+    kv_cache_config: KVCacheConfig,
+) -> bool:
+    """Return whether the KV layout is DeepSeek V4's MLA/SWA hybrid layout."""
+    if len(kv_cache_config.kv_cache_groups) <= 1:
+        return False
+
+    flattened_specs: list[KVCacheSpec] = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            flattened_specs.extend(spec.kv_cache_specs.values())
+        else:
+            flattened_specs.append(spec)
+
+    if not flattened_specs:
+        return False
+    has_deepseek_v4_swa = any(
+        isinstance(spec, SlidingWindowMLASpec)
+        and getattr(spec, "model_version", None) == "deepseek_v4"
+        for spec in flattened_specs
+    )
+    if not has_deepseek_v4_swa:
+        return False
+    return all(
+        isinstance(spec, MLAAttentionSpec | SlidingWindowMLASpec)
+        for spec in flattened_specs
+    )
 
 
 def get_request_block_hasher(
