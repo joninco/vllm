@@ -16,12 +16,14 @@ DSV4 compressed-MLA contract (== upstream/DeepGEMM): q_head_dim = 448 NoPE +
 128 RoPE bf16 + 8-byte UE8M0 footer) is read directly.
 """
 
+import os
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import torch
 
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.common.ops import (
+    compute_dcp_global_topk_indices_and_lens,
     compute_global_topk_indices_and_lens,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import (
@@ -30,6 +32,8 @@ from vllm.models.deepseek_v4.nvidia.flashmla import (
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 
 if TYPE_CHECKING:
     from vllm.models.deepseek_v4.attention import DeepseekV4MLAAttention
@@ -40,6 +44,7 @@ _DSV4_HEAD_DIM = 512
 _DSV4_V_HEAD_DIM = 512
 _DSV4_CACHE_BYTES_PER_TOKEN = 584
 _DECODE_SPLIT_TILE = 64
+_VALIDATE_DCP_INDICES_ENV = "VLLM_DSV4_DCP_VALIDATE_INDICES"
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -90,11 +95,107 @@ def _b12x_cache_page_view(
     return page_view
 
 
+def _validate_index_matrix_for_b12x(
+    *,
+    name: str,
+    indices: torch.Tensor,
+    lens: torch.Tensor,
+    rows: int,
+    page_size: int,
+    num_pages: int,
+) -> None:
+    if indices.ndim == 3 and indices.shape[1] == 1:
+        indices_2d = indices[:, 0]
+    elif indices.ndim == 2:
+        indices_2d = indices
+    else:
+        raise RuntimeError(
+            f"{name} indices must be [rows, width] or [rows, 1, width], "
+            f"got {tuple(indices.shape)}"
+        )
+
+    if int(indices_2d.shape[0]) != rows:
+        raise RuntimeError(
+            f"{name} row count {int(indices_2d.shape[0])} != q rows {rows}"
+        )
+    if tuple(lens.shape) != (rows,):
+        raise RuntimeError(f"{name} lens shape {tuple(lens.shape)} != ({rows},)")
+
+    width = int(indices_2d.shape[1])
+    max_slots = int(page_size) * int(num_pages)
+    lens_min = int(lens.min().item()) if rows else 0
+    lens_max = int(lens.max().item()) if rows else 0
+    if lens_min < 0 or lens_max > width:
+        raise RuntimeError(
+            f"{name} lens out of range: min={lens_min}, max={lens_max}, "
+            f"width={width}"
+        )
+
+    if rows == 0 or width == 0:
+        return
+
+    offsets = torch.arange(width, device=indices_2d.device)
+    prefix_mask = offsets.unsqueeze(0) < lens.unsqueeze(1)
+    if not bool(prefix_mask.any().item()):
+        return
+
+    prefix_values = indices_2d[prefix_mask]
+    bad_mask = (prefix_values < 0) | (prefix_values >= max_slots)
+    if bool(bad_mask.any().item()):
+        bad_value = int(prefix_values[bad_mask][0].item())
+        raise RuntimeError(
+            f"{name} contains out-of-cache slot {bad_value}; "
+            f"valid range is [0, {max_slots}) with page_size={page_size}, "
+            f"num_pages={num_pages}"
+        )
+
+
+def _maybe_validate_compressed_mla_inputs(
+    *,
+    q: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_page_size: int,
+    indexed_k_cache: torch.Tensor | None,
+    indexed_indices: torch.Tensor | None,
+    indexed_lens: torch.Tensor | None,
+    indexed_page_size: int | None,
+) -> None:
+    if os.environ.get(_VALIDATE_DCP_INDICES_ENV) != "1":
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+
+    rows = int(q.shape[0])
+    _validate_index_matrix_for_b12x(
+        name="swa",
+        indices=swa_indices,
+        lens=swa_lens,
+        rows=rows,
+        page_size=swa_page_size,
+        num_pages=int(swa_k_cache.shape[0]),
+    )
+    if indexed_k_cache is None:
+        return
+    assert indexed_indices is not None
+    assert indexed_lens is not None
+    assert indexed_page_size is not None
+    _validate_index_matrix_for_b12x(
+        name="indexed",
+        indices=indexed_indices,
+        lens=indexed_lens,
+        rows=rows,
+        page_size=indexed_page_size,
+        num_pages=int(indexed_k_cache.shape[0]),
+    )
+
+
 def _run_compressed_mla(
     *,
     q: torch.Tensor,
     output: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     scale: float,
     swa_k_cache: torch.Tensor,
     swa_indices: torch.Tensor,
@@ -105,7 +206,9 @@ def _run_compressed_mla(
     indexed_lens: torch.Tensor | None,
     indexed_page_size: int | None,
     mode: Literal["decode", "extend"] = "decode",
-) -> None:
+    return_lse: bool = False,
+    lse_scale: Literal["natural", "base2"] = "natural",
+) -> torch.Tensor | None:
     """Plan, bind, and call b12x compressed MLA in plain eager Python.
 
     ``q`` is ``[tokens, padded_heads, 512]`` (heads pre-padded to
@@ -129,6 +232,18 @@ def _run_compressed_mla(
         indexed_indices = indexed_indices.contiguous()
     if indexed_lens is not None:
         indexed_lens = indexed_lens.contiguous()
+
+    _maybe_validate_compressed_mla_inputs(
+        q=q,
+        swa_k_cache=swa_k_cache,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        swa_page_size=swa_page_size,
+        indexed_k_cache=indexed_k_cache,
+        indexed_indices=indexed_indices,
+        indexed_lens=indexed_lens,
+        indexed_page_size=indexed_page_size,
+    )
 
     # b12x checks total_width = swa_width + indexed_width against scratch.topk,
     # so the scratch must be planned for the combined dual-cache width.
@@ -172,9 +287,11 @@ def _run_compressed_mla(
     binding.scratch.mode = mode
 
     # attn_sink is sized to the model's padded_heads (max(n_local,64)); b12x
-    # wants it at the real local head count (== q heads).
-    sink = attn_sink[:heads].contiguous()
-    out = compressed_mla_decode_forward(
+    # wants it at the real local head count (== q heads). Under DCP, only one
+    # rank contributes the gathered sink so the LSE reducer does not count it
+    # once per DCP rank.
+    sink = attn_sink[:heads].contiguous() if attn_sink is not None else None
+    result = compressed_mla_decode_forward(
         binding=binding,
         swa_k_cache=swa_k_cache,
         swa_page_size=int(swa_page_size),
@@ -183,8 +300,78 @@ def _run_compressed_mla(
         attn_sink=sink,
         sm_scale=scale,
         expected_num_q_heads=heads,
+        return_lse=return_lse,
+        lse_scale=lse_scale,
     )
+    if return_lse:
+        out, lse = cast(tuple[torch.Tensor, torch.Tensor], result)
+        output.copy_(out)
+        return lse
+    out = cast(torch.Tensor, result)
     output.copy_(out)
+    return None
+
+
+def _run_dcp_compressed_mla(
+    *,
+    q: torch.Tensor,
+    output: torch.Tensor,
+    attn_sink: torch.Tensor,
+    scale: float,
+    dcp_comm_backend: str,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_page_size: int,
+    indexed_k_cache: torch.Tensor | None,
+    indexed_indices: torch.Tensor | None,
+    indexed_lens: torch.Tensor | None,
+    indexed_page_size: int | None,
+    mode: Literal["decode", "extend"] = "decode",
+) -> None:
+    from vllm.distributed.parallel_state import get_dcp_group
+
+    dcp_group = get_dcp_group()
+    q_all = dcp_group.all_gather(q.contiguous(), dim=1)
+    local_heads = int(q.shape[1])
+    gathered_sink = dcp_group.all_gather(attn_sink[:local_heads].contiguous(), dim=0)
+    sink = gathered_sink if dcp_group.rank_in_group == 0 else None
+
+    partial_output = q_all.new_empty((q_all.shape[0], q_all.shape[1], _DSV4_V_HEAD_DIM))
+    lse = _run_compressed_mla(
+        q=q_all,
+        output=partial_output,
+        attn_sink=sink,
+        scale=scale,
+        swa_k_cache=swa_k_cache,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        swa_page_size=swa_page_size,
+        indexed_k_cache=indexed_k_cache,
+        indexed_indices=indexed_indices,
+        indexed_lens=indexed_lens,
+        indexed_page_size=indexed_page_size,
+        mode=mode,
+        return_lse=True,
+        lse_scale="natural",
+    )
+    assert lse is not None
+
+    if dcp_comm_backend == "a2a":
+        reduced = dcp_a2a_lse_reduce(
+            partial_output,
+            lse,
+            dcp_group,
+            is_lse_base_on_e=True,
+        )
+    else:
+        reduced = cp_lse_ag_out_rs(
+            partial_output,
+            lse,
+            dcp_group,
+            is_lse_base_on_e=True,
+        )
+    output.copy_(reduced)
 
 
 class DeepseekV4B12xMLASparseBackend(DeepseekV4FlashMLASparseBackend):
@@ -249,6 +436,7 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         topk_indices_buffer = layer.topk_indices_buffer
         attn_sink = layer.attn_sink
         scale = layer.scale
+        vllm_config = layer.vllm_config
 
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -289,6 +477,7 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 topk_indices_buffer=topk_indices_buffer,
                 attn_sink=attn_sink,
                 scale=scale,
+                vllm_config=vllm_config,
             )
         if num_decodes > 0:
             cls._forward_decode(
@@ -303,6 +492,7 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 attn_sink=attn_sink,
                 scale=scale,
                 output=output[:num_decode_tokens],
+                vllm_config=vllm_config,
             )
 
     @classmethod
@@ -319,9 +509,11 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         attn_sink: torch.Tensor,
         scale: float,
         output: torch.Tensor,
+        vllm_config,
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
 
         # Indexed (compressed) region global top-k.
         topk_indices = None
@@ -336,6 +528,10 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
             if compress_ratio == 4:
                 assert topk_indices_buffer is not None
+                # The C4 sparse indexer searches this rank's DCP-local cache and
+                # returns request-relative local K positions. Convert them through
+                # the ordinary local block table, matching the GLM non-compressed
+                # sparse MLA DCP contract.
                 topk_indices, topk_lens = compute_global_topk_indices_and_lens(
                     topk_indices_buffer[:num_decode_tokens],
                     swa_metadata.token_to_req_indices,
@@ -363,21 +559,39 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             "swa_k_cache",
         )
 
-        _run_compressed_mla(
-            q=q,
-            output=output,
-            attn_sink=attn_sink,
-            scale=scale,
-            swa_k_cache=swa_k_cache,
-            swa_indices=swa_indices,
-            swa_lens=swa_lens,
-            swa_page_size=swa_metadata.block_size,
-            indexed_k_cache=indexed_k_cache,
-            indexed_indices=topk_indices,
-            indexed_lens=topk_lens,
-            indexed_page_size=indexed_page_size,
-            mode="decode",
-        )
+        if dcp_world_size > 1:
+            _run_dcp_compressed_mla(
+                q=q,
+                output=output,
+                attn_sink=attn_sink,
+                scale=scale,
+                dcp_comm_backend=vllm_config.parallel_config.dcp_comm_backend,
+                swa_k_cache=swa_k_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                swa_page_size=swa_metadata.block_size,
+                indexed_k_cache=indexed_k_cache,
+                indexed_indices=topk_indices,
+                indexed_lens=topk_lens,
+                indexed_page_size=indexed_page_size,
+                mode="decode",
+            )
+        else:
+            _run_compressed_mla(
+                q=q,
+                output=output,
+                attn_sink=attn_sink,
+                scale=scale,
+                swa_k_cache=swa_k_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                swa_page_size=swa_metadata.block_size,
+                indexed_k_cache=indexed_k_cache,
+                indexed_indices=topk_indices,
+                indexed_lens=topk_lens,
+                indexed_page_size=indexed_page_size,
+                mode="decode",
+            )
 
     @classmethod
     def _forward_prefill(
@@ -392,12 +606,19 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         topk_indices_buffer: torch.Tensor | None,
         attn_sink: torch.Tensor,
         scale: float,
+        vllm_config,
     ) -> None:
         swa_only = compress_ratio <= 1
         num_prefills = swa_metadata.num_prefills
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
         num_prefill_tokens = swa_metadata.num_prefill_tokens
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        dcp_rank = 0
+        if dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            dcp_rank = get_dcp_group().rank_in_group
 
         query_start_loc_cpu = swa_metadata.query_start_loc_cpu
         assert query_start_loc_cpu is not None
@@ -424,13 +645,31 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
             block_size = attn_metadata.block_size // compress_ratio
-            extra_topk_indices, extra_topk_lens = compute_global_topk_indices_and_lens(
-                local_topk_indices,
-                swa_metadata.token_to_req_indices[prefill_slice],
-                attn_metadata.block_table,
-                block_size,
-                swa_metadata.is_valid_token[prefill_slice],
-            )
+            if dcp_world_size > 1 and compress_ratio != 4:
+                extra_topk_indices, extra_topk_lens = (
+                    compute_dcp_global_topk_indices_and_lens(
+                        local_topk_indices,
+                        swa_metadata.token_to_req_indices[prefill_slice],
+                        attn_metadata.block_table,
+                        block_size,
+                        swa_metadata.is_valid_token[prefill_slice],
+                        dcp_world_size,
+                        dcp_rank,
+                        vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                    )
+                )
+            else:
+                # C4 top-k ids are already DCP-local because the sparse indexer
+                # gathers/searches only local compressed K rows under DCP.
+                extra_topk_indices, extra_topk_lens = (
+                    compute_global_topk_indices_and_lens(
+                        local_topk_indices,
+                        swa_metadata.token_to_req_indices[prefill_slice],
+                        attn_metadata.block_table,
+                        block_size,
+                        swa_metadata.is_valid_token[prefill_slice],
+                    )
+                )
             indexed_page_size = block_size
             indexed_k_cache = _b12x_cache_page_view(
                 compressed_k_cache,
@@ -469,18 +708,40 @@ class DeepseekV4B12xMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 if extra_topk_lens is not None
                 else None
             )
-            _run_compressed_mla(
-                q=q[query_start:query_end],
-                output=output[query_start:query_end],
-                attn_sink=attn_sink,
-                scale=scale,
-                swa_k_cache=swa_k_cache,
-                swa_indices=swa_metadata.prefill_swa_indices[query_start:query_end],
-                swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
-                swa_page_size=swa_metadata.block_size,
-                indexed_k_cache=indexed_k_cache,
-                indexed_indices=idx_chunk,
-                indexed_lens=idx_lens_chunk,
-                indexed_page_size=indexed_page_size,
-                mode="extend",
-            )
+            if dcp_world_size > 1:
+                _run_dcp_compressed_mla(
+                    q=q[query_start:query_end],
+                    output=output[query_start:query_end],
+                    attn_sink=attn_sink,
+                    scale=scale,
+                    dcp_comm_backend=vllm_config.parallel_config.dcp_comm_backend,
+                    swa_k_cache=swa_k_cache,
+                    swa_indices=swa_metadata.prefill_swa_indices[
+                        query_start:query_end
+                    ],
+                    swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
+                    swa_page_size=swa_metadata.block_size,
+                    indexed_k_cache=indexed_k_cache,
+                    indexed_indices=idx_chunk,
+                    indexed_lens=idx_lens_chunk,
+                    indexed_page_size=indexed_page_size,
+                    mode="extend",
+                )
+            else:
+                _run_compressed_mla(
+                    q=q[query_start:query_end],
+                    output=output[query_start:query_end],
+                    attn_sink=attn_sink,
+                    scale=scale,
+                    swa_k_cache=swa_k_cache,
+                    swa_indices=swa_metadata.prefill_swa_indices[
+                        query_start:query_end
+                    ],
+                    swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
+                    swa_page_size=swa_metadata.block_size,
+                    indexed_k_cache=indexed_k_cache,
+                    indexed_indices=idx_chunk,
+                    indexed_lens=idx_lens_chunk,
+                    indexed_page_size=indexed_page_size,
+                    mode="extend",
+                )
