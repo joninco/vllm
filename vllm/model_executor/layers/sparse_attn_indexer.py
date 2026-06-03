@@ -64,6 +64,16 @@ def _round_up_to_multiple(x: int, y: int) -> int:
     return _ceil_div(x, y) * int(y)
 
 
+def _get_b12x_indexer_extend_profile_q_rows(
+    q_rows: int,
+    total_seq_lens: int,
+) -> int:
+    """Return the largest q chunk the real prefill chunker can hand to b12x."""
+    max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
+    max_q_rows = max(1, max_logits_elems // max(1, int(total_seq_lens)))
+    return min(max(1, int(q_rows)), max_q_rows)
+
+
 def _b12x_sparse_indexer_requested(enabled: bool | None = None) -> bool:
     if enabled is not None:
         return bool(enabled)
@@ -524,8 +534,12 @@ def sparse_attn_indexer(
         )
         if _b12x_sparse_indexer_requested(use_b12x_sparse_indexer):
             _ensure_b12x_sparse_indexer_supported()
+            profile_q_rows = _get_b12x_indexer_extend_profile_q_rows(
+                int(q_quant.shape[0]),
+                total_seq_lens,
+            )
             _get_b12x_indexer_extend_buffers(
-                q_fp8=q_quant,
+                q_fp8=q_quant[:profile_q_rows],
                 topk_tokens=topk_tokens,
                 total_seq_lens=total_seq_lens,
                 head_dim=head_dim,
