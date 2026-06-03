@@ -41,8 +41,16 @@ _B12X_COMPRESSED_INDEX_PAGE_WIDTH = _B12X_COMPRESSED_INDEX_PAGE_SIZE * (
 _B12X_EXTEND_TOPK_SUPERTILE_K = int(
     os.getenv("VLLM_B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "32768")
 )
+_B12X_DECODE_TOPK_SUPERTILE_K = int(
+    os.getenv(
+        "VLLM_B12X_NSA_DECODE_TOPK_SUPERTILE_K",
+        os.getenv("VLLM_B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "32768"),
+    )
+)
 _B12X_INDEXER_EXTEND_BLOCK_Q = 32
 _B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K = 256
+_B12X_INDEXER_DECODE_BLOCK_Q = 32
+_B12X_INDEXER_DECODE_BLOCK_K = 512
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -282,39 +290,148 @@ def _run_b12x_decode_topk(
     topk_indices: torch.Tensor,
     topk_tokens: int,
 ) -> torch.Tensor:
-    from b12x.attention.indexer.tiled_topk import run_row_topk
-    from b12x.integration.indexer import (
-        IndexerPagedDecodeMetadata,
-        paged_decode_logits,
+    from b12x.attention.indexer.kernel import run_paged_windowed_tiled_logits_kernel
+    from b12x.attention.indexer.tiled_topk import (
+        merge_tiled_topk_candidates,
+        run_tiled_topk,
     )
+    from b12x.integration.indexer import uses_paged_mqa_schedule
+
+    if q_fp8.ndim != 3:
+        raise RuntimeError(
+            "b12x decode indexer expected q_fp8 rank 3, "
+            f"got {q_fp8.ndim}."
+        )
+    q_rows = int(q_fp8.shape[0])
+    page_table_width = int(block_table.shape[1])
+    page_size = _B12X_COMPRESSED_INDEX_PAGE_SIZE
+    if q_rows == 0 or page_table_width == 0:
+        topk_indices.fill_(-1)
+        return topk_indices
 
     index_k_cache = _flatten_b12x_paged_index_cache(kv_cache)
-    metadata = IndexerPagedDecodeMetadata(
-        real_page_table=block_table,
-        cache_seqlens_int32=seq_lens,
-        paged_mqa_schedule_metadata=schedule_metadata,
+    weights = (
+        weights.squeeze(2).contiguous()
+        if weights.ndim == 3 and int(weights.shape[2]) == 1
+        else weights.contiguous()
     )
-    logits = paged_decode_logits(
-        q_fp8=q_fp8,
-        weights=weights,
-        index_k_cache=index_k_cache,
-        metadata=metadata,
-        page_size=_B12X_COMPRESSED_INDEX_PAGE_SIZE,
-        preinitialize_invalid_logits=False,
+    if weights.shape != (q_rows, int(q_fp8.shape[1])):
+        raise RuntimeError(
+            "b12x decode indexer expected weights shape "
+            f"{(q_rows, int(q_fp8.shape[1]))}, got {tuple(weights.shape)}."
+        )
+
+    supertile_tokens = _round_up_to_multiple(
+        max(
+            int(_B12X_DECODE_TOPK_SUPERTILE_K),
+            _B12X_INDEXER_DECODE_BLOCK_K,
+        ),
+        _B12X_INDEXER_DECODE_BLOCK_K,
     )
-    topk_values = torch.empty(
-        (int(q_fp8.shape[0]), int(topk_tokens)),
-        dtype=torch.float32,
-        device=q_fp8.device,
+    supertile_pages = max(1, supertile_tokens // page_size)
+    supertile_k_tiles = supertile_tokens // _B12X_INDEXER_DECODE_BLOCK_K
+    num_chunks = max(1, _ceil_div(page_table_width, supertile_pages))
+    if uses_paged_mqa_schedule(q_rows=q_rows, max_pages=supertile_pages):
+        raise RuntimeError(
+            "b12x GLM sparse indexer supertile top-k requires an unscheduled "
+            "paged scorer tile; reduce VLLM_B12X_NSA_DECODE_TOPK_SUPERTILE_K "
+            f"below {supertile_tokens} tokens."
+        )
+
+    num_q_tiles = _ceil_div(q_rows, _B12X_INDEXER_DECODE_BLOCK_Q)
+    tile_elements = max(
+        1,
+        num_q_tiles
+        * supertile_k_tiles
+        * _B12X_INDEXER_DECODE_BLOCK_Q
+        * _B12X_INDEXER_DECODE_BLOCK_K,
     )
-    _, result = run_row_topk(
-        row_logits=logits,
-        lengths=seq_lens,
-        topk=topk_tokens,
-        output_values=topk_values,
-        output_indices=topk_indices,
-    )
-    return result
+    topk_tokens = int(topk_tokens)
+
+    workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
+        ((1,), torch.int32),
+        ((tile_elements,), torch.float32),
+        ((q_rows, topk_tokens), torch.float32),
+    ]
+    if num_chunks > 1:
+        workspace_specs.extend(
+            (
+                ((num_chunks, q_rows, topk_tokens), torch.float32),
+                ((num_chunks, q_rows, topk_tokens), torch.int32),
+                ((q_rows, topk_tokens), torch.int64),
+            )
+        )
+    workspace = current_workspace_manager().get_simultaneous(*workspace_specs)
+    active_width = workspace[0]
+    tile_logits = workspace[1]
+    topk_values = workspace[2]
+    candidate_values = candidate_indices = merge_positions = None
+    if num_chunks > 1:
+        candidate_values = workspace[3]
+        candidate_indices = workspace[4]
+        merge_positions = workspace[5]
+
+    width_tokens = page_table_width * page_size
+    torch.amax(seq_lens, dim=0, keepdim=True, out=active_width)
+    active_width.clamp_(min=0, max=width_tokens)
+
+    for chunk_idx in range(num_chunks):
+        page_begin = chunk_idx * supertile_pages
+        page_end = min(page_begin + supertile_pages, page_table_width)
+        chunk_pages = page_end - page_begin
+        chunk_width_tokens = chunk_pages * page_size
+        chunk_start_token = page_begin * page_size
+
+        run_paged_windowed_tiled_logits_kernel(
+            q_fp8=q_fp8,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            real_page_table=block_table,
+            seqlens_per_query=seq_lens,
+            active_width=active_width,
+            tile_logits=tile_logits,
+            source_page_offset=page_begin,
+            output_width_tokens=supertile_tokens,
+            page_size=page_size,
+            tile_block_q=_B12X_INDEXER_DECODE_BLOCK_Q,
+            tile_block_k=_B12X_INDEXER_DECODE_BLOCK_K,
+            workspace=None,
+            preinitialize_tile_logits=False,
+            stage_runtime_metadata=False,
+        )
+
+        out_values = topk_values
+        out_indices = topk_indices
+        if candidate_values is not None and candidate_indices is not None:
+            out_values = candidate_values[chunk_idx]
+            out_indices = candidate_indices[chunk_idx]
+        run_tiled_topk(
+            tile_logits=tile_logits,
+            k_start=None,
+            lengths=seq_lens,
+            topk=topk_tokens,
+            block_q=_B12X_INDEXER_DECODE_BLOCK_Q,
+            block_k=_B12X_INDEXER_DECODE_BLOCK_K,
+            output_values=out_values,
+            output_indices=out_indices,
+            num_k_tiles=supertile_k_tiles,
+            input_index_offset=chunk_start_token,
+            input_extent=chunk_width_tokens,
+            output_index_offset=chunk_start_token,
+            zero_row_start=True,
+        )
+
+    if candidate_values is not None and candidate_indices is not None:
+        _, result = merge_tiled_topk_candidates(
+            candidate_values=candidate_values,
+            candidate_indices=candidate_indices,
+            topk=topk_tokens,
+            output_values=topk_values,
+            output_indices=topk_indices,
+            merge_positions=merge_positions,
+        )
+        return result
+    return topk_indices
 
 
 def _run_b12x_compressed_decode_topk(
