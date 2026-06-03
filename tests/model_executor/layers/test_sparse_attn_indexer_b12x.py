@@ -141,3 +141,23 @@ def test_b12x_glm_decode_indexer_uses_paged_supertile_topk(monkeypatch):
         ("topk", 512, 128, 1, True),
         ("merge", (2, q_rows, topk)),
     ]
+
+
+def test_b12x_extend_profile_rows_follow_logits_budget(monkeypatch):
+    monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+
+    assert (
+        indexer_mod._get_b12x_indexer_extend_profile_q_rows(
+            q_rows=65536,
+            total_seq_lens=5_242_880,
+        )
+        == 25
+    )
+
+    assert (
+        indexer_mod._get_b12x_indexer_extend_profile_q_rows(
+            q_rows=65536,
+            total_seq_lens=65_536,
+        )
+        == 2048
+    )
