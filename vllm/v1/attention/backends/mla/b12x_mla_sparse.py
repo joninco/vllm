@@ -561,8 +561,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             )
 
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
+        # The decode kernel handles independent one-token query rows. MTP
+        # verification has multiple query rows per request, and later rows must
+        # attend to earlier draft rows in the same verifier batch. Route those
+        # batches through the extend path unless explicitly overridden.
         self.spec_extend_as_decode = (
-            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "1") != "0"
+            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "0") != "0"
         )
 
         # Decode query rows per request (1, plus speculative draft tokens).
