@@ -28,7 +28,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import CommonAttentionMetadata, SparseMLAAttentionImpl
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
 from vllm.v1.attention.backends.mla.prefill import (
     MLAPrefillBackendEnum,
@@ -408,6 +408,59 @@ class MockSparseMLAAttentionLayer:
         )
 
         return output
+
+
+def test_sparse_mla_profile_skips_dense_prefill_workspace(monkeypatch):
+    class ProfileSparseImpl(SparseMLAAttentionImpl):
+        def __init__(self) -> None:
+            self.dcp_world_size = 1
+            self.supports_quant_query_input = False
+
+        def forward_mqa(self, *args, **kwargs):
+            raise AssertionError("profile run should return before forward_mqa")
+
+    num_heads = 8
+    qk_nope_head_dim = 128
+    v_head_dim = 128
+    workspace_size = 315_392
+    dummy_shape = (workspace_size, num_heads, qk_nope_head_dim + v_head_dim)
+
+    layer = object.__new__(MLAAttention)
+    layer.impl = ProfileSparseImpl()
+    layer.num_heads = num_heads
+    layer.qk_nope_head_dim = qk_nope_head_dim
+    layer.v_head_dim = v_head_dim
+    layer.kv_cache_dtype = "fp8_ds_mla"
+    layer._chunked_prefill_workspace_size = workspace_size
+
+    q = torch.empty((1, num_heads, qk_nope_head_dim + 64), dtype=torch.bfloat16)
+    kv_c = torch.empty((1, 512), dtype=torch.bfloat16)
+    k_pe = torch.empty((1, 1, 64), dtype=torch.bfloat16)
+    kv_cache = torch.empty((0,), dtype=torch.uint8)
+    output = torch.empty((1, num_heads * v_head_dim), dtype=torch.bfloat16)
+
+    torch_empty = torch.empty
+
+    def guarded_empty(*args, **kwargs):
+        shape = args[0] if args else kwargs.get("size")
+        if shape == dummy_shape:
+            raise AssertionError("sparse MLA profile allocated dense prefill dummy")
+        return torch_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", guarded_empty)
+
+    result = MLAAttention.forward_impl(
+        layer,
+        q,
+        kv_c,
+        k_pe,
+        kv_cache,
+        None,
+        output,
+    )
+
+    assert result is output
+    assert torch.equal(output, torch.zeros_like(output))
 
 
 class MockMLAAttentionLayer(MLAAttention):
