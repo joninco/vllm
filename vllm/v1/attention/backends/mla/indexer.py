@@ -202,6 +202,11 @@ class DeepSeekV32IndexerDecodeMetadata:
     requires_padding: bool
     schedule_metadata: torch.Tensor | None
     compress_ratio: int = 1
+    # Live scorer window (max compressed context across the batch) in cache
+    # tokens, computed host-side in build() — a metadata tensor read by the
+    # captured indexer kernel, never an in-kernel reduction. None => b12x uses
+    # the capacity cap.
+    active_width: torch.Tensor | None = None
 
 
 @dataclass
@@ -342,6 +347,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # See: DeepGMM/csrc/apis/attention.hpp
         self.scheduler_metadata_buffer = torch.empty(
             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
+        )
+
+        # Persistent live-active-width buffer for the b12x indexer decode
+        # scorer window. Filled host-side each build() (outside cudagraph
+        # capture) and read by the captured kernel at a stable address.
+        self.b12x_active_width_buffer = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
         )
 
         # KV compression. Default to 1 for no compression.
@@ -765,6 +777,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     seq_lens
                 )
 
+            active_width = None
+            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+                # Live scorer window in cache tokens. ceil(max_seq_len /
+                # compress_ratio) is an upper bound on the max compressed
+                # context across the batch, so windowing to it is top-k-identical
+                # to the capacity cap and only skips wasted k-tiles. Computed on
+                # the host here (metadata-prep, outside cudagraph capture) and
+                # filled into the persistent buffer the captured kernel reads.
+                active_width_tokens = -(
+                    -int(common_attn_metadata.max_seq_len) // self.compress_ratio
+                )
+                self.b12x_active_width_buffer.fill_(active_width_tokens)
+                active_width = self.b12x_active_width_buffer
+
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
@@ -772,6 +798,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
                 compress_ratio=self.compress_ratio,
+                active_width=active_width,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(
