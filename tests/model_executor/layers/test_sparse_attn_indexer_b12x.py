@@ -160,6 +160,72 @@ def _install_fake_b12x_indexer(
         calls.append(("extend_tiled_topk",))
         raise AssertionError("streaming wrapper must not call extend_tiled_topk")
 
+    class B12XIndexerExtendScratchCaps:
+        def __init__(
+            self,
+            *,
+            device,
+            num_q_heads,
+            max_q_rows,
+            max_k_rows,
+            topk,
+            k_dtype,
+            supertile_k,
+            prefill_block_k,
+        ) -> None:
+            self.device = device
+            self.num_q_heads = num_q_heads
+            self.max_q_rows = max_q_rows
+            self.max_k_rows = max_k_rows
+            self.topk = topk
+            self.k_dtype = k_dtype
+            self.supertile_k = supertile_k
+            self.prefill_block_k = prefill_block_k
+
+    class _FakeExtendPlan:
+        BLOCK_Q = 32
+        HEAD_DIM = 128
+
+        def __init__(self, caps) -> None:
+            self.caps = caps
+
+        def shapes_and_dtypes(self):
+            c = self.caps
+            q_rows = max(1, int(c.max_q_rows))
+            k_rows_cap = max(1, int(c.max_k_rows))
+            topk = max(1, int(c.topk))
+            prefill_block_k = max(1, int(c.prefill_block_k))
+            num_q_tiles = (q_rows + self.BLOCK_Q - 1) // self.BLOCK_Q
+            num_k_tiles = max(1, (k_rows_cap + prefill_block_k - 1) // prefill_block_k)
+            st_k = max(int(c.supertile_k), prefill_block_k)
+            st_k = ((st_k + prefill_block_k - 1) // prefill_block_k) * prefill_block_k
+            supertile_tiles = max(1, st_k // prefill_block_k)
+            max_chunk_tiles = min(supertile_tiles, num_k_tiles)
+            tile_elements = max(
+                1,
+                num_q_tiles * max_chunk_tiles * self.BLOCK_Q * prefill_block_k,
+            )
+            return (
+                ((k_rows_cap, self.HEAD_DIM), c.k_dtype),
+                ((k_rows_cap, 4), torch.uint8),
+                ((tile_elements,), torch.float32),
+                ((q_rows,), torch.int32),
+                ((q_rows, topk), torch.float32),
+                ((q_rows, topk), torch.int32),
+                ((2, q_rows, topk), torch.float32),
+                ((2, q_rows, topk), torch.int32),
+                ((q_rows, topk), torch.int64),
+            )
+
+        def bind(self, *, scratch, k_start, k_end, gather_rows, topk):
+            return types.SimpleNamespace(scratch=scratch)
+
+    def plan_indexer_extend_scratch(caps):
+        return _FakeExtendPlan(caps)
+
+    integration_mod.B12XIndexerExtendScratchCaps = B12XIndexerExtendScratchCaps
+    integration_mod.plan_indexer_extend_scratch = plan_indexer_extend_scratch
+
     attention_indexer_mod.IndexerExtendMetadata = IndexerExtendMetadata
     attention_indexer_mod.resolve_extend_prefill_block_k = (
         resolve_extend_prefill_block_k
@@ -200,9 +266,7 @@ def test_prefill_topk_normalization_converts_packed_indices_to_req_relative():
         cu_seq_lens=torch.tensor([0, 3, 8], dtype=torch.int32),
         token_to_seq=torch.tensor([0, 0, 0, 1, 1, 1, 1, 1], dtype=torch.int32),
     )
-    topk_indices = torch.tensor(
-        [[0, 2, 3, -1], [4, 6, 7, 1]], dtype=torch.int32
-    )
+    topk_indices = torch.tensor([[0, 2, 3, -1], [4, 6, 7, 1]], dtype=torch.int32)
 
     indexer_mod._normalize_prefill_topk_to_req_relative(chunk, topk_indices)
 
@@ -242,13 +306,11 @@ def test_b12x_glm_decode_indexer_uses_paged_supertile_topk(monkeypatch):
     page_table_width = 10
     q_fp8 = torch.empty((q_rows, num_heads, 128), dtype=torch.uint8)
     weights = torch.empty((q_rows, num_heads, 1), dtype=torch.float32)
-    kv_cache = torch.empty(
-        (page_table_width, 64, 132), dtype=torch.uint8
-    ).contiguous()
+    kv_cache = torch.empty((page_table_width, 64, 132), dtype=torch.uint8).contiguous()
     seq_lens = torch.tensor([600, 640], dtype=torch.int32)
-    block_table = torch.arange(
-        q_rows * page_table_width, dtype=torch.int32
-    ).reshape(q_rows, page_table_width)
+    block_table = torch.arange(q_rows * page_table_width, dtype=torch.int32).reshape(
+        q_rows, page_table_width
+    )
     topk_indices = torch.empty((q_rows, topk), dtype=torch.int32)
 
     result = indexer_mod._run_b12x_decode_topk(
@@ -302,13 +364,11 @@ def test_b12x_glm_decode_indexer_streams_multichunk_topk(monkeypatch):
     page_table_width = 24
     q_fp8 = torch.empty((q_rows, num_heads, 128), dtype=torch.uint8)
     weights = torch.empty((q_rows, num_heads, 1), dtype=torch.float32)
-    kv_cache = torch.empty(
-        (page_table_width, 64, 132), dtype=torch.uint8
-    ).contiguous()
+    kv_cache = torch.empty((page_table_width, 64, 132), dtype=torch.uint8).contiguous()
     seq_lens = torch.full((q_rows,), 1536, dtype=torch.int32)
-    block_table = torch.arange(
-        q_rows * page_table_width, dtype=torch.int32
-    ).reshape(q_rows, page_table_width)
+    block_table = torch.arange(q_rows * page_table_width, dtype=torch.int32).reshape(
+        q_rows, page_table_width
+    )
     topk_indices = torch.empty((q_rows, topk), dtype=torch.int32)
 
     result = indexer_mod._run_b12x_decode_topk(
@@ -578,21 +638,111 @@ def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
     assert ((2, q_rows, topk), torch.int32) in workspace_manager.specs
 
 
-def test_b12x_extend_profile_rows_follow_logits_budget(monkeypatch):
+class _RecordingWorkspaceManager:
+    """FakeWorkspaceManager that retains every get_simultaneous call.
+
+    Mirrors WorkspaceManager.get_simultaneous's lock semantics enough to verify
+    the sweep reserve grows the workspace past every (q, k) point it visits.
+    """
+
+    def __init__(self) -> None:
+        self.spec_log: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
+        self.specs: tuple[tuple[tuple[int, ...], torch.dtype], ...] | None = None
+
+    def get_simultaneous(
+        self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> list[torch.Tensor]:
+        self.spec_log.append(shapes_and_dtypes)
+        self.specs = shapes_and_dtypes
+        return [torch.empty(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes]
+
+
+def _spec_bytes(specs: tuple[tuple[tuple[int, ...], torch.dtype], ...]) -> int:
+    """256-aligned sum of tensor bytes (mirrors WorkspaceManager sizing)."""
+    total = 0
+    for shape, dtype in specs:
+        elems = 1
+        for d in shape:
+            elems *= int(d)
+        actual = elems * torch.tensor([], dtype=dtype).element_size()
+        total += (actual + 255) & ~255
+    return total
+
+
+def _record_extend_buffer_calls(monkeypatch) -> list[tuple[int, int, int]]:
+    """Replace _get_b12x_indexer_extend_binding with a recorder that captures
+    the (q_rows, k_rows, max_k_rows) the sweep hands it."""
+    calls: list[tuple[int, int, int]] = []
+    real_fn = indexer_mod._get_b12x_indexer_extend_binding
+
+    def recording_fn(*, q_fp8, total_seq_lens, max_k_rows=None, **kwargs):
+        calls.append((int(q_fp8.shape[0]), int(total_seq_lens), int(max_k_rows or 0)))
+        return real_fn(
+            q_fp8=q_fp8,
+            total_seq_lens=total_seq_lens,
+            max_k_rows=max_k_rows,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(indexer_mod, "_get_b12x_indexer_extend_binding", recording_fn)
+    return calls
+
+
+def test_b12x_extend_profile_sweep_includes_q_cap_and_bin_lower_edge(monkeypatch):
+    """Sweep must cover both q_cap and the rounding-adversary q in the same
+    BLOCK_Q bin so workspaces sized for lower-q + higher-k chunks are reserved."""
+    fake_calls: list[tuple] = []
+    _install_fake_b12x_indexer(monkeypatch, fake_calls)
+    manager = _RecordingWorkspaceManager()
+    monkeypatch.setattr(indexer_mod, "current_workspace_manager", lambda: manager)
     monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+    sweep_calls = _record_extend_buffer_calls(monkeypatch)
 
-    assert (
-        indexer_mod._get_b12x_indexer_extend_profile_q_rows(
-            q_rows=65536,
-            total_seq_lens=5_242_880,
-        )
-        == 25
+    q_cap = 8192
+    q_quant = torch.empty((q_cap, 64, 128), dtype=torch.uint8)
+
+    indexer_mod._reserve_b12x_indexer_extend_worst_case(
+        q_quant=q_quant,
+        topk_tokens=2048,
+        fp8_dtype=torch.uint8,
+        max_model_len=393_216,
+        total_seq_lens=393_216,
     )
 
-    assert (
-        indexer_mod._get_b12x_indexer_extend_profile_q_rows(
-            q_rows=65536,
-            total_seq_lens=65_536,
-        )
-        == 2048
+    qs_visited = {q for q, _, _ in sweep_calls}
+    block_q = indexer_mod._B12X_INDEXER_EXTEND_BLOCK_Q
+    nq_max = (q_cap + block_q - 1) // block_q
+    q_lo = (nq_max - 1) * block_q + 1
+    assert q_cap in qs_visited
+    assert q_lo in qs_visited
+
+
+def test_b12x_extend_profile_sweep_skips_invariant_violators(monkeypatch):
+    """Sweep must drop (q, k) pairs that violate the chunker's q*k <= E
+    invariant; reserving past it would massively over-allocate workspace."""
+    fake_calls: list[tuple] = []
+    _install_fake_b12x_indexer(monkeypatch, fake_calls)
+    manager = _RecordingWorkspaceManager()
+    monkeypatch.setattr(indexer_mod, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+    max_logits_elems = 512 * 1024 * 1024 // 4
+    sweep_calls = _record_extend_buffer_calls(monkeypatch)
+
+    q_cap = 16384
+    q_quant = torch.empty((q_cap, 64, 128), dtype=torch.uint8)
+
+    indexer_mod._reserve_b12x_indexer_extend_worst_case(
+        q_quant=q_quant,
+        topk_tokens=2048,
+        fp8_dtype=torch.uint8,
+        max_model_len=393_216,
+        total_seq_lens=393_216,
     )
+
+    assert sweep_calls
+    for q, k, _ in sweep_calls:
+        assert q * k <= max_logits_elems, (
+            f"sweep reserved invariant-violating shape (q={q}, k={k}, "
+            f"q*k={q * k} > E={max_logits_elems})"
+        )
+        assert k <= 393_216

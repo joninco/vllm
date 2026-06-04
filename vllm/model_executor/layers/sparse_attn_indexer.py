@@ -45,11 +45,16 @@ _B12X_DECODE_TOPK_SUPERTILE_K = int(
     )
 )
 _B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K = 256
+_B12X_INDEXER_EXTEND_BLOCK_Q = 32
 _B12X_INDEXER_DECODE_BLOCK_Q = 32
 _B12X_INDEXER_DECODE_BLOCK_K = 512
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _ceil_div(x: int, y: int) -> int:
+    return (int(x) + int(y) - 1) // int(y)
 
 
 def _get_b12x_indexer_extend_profile_q_rows(
@@ -60,6 +65,89 @@ def _get_b12x_indexer_extend_profile_q_rows(
     max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
     max_q_rows = max(1, max_logits_elems // max(1, int(total_seq_lens)))
     return min(max(1, int(q_rows)), max_q_rows)
+
+
+def _reserve_b12x_indexer_extend_worst_case(
+    *,
+    q_quant: torch.Tensor,
+    topk_tokens: int,
+    fp8_dtype: torch.dtype,
+    max_model_len: int,
+    total_seq_lens: int,
+) -> None:
+    """Sweep the chunker envelope and reserve worst-case extend-prefill scratch.
+
+    The prefill chunker enforces ``q_rows * k_rows <= max_logits_elems`` per
+    chunk and ``k_rows <= max_k_rows``. Inside that envelope ``tile_logits``
+    scratch grows as ``ceil(q/BLOCK_Q)*BLOCK_Q * min(SUPERTILE_K, k_padded)``
+    while the topk arrays scale linearly with ``q``. Sizing once at a single
+    ``(q_cap, max_logits_elems // q_cap)`` point is exact only when
+    ``q_cap * SUPERTILE_K <= max_logits_elems`` — past that, the q*k budget
+    saturates and rounding lets ``(q_cap - BLOCK_Q + 1, k_budget_for_that_q)``
+    peak above the q_cap point by up to ~30 MB (one extra k-tile bin per
+    q-tile). We sweep both q (q_cap and the same ceil(q/BLOCK_Q) bin's lower
+    edge) and k (geometric sweep plus SUPERTILE_K, the q*k=E saturation
+    boundary, and the effective k ceiling) and call
+    _get_b12x_indexer_extend_binding at each valid point so the workspace
+    manager keeps the true envelope max before lock_workspace().
+
+    ``total_seq_lens`` (outer ``max_total_seq_len``) drives the runtime
+    binding's ``max_k_rows`` at line 642 and may exceed ``max_model_len``
+    under indexer compression / prefill-buffer math. We take the max of both
+    so the sweep covers the runtime cap. ``q_quant.shape[0]`` at profile is
+    bounded by max_num_batched_tokens and undershoots the chunker's true q
+    ceiling when k is small; we lift the q_cap to ``max_logits_elems //
+    SUPERTILE_K`` and synthesize a placeholder q tensor for sizing-only
+    calls when the profile tensor is smaller.
+    """
+    max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
+    supertile_k = max(
+        int(_B12X_EXTEND_TOPK_SUPERTILE_K),
+        _B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K,
+    )
+
+    effective_max_k = max(int(max_model_len), int(total_seq_lens))
+    chunker_q_cap = max(1, max_logits_elems // max(1, supertile_k))
+    q_cap = max(int(q_quant.shape[0]), chunker_q_cap)
+
+    nq_max = _ceil_div(q_cap, _B12X_INDEXER_EXTEND_BLOCK_Q)
+    q_lo = max(1, (nq_max - 1) * _B12X_INDEXER_EXTEND_BLOCK_Q + 1)
+    q_set = sorted({q_cap, q_lo})
+
+    base_ks: set[int] = {supertile_k, effective_max_k}
+    kk = 1
+    while kk <= effective_max_k:
+        base_ks.add(kk)
+        kk *= 2
+
+    profile_q_rows = int(q_quant.shape[0])
+
+    def _q_view(q: int) -> torch.Tensor:
+        if q <= profile_q_rows:
+            return q_quant[:q]
+        return q_quant.new_empty((q, int(q_quant.shape[1]), int(q_quant.shape[2])))
+
+    for q in q_set:
+        if q < 1 or q > q_cap:
+            continue
+        k_budget = max(1, max_logits_elems // q)
+        k_hi = min(effective_max_k, k_budget)
+        ks = set(base_ks)
+        ks.add(k_budget)
+        ks.add(k_hi)
+        q_view = _q_view(q)
+        for k in sorted(ks):
+            if k < 1 or k > effective_max_k:
+                continue
+            if q * k > max_logits_elems:
+                continue
+            _get_b12x_indexer_extend_binding(
+                q_fp8=q_view,
+                topk_tokens=topk_tokens,
+                total_seq_lens=k,
+                fp8_dtype=fp8_dtype,
+                max_k_rows=effective_max_k,
+            )
 
 
 def _b12x_sparse_indexer_requested(enabled: bool | None = None) -> bool:
@@ -85,9 +173,7 @@ def _ensure_b12x_sparse_indexer_supported() -> None:
     if not current_platform.is_cuda():
         raise RuntimeError("B12X sparse indexer/top-k requires CUDA.")
     if not current_platform.is_device_capability_family(120):
-        raise RuntimeError(
-            "B12X sparse indexer/top-k currently requires an SM120 GPU."
-        )
+        raise RuntimeError("B12X sparse indexer/top-k currently requires an SM120 GPU.")
 
 
 def _use_b12x_sparse_indexer(enabled: bool | None = None) -> bool:
@@ -174,9 +260,7 @@ def _get_b12x_indexer_extend_binding(
             prefill_block_k=_B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K,
         )
     )
-    scratch = current_workspace_manager().get_simultaneous(
-        *plan.shapes_and_dtypes()
-    )
+    scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
     return plan.bind(
         scratch=scratch,
         k_start=k_start,
@@ -206,9 +290,7 @@ def _normalize_prefill_topk_to_req_relative_kernel(
     topk_ptrs = topk_indices_ptr + rows * topk_stride_0 + cols * topk_stride_1
 
     packed_indices = tl.load(topk_ptrs, mask=mask, other=-1)
-    valid_indices = mask & (packed_indices >= 0) & (
-        packed_indices < token_to_seq_len
-    )
+    valid_indices = mask & (packed_indices >= 0) & (packed_indices < token_to_seq_len)
     seq_ids = tl.load(
         token_to_seq_ptr + packed_indices,
         mask=valid_indices,
@@ -374,9 +456,7 @@ def _run_b12x_decode_topk(
             reserve_paged_logits=False,
         )
     )
-    scratch = current_workspace_manager().get_simultaneous(
-        *plan.shapes_and_dtypes()
-    )
+    scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
     binding = plan.bind(
         scratch=scratch,
         real_page_table=block_table,
@@ -427,6 +507,13 @@ def sparse_attn_indexer(
         )
         if _b12x_sparse_indexer_requested(use_b12x_sparse_indexer):
             _ensure_b12x_sparse_indexer_supported()
+            _reserve_b12x_indexer_extend_worst_case(
+                q_quant=q_quant,
+                topk_tokens=topk_tokens,
+                fp8_dtype=fp8_dtype,
+                max_model_len=max_model_len,
+                total_seq_lens=total_seq_lens,
+            )
             profile_q_rows = _get_b12x_indexer_extend_profile_q_rows(
                 int(q_quant.shape[0]),
                 total_seq_lens,
