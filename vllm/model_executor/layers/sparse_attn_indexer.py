@@ -161,6 +161,7 @@ def _get_b12x_indexer_extend_buffers(
     total_seq_lens: int,
     head_dim: int,
     fp8_dtype: torch.dtype,
+    max_k_rows: int | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -176,6 +177,9 @@ def _get_b12x_indexer_extend_buffers(
 
     q_rows = max(1, int(q_fp8.shape[0]))
     k_rows = max(1, int(total_seq_lens))
+    # Size k_quant/k_scale from the constant capacity cap so the workspace stays
+    # constant after locking. The gather kernel still runs over [:k_rows].
+    k_rows_cap = max(k_rows, int(max_k_rows)) if max_k_rows is not None else k_rows
     indexer_num_q_heads = int(q_fp8.shape[1])
     prefill_block_k = resolve_extend_prefill_block_k(
         valid_q_rows=q_rows,
@@ -204,7 +208,7 @@ def _get_b12x_indexer_extend_buffers(
     topk_tokens = max(int(topk_tokens), 1)
 
     values_spec, scales_spec = _gather_workspace_shapes(
-        k_rows, head_dim, fp8_dtype, use_fp4_cache=False
+        k_rows_cap, head_dim, fp8_dtype, use_fp4_cache=False
     )
     (
         k_quant,
@@ -690,6 +694,7 @@ def sparse_attn_indexer(
                 total_seq_lens=total_seq_lens,
                 head_dim=head_dim,
                 fp8_dtype=fp8_dtype,
+                max_k_rows=max_model_len,
             )
         else:
             # Reserve workspace for indexer during profiling run.
@@ -830,6 +835,7 @@ def sparse_attn_indexer(
                     total_seq_lens=chunk.total_seq_lens,
                     head_dim=head_dim,
                     fp8_dtype=fp8_dtype,
+                    max_k_rows=max_model_len,
                 )
             else:
                 k_quant = k_quant_full[: chunk.total_seq_lens]
