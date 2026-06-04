@@ -394,11 +394,57 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
-    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _model_compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+    ) -> torch.Tensor:
+        try:
+            return self.model.compute_logits(
+                hidden_states, spec_step_idx=spec_step_idx
+            )
+        except TypeError as err:
+            if "spec_step_idx" not in str(err):
+                raise
+            return self.model.compute_logits(hidden_states)
+
+    def _model_get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+    ) -> torch.Tensor:
+        try:
+            return self.model.get_top_tokens(
+                hidden_states, spec_step_idx=spec_step_idx
+            )
+        except TypeError as err:
+            if "spec_step_idx" not in str(err):
+                raise
+            return self.model.get_top_tokens(hidden_states)
+
+    def _model_forward(
+        self,
+        model_kwargs: dict[str, Any],
+        spec_step_idx: int,
+    ) -> Any:
+        if spec_step_idx == 0:
+            return self.model(**model_kwargs)
+        try:
+            return self.model(**model_kwargs, spec_step_idx=spec_step_idx)
+        except TypeError as err:
+            if "spec_step_idx" not in str(err):
+                raise
+            return self.model(**model_kwargs)
+
+    def _greedy_sample(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+            return self._model_get_top_tokens(hidden_states, spec_step_idx)
+        return self._model_compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
 
     def _sample_from_logits(
         self,
@@ -415,10 +461,11 @@ class SpecDecodeBaseProposer:
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        spec_step_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
-            return self._greedy_sample(hidden_states), None
-        logits = self.model.compute_logits(hidden_states)
+            return self._greedy_sample(hidden_states, spec_step_idx), None
+        logits = self._model_compute_logits(hidden_states, spec_step_idx)
         return self._sample_from_logits(logits, sampling_metadata)
 
     def take_last_draft_probs(self) -> torch.Tensor | None:
@@ -494,7 +541,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**model_kwargs)
+            ret_hidden_states = self._model_forward(model_kwargs, spec_step_idx=0)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -506,7 +553,7 @@ class SpecDecodeBaseProposer:
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata
+                sample_hidden_states, sampling_metadata, spec_step_idx=0
             )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
@@ -527,7 +574,7 @@ class SpecDecodeBaseProposer:
             self.positions[:batch_size] = positions
 
         draft_token_ids, draft_probs = self._sample_draft_tokens(
-            sample_hidden_states, sampling_metadata
+            sample_hidden_states, sampling_metadata, spec_step_idx=0
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
 
@@ -605,6 +652,7 @@ class SpecDecodeBaseProposer:
                 inputs_embeds = None
 
             # Run the model.
+            spec_step_idx = token_index + 1
             model_kwargs = {
                 "input_ids": input_ids,
                 "positions": self._get_positions(input_batch_size),
@@ -621,7 +669,9 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
-                ret_hidden_states = self.model(**model_kwargs)
+                ret_hidden_states = self._model_forward(
+                    model_kwargs, spec_step_idx=spec_step_idx
+                )
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -630,7 +680,9 @@ class SpecDecodeBaseProposer:
 
             hidden_states = hidden_states[:batch_size]
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
+                last_hidden_states[:batch_size],
+                sampling_metadata,
+                spec_step_idx=spec_step_idx,
             )
             if draft_probs is not None:
                 assert draft_probs_list is not None
