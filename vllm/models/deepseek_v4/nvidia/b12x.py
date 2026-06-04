@@ -6,10 +6,9 @@ The DSV4 sparse-MLA path uses global top-k slot ids from
 ``compute_global_topk_indices_and_lens``, a SWA + indexed dual cache, paged
 per-chunk prefill, and ``attn_sink``. The leaf call goes through b12x's
 ``compressed_mla_decode_forward`` binding API (``plan_compressed_mla_scratch``
--> fresh scratch -> ``plan.bind`` in ordinary Python, then one
-``compressed_mla_decode_forward`` leaf call), matching the plan/bind style used
-by the b12x WO-projection and mHC integrations in this tree. No persistent
-workspace object is held.
+-> vLLM workspace-manager scratch -> ``plan.bind`` in ordinary Python, then one
+``compressed_mla_decode_forward`` leaf call). No persistent workspace object is
+held.
 
 DSV4 compressed-MLA contract (== upstream/DeepGEMM): q_head_dim = 448 NoPE +
 64 RoPE = 512, V = 512; the ``fp8_ds_mla`` 584 B/token page (448 NoPE fp8 +
@@ -34,6 +33,7 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.models.deepseek_v4.attention import DeepseekV4MLAAttention
@@ -271,9 +271,8 @@ def _run_compressed_mla(
             max_chunks_per_row=num_splits_cap,
         )
     )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=q.device)
-        for shape, dtype in plan.shapes_and_dtypes()
+    scratch = current_workspace_manager().get_simultaneous(
+        *plan.shapes_and_dtypes()
     )
 
     binding = plan.bind(
