@@ -8,7 +8,12 @@ export TP_SIZE="${TP_SIZE:-6}"
 
 virtual_tp_sharding="${VIRTUAL_TP_SHARDING:-b12x-padded}"
 attention_head_alignment="${B12X_VIRTUAL_TP_ATTENTION_HEAD_ALIGNMENT:-1}"
-moe_intermediate_alignment="${B12X_VIRTUAL_TP_MOE_INTERMEDIATE_ALIGNMENT:-32}"
+moe_intermediate_alignment="${B12X_VIRTUAL_TP_MOE_INTERMEDIATE_ALIGNMENT:-128}"
+
+export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.935}"
+export MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
+export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+export MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 
 exec "${SCRIPT_DIR}/serve-glm51.sh" \
   --virtual-tp-sharding "${virtual_tp_sharding}" \

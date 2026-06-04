@@ -38,12 +38,12 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 model_path="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
 served_model_name="${SERVED_MODEL_NAME:-DeepSeek-V4-Flash}"
-tp_size="${TP_SIZE:-4}"
+tp_size="${TP_SIZE:-2}"
 dcp_size="${DCP_SIZE:-1}"
 dcp_comm_backend="${DCP_COMM_BACKEND:-a2a}"
 port="${PORT:-8000}"
-gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.85}"
-max_model_len="${MAX_MODEL_LEN:-65536}"
+gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.875}"
+max_model_len="${MAX_MODEL_LEN:-130000}"
 max_num_seqs="${MAX_NUM_SEQS:-16}"
 max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-4096}"
 max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-4096}"
@@ -73,7 +73,7 @@ if [[ "${VLLM_ENABLE_TORCH_PROFILER:-0}" == "1" ]]; then
 fi
 
 spec_args=()
-if [[ "${VLLM_ENABLE_MTP:-0}" == "1" ]]; then
+if [[ "${VLLM_ENABLE_MTP:-1}" == "1" ]]; then
   spec_args=('--speculative-config' '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":true}')
 fi
 
