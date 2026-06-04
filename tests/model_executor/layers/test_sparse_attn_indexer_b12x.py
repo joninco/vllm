@@ -578,21 +578,163 @@ def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
     assert ((2, q_rows, topk), torch.int32) in workspace_manager.specs
 
 
-def test_b12x_extend_profile_rows_follow_logits_budget(monkeypatch):
-    monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+class _RecordingWorkspaceManager:
+    """FakeWorkspaceManager that retains every get_simultaneous call.
 
-    assert (
-        indexer_mod._get_b12x_indexer_extend_profile_q_rows(
-            q_rows=65536,
-            total_seq_lens=5_242_880,
+    Mirrors WorkspaceManager.get_simultaneous's lock semantics enough to verify
+    the sweep reserve grows the workspace past every (q, k) point it visits.
+    """
+
+    def __init__(self) -> None:
+        self.spec_log: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
+        self.specs: tuple[tuple[tuple[int, ...], torch.dtype], ...] | None = None
+
+    def get_simultaneous(
+        self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> list[torch.Tensor]:
+        self.spec_log.append(shapes_and_dtypes)
+        self.specs = shapes_and_dtypes
+        return [
+            torch.empty(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes
+        ]
+
+
+def _spec_bytes(specs: tuple[tuple[tuple[int, ...], torch.dtype], ...]) -> int:
+    """256-aligned sum of tensor bytes (mirrors WorkspaceManager sizing)."""
+    total = 0
+    for shape, dtype in specs:
+        elems = 1
+        for d in shape:
+            elems *= int(d)
+        actual = elems * torch.tensor([], dtype=dtype).element_size()
+        total += (actual + 255) & ~255
+    return total
+
+
+def _record_extend_buffer_calls(monkeypatch) -> list[tuple[int, int, int]]:
+    """Replace _get_b12x_indexer_extend_buffers with a recorder that captures
+    the (q_rows, k_rows, max_k_rows) the sweep hands it."""
+    calls: list[tuple[int, int, int]] = []
+    real_fn = indexer_mod._get_b12x_indexer_extend_buffers
+
+    def recording_fn(*, q_fp8, total_seq_lens, max_k_rows=None, **kwargs):
+        calls.append(
+            (int(q_fp8.shape[0]), int(total_seq_lens), int(max_k_rows or 0))
         )
-        == 25
+        return real_fn(
+            q_fp8=q_fp8,
+            total_seq_lens=total_seq_lens,
+            max_k_rows=max_k_rows,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        indexer_mod, "_get_b12x_indexer_extend_buffers", recording_fn
+    )
+    return calls
+
+
+def test_b12x_extend_profile_sweep_includes_q_cap_and_bin_lower_edge(monkeypatch):
+    """Sweep must cover both q_cap and the rounding-adversary q in the same
+    BLOCK_Q bin so workspaces sized for lower-q + higher-k chunks are reserved."""
+    fake_calls: list[tuple] = []
+    _install_fake_b12x_indexer(monkeypatch, fake_calls)
+    manager = _RecordingWorkspaceManager()
+    monkeypatch.setattr(indexer_mod, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+    sweep_calls = _record_extend_buffer_calls(monkeypatch)
+
+    q_cap = 8192
+    q_quant = torch.empty((q_cap, 64, 128), dtype=torch.uint8)
+
+    indexer_mod._reserve_b12x_indexer_extend_worst_case(
+        q_quant=q_quant,
+        topk_tokens=2048,
+        head_dim=128,
+        fp8_dtype=torch.uint8,
+        max_model_len=393_216,
     )
 
-    assert (
-        indexer_mod._get_b12x_indexer_extend_profile_q_rows(
-            q_rows=65536,
-            total_seq_lens=65_536,
+    qs_visited = {q for q, _, _ in sweep_calls}
+    block_q = indexer_mod._B12X_INDEXER_EXTEND_BLOCK_Q
+    nq_max = (q_cap + block_q - 1) // block_q
+    q_lo = (nq_max - 1) * block_q + 1
+    assert q_cap in qs_visited
+    assert q_lo in qs_visited
+
+
+def test_b12x_extend_profile_sweep_skips_invariant_violators(monkeypatch):
+    """Sweep must drop (q, k) pairs that violate the chunker's q*k <= E
+    invariant; reserving past it would massively over-allocate workspace."""
+    fake_calls: list[tuple] = []
+    _install_fake_b12x_indexer(monkeypatch, fake_calls)
+    manager = _RecordingWorkspaceManager()
+    monkeypatch.setattr(indexer_mod, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+    max_logits_elems = 512 * 1024 * 1024 // 4
+    sweep_calls = _record_extend_buffer_calls(monkeypatch)
+
+    q_cap = 16384
+    q_quant = torch.empty((q_cap, 64, 128), dtype=torch.uint8)
+
+    indexer_mod._reserve_b12x_indexer_extend_worst_case(
+        q_quant=q_quant,
+        topk_tokens=2048,
+        head_dim=128,
+        fp8_dtype=torch.uint8,
+        max_model_len=393_216,
+    )
+
+    assert sweep_calls
+    for q, k, _ in sweep_calls:
+        assert q * k <= max_logits_elems, (
+            f"sweep reserved invariant-violating shape (q={q}, k={k}, "
+            f"q*k={q * k} > E={max_logits_elems})"
         )
-        == 2048
+        assert k <= 393_216
+
+
+def test_b12x_extend_profile_sweep_covers_rounding_adversary_peak(monkeypatch):
+    """At q_cap > E/SUPERTILE_K the workspace peak lives at q_lo paired with a
+    k that bumps num_k_tiles past q_cap's allocation. Sweep must touch the
+    high-water bytes; single-point reserve at (q_cap, E//q_cap) misses it."""
+    fake_calls: list[tuple] = []
+    _install_fake_b12x_indexer(monkeypatch, fake_calls)
+    manager = _RecordingWorkspaceManager()
+    monkeypatch.setattr(indexer_mod, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+
+    q_cap = 16384
+    q_quant = torch.empty((q_cap, 64, 128), dtype=torch.uint8)
+    max_model_len = 393_216
+
+    indexer_mod._reserve_b12x_indexer_extend_worst_case(
+        q_quant=q_quant,
+        topk_tokens=2048,
+        head_dim=128,
+        fp8_dtype=torch.uint8,
+        max_model_len=max_model_len,
+    )
+
+    sweep_peak = max(_spec_bytes(spec) for spec in manager.spec_log)
+
+    # Reference: bytes a single-point reserve at (q_cap, E // q_cap) would size.
+    manager_single = _RecordingWorkspaceManager()
+    monkeypatch.setattr(
+        indexer_mod, "current_workspace_manager", lambda: manager_single
+    )
+    max_logits_elems = 512 * 1024 * 1024 // 4
+    indexer_mod._get_b12x_indexer_extend_buffers(
+        q_fp8=q_quant[:q_cap],
+        topk_tokens=2048,
+        total_seq_lens=max(1, min(max_model_len, max_logits_elems // q_cap)),
+        head_dim=128,
+        fp8_dtype=torch.uint8,
+        max_k_rows=max_model_len,
+    )
+    single_point = _spec_bytes(manager_single.spec_log[-1])
+
+    assert sweep_peak > single_point, (
+        "sweep reservation must exceed naive single-point reserve "
+        f"(sweep={sweep_peak}, single={single_point})"
     )
