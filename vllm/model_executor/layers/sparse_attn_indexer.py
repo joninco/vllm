@@ -11,11 +11,11 @@ import torch
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -193,7 +193,6 @@ def _get_b12x_indexer_extend_buffers(
         prefill_block_k,
     )
     supertile_tiles = max(1, supertile_k // prefill_block_k)
-    num_chunks = _ceil_div(num_k_tiles, supertile_tiles)
     max_chunk_tiles = min(supertile_tiles, num_k_tiles)
     tile_elements = max(
         1,
@@ -224,8 +223,8 @@ def _get_b12x_indexer_extend_buffers(
         ((q_rows,), torch.int32),
         ((q_rows, topk_tokens), torch.float32),
         ((q_rows, topk_tokens), torch.int32),
-        ((max(num_chunks, 1), q_rows, topk_tokens), torch.float32),
-        ((max(num_chunks, 1), q_rows, topk_tokens), torch.int32),
+        ((2, q_rows, topk_tokens), torch.float32),
+        ((2, q_rows, topk_tokens), torch.int32),
         ((q_rows, topk_tokens), torch.int64),
     )
     return (
@@ -235,10 +234,73 @@ def _get_b12x_indexer_extend_buffers(
         lengths[:q_rows],
         topk_values[:q_rows, :topk_tokens],
         topk_indices[:q_rows, :topk_tokens],
-        candidate_values[: max(num_chunks, 1), :q_rows, :topk_tokens],
-        candidate_indices[: max(num_chunks, 1), :q_rows, :topk_tokens],
+        candidate_values[:, :q_rows, :topk_tokens],
+        candidate_indices[:, :q_rows, :topk_tokens],
         merge_positions[:q_rows, :topk_tokens],
     )
+
+
+def _normalize_b12x_indexer_weights(
+    weights: torch.Tensor,
+    *,
+    q_rows: int,
+    num_heads: int,
+) -> torch.Tensor:
+    if weights.ndim == 3:
+        if int(weights.shape[2]) != 1:
+            raise RuntimeError(
+                "b12x extend indexer expected rank-3 weights to have "
+                f"trailing dimension 1, got {tuple(weights.shape)}."
+            )
+        weights = weights.squeeze(2)
+    if weights.ndim != 2:
+        raise RuntimeError(
+            "b12x extend indexer expected weights rank 2 or 3, "
+            f"got {weights.ndim}."
+        )
+    if weights.shape != (q_rows, num_heads):
+        raise RuntimeError(
+            "b12x extend indexer expected weights shape "
+            f"{(q_rows, num_heads)}, got {tuple(weights.shape)}."
+        )
+    return weights.to(torch.float32)
+
+
+@triton.jit
+def _normalize_prefill_topk_to_req_relative_kernel(
+    topk_indices_ptr,
+    cu_seq_lens_ptr,
+    token_to_seq_ptr,
+    topk_cols,
+    num_elems,
+    topk_stride_0,
+    topk_stride_1,
+    token_to_seq_len,
+    num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_elems
+    rows = offsets // topk_cols
+    cols = offsets - rows * topk_cols
+    topk_ptrs = topk_indices_ptr + rows * topk_stride_0 + cols * topk_stride_1
+
+    packed_indices = tl.load(topk_ptrs, mask=mask, other=-1)
+    valid_indices = mask & (packed_indices >= 0) & (
+        packed_indices < token_to_seq_len
+    )
+    seq_ids = tl.load(
+        token_to_seq_ptr + packed_indices,
+        mask=valid_indices,
+        other=0,
+    )
+    valid_seq_ids = valid_indices & (seq_ids >= 0) & (seq_ids < num_reqs)
+    seq_starts = tl.load(
+        cu_seq_lens_ptr + seq_ids,
+        mask=valid_seq_ids,
+        other=0,
+    )
+    tl.store(topk_ptrs, packed_indices - seq_starts, mask=valid_seq_ids)
 
 
 def _normalize_prefill_topk_to_req_relative(
@@ -247,7 +309,30 @@ def _normalize_prefill_topk_to_req_relative(
     """Convert packed prefill offsets to per-request token offsets."""
     cu_seq_lens = getattr(chunk, "cu_seq_lens", None)
     token_to_seq = getattr(chunk, "token_to_seq", None)
-    if cu_seq_lens is None or token_to_seq is None or cu_seq_lens.numel() <= 2:
+    if (
+        cu_seq_lens is None
+        or token_to_seq is None
+        or cu_seq_lens.numel() <= 2
+        or token_to_seq.numel() == 0
+        or topk_indices.numel() == 0
+    ):
+        return
+
+    if topk_indices.is_cuda:
+        block_size = 1024
+        grid = (triton.cdiv(topk_indices.numel(), block_size),)
+        _normalize_prefill_topk_to_req_relative_kernel[grid](
+            topk_indices,
+            cu_seq_lens,
+            token_to_seq,
+            topk_indices.shape[1],
+            topk_indices.numel(),
+            topk_indices.stride(0),
+            topk_indices.stride(1),
+            token_to_seq.numel(),
+            cu_seq_lens.numel() - 1,
+            BLOCK_SIZE=block_size,
+        )
         return
 
     valid = topk_indices >= 0
@@ -256,6 +341,212 @@ def _normalize_prefill_topk_to_req_relative(
     seq_starts = cu_seq_lens[seq_ids]
     normalized = topk_indices - seq_starts
     topk_indices.copy_(torch.where(valid, normalized, topk_indices))
+
+
+def _run_b12x_extend_tiled_topk_streaming(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    kv_fp8: tuple[torch.Tensor, torch.Tensor],
+    metadata: Any,
+    topk: int,
+    contract_phantoms: dict[str, torch.Tensor] | None,
+    workspace: Any,
+    tile_logits: torch.Tensor,
+    lengths: torch.Tensor,
+    output_values: torch.Tensor,
+    output_indices: torch.Tensor,
+    candidate_values: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    merge_positions: torch.Tensor,
+    supertile_k: int,
+) -> torch.Tensor:
+    from b12x.attention.indexer import resolve_extend_prefill_block_k
+    from b12x.attention.indexer.extend_kernel import (
+        run_extend_logits_kernel,
+        supports_extend_logits_kernel,
+    )
+    from b12x.attention.indexer.tiled_topk import (
+        merge_tiled_topk_candidates,
+        run_tiled_topk,
+    )
+
+    if q_fp8.ndim != 3:
+        raise RuntimeError(
+            "b12x extend indexer expected q_fp8 rank 3, "
+            f"got {q_fp8.ndim}."
+        )
+    k_start = metadata.k_start
+    k_end = metadata.k_end
+    if k_start.ndim != 1 or k_end.ndim != 1 or k_start.shape != k_end.shape:
+        raise RuntimeError(
+            "b12x extend indexer requires matching rank-1 k_start/k_end, "
+            f"got {tuple(k_start.shape)} and {tuple(k_end.shape)}."
+        )
+
+    topk = int(topk)
+    num_q_rows = int(k_start.shape[0])
+    num_heads = int(q_fp8.shape[1])
+    weights_f = _normalize_b12x_indexer_weights(
+        weights, q_rows=int(q_fp8.shape[0]), num_heads=num_heads
+    )
+    k_quant, k_scale = kv_fp8
+
+    if not supports_extend_logits_kernel(
+        q_fp8=q_fp8,
+        weights=weights_f,
+        k_quant=k_quant,
+        k_scale=k_scale,
+        k_start=k_start,
+        k_end=k_end,
+    ):
+        from b12x.attention.indexer.api import _reference_topk_indices_from_logits
+        from b12x.attention.indexer.reference import extend_logits_reference
+
+        torch.sub(k_end, k_start, out=lengths[:num_q_rows])
+        logits = extend_logits_reference(
+            q_fp8=q_fp8,
+            weights=weights_f,
+            kv_fp8=kv_fp8,
+            k_start=k_start,
+            k_end=k_end,
+        )
+        return _reference_topk_indices_from_logits(
+            logits[:num_q_rows],
+            topk=topk,
+            output_values=output_values,
+            output_indices=output_indices,
+        )
+
+    prefill_block_k = resolve_extend_prefill_block_k(
+        valid_q_rows=num_q_rows,
+        k_rows=int(k_quant.shape[0]),
+        num_heads=num_heads,
+    )
+    if prefill_block_k is None:
+        prefill_block_k = _B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K
+    prefill_block_k = int(prefill_block_k)
+    block_q = _B12X_INDEXER_EXTEND_BLOCK_Q
+    num_q_tiles = _ceil_div(num_q_rows, block_q)
+    num_k_tiles = _ceil_div(int(k_quant.shape[0]), prefill_block_k)
+    tile_size = block_q * prefill_block_k
+    resolved_supertile_k = _round_up_to_multiple(
+        max(int(supertile_k), prefill_block_k),
+        prefill_block_k,
+    )
+    supertile_tiles = max(1, resolved_supertile_k // prefill_block_k)
+    num_chunks = _ceil_div(num_k_tiles, supertile_tiles)
+    max_chunk_tiles = min(supertile_tiles, num_k_tiles)
+    chunk_tile_elements = num_q_tiles * max_chunk_tiles * tile_size
+    if int(tile_logits.numel()) < chunk_tile_elements:
+        raise RuntimeError(
+            "b12x extend indexer tile_logits scratch is too small: "
+            f"{int(tile_logits.numel())} elements for {chunk_tile_elements}."
+        )
+
+    if lengths.ndim != 1 or int(lengths.shape[0]) < num_q_rows:
+        raise RuntimeError(
+            "b12x extend indexer lengths scratch has shape "
+            f"{tuple(lengths.shape)}, expected at least ({num_q_rows},)."
+        )
+    global_lengths = lengths[:num_q_rows]
+    torch.sub(k_end, k_start, out=global_lengths)
+
+    if num_chunks <= 1:
+        tile_logits[:chunk_tile_elements].fill_(float("-inf"))
+        run_extend_logits_kernel(
+            q_fp8=q_fp8,
+            weights=weights_f,
+            k_quant=k_quant,
+            k_scale=k_scale,
+            k_start=k_start,
+            k_end=k_end,
+            contract_phantoms=contract_phantoms,
+            workspace=workspace,
+            preinitialize_invalid_logits=True,
+            tile_logits=tile_logits,
+            tile_k_offset=0,
+            tile_num_k_tiles=num_k_tiles,
+        )
+        _, topk_indices = run_tiled_topk(
+            tile_logits=tile_logits,
+            k_start=k_start,
+            lengths=global_lengths,
+            topk=topk,
+            block_q=block_q,
+            block_k=prefill_block_k,
+            output_values=output_values,
+            output_indices=output_indices,
+            num_k_tiles=num_k_tiles,
+            contract_phantoms=contract_phantoms,
+        )
+        return topk_indices
+
+    expected_candidate_shape = (2, num_q_rows, topk)
+    if (
+        tuple(candidate_values.shape) != expected_candidate_shape
+        or tuple(candidate_indices.shape) != expected_candidate_shape
+    ):
+        raise RuntimeError(
+            "b12x extend indexer streaming candidates must have fixed shape "
+            f"{expected_candidate_shape}, got {tuple(candidate_values.shape)} "
+            f"and {tuple(candidate_indices.shape)}."
+        )
+
+    for chunk_idx in range(num_chunks):
+        chunk_tile_begin = chunk_idx * supertile_tiles
+        chunk_tile_end = min(chunk_tile_begin + supertile_tiles, num_k_tiles)
+        chunk_tiles = chunk_tile_end - chunk_tile_begin
+        chunk_start = chunk_tile_begin * prefill_block_k
+        chunk_rows = chunk_tiles * prefill_block_k
+        chunk_elements = num_q_tiles * chunk_tiles * tile_size
+
+        tile_logits[:chunk_elements].fill_(float("-inf"))
+        run_extend_logits_kernel(
+            q_fp8=q_fp8,
+            weights=weights_f,
+            k_quant=k_quant,
+            k_scale=k_scale,
+            k_start=k_start,
+            k_end=k_end,
+            contract_phantoms=contract_phantoms,
+            workspace=workspace,
+            preinitialize_invalid_logits=True,
+            tile_logits=tile_logits,
+            tile_k_offset=chunk_tile_begin,
+            tile_num_k_tiles=chunk_tiles,
+        )
+        candidate_slot = 0 if chunk_idx == 0 else 1
+        run_tiled_topk(
+            tile_logits=tile_logits,
+            k_start=k_start,
+            lengths=global_lengths,
+            topk=topk,
+            block_q=block_q,
+            block_k=prefill_block_k,
+            output_values=candidate_values[candidate_slot],
+            output_indices=candidate_indices[candidate_slot],
+            num_k_tiles=chunk_tiles,
+            input_index_offset=chunk_start,
+            input_extent=chunk_rows,
+            output_index_offset=chunk_start,
+            contract_phantoms=contract_phantoms,
+        )
+        if chunk_idx == 0:
+            continue
+
+        merge_tiled_topk_candidates(
+            candidate_values=candidate_values,
+            candidate_indices=candidate_indices,
+            topk=topk,
+            output_values=output_values,
+            output_indices=output_indices,
+            merge_positions=merge_positions,
+        )
+        candidate_values[0].copy_(output_values)
+        candidate_indices[0].copy_(output_indices)
+
+    return output_indices
 
 
 def _flatten_b12x_paged_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
@@ -299,166 +590,21 @@ def _run_b12x_decode_topk(
     schedule_metadata: torch.Tensor | None,
     topk_indices: torch.Tensor,
     topk_tokens: int,
+    active_width: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    from b12x.attention.indexer.kernel import run_paged_windowed_tiled_logits_kernel
-    from b12x.attention.indexer.tiled_topk import (
-        merge_tiled_topk_candidates,
-        run_tiled_topk,
-    )
-    from b12x.integration.indexer import uses_paged_mqa_schedule
+    """Unified b12x indexer decode top-k for both DSV4 and GLM.
 
-    if q_fp8.ndim != 3:
-        raise RuntimeError(
-            "b12x decode indexer expected q_fp8 rank 3, "
-            f"got {q_fp8.ndim}."
-        )
-    q_rows = int(q_fp8.shape[0])
-    page_table_width = int(block_table.shape[1])
-    page_size = _B12X_COMPRESSED_INDEX_PAGE_SIZE
-    if q_rows == 0 or page_table_width == 0:
-        topk_indices.fill_(-1)
-        return topk_indices
-
-    index_k_cache = _flatten_b12x_paged_index_cache(kv_cache)
-    weights = (
-        weights.squeeze(2).contiguous()
-        if weights.ndim == 3 and int(weights.shape[2]) == 1
-        else weights.contiguous()
-    )
-    if weights.shape != (q_rows, int(q_fp8.shape[1])):
-        raise RuntimeError(
-            "b12x decode indexer expected weights shape "
-            f"{(q_rows, int(q_fp8.shape[1]))}, got {tuple(weights.shape)}."
-        )
-
-    supertile_tokens = _round_up_to_multiple(
-        max(
-            int(_B12X_DECODE_TOPK_SUPERTILE_K),
-            _B12X_INDEXER_DECODE_BLOCK_K,
-        ),
-        _B12X_INDEXER_DECODE_BLOCK_K,
-    )
-    supertile_pages = max(1, supertile_tokens // page_size)
-    supertile_k_tiles = supertile_tokens // _B12X_INDEXER_DECODE_BLOCK_K
-    num_chunks = max(1, _ceil_div(page_table_width, supertile_pages))
-    if uses_paged_mqa_schedule(q_rows=q_rows, max_pages=supertile_pages):
-        raise RuntimeError(
-            "b12x GLM sparse indexer supertile top-k requires an unscheduled "
-            "paged scorer tile; reduce VLLM_B12X_NSA_DECODE_TOPK_SUPERTILE_K "
-            f"below {supertile_tokens} tokens."
-        )
-
-    num_q_tiles = _ceil_div(q_rows, _B12X_INDEXER_DECODE_BLOCK_Q)
-    tile_elements = max(
-        1,
-        num_q_tiles
-        * supertile_k_tiles
-        * _B12X_INDEXER_DECODE_BLOCK_Q
-        * _B12X_INDEXER_DECODE_BLOCK_K,
-    )
-    topk_tokens = int(topk_tokens)
-
-    workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
-        ((1,), torch.int32),
-        ((tile_elements,), torch.float32),
-        ((q_rows, topk_tokens), torch.float32),
-    ]
-    if num_chunks > 1:
-        workspace_specs.extend(
-            (
-                ((num_chunks, q_rows, topk_tokens), torch.float32),
-                ((num_chunks, q_rows, topk_tokens), torch.int32),
-                ((q_rows, topk_tokens), torch.int64),
-            )
-        )
-    workspace = current_workspace_manager().get_simultaneous(*workspace_specs)
-    active_width = workspace[0]
-    tile_logits = workspace[1]
-    topk_values = workspace[2]
-    candidate_values = candidate_indices = merge_positions = None
-    if num_chunks > 1:
-        candidate_values = workspace[3]
-        candidate_indices = workspace[4]
-        merge_positions = workspace[5]
-
-    width_tokens = page_table_width * page_size
-    torch.amax(seq_lens, dim=0, keepdim=True, out=active_width)
-    active_width.clamp_(min=0, max=width_tokens)
-
-    for chunk_idx in range(num_chunks):
-        page_begin = chunk_idx * supertile_pages
-        page_end = min(page_begin + supertile_pages, page_table_width)
-        chunk_pages = page_end - page_begin
-        chunk_width_tokens = chunk_pages * page_size
-        chunk_start_token = page_begin * page_size
-
-        run_paged_windowed_tiled_logits_kernel(
-            q_fp8=q_fp8,
-            weights=weights,
-            index_k_cache=index_k_cache,
-            real_page_table=block_table,
-            seqlens_per_query=seq_lens,
-            active_width=active_width,
-            tile_logits=tile_logits,
-            source_page_offset=page_begin,
-            output_width_tokens=supertile_tokens,
-            page_size=page_size,
-            tile_block_q=_B12X_INDEXER_DECODE_BLOCK_Q,
-            tile_block_k=_B12X_INDEXER_DECODE_BLOCK_K,
-            workspace=None,
-            preinitialize_tile_logits=False,
-            stage_runtime_metadata=False,
-        )
-
-        out_values = topk_values
-        out_indices = topk_indices
-        if candidate_values is not None and candidate_indices is not None:
-            out_values = candidate_values[chunk_idx]
-            out_indices = candidate_indices[chunk_idx]
-        run_tiled_topk(
-            tile_logits=tile_logits,
-            k_start=None,
-            lengths=seq_lens,
-            topk=topk_tokens,
-            block_q=_B12X_INDEXER_DECODE_BLOCK_Q,
-            block_k=_B12X_INDEXER_DECODE_BLOCK_K,
-            output_values=out_values,
-            output_indices=out_indices,
-            num_k_tiles=supertile_k_tiles,
-            input_index_offset=chunk_start_token,
-            input_extent=chunk_width_tokens,
-            output_index_offset=chunk_start_token,
-            zero_row_start=True,
-        )
-
-    if candidate_values is not None and candidate_indices is not None:
-        _, result = merge_tiled_topk_candidates(
-            candidate_values=candidate_values,
-            candidate_indices=candidate_indices,
-            topk=topk_tokens,
-            output_values=topk_values,
-            output_indices=topk_indices,
-            merge_positions=merge_positions,
-        )
-        return result
-    return topk_indices
-
-
-def _run_b12x_compressed_decode_topk(
-    *,
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    kv_cache: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    schedule_metadata: torch.Tensor | None,
-    topk_indices: torch.Tensor,
-    topk_tokens: int,
-) -> torch.Tensor:
+    Both compression modes read the identical page-64 FP8+scale index cache, so
+    one b12x-orchestrated entry serves both: b12x sizes the scratch
+    (plan_compressed_indexer_scratch), vLLM allocates it (get_simultaneous), and
+    index_topk_fp8 owns the internal scorer/top-k routing. ``active_width`` is
+    the builder-computed live window (a metadata tensor, not an in-kernel
+    reduction); when None, b12x falls back to the capacity cap.
+    """
     from b12x.integration.compressed_indexer import (
         COMPRESSED_INDEX_PAGE_SIZE,
         B12XCompressedIndexerScratchCaps,
-        compressed_index_decode_supertile_fp8,
+        index_topk_fp8,
         plan_compressed_indexer_scratch,
     )
 
@@ -488,10 +634,11 @@ def _run_b12x_compressed_decode_topk(
         scratch=scratch,
         real_page_table=block_table,
         cache_seqlens_int32=seq_lens,
+        active_width=active_width,
         schedule_metadata=schedule_metadata,
         expected_num_q_heads=expected_num_q_heads,
     )
-    return compressed_index_decode_supertile_fp8(
+    return index_topk_fp8(
         q_fp8=q_fp8,
         weights=weights,
         index_k_cache=index_k_cache,
@@ -502,7 +649,6 @@ def _run_b12x_compressed_decode_topk(
     )
 
 
-@eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -551,12 +697,14 @@ def sparse_attn_indexer(
                 values_spec, scales_spec, ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8)
             )
 
-        # Dummy allocation to simulate for peak logits tensor memory during inference.
-        # FP8 elements so elements == bytes
-        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-        _ = torch.empty(
-            max_logits_elems, dtype=torch.uint8, device=hidden_states.device
-        )
+            # Dummy allocation to simulate peak logits tensor memory during
+            # inference. The B12X path above streams one supertile at a time and
+            # has already reserved its fixed scratch via the workspace manager.
+            # FP8 elements so elements == bytes.
+            max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            _ = torch.empty(
+                max_logits_elems, dtype=torch.uint8, device=hidden_states.device
+            )
 
         return sparse_attn_indexer_fake(
             hidden_states,
@@ -705,7 +853,7 @@ def sparse_attn_indexer(
                     else k_quant
                 )
                 topk_indices.copy_(
-                    b12x_indexer.extend_tiled_topk(
+                    _run_b12x_extend_tiled_topk_streaming(
                         q_fp8=q_slice,
                         weights=weights_slice,
                         kv_fp8=(k_fp8_b12x, k_scale_f32),
@@ -819,18 +967,18 @@ def sparse_attn_indexer(
             seq_lens = b12x_seq_lens[:num_decode_tokens]
             block_table = b12x_block_table[:num_decode_tokens]
             topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
-            decode_fn = (
-                _run_b12x_compressed_decode_topk
-                if decode_metadata.compress_ratio > 1
-                else _run_b12x_decode_topk
-            )
-            decode_fn(
+            # One unified b12x decode path for both DSV4 (compress_ratio>1) and
+            # GLM (compress_ratio==1): the kernel byte layout is identical, so
+            # compress_ratio only shapes the seq_lens/active_width the builder
+            # already prepared. b12x owns the scorer/top-k routing internally.
+            _run_b12x_decode_topk(
                 q_fp8=q_quant[:num_decode_tokens].contiguous(),
                 weights=weights[:num_decode_tokens].contiguous(),
                 kv_cache=kv_cache,
                 seq_lens=seq_lens,
                 block_table=block_table,
                 schedule_metadata=decode_metadata.schedule_metadata,
+                active_width=decode_metadata.active_width,
                 topk_indices=topk_indices,
                 topk_tokens=topk_tokens,
             )
