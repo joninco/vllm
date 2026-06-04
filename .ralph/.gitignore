@@ -1,0 +1,4 @@
+# Ralph ephemera. Specs and prompts are tracked; planning state and
+# the loop script are not (they're tooling for this rebase only).
+IMPLEMENTATION_PLAN.md
+loop.sh
