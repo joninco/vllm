@@ -99,7 +99,7 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --tensor-parallel-size "${tp_size}" \
   "${dcp_args[@]}" \
   --virtual-tp-sharding b12x-padded \
-  --b12x-virtual-tp-moe-intermediate-alignment 32 \
+  --b12x-virtual-tp-moe-intermediate-alignment 128 \
   --moe-backend b12x \
   --linear-backend b12x \
   --gpu-memory-utilization "${gpu_memory_utilization}" \
