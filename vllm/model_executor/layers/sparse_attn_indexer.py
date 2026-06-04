@@ -64,14 +64,68 @@ def _round_up_to_multiple(x: int, y: int) -> int:
     return _ceil_div(x, y) * int(y)
 
 
-def _get_b12x_indexer_extend_profile_q_rows(
-    q_rows: int,
-    total_seq_lens: int,
-) -> int:
-    """Return the largest q chunk the real prefill chunker can hand to b12x."""
+def _reserve_b12x_indexer_extend_worst_case(
+    *,
+    q_quant: torch.Tensor,
+    topk_tokens: int,
+    head_dim: int,
+    fp8_dtype: torch.dtype,
+    max_model_len: int,
+) -> None:
+    """Sweep the chunker envelope and reserve worst-case extend-prefill scratch.
+
+    The prefill chunker enforces ``q_rows * k_rows <= max_logits_elems`` per
+    chunk and ``k_rows <= max_k_rows``. Inside that envelope ``tile_logits``
+    scratch grows as ``ceil(q/BLOCK_Q)*BLOCK_Q * min(SUPERTILE_K, k_padded)``
+    while the topk arrays scale linearly with ``q``. Sizing once at a single
+    ``(q_cap, max_logits_elems // q_cap)`` point is exact only when
+    ``q_cap * SUPERTILE_K <= max_logits_elems`` — past that, the q*k budget
+    saturates and rounding lets ``(q_cap - BLOCK_Q + 1, k_budget_for_that_q)``
+    peak above the q_cap point by up to ~30 MB (one extra k-tile bin per
+    q-tile). We sweep both q (q_cap and the same ceil(q/BLOCK_Q) bin's lower
+    edge) and k (geometric sweep plus SUPERTILE_K, the q*k=E saturation
+    boundary, and max_model_len) and call _get_b12x_indexer_extend_buffers at
+    each valid point so the workspace manager keeps the true envelope max
+    before lock_workspace().
+    """
+    q_cap = max(1, int(q_quant.shape[0]))
     max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
-    max_q_rows = max(1, max_logits_elems // max(1, int(total_seq_lens)))
-    return min(max(1, int(q_rows)), max_q_rows)
+    supertile_k = max(
+        int(_B12X_EXTEND_TOPK_SUPERTILE_K),
+        _B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K,
+    )
+
+    nq_max = _ceil_div(q_cap, _B12X_INDEXER_EXTEND_BLOCK_Q)
+    q_lo = max(1, (nq_max - 1) * _B12X_INDEXER_EXTEND_BLOCK_Q + 1)
+    q_set = sorted({q_cap, q_lo})
+
+    base_ks: set[int] = {supertile_k, int(max_model_len)}
+    kk = 1
+    while kk <= max_model_len:
+        base_ks.add(kk)
+        kk *= 2
+
+    for q in q_set:
+        if q < 1 or q > q_cap:
+            continue
+        k_budget = max(1, max_logits_elems // q)
+        k_hi = min(int(max_model_len), k_budget)
+        ks = set(base_ks)
+        ks.add(k_budget)
+        ks.add(k_hi)
+        for k in sorted(ks):
+            if k < 1 or k > max_model_len:
+                continue
+            if q * k > max_logits_elems:
+                continue
+            _get_b12x_indexer_extend_buffers(
+                q_fp8=q_quant[:q],
+                topk_tokens=topk_tokens,
+                total_seq_lens=k,
+                head_dim=head_dim,
+                fp8_dtype=fp8_dtype,
+                max_k_rows=max_model_len,
+            )
 
 
 def _b12x_sparse_indexer_requested(enabled: bool | None = None) -> bool:
@@ -684,17 +738,12 @@ def sparse_attn_indexer(
         )
         if _b12x_sparse_indexer_requested(use_b12x_sparse_indexer):
             _ensure_b12x_sparse_indexer_supported()
-            profile_q_rows = _get_b12x_indexer_extend_profile_q_rows(
-                int(q_quant.shape[0]),
-                total_seq_lens,
-            )
-            _get_b12x_indexer_extend_buffers(
-                q_fp8=q_quant[:profile_q_rows],
+            _reserve_b12x_indexer_extend_worst_case(
+                q_quant=q_quant,
                 topk_tokens=topk_tokens,
-                total_seq_lens=total_seq_lens,
                 head_dim=head_dim,
                 fp8_dtype=fp8_dtype,
-                max_k_rows=max_model_len,
+                max_model_len=max_model_len,
             )
         else:
             # Reserve workspace for indexer during profiling run.
