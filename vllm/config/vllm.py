@@ -856,6 +856,9 @@ class VllmConfig:
         self.try_verify_and_update_config()
 
         if self.model_config is not None:
+            from vllm.config.virtual_tp import maybe_apply_b12x_virtual_tp_padding
+
+            maybe_apply_b12x_virtual_tp_padding(self)
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
 

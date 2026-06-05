@@ -450,6 +450,29 @@ def test_attention_config():
         engine_args.create_engine_config()
 
 
+def test_virtual_tp_sharding_cli_alias():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args(
+        [
+            "--virtual-tp-sharding",
+            "b12x-padded",
+            "--b12x-virtual-tp-attention-head-alignment",
+            "16",
+            "--b12x-virtual-tp-moe-intermediate-alignment",
+            "128",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.virtual_tp_sharding == "b12x-padded"
+    assert engine_args.b12x_virtual_tp_attention_head_alignment == 16
+    assert engine_args.b12x_virtual_tp_moe_intermediate_alignment == 128
+
+    args = parser.parse_args(["--b12x-allow-odd-tp"])
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.virtual_tp_sharding == "b12x-padded"
+
+
 def test_prefix_cache_default():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args([])
