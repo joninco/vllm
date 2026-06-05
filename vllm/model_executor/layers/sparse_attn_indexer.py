@@ -2,21 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+from importlib import import_module
+from typing import Any
+
 import torch
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import (
-    fp8_fp4_mqa_logits,
-    fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
-)
+from vllm.triton_utils import tl, triton
+from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -29,12 +28,77 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
-logger = init_logger(__name__)
-
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+_B12X_COMPRESSED_INDEX_PAGE_SIZE = 64
+_B12X_COMPRESSED_INDEX_HEAD_DIM = 128
+_B12X_COMPRESSED_INDEX_SCALE_BYTES = 4
+_B12X_COMPRESSED_INDEX_PAGE_WIDTH = _B12X_COMPRESSED_INDEX_PAGE_SIZE * (
+    _B12X_COMPRESSED_INDEX_HEAD_DIM + _B12X_COMPRESSED_INDEX_SCALE_BYTES
+)
+_B12X_EXTEND_TOPK_SUPERTILE_K = int(
+    os.getenv("VLLM_B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "32768")
+)
+_B12X_DECODE_TOPK_SUPERTILE_K = int(
+    os.getenv(
+        "VLLM_B12X_NSA_DECODE_TOPK_SUPERTILE_K",
+        os.getenv("VLLM_B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "32768"),
+    )
+)
+_B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K = 256
+_B12X_INDEXER_DECODE_BLOCK_Q = 32
+_B12X_INDEXER_DECODE_BLOCK_K = 512
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _get_b12x_indexer_extend_profile_q_rows(
+    q_rows: int,
+    total_seq_lens: int,
+) -> int:
+    """Return the largest q chunk the real prefill chunker can hand to b12x."""
+    max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
+    max_q_rows = max(1, max_logits_elems // max(1, int(total_seq_lens)))
+    return min(max(1, int(q_rows)), max_q_rows)
+
+
+def _b12x_sparse_indexer_requested(enabled: bool | None = None) -> bool:
+    if enabled is not None:
+        return bool(enabled)
+
+    if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+        return True
+
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return False
+
+    backend = vllm_config.attention_config.backend
+    if isinstance(backend, str):
+        return backend == "B12X_MLA_SPARSE"
+    return getattr(backend, "name", None) == "B12X_MLA_SPARSE"
+
+
+def _ensure_b12x_sparse_indexer_supported() -> None:
+    if not current_platform.is_cuda():
+        raise RuntimeError("B12X sparse indexer/top-k requires CUDA.")
+    if not current_platform.is_device_capability_family(120):
+        raise RuntimeError(
+            "B12X sparse indexer/top-k currently requires an SM120 GPU."
+        )
+
+
+def _use_b12x_sparse_indexer(enabled: bool | None = None) -> bool:
+    if not _b12x_sparse_indexer_requested(enabled):
+        return False
+    _ensure_b12x_sparse_indexer_supported()
+    return True
+
+
+def use_b12x_sparse_indexer(enabled: bool | None = None) -> bool:
+    return _use_b12x_sparse_indexer(enabled)
 
 
 def _gather_workspace_shapes(
@@ -78,7 +142,260 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
-@eager_break_during_capture
+def _get_b12x_indexer_extend_binding(
+    *,
+    q_fp8: torch.Tensor,
+    topk_tokens: int,
+    total_seq_lens: int,
+    fp8_dtype: torch.dtype,
+    k_start: torch.Tensor | None = None,
+    k_end: torch.Tensor | None = None,
+    max_k_rows: int | None = None,
+) -> Any:
+    from b12x.integration import (
+        B12XIndexerExtendScratchCaps,
+        plan_indexer_extend_scratch,
+    )
+
+    q_rows = max(1, int(q_fp8.shape[0]))
+    k_rows = max(1, int(total_seq_lens))
+    # This is gathered-K scratch capacity for the current compressed prefill
+    # window, not a model-length reservation.
+    k_rows_cap = max(k_rows, int(max_k_rows)) if max_k_rows is not None else k_rows
+    plan = plan_indexer_extend_scratch(
+        B12XIndexerExtendScratchCaps(
+            device=q_fp8.device,
+            num_q_heads=int(q_fp8.shape[1]),
+            max_q_rows=q_rows,
+            max_k_rows=k_rows_cap,
+            topk=int(topk_tokens),
+            k_dtype=fp8_dtype,
+            supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
+            prefill_block_k=_B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K,
+        )
+    )
+    scratch = current_workspace_manager().get_simultaneous(
+        *plan.shapes_and_dtypes()
+    )
+    return plan.bind(
+        scratch=scratch,
+        k_start=k_start,
+        k_end=k_end,
+        gather_rows=k_rows,
+        topk=int(topk_tokens),
+    )
+
+
+@triton.jit
+def _normalize_prefill_topk_to_req_relative_kernel(
+    topk_indices_ptr,
+    cu_seq_lens_ptr,
+    token_to_seq_ptr,
+    topk_cols,
+    num_elems,
+    topk_stride_0,
+    topk_stride_1,
+    token_to_seq_len,
+    num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_elems
+    rows = offsets // topk_cols
+    cols = offsets - rows * topk_cols
+    topk_ptrs = topk_indices_ptr + rows * topk_stride_0 + cols * topk_stride_1
+
+    packed_indices = tl.load(topk_ptrs, mask=mask, other=-1)
+    valid_indices = mask & (packed_indices >= 0) & (
+        packed_indices < token_to_seq_len
+    )
+    seq_ids = tl.load(
+        token_to_seq_ptr + packed_indices,
+        mask=valid_indices,
+        other=0,
+    )
+    valid_seq_ids = valid_indices & (seq_ids >= 0) & (seq_ids < num_reqs)
+    seq_starts = tl.load(
+        cu_seq_lens_ptr + seq_ids,
+        mask=valid_seq_ids,
+        other=0,
+    )
+    tl.store(topk_ptrs, packed_indices - seq_starts, mask=valid_seq_ids)
+
+
+def _normalize_prefill_topk_to_req_relative(
+    chunk: object, topk_indices: torch.Tensor
+) -> None:
+    """Convert packed prefill offsets to per-request token offsets."""
+    cu_seq_lens = getattr(chunk, "cu_seq_lens", None)
+    token_to_seq = getattr(chunk, "token_to_seq", None)
+    if (
+        cu_seq_lens is None
+        or token_to_seq is None
+        or cu_seq_lens.numel() <= 2
+        or token_to_seq.numel() == 0
+        or topk_indices.numel() == 0
+    ):
+        return
+
+    if topk_indices.is_cuda:
+        block_size = 1024
+        grid = (triton.cdiv(topk_indices.numel(), block_size),)
+        _normalize_prefill_topk_to_req_relative_kernel[grid](
+            topk_indices,
+            cu_seq_lens,
+            token_to_seq,
+            topk_indices.shape[1],
+            topk_indices.numel(),
+            topk_indices.stride(0),
+            topk_indices.stride(1),
+            token_to_seq.numel(),
+            cu_seq_lens.numel() - 1,
+            BLOCK_SIZE=block_size,
+        )
+        return
+
+    valid = topk_indices >= 0
+    safe_indices = topk_indices.clamp(min=0, max=int(token_to_seq.numel()) - 1)
+    seq_ids = token_to_seq[safe_indices]
+    seq_starts = cu_seq_lens[seq_ids]
+    normalized = topk_indices - seq_starts
+    topk_indices.copy_(torch.where(valid, normalized, topk_indices))
+
+
+def _warmup_b12x_extend_indexer(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    binding: Any,
+    topk_tokens: int,
+    total_seq_lens: int,
+) -> None:
+    q_rows = int(q_fp8.shape[0])
+    if q_rows <= 0:
+        return
+
+    k_rows = max(1, int(total_seq_lens))
+    warmup_k_cap = max(
+        int(_B12X_EXTEND_TOPK_SUPERTILE_K),
+        int(_B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K),
+    )
+    scratch = binding.scratch
+    warmup_k_rows = min(k_rows, int(scratch.k_quant.shape[0]), warmup_k_cap)
+    scratch.k_quant[:warmup_k_rows].zero_()
+    scratch.k_scale_bytes[:warmup_k_rows].zero_()
+    scratch.metadata_k_start[:q_rows].zero_()
+    scratch.metadata_k_end[:q_rows].fill_(warmup_k_rows)
+
+    b12x_indexer = import_module("b12x.integration.indexer")
+    b12x_indexer.extend_tiled_topk(
+        q_fp8=q_fp8,
+        weights=weights,
+        kv_fp8=(scratch.k_quant[:warmup_k_rows], scratch.k_scale[:warmup_k_rows]),
+        binding=binding,
+    )
+
+
+def _flatten_b12x_paged_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
+    expected_shape_tail = (
+        _B12X_COMPRESSED_INDEX_PAGE_SIZE,
+        _B12X_COMPRESSED_INDEX_HEAD_DIM + _B12X_COMPRESSED_INDEX_SCALE_BYTES,
+    )
+
+    if kv_cache.ndim != 3 or kv_cache.dtype != torch.uint8:
+        raise RuntimeError(
+            "b12x paged indexer cache must be rank-3 uint8 with "
+            f"shape [num_blocks, {expected_shape_tail[0]}, "
+            f"{expected_shape_tail[1]}], got shape={tuple(kv_cache.shape)} "
+            f"dtype={kv_cache.dtype}."
+        )
+    if tuple(kv_cache.shape[1:]) != expected_shape_tail:
+        raise RuntimeError(
+            "b12x paged indexer cache has an unsupported shape, "
+            f"got {tuple(kv_cache.shape)}; expected tail {expected_shape_tail}."
+        )
+    if kv_cache.stride(1) != expected_shape_tail[1] or kv_cache.stride(2) != 1:
+        raise RuntimeError(
+            "b12x paged indexer cache has an unsupported layout, "
+            f"shape={tuple(kv_cache.shape)} stride={tuple(kv_cache.stride())}; "
+            f"expected inner strides ({expected_shape_tail[1]}, 1)."
+        )
+
+    return kv_cache.as_strided(
+        (int(kv_cache.shape[0]), _B12X_COMPRESSED_INDEX_PAGE_WIDTH),
+        (int(kv_cache.stride(0)), 1),
+    )
+
+
+def _run_b12x_decode_topk(
+    *,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    kv_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    schedule_metadata: torch.Tensor | None,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+    active_width: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Unified b12x indexer decode top-k for both DSV4 and GLM.
+
+    Both compression modes read the identical page-64 FP8+scale index cache, so
+    one b12x-orchestrated entry serves both: b12x sizes the scratch
+    (plan_compressed_indexer_scratch), vLLM allocates it (get_simultaneous), and
+    index_topk_fp8 owns the internal scorer/top-k routing. ``active_width`` is
+    the builder-computed live window (a metadata tensor, not an in-kernel
+    reduction); when None, b12x falls back to the capacity cap.
+    """
+    from b12x.integration.compressed_indexer import (
+        COMPRESSED_INDEX_PAGE_SIZE,
+        B12XCompressedIndexerScratchCaps,
+        index_topk_fp8,
+        plan_compressed_indexer_scratch,
+    )
+
+    if int(COMPRESSED_INDEX_PAGE_SIZE) != _B12X_COMPRESSED_INDEX_PAGE_SIZE:
+        raise RuntimeError(
+            "b12x compressed indexer page-size contract changed, got "
+            f"{COMPRESSED_INDEX_PAGE_SIZE}; expected "
+            f"{_B12X_COMPRESSED_INDEX_PAGE_SIZE}."
+        )
+
+    index_k_cache = _flatten_b12x_paged_index_cache(kv_cache)
+    expected_num_q_heads = int(q_fp8.shape[1])
+    plan = plan_compressed_indexer_scratch(
+        B12XCompressedIndexerScratchCaps(
+            device=q_fp8.device,
+            num_q_heads=expected_num_q_heads,
+            max_q_rows=int(q_fp8.shape[0]),
+            max_page_table_width=int(block_table.shape[1]),
+            topk=int(topk_tokens),
+            reserve_paged_logits=False,
+        )
+    )
+    scratch = current_workspace_manager().get_simultaneous(
+        *plan.shapes_and_dtypes()
+    )
+    binding = plan.bind(
+        scratch=scratch,
+        real_page_table=block_table,
+        cache_seqlens_int32=seq_lens,
+        active_width=active_width,
+        schedule_metadata=schedule_metadata,
+        expected_num_q_heads=expected_num_q_heads,
+    )
+    return index_topk_fp8(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        binding=binding,
+        page_size=COMPRESSED_INDEX_PAGE_SIZE,
+        expected_num_q_heads=expected_num_q_heads,
+        out_indices=topk_indices,
+    )
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -96,6 +413,7 @@ def sparse_attn_indexer(
     topk_indices_buffer: torch.Tensor,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
+    use_b12x_sparse_indexer: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -104,22 +422,44 @@ def sparse_attn_indexer(
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
-        # Reserve workspace for indexer during profiling run
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
-        current_workspace_manager().get_simultaneous(
-            values_spec,
-            scales_spec,
-            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-        )
+        if _b12x_sparse_indexer_requested(use_b12x_sparse_indexer):
+            _ensure_b12x_sparse_indexer_supported()
+            profile_q_rows = _get_b12x_indexer_extend_profile_q_rows(
+                int(q_quant.shape[0]),
+                total_seq_lens,
+            )
+            q_profile = q_quant[:profile_q_rows]
+            binding = _get_b12x_indexer_extend_binding(
+                q_fp8=q_profile,
+                topk_tokens=topk_tokens,
+                total_seq_lens=total_seq_lens,
+                fp8_dtype=fp8_dtype,
+                max_k_rows=total_seq_lens,
+            )
+            _warmup_b12x_extend_indexer(
+                q_fp8=q_profile,
+                weights=weights[:profile_q_rows],
+                binding=binding,
+                topk_tokens=topk_tokens,
+                total_seq_lens=total_seq_lens,
+            )
+        else:
+            # Reserve workspace for indexer during profiling run.
+            current_workspace_manager().get_simultaneous(
+                values_spec, scales_spec, ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8)
+            )
 
-        # Dummy allocation to simulate for peak logits tensor memory during inference.
-        # FP8 elements so elements == bytes
-        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-        _ = torch.empty(
-            max_logits_elems, dtype=torch.uint8, device=hidden_states.device
-        )
+            # Dummy allocation to simulate peak logits tensor memory during
+            # inference. The B12X path above streams one supertile at a time and
+            # has already reserved its fixed scratch via the workspace manager.
+            # FP8 elements so elements == bytes.
+            max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            _ = torch.empty(
+                max_logits_elems, dtype=torch.uint8, device=hidden_states.device
+            )
 
         return sparse_attn_indexer_fake(
             hidden_states,
@@ -138,6 +478,7 @@ def sparse_attn_indexer(
             topk_indices_buffer,
             skip_k_cache_insert,
             use_fp4_cache,
+            use_b12x_sparse_indexer,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -177,21 +518,69 @@ def sparse_attn_indexer(
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
 
-        # Get the full shared workspace buffers once (will allocate on first use).
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
         # MXFP4 (head_dim/2 bytes packed + head_dim/MXFP4_BLOCK_SIZE ue8m0
         # scales) based on use_fp4_cache.
-        workspace_manager = current_workspace_manager()
-        values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
-        )
-        k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
-            values_spec,
-            scales_spec,
-        )
+        use_b12x_indexer = _use_b12x_sparse_indexer(use_b12x_sparse_indexer)
+        if use_b12x_indexer and use_fp4_cache:
+            raise RuntimeError(
+                "b12x sparse indexer currently requires the FP8 indexer cache; "
+                "disable use_fp4_indexer_cache or disable b12x sparse indexer."
+            )
+        b12x_indexer: Any = None
+        if use_b12x_indexer:
+            b12x_indexer = import_module("b12x.integration.indexer")
+        else:
+            workspace_manager = current_workspace_manager()
+            values_spec, scales_spec = _gather_workspace_shapes(
+                total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            )
+            k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
+                values_spec,
+                scales_spec,
+            )
         for chunk in prefill_metadata.chunks:
-            k_quant = k_quant_full[: chunk.total_seq_lens]
-            k_scale = k_scale_full[: chunk.total_seq_lens]
+            q_slice = q_quant[chunk.token_start : chunk.token_end]
+            q_scale_slice = (
+                q_scale[chunk.token_start : chunk.token_end]
+                if q_scale is not None
+                else None
+            )
+            weights_slice = weights[chunk.token_start : chunk.token_end]
+            topk_indices = topk_indices_buffer[
+                chunk.token_start : chunk.token_end, :topk_tokens
+            ]
+            if chunk.total_seq_lens <= 0:
+                topk_indices.fill_(-1)
+                continue
+
+            if use_b12x_indexer:
+                row_has_no_kv = chunk.cu_seqlen_ke <= chunk.cu_seqlen_ks
+                b12x_cu_seqlen_ks = torch.where(
+                    row_has_no_kv,
+                    torch.zeros_like(chunk.cu_seqlen_ks),
+                    chunk.cu_seqlen_ks,
+                )
+                b12x_cu_seqlen_ke = torch.where(
+                    row_has_no_kv,
+                    torch.ones_like(chunk.cu_seqlen_ke),
+                    chunk.cu_seqlen_ke,
+                )
+                binding = _get_b12x_indexer_extend_binding(
+                    q_fp8=q_slice,
+                    topk_tokens=topk_tokens,
+                    total_seq_lens=chunk.total_seq_lens,
+                    fp8_dtype=fp8_dtype,
+                    k_start=b12x_cu_seqlen_ks,
+                    k_end=b12x_cu_seqlen_ke,
+                    max_k_rows=total_seq_lens,
+                )
+                scratch = binding.scratch
+                k_quant = scratch.k_quant[: chunk.total_seq_lens]
+                k_scale = scratch.k_scale_bytes[: chunk.total_seq_lens]
+            else:
+                k_quant = k_quant_full[: chunk.total_seq_lens]
+                k_scale = k_scale_full[: chunk.total_seq_lens]
 
             if not chunk.skip_kv_gather:
                 ops.cp_gather_indexer_k_quant_cache(
@@ -202,12 +591,26 @@ def sparse_attn_indexer(
                     chunk.cu_seq_lens,
                 )
 
-            q_slice = q_quant[chunk.token_start : chunk.token_end]
-            q_scale_slice = (
-                q_scale[chunk.token_start : chunk.token_end]
-                if q_scale is not None
-                else None
-            )
+            if use_b12x_indexer:
+                assert b12x_indexer is not None
+                k_scale_f32 = k_scale.view(torch.float32).flatten()
+                k_fp8_b12x = (
+                    k_quant.view(torch.float8_e4m3fn)
+                    if k_quant.dtype == torch.uint8
+                    else k_quant
+                )
+                topk_indices.copy_(
+                    b12x_indexer.extend_tiled_topk(
+                        q_fp8=q_slice,
+                        weights=weights_slice,
+                        kv_fp8=(k_fp8_b12x, k_scale_f32),
+                        binding=binding,
+                    )
+                )
+                topk_indices.masked_fill_(row_has_no_kv[:, None], -1)
+                _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
+                continue
+
             # DeepGEMM scalar-type tags (zero-copy): MXFP4 values → int8
             # (kPackedFP4), scales → int32 squeezed to 1-D kv_sf / 2-D q_sf.
             if use_fp4_cache:
@@ -225,24 +628,22 @@ def sparse_attn_indexer(
                     q_slice_cast,
                     k_quant_cast,
                     k_scale_cast,
-                    weights[chunk.token_start : chunk.token_end],
+                    weights_slice,
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                 )
             else:
+                from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
                     (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
+                    weights_slice,
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                     clean_logits=False,
                 )
             num_rows = logits.shape[0]
-
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
 
             ops.top_k_per_row_prefill(
                 logits,
@@ -258,6 +659,72 @@ def sparse_attn_indexer(
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
+        use_b12x_indexer = _use_b12x_sparse_indexer(use_b12x_sparse_indexer)
+        if use_b12x_indexer and use_fp4_cache:
+            raise RuntimeError(
+                "b12x sparse indexer currently requires the FP8 indexer cache; "
+                "disable use_fp4_indexer_cache or disable b12x sparse indexer."
+            )
+
+        b12x_seq_lens = decode_metadata.seq_lens
+        b12x_block_table = decode_metadata.block_table
+        if b12x_seq_lens.dim() == 2:
+            b12x_batch_size, b12x_next_n = b12x_seq_lens.shape
+            if num_decode_tokens == b12x_batch_size * b12x_next_n:
+                b12x_seq_lens = b12x_seq_lens.reshape(-1).contiguous()
+                b12x_block_table = b12x_block_table.repeat_interleave(
+                    b12x_next_n, dim=0
+                ).contiguous()
+        b12x_decode_supported = (
+            use_b12x_indexer
+            and not decode_metadata.requires_padding
+            and b12x_seq_lens.dim() == 1
+        )
+        if use_b12x_indexer and (
+            decode_metadata.requires_padding or b12x_seq_lens.dim() != 1
+        ):
+            raise RuntimeError(
+                "b12x sparse indexer decode requires an unpadded rank-1 "
+                "seq_lens contract after native-spec normalization; refusing "
+                "to fall back to DeepGEMM. "
+                f"requires_padding={decode_metadata.requires_padding}, "
+                f"seq_lens_shape={tuple(decode_metadata.seq_lens.shape)}, "
+                f"normalized_seq_lens_shape={tuple(b12x_seq_lens.shape)}, "
+                f"num_decode_tokens={num_decode_tokens}."
+            )
+
+        if b12x_decode_supported:
+            # Prefix slice of an already-contiguous buffer stays contiguous
+            # (b12x_seq_lens/b12x_block_table are normalized contiguous upstream),
+            # so .contiguous() here was a guaranteed no-op per decoded token.
+            seq_lens = b12x_seq_lens[:num_decode_tokens]
+            block_table = b12x_block_table[:num_decode_tokens]
+            topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
+            # One unified b12x decode path for both DSV4 (compress_ratio>1) and
+            # GLM (compress_ratio==1): the kernel byte layout is identical, so
+            # compress_ratio only shapes the seq_lens/active_width the builder
+            # already prepared. b12x owns the scorer/top-k routing internally.
+            _run_b12x_decode_topk(
+                q_fp8=q_quant[:num_decode_tokens].contiguous(),
+                weights=weights[:num_decode_tokens].contiguous(),
+                kv_cache=kv_cache,
+                seq_lens=seq_lens,
+                block_table=block_table,
+                schedule_metadata=decode_metadata.schedule_metadata,
+                active_width=decode_metadata.active_width,
+                topk_indices=topk_indices,
+                topk_tokens=topk_tokens,
+            )
+            return topk_indices_buffer
+
+        schedule_metadata = decode_metadata.schedule_metadata
+        if schedule_metadata is None:
+            raise RuntimeError(
+                "DeepGEMM/XPU sparse indexer decode requires schedule metadata; "
+                "enable VLLM_USE_B12X_SPARSE_INDEXER for the b12x path or check "
+                "the indexer metadata builder."
+            )
+
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
@@ -317,17 +784,19 @@ def sparse_attn_indexer(
                 weights[:num_padded_tokens],
                 seq_lens_xpu,
                 decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
+                schedule_metadata,
                 max_model_len,
             )
         else:
+            from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
                 weights[:num_padded_tokens],
                 seq_lens,
                 decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
+                schedule_metadata,
                 max_model_len=max_model_len,
                 clean_logits=False,
             )
@@ -390,6 +859,7 @@ def sparse_attn_indexer_fake(
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
+    use_b12x_sparse_indexer: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -440,7 +910,14 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        self.use_b12x_sparse_indexer = use_b12x_sparse_indexer()
+        if self.use_b12x_sparse_indexer:
+            if self.use_fp4_cache:
+                raise RuntimeError(
+                    "B12X sparse indexer/top-k requires the FP8/C4 indexer "
+                    "cache; disable use_fp4_indexer_cache."
+                )
+        elif current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )
@@ -492,6 +969,7 @@ class SparseAttnIndexer(CustomOp):
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
             self.use_fp4_cache,
+            self.use_b12x_sparse_indexer,
         )
 
     def forward_xpu(
