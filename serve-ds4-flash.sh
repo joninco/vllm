@@ -5,6 +5,9 @@ cd "$(dirname "$0")"
 
 export CUTE_DSL_ARCH=sm_120a
 export NCCL_IB_DISABLE=1
+if [[ -z "${NCCL_GRAPH_FILE:-}" ]]; then
+  unset NCCL_GRAPH_FILE
+fi
 
 export VLLM_USE_AOT_COMPILE=1
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0
