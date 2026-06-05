@@ -149,3 +149,6 @@ change and explain why**.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+- **B12X vLLM bindings**:
+  [`docs/contributing/b12x-vllm-bindings.md`](docs/contributing/b12x-vllm-bindings.md)
+  — Keep vLLM B12X paths eager and caller-scratch-owned; do not use sglang-style workspaces or arenas.
