@@ -392,10 +392,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 num_heads=self.num_heads,
             )
 
-        # FlashMLA Sparse Attention fp8 backend uses "fp8_ds_mla" kv-cache format
-        # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
+        # FlashMLA/B12X sparse MLA fp8 backends use the fp8_ds_mla KV-cache
+        # format. Automatically convert the generic fp8 spelling.
+        sparse_ds_mla_backends = {"FLASHMLA_SPARSE", "B12X_MLA_SPARSE"}
         if (
-            self.attn_backend.get_name() == "FLASHMLA_SPARSE"
+            self.attn_backend.get_name() in sparse_ds_mla_backends
             and is_quantized_kv_cache(kv_cache_dtype)
             and kv_cache_dtype != "fp8_ds_mla"
         ):
@@ -403,9 +404,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             cache_config.cache_dtype = "fp8_ds_mla"
             kv_cache_dtype = "fp8_ds_mla"
             logger.info_once(
-                "Using DeepSeek's fp8_ds_mla KV cache format. To use standard "
-                "fp8 kv-cache format, please set `--attention-backend "
-                "FLASHINFER_MLA_SPARSE`"
+                "Using fp8_ds_mla KV cache format for %s.",
+                self.attn_backend.get_name(),
             )
 
         if (
@@ -461,6 +461,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             **extra_impl_args,
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
+        self.force_contiguous_mla_bmm_input = getattr(
+            self.impl, "force_contiguous_mla_bmm_input", False
+        )
+        self.force_contiguous_mla_bmm_weight = getattr(
+            self.impl, "force_contiguous_mla_bmm_weight", False
+        )
+        self.force_contiguous_mla_bmm_output = getattr(
+            self.impl, "force_contiguous_mla_bmm_output", False
+        )
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
@@ -635,18 +644,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         if attn_metadata is None:
-            # During the profile run try to simulate to worse case output size
-            # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
-            # since this can be large
-            _ = torch.empty(
-                (
-                    self.chunked_prefill_workspace_size,
-                    self.num_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                ),
-                device=k_c_normed.device,
-                dtype=k_c_normed.dtype,
-            )
+            if not isinstance(self.impl, SparseMLAAttentionImpl):
+                # During the profile run try to simulate the worst case output
+                # size for `self.kv_b_proj(kv_c_normed)` in
+                # `_compute_prefill_context` since this can be large. Sparse MLA
+                # impls run all tokens through forward_mqa and reserve their own
+                # backend scratch instead.
+                _ = torch.empty(
+                    (
+                        self.chunked_prefill_workspace_size,
+                        self.num_heads,
+                        self.qk_nope_head_dim + self.v_head_dim,
+                    ),
+                    device=k_c_normed.device,
+                    dtype=k_c_normed.dtype,
+                )
 
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the
@@ -656,7 +668,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return output.fill_(0)
 
         if self.impl.dcp_world_size == -1:
-            self.impl.dcp_world_size = get_dcp_group().world_size
+            dcp_group = get_dcp_group()
+            self.impl.dcp_world_size = dcp_group.world_size
+            self.impl.dcp_rank = dcp_group.rank_in_group
+            self.impl.total_cp_world_size = (
+                self.impl.pcp_world_size * self.impl.dcp_world_size
+            )
+            self.impl.total_cp_rank = (
+                self.impl.pcp_rank * self.impl.dcp_world_size + self.impl.dcp_rank
+            )
+            self.impl.need_to_return_lse_for_decode = (
+                self.impl.dcp_world_size > 1 and self.impl.can_return_lse_for_decode
+            )
 
         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
 
@@ -741,6 +764,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 N, B, P = mqa_q_nope.shape
                 _, _, L = self.W_UK_T.shape
 
+                if self.force_contiguous_mla_bmm_input:
+                    mqa_q_nope = mqa_q_nope.contiguous()
+
                 if self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
                     mqa_ql_nope.resize_((N, B, L))
@@ -762,9 +788,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             if self.impl.dcp_world_size > 1:
-                assert not fp8_attention, "DCP not support fp8 kvcache now."
-                # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
-                mqa_q = torch.cat(mqa_q, dim=-1)
+                if not self.impl.can_return_lse_for_decode:
+                    raise NotImplementedError(
+                        f"{type(self.impl).__name__} cannot use DCP because it "
+                        "does not return decode softmax LSE."
+                    )
+                self.impl.need_to_return_lse_for_decode = True
+                if (
+                    fp8_attention
+                    and isinstance(mqa_q, torch.Tensor)
+                    and not getattr(self.impl, "supports_dcp_quant_query_input", False)
+                ):
+                    raise NotImplementedError(
+                        f"{type(self.impl).__name__} does not declare support for "
+                        "DCP with FP8 KV cache and pre-quantized query input."
+                    )
+                if isinstance(mqa_q, tuple):
+                    # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                    mqa_q = torch.cat(mqa_q, dim=-1)
                 # mqa_q do allgather in head dim.
                 mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
@@ -775,6 +816,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
+                if lse is None:
+                    raise RuntimeError(
+                        f"{type(self.impl).__name__} did not return decode "
+                        "softmax LSE required by DCP."
+                    )
                 if self.dcp_a2a:
                     attn_out = dcp_a2a_lse_reduce(
                         attn_out,
@@ -920,6 +966,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.W_UV = W_UV.transpose(0, 1)
             # Convert from (L, N, P) to (N, P, L)
             self.W_UK_T = W_UK.permute(1, 2, 0)
+            if self.force_contiguous_mla_bmm_weight:
+                self.W_UV = self.W_UV.contiguous()
+                self.W_UK_T = self.W_UK_T.contiguous()
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
@@ -966,7 +1015,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
-            cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            cache_dtype_str=self.kv_cache_dtype,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
@@ -991,7 +1040,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+            if self.force_contiguous_mla_bmm_input:
+                x = x.contiguous()
+            if self.force_contiguous_mla_bmm_output:
+                bmm_out = torch.empty(
+                    (self.num_heads, x.shape[1], self.v_head_dim),
+                    dtype=out.dtype,
+                    device=out.device,
+                )
+                torch.bmm(x, self.W_UV, out=bmm_out)
+                out.copy_(bmm_out.transpose(0, 1))
+            else:
+                torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
 
 
 def unified_mla_kv_cache_update(

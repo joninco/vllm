@@ -8,6 +8,8 @@ Known Issues:
   test_backend_correctness[small_prefill], but passes when run alone.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -28,7 +30,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import CommonAttentionMetadata, SparseMLAAttentionImpl
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
 from vllm.v1.attention.backends.mla.prefill import (
     MLAPrefillBackendEnum,
@@ -408,6 +410,209 @@ class MockSparseMLAAttentionLayer:
         )
 
         return output
+
+
+def test_sparse_mla_profile_skips_dense_prefill_workspace(monkeypatch):
+    class ProfileSparseImpl(SparseMLAAttentionImpl):
+        def __init__(self) -> None:
+            self.dcp_world_size = 1
+            self.supports_quant_query_input = False
+
+        def forward_mqa(self, *args, **kwargs):
+            raise AssertionError("profile run should return before forward_mqa")
+
+    num_heads = 8
+    qk_nope_head_dim = 128
+    v_head_dim = 128
+    workspace_size = 315_392
+    dummy_shape = (workspace_size, num_heads, qk_nope_head_dim + v_head_dim)
+
+    layer = object.__new__(MLAAttention)
+    layer.impl = ProfileSparseImpl()
+    layer.num_heads = num_heads
+    layer.qk_nope_head_dim = qk_nope_head_dim
+    layer.v_head_dim = v_head_dim
+    layer.kv_cache_dtype = "fp8_ds_mla"
+    layer._chunked_prefill_workspace_size = workspace_size
+
+    q = torch.empty((1, num_heads, qk_nope_head_dim + 64), dtype=torch.bfloat16)
+    kv_c = torch.empty((1, 512), dtype=torch.bfloat16)
+    k_pe = torch.empty((1, 1, 64), dtype=torch.bfloat16)
+    kv_cache = torch.empty((0,), dtype=torch.uint8)
+    output = torch.empty((1, num_heads * v_head_dim), dtype=torch.bfloat16)
+
+    torch_empty = torch.empty
+
+    def guarded_empty(*args, **kwargs):
+        shape = args[0] if args else kwargs.get("size")
+        if shape == dummy_shape:
+            raise AssertionError("sparse MLA profile allocated dense prefill dummy")
+        return torch_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", guarded_empty)
+
+    result = MLAAttention.forward_impl(
+        layer,
+        q,
+        kv_c,
+        k_pe,
+        kv_cache,
+        None,
+        output,
+    )
+
+    assert result is output
+    assert torch.equal(output, torch.zeros_like(output))
+
+
+def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
+    from vllm.model_executor.layers.attention import mla_attention
+
+    class FakeDCPGroup:
+        world_size = 2
+        rank_in_group = 0
+
+        def all_gather(self, x, dim):
+            return torch.cat((x, x), dim=dim)
+
+    class FakeSparseImpl(SparseMLAAttentionImpl):
+        can_return_lse_for_decode = True
+        supports_quant_query_input = False
+
+        def __init__(self):
+            self.dcp_world_size = -1
+            self.dcp_rank = 0
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
+            self.total_cp_world_size = 1
+            self.total_cp_rank = 0
+            self.need_to_return_lse_for_decode = False
+            self.seen_q = None
+
+        def forward_mqa(self, q, kv_cache, attn_metadata, layer):
+            assert self.need_to_return_lse_for_decode
+            assert isinstance(q, torch.Tensor)
+            assert q.dtype == torch.bfloat16
+            self.seen_q = q
+            out = torch.ones(
+                (q.shape[0], q.shape[1], layer.kv_lora_rank), dtype=q.dtype
+            )
+            lse = torch.zeros((q.shape[0], q.shape[1]), dtype=torch.float32)
+            return out, lse
+
+    def fake_lse_reduce(attn_out, lse, group, is_lse_base_on_e=True):
+        assert group.world_size == 2
+        assert lse is not None
+        return attn_out[:, :2, :]
+
+    monkeypatch.setattr(mla_attention, "get_dcp_group", lambda: FakeDCPGroup())
+    monkeypatch.setattr(mla_attention, "cp_lse_ag_out_rs", fake_lse_reduce)
+
+    layer = object.__new__(MLAAttention)
+    impl = FakeSparseImpl()
+    layer.impl = impl
+    layer.dcp_a2a = False
+    layer.kv_cache_dtype = "fp8_ds_mla"
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = 4
+    layer.qk_rope_head_dim = 2
+    layer.kv_lora_rank = 3
+    layer.v_head_dim = 3
+    layer.q_pad_num_heads = None
+    layer.force_contiguous_mla_bmm_input = False
+    layer.force_contiguous_mla_bmm_output = False
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)
+
+    def fake_v_up_proj(x, out):
+        out.copy_(x.reshape(out.shape))
+
+    layer._v_up_proj = fake_v_up_proj
+
+    q = torch.ones((1, 2, 6), dtype=torch.bfloat16)
+    kv_c = torch.empty((1, 3), dtype=torch.bfloat16)
+    k_pe = torch.empty((1, 1, 2), dtype=torch.bfloat16)
+    kv_cache = torch.empty((0,), dtype=torch.uint8)
+    output = torch.empty((1, 6), dtype=torch.bfloat16)
+    attn_metadata = SimpleNamespace(num_actual_tokens=1)
+
+    result = MLAAttention.forward_impl(
+        layer,
+        q,
+        kv_c,
+        k_pe,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert impl.seen_q is not None
+    assert impl.seen_q.shape == (1, 4, 5)
+
+
+def test_fp8_dcp_quantized_query_requires_backend_opt_in(monkeypatch):
+    from vllm.model_executor.layers.attention import mla_attention
+
+    class FakeDCPGroup:
+        world_size = 2
+        rank_in_group = 0
+
+    class FakeQuantImpl(SparseMLAAttentionImpl):
+        can_return_lse_for_decode = True
+        supports_quant_query_input = True
+
+        def __init__(self):
+            self.dcp_world_size = -1
+            self.dcp_rank = 0
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
+            self.total_cp_world_size = 1
+            self.total_cp_rank = 0
+            self.need_to_return_lse_for_decode = False
+
+        def forward_mqa(self, *args, **kwargs):
+            raise AssertionError("DCP quant-query gate should run first")
+
+    monkeypatch.setattr(mla_attention, "get_dcp_group", lambda: FakeDCPGroup())
+
+    layer = object.__new__(MLAAttention)
+    layer.impl = FakeQuantImpl()
+    layer.kv_cache_dtype = "fp8_ds_mla"
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = 4
+    layer.qk_rope_head_dim = 2
+    layer.kv_lora_rank = 3
+    layer.v_head_dim = 3
+    layer.q_pad_num_heads = None
+    layer.force_contiguous_mla_bmm_input = False
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)
+    layer._q_scale = torch.tensor(1.0, dtype=torch.float32)
+    layer._decode_concat_quant_fp8_op = lambda q_nope, q_pe, scale: torch.empty(
+        (q_nope.shape[0], q_nope.shape[1], q_nope.shape[2] + q_pe.shape[2]),
+        dtype=current_platform.fp8_dtype(),
+    )
+
+    q = torch.ones((1, 2, 6), dtype=torch.bfloat16)
+    kv_c = torch.empty((1, 3), dtype=torch.bfloat16)
+    k_pe = torch.empty((1, 1, 2), dtype=torch.bfloat16)
+    kv_cache = torch.empty((0,), dtype=torch.uint8)
+    output = torch.empty((1, 6), dtype=torch.bfloat16)
+    attn_metadata = SimpleNamespace(num_actual_tokens=1)
+
+    with pytest.raises(NotImplementedError, match="pre-quantized query input"):
+        MLAAttention.forward_impl(
+            layer,
+            q,
+            kv_c,
+            k_pe,
+            kv_cache,
+            attn_metadata,
+            output,
+        )
 
 
 class MockMLAAttentionLayer(MLAAttention):
