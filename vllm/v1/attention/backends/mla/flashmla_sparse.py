@@ -341,9 +341,22 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             hasattr(hf_config, "compress_ratios") and len(hf_config.compress_ratios) > 0
         )
         self.compress_ratio = 1
+        self.deepseek_v4_decode_threshold = self.reorder_batch_threshold or 1
         if self.is_deepseek_v4:
             assert hasattr(self.kv_cache_spec, "compress_ratio")
             self.compress_ratio = self.kv_cache_spec.compress_ratio
+            speculative_config = self.vllm_config.speculative_config
+            num_speculative_tokens = (
+                speculative_config.num_speculative_tokens
+                if speculative_config is not None
+                and speculative_config.num_speculative_tokens is not None
+                else 0
+            )
+            # DeepSeek V4 SWA and indexer metadata treat MTP rows as decode
+            # rows even under DCP. C128A top-k metadata must use the same split
+            # so B12X gets indexed cache pointers and indexed top-k metadata
+            # together.
+            self.deepseek_v4_decode_threshold = 1 + num_speculative_tokens
             # Pre-allocate compressed slot mapping buffer for CUDA graph
             # address stability when compress_ratio > 1.
             if self.compress_ratio > 1:
@@ -680,7 +693,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # query lengths.
         (num_decodes, _, num_decode_tokens, num_prefill_tokens) = (
             cm.split_decodes_and_prefills(
-                decode_threshold=self.reorder_batch_threshold or 1,
+                decode_threshold=self.deepseek_v4_decode_threshold,
             )
         )
 
