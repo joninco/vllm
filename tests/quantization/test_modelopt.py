@@ -516,3 +516,35 @@ def test_modelopt_mixed_precision_builds_w4a16_sibling_config():
     assert config.nvfp4_config.LinearMethodCls is m.ModelOptNvFp4LinearMethod
     assert config.w4a16_nvfp4_config.quant_method == "W4A16_NVFP4"
     assert config.w4a16_nvfp4_config.LinearMethodCls is m.ModelOptNvFp4W4A16LinearMethod
+
+
+def test_modelopt_mixed_precision_infers_sparse_routed_expert_metadata():
+    """GLM ModelOpt checkpoints may list only NextN/MTP expert prefixes.
+
+    If all listed routed experts use the same algorithm, missing base
+    ``*.mlp.experts`` prefixes should inherit that algorithm. Dense/shared
+    prefixes must not inherit it.
+    """
+    config = _mixed_precision_config(
+        {
+            "model.layers.78.mlp.experts.0.gate_proj": {"quant_algo": "NVFP4"},
+            "model.layers.78.mtp_block.mlp.experts.0.gate_proj": {
+                "quant_algo": "NVFP4"
+            },
+        }
+    )
+
+    assert config._resolve_quant_algo("model.layers.3.mlp.experts") == "NVFP4"
+    assert config._resolve_quant_algo("model.layers.3.mlp.shared_experts") is None
+    assert config._resolve_quant_algo("model.layers.3.self_attn.q_a_proj") is None
+
+
+def test_modelopt_mixed_precision_does_not_infer_ambiguous_expert_metadata():
+    config = _mixed_precision_config(
+        {
+            "model.layers.78.mlp.experts.0.gate_proj": {"quant_algo": "NVFP4"},
+            "model.layers.79.mlp.experts.0.gate_proj": {"quant_algo": "MXFP8"},
+        }
+    )
+
+    assert config._resolve_quant_algo("model.layers.3.mlp.experts") is None

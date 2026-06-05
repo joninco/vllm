@@ -2208,6 +2208,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
+        self._fallback_routed_expert_quant_algo = (
+            self._resolve_fallback_routed_expert_quant_algo()
+        )
         # Optional sibling config for layers that declare quant_algo: "MXFP8".
         # Kept optional/default-constructed so existing callers (and tests) that
         # predate mixed MXFP8 support don't break; the dispatch below only ever
@@ -2309,6 +2312,24 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             w4a16_nvfp4_config=w4a16_nvfp4_config,
         )
 
+    def _resolve_fallback_routed_expert_quant_algo(self) -> str | None:
+        """Infer the routed-expert algorithm when metadata is sparse.
+
+        Some ModelOpt GLM checkpoints serialize FP4 expert weights for all MoE
+        layers, but only list the NextN/MTP expert prefixes in
+        ``quantized_layers``. Treat a single, consistent routed-expert algo as a
+        template for missing ``*.mlp.experts`` entries; dense/shared layers still
+        require an exact metadata hit and remain unquantized otherwise.
+        """
+        expert_algos = {
+            info["quant_algo"].upper()
+            for key, info in self.quantized_layers.items()
+            if ".mlp.experts." in key and "quant_algo" in info
+        }
+        if len(expert_algos) == 1:
+            return next(iter(expert_algos))
+        return None
+
     def _resolve_quant_algo(self, prefix: str) -> str | None:
         """Look up the quant_algo for a vLLM-side layer prefix.
 
@@ -2360,6 +2381,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             for key, info in self.quantized_layers.items():
                 if key.startswith(parent_dot):
                     return info["quant_algo"].upper()
+
+            if ".mlp.experts" in prefix:
+                return self._fallback_routed_expert_quant_algo
 
         return None
 
