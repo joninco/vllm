@@ -54,6 +54,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
@@ -946,13 +947,19 @@ class DeepseekV4Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
 
-        self.max_model_len = (
-            vllm_config.model_config.max_model_len // self.compress_ratio
+        cp_size = (
+            vllm_config.parallel_config.prefill_context_parallel_size
+            * vllm_config.parallel_config.decode_context_parallel_size
+        )
+        self.max_model_len = cdiv(
+            vllm_config.model_config.max_model_len,
+            self.compress_ratio * cp_size,
         )
         self.prefix = prefix
 
-        self.max_total_seq_len = (
-            get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
+        self.max_total_seq_len = cdiv(
+            get_max_prefill_buffer_size(vllm_config),
+            self.compress_ratio * cp_size,
         )
 
         assert cache_config is not None, "Deepseek V4 indexer requires cache_config"

@@ -12,7 +12,6 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -28,8 +27,6 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
-
-logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 _B12X_COMPRESSED_INDEX_PAGE_SIZE = 64
@@ -47,21 +44,12 @@ _B12X_DECODE_TOPK_SUPERTILE_K = int(
         os.getenv("VLLM_B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "32768"),
     )
 )
-_B12X_INDEXER_EXTEND_BLOCK_Q = 32
 _B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K = 256
 _B12X_INDEXER_DECODE_BLOCK_Q = 32
 _B12X_INDEXER_DECODE_BLOCK_K = 512
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
-
-
-def _ceil_div(x: int, y: int) -> int:
-    return (int(x) + int(y) - 1) // int(y)
-
-
-def _round_up_to_multiple(x: int, y: int) -> int:
-    return _ceil_div(x, y) * int(y)
 
 
 def _get_b12x_indexer_extend_profile_q_rows(
@@ -154,120 +142,48 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
-def _get_b12x_indexer_extend_buffers(
+def _get_b12x_indexer_extend_binding(
     *,
     q_fp8: torch.Tensor,
     topk_tokens: int,
     total_seq_lens: int,
-    head_dim: int,
     fp8_dtype: torch.dtype,
+    k_start: torch.Tensor | None = None,
+    k_end: torch.Tensor | None = None,
     max_k_rows: int | None = None,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    from b12x.attention.indexer import resolve_extend_prefill_block_k
+) -> Any:
+    from b12x.integration import (
+        B12XIndexerExtendScratchCaps,
+        plan_indexer_extend_scratch,
+    )
 
     q_rows = max(1, int(q_fp8.shape[0]))
     k_rows = max(1, int(total_seq_lens))
-    # Size k_quant/k_scale from the constant capacity cap so the workspace stays
-    # constant after locking. The gather kernel still runs over [:k_rows].
+    # This is gathered-K scratch capacity for the current compressed prefill
+    # window, not a model-length reservation.
     k_rows_cap = max(k_rows, int(max_k_rows)) if max_k_rows is not None else k_rows
-    indexer_num_q_heads = int(q_fp8.shape[1])
-    prefill_block_k = resolve_extend_prefill_block_k(
-        valid_q_rows=q_rows,
-        k_rows=k_rows,
-        num_heads=indexer_num_q_heads,
-    )
-    if prefill_block_k is None:
-        prefill_block_k = _B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K
-    prefill_block_k = int(prefill_block_k)
-
-    num_q_tiles = _ceil_div(q_rows, _B12X_INDEXER_EXTEND_BLOCK_Q)
-    num_k_tiles = _ceil_div(k_rows, prefill_block_k)
-    supertile_k = _round_up_to_multiple(
-        max(int(_B12X_EXTEND_TOPK_SUPERTILE_K), prefill_block_k),
-        prefill_block_k,
-    )
-    supertile_tiles = max(1, supertile_k // prefill_block_k)
-    max_chunk_tiles = min(supertile_tiles, num_k_tiles)
-    tile_elements = max(
-        1,
-        num_q_tiles
-        * max_chunk_tiles
-        * _B12X_INDEXER_EXTEND_BLOCK_Q
-        * prefill_block_k,
-    )
-    topk_tokens = max(int(topk_tokens), 1)
-
-    values_spec, scales_spec = _gather_workspace_shapes(
-        k_rows_cap, head_dim, fp8_dtype, use_fp4_cache=False
-    )
-    (
-        k_quant,
-        k_scale,
-        tile_logits,
-        lengths,
-        topk_values,
-        topk_indices,
-        candidate_values,
-        candidate_indices,
-        merge_positions,
-    ) = current_workspace_manager().get_simultaneous(
-        values_spec,
-        scales_spec,
-        ((tile_elements,), torch.float32),
-        ((q_rows,), torch.int32),
-        ((q_rows, topk_tokens), torch.float32),
-        ((q_rows, topk_tokens), torch.int32),
-        ((2, q_rows, topk_tokens), torch.float32),
-        ((2, q_rows, topk_tokens), torch.int32),
-        ((q_rows, topk_tokens), torch.int64),
-    )
-    return (
-        k_quant[:k_rows],
-        k_scale[:k_rows],
-        tile_logits[:tile_elements],
-        lengths[:q_rows],
-        topk_values[:q_rows, :topk_tokens],
-        topk_indices[:q_rows, :topk_tokens],
-        candidate_values[:, :q_rows, :topk_tokens],
-        candidate_indices[:, :q_rows, :topk_tokens],
-        merge_positions[:q_rows, :topk_tokens],
-    )
-
-
-def _normalize_b12x_indexer_weights(
-    weights: torch.Tensor,
-    *,
-    q_rows: int,
-    num_heads: int,
-) -> torch.Tensor:
-    if weights.ndim == 3:
-        if int(weights.shape[2]) != 1:
-            raise RuntimeError(
-                "b12x extend indexer expected rank-3 weights to have "
-                f"trailing dimension 1, got {tuple(weights.shape)}."
-            )
-        weights = weights.squeeze(2)
-    if weights.ndim != 2:
-        raise RuntimeError(
-            "b12x extend indexer expected weights rank 2 or 3, "
-            f"got {weights.ndim}."
+    plan = plan_indexer_extend_scratch(
+        B12XIndexerExtendScratchCaps(
+            device=q_fp8.device,
+            num_q_heads=int(q_fp8.shape[1]),
+            max_q_rows=q_rows,
+            max_k_rows=k_rows_cap,
+            topk=int(topk_tokens),
+            k_dtype=fp8_dtype,
+            supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
+            prefill_block_k=_B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K,
         )
-    if weights.shape != (q_rows, num_heads):
-        raise RuntimeError(
-            "b12x extend indexer expected weights shape "
-            f"{(q_rows, num_heads)}, got {tuple(weights.shape)}."
-        )
-    return weights.to(torch.float32)
+    )
+    scratch = current_workspace_manager().get_simultaneous(
+        *plan.shapes_and_dtypes()
+    )
+    return plan.bind(
+        scratch=scratch,
+        k_start=k_start,
+        k_end=k_end,
+        gather_rows=k_rows,
+        topk=int(topk_tokens),
+    )
 
 
 @triton.jit
@@ -347,210 +263,37 @@ def _normalize_prefill_topk_to_req_relative(
     topk_indices.copy_(torch.where(valid, normalized, topk_indices))
 
 
-def _run_b12x_extend_tiled_topk_streaming(
+def _warmup_b12x_extend_indexer(
     *,
     q_fp8: torch.Tensor,
     weights: torch.Tensor,
-    kv_fp8: tuple[torch.Tensor, torch.Tensor],
-    metadata: Any,
-    topk: int,
-    contract_phantoms: dict[str, torch.Tensor] | None,
-    workspace: Any,
-    tile_logits: torch.Tensor,
-    lengths: torch.Tensor,
-    output_values: torch.Tensor,
-    output_indices: torch.Tensor,
-    candidate_values: torch.Tensor,
-    candidate_indices: torch.Tensor,
-    merge_positions: torch.Tensor,
-    supertile_k: int,
-) -> torch.Tensor:
-    from b12x.attention.indexer import resolve_extend_prefill_block_k
-    from b12x.attention.indexer.extend_kernel import (
-        run_extend_logits_kernel,
-        supports_extend_logits_kernel,
-    )
-    from b12x.attention.indexer.tiled_topk import (
-        merge_tiled_topk_candidates,
-        run_tiled_topk,
-    )
+    binding: Any,
+    topk_tokens: int,
+    total_seq_lens: int,
+) -> None:
+    q_rows = int(q_fp8.shape[0])
+    if q_rows <= 0:
+        return
 
-    if q_fp8.ndim != 3:
-        raise RuntimeError(
-            "b12x extend indexer expected q_fp8 rank 3, "
-            f"got {q_fp8.ndim}."
-        )
-    k_start = metadata.k_start
-    k_end = metadata.k_end
-    if k_start.ndim != 1 or k_end.ndim != 1 or k_start.shape != k_end.shape:
-        raise RuntimeError(
-            "b12x extend indexer requires matching rank-1 k_start/k_end, "
-            f"got {tuple(k_start.shape)} and {tuple(k_end.shape)}."
-        )
-
-    topk = int(topk)
-    num_q_rows = int(k_start.shape[0])
-    num_heads = int(q_fp8.shape[1])
-    weights_f = _normalize_b12x_indexer_weights(
-        weights, q_rows=int(q_fp8.shape[0]), num_heads=num_heads
+    k_rows = max(1, int(total_seq_lens))
+    warmup_k_cap = max(
+        int(_B12X_EXTEND_TOPK_SUPERTILE_K),
+        int(_B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K),
     )
-    k_quant, k_scale = kv_fp8
+    scratch = binding.scratch
+    warmup_k_rows = min(k_rows, int(scratch.k_quant.shape[0]), warmup_k_cap)
+    scratch.k_quant[:warmup_k_rows].zero_()
+    scratch.k_scale_bytes[:warmup_k_rows].zero_()
+    scratch.metadata_k_start[:q_rows].zero_()
+    scratch.metadata_k_end[:q_rows].fill_(warmup_k_rows)
 
-    if not supports_extend_logits_kernel(
+    b12x_indexer = import_module("b12x.integration.indexer")
+    b12x_indexer.extend_tiled_topk(
         q_fp8=q_fp8,
-        weights=weights_f,
-        k_quant=k_quant,
-        k_scale=k_scale,
-        k_start=k_start,
-        k_end=k_end,
-    ):
-        from b12x.attention.indexer.api import _reference_topk_indices_from_logits
-        from b12x.attention.indexer.reference import extend_logits_reference
-
-        torch.sub(k_end, k_start, out=lengths[:num_q_rows])
-        logits = extend_logits_reference(
-            q_fp8=q_fp8,
-            weights=weights_f,
-            kv_fp8=kv_fp8,
-            k_start=k_start,
-            k_end=k_end,
-        )
-        return _reference_topk_indices_from_logits(
-            logits[:num_q_rows],
-            topk=topk,
-            output_values=output_values,
-            output_indices=output_indices,
-        )
-
-    prefill_block_k = resolve_extend_prefill_block_k(
-        valid_q_rows=num_q_rows,
-        k_rows=int(k_quant.shape[0]),
-        num_heads=num_heads,
+        weights=weights,
+        kv_fp8=(scratch.k_quant[:warmup_k_rows], scratch.k_scale[:warmup_k_rows]),
+        binding=binding,
     )
-    if prefill_block_k is None:
-        prefill_block_k = _B12X_INDEXER_EXTEND_FALLBACK_BLOCK_K
-    prefill_block_k = int(prefill_block_k)
-    block_q = _B12X_INDEXER_EXTEND_BLOCK_Q
-    num_q_tiles = _ceil_div(num_q_rows, block_q)
-    num_k_tiles = _ceil_div(int(k_quant.shape[0]), prefill_block_k)
-    tile_size = block_q * prefill_block_k
-    resolved_supertile_k = _round_up_to_multiple(
-        max(int(supertile_k), prefill_block_k),
-        prefill_block_k,
-    )
-    supertile_tiles = max(1, resolved_supertile_k // prefill_block_k)
-    num_chunks = _ceil_div(num_k_tiles, supertile_tiles)
-    max_chunk_tiles = min(supertile_tiles, num_k_tiles)
-    chunk_tile_elements = num_q_tiles * max_chunk_tiles * tile_size
-    if int(tile_logits.numel()) < chunk_tile_elements:
-        raise RuntimeError(
-            "b12x extend indexer tile_logits scratch is too small: "
-            f"{int(tile_logits.numel())} elements for {chunk_tile_elements}."
-        )
-
-    if lengths.ndim != 1 or int(lengths.shape[0]) < num_q_rows:
-        raise RuntimeError(
-            "b12x extend indexer lengths scratch has shape "
-            f"{tuple(lengths.shape)}, expected at least ({num_q_rows},)."
-        )
-    global_lengths = lengths[:num_q_rows]
-    torch.sub(k_end, k_start, out=global_lengths)
-
-    if num_chunks <= 1:
-        tile_logits[:chunk_tile_elements].fill_(float("-inf"))
-        run_extend_logits_kernel(
-            q_fp8=q_fp8,
-            weights=weights_f,
-            k_quant=k_quant,
-            k_scale=k_scale,
-            k_start=k_start,
-            k_end=k_end,
-            contract_phantoms=contract_phantoms,
-            workspace=workspace,
-            preinitialize_invalid_logits=True,
-            tile_logits=tile_logits,
-            tile_k_offset=0,
-            tile_num_k_tiles=num_k_tiles,
-        )
-        _, topk_indices = run_tiled_topk(
-            tile_logits=tile_logits,
-            k_start=k_start,
-            lengths=global_lengths,
-            topk=topk,
-            block_q=block_q,
-            block_k=prefill_block_k,
-            output_values=output_values,
-            output_indices=output_indices,
-            num_k_tiles=num_k_tiles,
-            contract_phantoms=contract_phantoms,
-        )
-        return topk_indices
-
-    expected_candidate_shape = (2, num_q_rows, topk)
-    if (
-        tuple(candidate_values.shape) != expected_candidate_shape
-        or tuple(candidate_indices.shape) != expected_candidate_shape
-    ):
-        raise RuntimeError(
-            "b12x extend indexer streaming candidates must have fixed shape "
-            f"{expected_candidate_shape}, got {tuple(candidate_values.shape)} "
-            f"and {tuple(candidate_indices.shape)}."
-        )
-
-    for chunk_idx in range(num_chunks):
-        chunk_tile_begin = chunk_idx * supertile_tiles
-        chunk_tile_end = min(chunk_tile_begin + supertile_tiles, num_k_tiles)
-        chunk_tiles = chunk_tile_end - chunk_tile_begin
-        chunk_start = chunk_tile_begin * prefill_block_k
-        chunk_rows = chunk_tiles * prefill_block_k
-        chunk_elements = num_q_tiles * chunk_tiles * tile_size
-
-        tile_logits[:chunk_elements].fill_(float("-inf"))
-        run_extend_logits_kernel(
-            q_fp8=q_fp8,
-            weights=weights_f,
-            k_quant=k_quant,
-            k_scale=k_scale,
-            k_start=k_start,
-            k_end=k_end,
-            contract_phantoms=contract_phantoms,
-            workspace=workspace,
-            preinitialize_invalid_logits=True,
-            tile_logits=tile_logits,
-            tile_k_offset=chunk_tile_begin,
-            tile_num_k_tiles=chunk_tiles,
-        )
-        candidate_slot = 0 if chunk_idx == 0 else 1
-        run_tiled_topk(
-            tile_logits=tile_logits,
-            k_start=k_start,
-            lengths=global_lengths,
-            topk=topk,
-            block_q=block_q,
-            block_k=prefill_block_k,
-            output_values=candidate_values[candidate_slot],
-            output_indices=candidate_indices[candidate_slot],
-            num_k_tiles=chunk_tiles,
-            input_index_offset=chunk_start,
-            input_extent=chunk_rows,
-            output_index_offset=chunk_start,
-            contract_phantoms=contract_phantoms,
-        )
-        if chunk_idx == 0:
-            continue
-
-        merge_tiled_topk_candidates(
-            candidate_values=candidate_values,
-            candidate_indices=candidate_indices,
-            topk=topk,
-            output_values=output_values,
-            output_indices=output_indices,
-            merge_positions=merge_positions,
-        )
-        candidate_values[0].copy_(output_values)
-        candidate_indices[0].copy_(output_indices)
-
-    return output_indices
 
 
 def _flatten_b12x_paged_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
@@ -688,13 +431,20 @@ def sparse_attn_indexer(
                 int(q_quant.shape[0]),
                 total_seq_lens,
             )
-            _get_b12x_indexer_extend_buffers(
-                q_fp8=q_quant[:profile_q_rows],
+            q_profile = q_quant[:profile_q_rows]
+            binding = _get_b12x_indexer_extend_binding(
+                q_fp8=q_profile,
                 topk_tokens=topk_tokens,
                 total_seq_lens=total_seq_lens,
-                head_dim=head_dim,
                 fp8_dtype=fp8_dtype,
-                max_k_rows=max_model_len,
+                max_k_rows=total_seq_lens,
+            )
+            _warmup_b12x_extend_indexer(
+                q_fp8=q_profile,
+                weights=weights[:profile_q_rows],
+                binding=binding,
+                topk_tokens=topk_tokens,
+                total_seq_lens=total_seq_lens,
             )
         else:
             # Reserve workspace for indexer during profiling run.
@@ -804,9 +554,6 @@ def sparse_attn_indexer(
                 topk_indices.fill_(-1)
                 continue
 
-            tile_logits = lengths = topk_values = None
-            candidate_values = candidate_indices = None
-            topk_indices_out = topk_indices
             if use_b12x_indexer:
                 row_has_no_kv = chunk.cu_seqlen_ke <= chunk.cu_seqlen_ks
                 b12x_cu_seqlen_ks = torch.where(
@@ -819,24 +566,18 @@ def sparse_attn_indexer(
                     torch.ones_like(chunk.cu_seqlen_ke),
                     chunk.cu_seqlen_ke,
                 )
-                (
-                    k_quant,
-                    k_scale,
-                    tile_logits,
-                    lengths,
-                    topk_values,
-                    topk_indices_out,
-                    candidate_values,
-                    candidate_indices,
-                    merge_positions,
-                ) = _get_b12x_indexer_extend_buffers(
+                binding = _get_b12x_indexer_extend_binding(
                     q_fp8=q_slice,
                     topk_tokens=topk_tokens,
                     total_seq_lens=chunk.total_seq_lens,
-                    head_dim=head_dim,
                     fp8_dtype=fp8_dtype,
-                    max_k_rows=max_model_len,
+                    k_start=b12x_cu_seqlen_ks,
+                    k_end=b12x_cu_seqlen_ke,
+                    max_k_rows=total_seq_lens,
                 )
+                scratch = binding.scratch
+                k_quant = scratch.k_quant[: chunk.total_seq_lens]
+                k_scale = scratch.k_scale_bytes[: chunk.total_seq_lens]
             else:
                 k_quant = k_quant_full[: chunk.total_seq_lens]
                 k_scale = k_scale_full[: chunk.total_seq_lens]
@@ -859,25 +600,11 @@ def sparse_attn_indexer(
                     else k_quant
                 )
                 topk_indices.copy_(
-                    _run_b12x_extend_tiled_topk_streaming(
+                    b12x_indexer.extend_tiled_topk(
                         q_fp8=q_slice,
                         weights=weights_slice,
                         kv_fp8=(k_fp8_b12x, k_scale_f32),
-                        metadata=b12x_indexer.IndexerExtendMetadata(
-                            k_start=b12x_cu_seqlen_ks,
-                            k_end=b12x_cu_seqlen_ke,
-                        ),
-                        topk=topk_tokens,
-                        contract_phantoms=None,
-                        workspace=None,
-                        tile_logits=tile_logits,
-                        lengths=lengths,
-                        output_values=topk_values,
-                        output_indices=topk_indices_out,
-                        candidate_values=candidate_values,
-                        candidate_indices=candidate_indices,
-                        merge_positions=merge_positions,
-                        supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
+                        binding=binding,
                     )
                 )
                 topk_indices.masked_fill_(row_has_no_kv[:, None], -1)
