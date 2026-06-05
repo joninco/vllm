@@ -198,6 +198,9 @@ if TYPE_CHECKING:
     )
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+    VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
+    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
+    VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "64KB"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1637,6 +1640,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
         "auto",
         ["auto", "trtllm", "mnnvl"],
+    ),
+    # Opt in to the b12x PCIe oneshot custom allreduce path on PCIe-only GPUs.
+    "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
+    ),
+    "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
+        "VLLM_PCIE_ALLREDUCE_BACKEND",
+        "cpp",
+        ["b12x", "cpp"],
+    ),
+    "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB"
     ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
