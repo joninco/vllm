@@ -50,7 +50,10 @@ max_model_len="${MAX_MODEL_LEN:-130000}"
 max_num_seqs="${MAX_NUM_SEQS:-16}"
 max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-4096}"
 max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-4096}"
-load_format="${LOAD_FORMAT:-instanttensor}"
+# The public DeepSeek-V4-Flash snapshot currently exposes safetensors shards.
+# Keep InstantTensor opt-in via LOAD_FORMAT=instanttensor instead of failing by
+# default on safetensors-only caches.
+load_format="${LOAD_FORMAT:-fastsafetensors}"
 enable_flashinfer_autotune="${ENABLE_FLASHINFER_AUTOTUNE:-1}"
 
 profiler_args=()
