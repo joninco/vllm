@@ -302,6 +302,21 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        # The DCP path all-gathers query heads and returns LSE for the cross-rank
+        # reduce. With the current B12X sparse MLA metadata/scratch contract,
+        # full CUDA graph replay corrupts DCP decode outputs while eager remains
+        # numerically coherent. Keep non-DCP fast path graphable, but force DCP
+        # to the non-full-graph attention path until the backend is graph-safe.
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
