@@ -443,19 +443,20 @@ def test_modelopt_nvfp4_moe_dispatches_to_marlin_when_w4a16(
     [
         ("NVFP4", "ModelOptNvFp4LinearMethod"),
         ("W4A16_NVFP4", "ModelOptNvFp4W4A16LinearMethod"),
+        ("MXFP8", "ModelOptMxFp8LinearMethod"),
     ],
 )
-def test_modelopt_mixed_precision_dispatches_w4a16_layer(
+def test_modelopt_mixed_precision_dispatches_layer_quant_algo(
     per_layer_algo, expected_linear_cls_name
 ):
     """``ModelOptMixedPrecisionConfig.get_quant_method`` must route a Linear
     layer to the right LinearMethod based on its per-layer ``quant_algo``
-    entry in ``quantized_layers``. Verifies the new ``W4A16_NVFP4`` branch
-    coexists with the existing ``NVFP4`` branch without regression. A
-    regression here would mean a W4A16 layer in a mixed-precision ckpt
+    entry in ``quantized_layers``. Verifies W4A16 and MXFP8 branches coexist
+    with the existing ``NVFP4`` branch without regression. A regression here
+    would mean a quantized layer in a mixed-precision ckpt
     silently fell through to ``UnquantizedLinearMethod``.
 
-    NOTE: FP8 dispatch (the third branch of get_quant_method) is not
+    NOTE: FP8 dispatch is not
     covered here because ``ModelOptFp8LinearMethod.__init__`` reads
     ``get_current_vllm_config().model_config.dtype``, which requires a
     fully constructed ``ModelConfig`` (real model path). FP8 routing in
