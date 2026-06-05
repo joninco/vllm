@@ -38,6 +38,7 @@ from vllm.model_executor.parameter import (
     RowvLLMParameter,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.virtual_tp import pad_or_narrow_weight
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -554,7 +555,9 @@ class ColumnParallelLinear(LinearBase):
         if output_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[output_dim]
             start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            loaded_weight = pad_or_narrow_weight(
+                loaded_weight, output_dim, start_idx, shard_size
+            )
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -843,7 +846,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
             if not is_sharded_weight:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                loaded_weight = pad_or_narrow_weight(
+                    loaded_weight, output_dim, start_idx, shard_size
+                )
         # Special case for per-tensor scales in fused case.
         elif needs_scalar_to_array:
             param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -1364,7 +1369,9 @@ class QKVParallelLinear(ColumnParallelLinear):
             start_idx = shard_rank * shard_size
 
             if not is_sharded_weight:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                loaded_weight = pad_or_narrow_weight(
+                    loaded_weight, output_dim, start_idx, shard_size
+                )
 
         # Special case for per-tensor scales in fused case.
         elif needs_scalar_to_array:
@@ -1515,7 +1522,9 @@ class RowParallelLinear(LinearBase):
         if input_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+            loaded_weight = pad_or_narrow_weight(
+                loaded_weight, input_dim, start_idx, shard_size
+            )
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
