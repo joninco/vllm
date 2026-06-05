@@ -690,10 +690,10 @@ class Worker(WorkerBase):
                 f"for peak activation, {format_gib(self.non_torch_memory)} GiB "
                 f"for non-torch memory, and {format_gib(cuda_graph_memory_bytes)} "
                 f"GiB for CUDAGraph memory. Replace gpu_memory_utilization "
-                f"config with `--kv-cache-memory="
+                f"config with `--kv-cache-memory-bytes="
                 f"{kv_cache_memory_bytes_to_requested_limit}` "
                 f"({format_gib(kv_cache_memory_bytes_to_requested_limit)} GiB) to fit "
-                f"into requested memory, or `--kv-cache-memory="
+                f"into requested memory, or `--kv-cache-memory-bytes="
                 f"{kv_cache_memory_bytes_to_gpu_limit}` "
                 f"({format_gib(kv_cache_memory_bytes_to_gpu_limit)} GiB) to fully "
                 f"utilize gpu memory. Current kv cache memory in use is "
@@ -1153,7 +1153,9 @@ class Worker(WorkerBase):
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
-            model_runner.shutdown()
+            shutdown = getattr(model_runner, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
