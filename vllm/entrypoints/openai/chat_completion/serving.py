@@ -68,7 +68,7 @@ from vllm.entrypoints.serve.utils.tool_calls_utils import (
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.outputs import RequestOutput
+from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.reasoning import ReasoningParser
