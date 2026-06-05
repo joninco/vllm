@@ -668,7 +668,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return output.fill_(0)
 
         if self.impl.dcp_world_size == -1:
-            self.impl.dcp_world_size = get_dcp_group().world_size
+            dcp_group = get_dcp_group()
+            self.impl.dcp_world_size = dcp_group.world_size
+            self.impl.dcp_rank = dcp_group.rank_in_group
+            self.impl.total_cp_world_size = (
+                self.impl.pcp_world_size * self.impl.dcp_world_size
+            )
+            self.impl.total_cp_rank = (
+                self.impl.pcp_rank * self.impl.dcp_world_size + self.impl.dcp_rank
+            )
+            self.impl.need_to_return_lse_for_decode = (
+                self.impl.dcp_world_size > 1 and self.impl.can_return_lse_for_decode
+            )
 
         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
 
@@ -777,9 +788,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             if self.impl.dcp_world_size > 1:
-                assert not fp8_attention, "DCP not support fp8 kvcache now."
-                # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
-                mqa_q = torch.cat(mqa_q, dim=-1)
+                if not self.impl.can_return_lse_for_decode:
+                    raise NotImplementedError(
+                        f"{type(self.impl).__name__} cannot use DCP because it "
+                        "does not return decode softmax LSE."
+                    )
+                self.impl.need_to_return_lse_for_decode = True
+                if (
+                    fp8_attention
+                    and isinstance(mqa_q, torch.Tensor)
+                    and not getattr(self.impl, "supports_dcp_quant_query_input", False)
+                ):
+                    raise NotImplementedError(
+                        f"{type(self.impl).__name__} does not declare support for "
+                        "DCP with FP8 KV cache and pre-quantized query input."
+                    )
+                if isinstance(mqa_q, tuple):
+                    # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                    mqa_q = torch.cat(mqa_q, dim=-1)
                 # mqa_q do allgather in head dim.
                 mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
@@ -790,6 +816,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
+                if lse is None:
+                    raise RuntimeError(
+                        f"{type(self.impl).__name__} did not return decode "
+                        "softmax LSE required by DCP."
+                    )
                 if self.dcp_a2a:
                     attn_out = dcp_a2a_lse_reduce(
                         attn_out,

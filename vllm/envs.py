@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_FP8_GEMM: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
+    VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -158,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
+    VLLM_CUDAGRAPH_CAPTURE_TIMING: bool = False
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -727,6 +729,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
         os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
     ),
+    # Log per-descriptor and per-subgraph CUDA graph capture timings.
+    "VLLM_CUDAGRAPH_CAPTURE_TIMING": lambda: bool(
+        int(os.getenv("VLLM_CUDAGRAPH_CAPTURE_TIMING", "0"))
+    ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').
     "VLLM_PATTERN_MATCH_DEBUG": lambda: os.environ.get(
@@ -1026,6 +1032,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_MOE": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_MOE", "0"))
+    ),
+    # Re-run every B12X piecewise subgraph eagerly immediately before capture.
+    # PIECEWISE descriptors already receive an eager full-forward warmup before
+    # capture, so this remains opt-in for debugging kernels that still need it.
+    "VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM": lambda: bool(
+        int(os.getenv("VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM", "0"))
     ),
     # Force DeepSeek V4 native MXFP4/E8M0 MoE weights through b12x's
     # native/modelopt-layout W4A16 prep path.

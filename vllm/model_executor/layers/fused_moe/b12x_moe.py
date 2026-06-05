@@ -204,12 +204,20 @@ def _prepare_b12x_e8m0_modelopt_moe_weights(**kwargs):
 def _prepare_b12x_fp4_moe_weights(**kwargs):
     from b12x.integration import prepare_b12x_fp4_moe_weights
 
-    if (
-        envs.VLLM_B12X_MOE_FORCE_MODELOPT_PREP
-        and kwargs.get("source_format") == "fp4_e8m0_k32"
+    w2_fp4 = kwargs.get("w2_fp4")
+    has_compact_e8m0_tail = (
+        isinstance(w2_fp4, torch.Tensor) and int(w2_fp4.shape[2]) * 2 % 32 != 0
+    )
+    should_use_native_e8m0 = (
+        kwargs.get("source_format") == "fp4_e8m0_k32"
         and kwargs.get("prepare_w4a16", False)
         and not kwargs.get("prepare_runtime_alphas", False)
-    ):
+        and (
+            has_compact_e8m0_tail
+            or envs.VLLM_B12X_MOE_FORCE_MODELOPT_PREP
+        )
+    )
+    if should_use_native_e8m0:
         return _prepare_b12x_e8m0_modelopt_moe_weights(**kwargs)
     return prepare_b12x_fp4_moe_weights(**kwargs)
 
