@@ -50,6 +50,7 @@ class InputBatch:
     # [num_reqs]
     # batch_idx -> num_scheduled_tokens
     num_scheduled_tokens: np.ndarray
+    max_query_len: int
     # sum(num_scheduled_tokens)
     num_tokens: int
     num_tokens_after_padding: int
@@ -65,6 +66,7 @@ class InputBatch:
     seq_lens: torch.Tensor
     # [num_reqs] CPU upper bound on seq_lens (see CommonAttentionMetadata).
     seq_lens_cpu_upper_bound: torch.Tensor
+    max_seq_len_upper_bound: int
     # [num_reqs]
     dcp_local_seq_lens: torch.Tensor | None
     # [num_reqs]
@@ -148,6 +150,7 @@ class InputBatch:
             expanded_idx_mapping=expanded_idx_mapping,
             expanded_local_pos=expanded_local_pos,
             num_scheduled_tokens=num_scheduled_tokens,
+            max_query_len=int(num_scheduled_tokens.max()),
             num_tokens=num_tokens,
             num_tokens_after_padding=num_tokens,
             num_draft_tokens=0,
@@ -156,6 +159,7 @@ class InputBatch:
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len_upper_bound=int(num_scheduled_tokens.max()),
             dcp_local_seq_lens=None,
             num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
