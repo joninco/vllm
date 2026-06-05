@@ -59,6 +59,13 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_USE_B12X_SPARSE_INDEXER: bool = False
+    VLLM_USE_B12X_MHC: bool = False
+    VLLM_USE_B12X_FP8_GEMM: bool = False
+    VLLM_USE_B12X_WO_PROJECTION: bool = False
+    VLLM_USE_B12X_MOE: bool = False
+    VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
+    VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -1001,6 +1008,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    # Use b12x for the DeepSeek V4 C4 sparse indexer and its top-k selection.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
+    ),
+    # Use b12x for DeepSeek V4 mHC pre/post residual mixing.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_MHC": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_MHC", "0"))
+    ),
+    # Use b12x for block-scaled FP8 linear GEMMs.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_FP8_GEMM": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_FP8_GEMM", "0"))
+    ),
+    # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
+    # This is separate from the generic FP8 linear switch for perf isolation.
+    "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_WO_PROJECTION", "0"))
+    ),
+    # Use b12x for FP4 MoE experts.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_MOE": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_MOE", "0"))
+    ),
+    # Re-run every B12X piecewise subgraph eagerly immediately before capture.
+    # PIECEWISE descriptors already receive an eager full-forward warmup before
+    # capture, so this remains opt-in for debugging kernels that still need it.
+    "VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM": lambda: bool(
+        int(os.getenv("VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM", "0"))
+    ),
+    # Force DeepSeek V4 native MXFP4/E8M0 MoE weights through b12x's
+    # native/modelopt-layout W4A16 prep path.
+    "VLLM_B12X_MOE_FORCE_MODELOPT_PREP": lambda: bool(
+        int(os.getenv("VLLM_B12X_MOE_FORCE_MODELOPT_PREP", "0"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
