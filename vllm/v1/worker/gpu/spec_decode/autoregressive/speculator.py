@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     DecodeSpeculatorCudaGraphManager,
     PrefillSpeculatorCudaGraphManager,
@@ -35,6 +36,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
         self.current_draft_step = torch.tensor(0, dtype=torch.int64, device=device)
+        self.active_num_reqs = torch.tensor(0, dtype=torch.int32, device=device)
         self.last_token_indices = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
@@ -190,6 +192,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             temperature,
             seeds,
         )
+        self.active_num_reqs.fill_(num_reqs)
 
         # Get the input ids and last token indices for the speculator.
         prepare_prefill_inputs(
@@ -277,6 +280,35 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         return self.draft_tokens[:num_reqs]
+
+    def sample_draft(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_step: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+    ) -> torch.Tensor:
+        logits = self.model.compute_logits(hidden_states)
+        if draft_logits is not None:
+            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
+            # used for draft and target sampling.
+            return gumbel_sample(
+                logits,
+                idx_mapping,
+                temperature,
+                seeds,
+                positions + 1,
+                apply_temperature=True,
+                output_processed_logits=draft_logits,
+                output_processed_logits_col=draft_step,
+                output_processed_logits_active_rows=self.active_num_reqs,
+                use_fp64=self.use_fp64_gumbel,
+            )
+        else:
+            return logits.argmax(dim=-1)
 
     @torch.inference_mode()
     def _run_model(
@@ -385,6 +417,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         attn_metadata = None
         slot_mappings_by_layer = None
         for step in range(1, self.num_speculative_steps):
+            self.active_num_reqs.fill_(num_reqs)
             # Rebuild every step when positions advance, or just once
             # on the first step when positions are constant (Gemma4 MTP).
             if not skip_attn and (self.advance_draft_positions or step == 1):
