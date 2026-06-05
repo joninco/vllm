@@ -166,6 +166,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.sliding_window,
             alignment=576 if is_flashmla else None,
+            dcp_sharded=True,
         )
 
     def forward(self): ...
@@ -197,6 +198,7 @@ class DeepseekCompressor(nn.Module):
         use_fp4_cache: bool = False,
     ):
         super().__init__()
+        self.vllm_config = vllm_config
         self.compress_ratio = compress_ratio
         self.hidden_size = hidden_size
         self.head_dim = head_dim
@@ -298,6 +300,13 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
+        parallel_config = self.vllm_config.parallel_config
+        dcp_world_size = parallel_config.decode_context_parallel_size
+        dcp_rank = 0
+        if dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            dcp_rank = get_dcp_group().rank_in_group
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
@@ -350,28 +359,47 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
-        # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
-        # does not, so the two callables have different signatures.
+        # cutedsl (head=512) accepts the full-cache flags; triton accepts the
+        # DCP mapping kwargs and stores the legacy UE8M0 paged layout.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
-            from .nvidia.ops.sparse_attn_compress_cutedsl import (
-                compress_norm_rope_store_cutedsl,
-            )
+        extra_kwargs: dict[str, Any] = {}
+        if current_platform.is_cuda() and not torch.compiler.is_compiling():
+            # NVIDIA GPUs.
+            use_triton_compressor = self.head_dim != 512 or dcp_world_size > 1
+            if not use_triton_compressor:
+                from .nvidia.ops.sparse_attn_compress_cutedsl import (
+                    compress_norm_rope_store_cutedsl,
+                )
 
-            # head=512 on CUDA always uses cutedsl, for both the legacy UE8M0
-            # layout and the FlashInfer full-cache layout. The full-cache flags
-            # are consumed only here.
-            compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
-            extra_kwargs: dict[str, Any] = dict(
-                store_full_kv=store_full_kv,
-                store_full_fp8=store_full_fp8,
-                fp8_scale=fp8_scale,
-            )
+                # head=512 on CUDA uses cutedsl unless DCP needs Triton's
+                # mapped state lookup. The full-cache flags are consumed only
+                # by this path.
+                compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
+                extra_kwargs = dict(
+                    store_full_kv=store_full_kv,
+                    store_full_fp8=store_full_fp8,
+                    fp8_scale=fp8_scale,
+                )
+            else:
+                # Indexer path (head_dim == 128), and the DCP main-compressor
+                # path where the CuTe kernel's raw state lookup is not valid.
+                compress_norm_rope_store_fn = compress_norm_rope_store_triton
         else:
-            # Indexer path (head_dim == 128) or AMD: triton, legacy UE8M0 only.
+            # AMD GPUs.
+            # Always use a triton kernel.
+            use_triton_compressor = True
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
-            extra_kwargs = {}
 
+        if use_triton_compressor:
+            extra_kwargs.update(
+                {
+                    "dcp_world_size": dcp_world_size,
+                    "dcp_rank": dcp_rank,
+                    "cp_kv_cache_interleave_size": (
+                        parallel_config.cp_kv_cache_interleave_size
+                    ),
+                }
+            )
         compress_norm_rope_store_fn(
             state_cache=state_cache,
             num_actual=num_actual,
