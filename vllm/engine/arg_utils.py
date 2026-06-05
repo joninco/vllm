@@ -60,6 +60,7 @@ from vllm.config import (
     SpeculativeConfig,
     StructuredOutputsConfig,
     UVAOffloadConfig,
+    VirtualTPSharding,
     VllmConfig,
     WeightTransferConfig,
     get_attr_docs,
@@ -464,6 +465,13 @@ class EngineArgs:
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
+    virtual_tp_sharding: VirtualTPSharding = ParallelConfig.virtual_tp_sharding
+    b12x_virtual_tp_attention_head_alignment: int = (
+        ParallelConfig.b12x_virtual_tp_attention_head_alignment
+    )
+    b12x_virtual_tp_moe_intermediate_alignment: int = (
+        ParallelConfig.b12x_virtual_tp_moe_intermediate_alignment
+    )
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
     dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
@@ -977,6 +985,24 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
+        )
+        parallel_group.add_argument(
+            "--virtual-tp-sharding", **parallel_kwargs["virtual_tp_sharding"]
+        )
+        parallel_group.add_argument(
+            "--b12x-allow-odd-tp",
+            action="store_const",
+            const="b12x-padded",
+            dest="virtual_tp_sharding",
+            help=argparse.SUPPRESS,
+        )
+        parallel_group.add_argument(
+            "--b12x-virtual-tp-attention-head-alignment",
+            **parallel_kwargs["b12x_virtual_tp_attention_head_alignment"],
+        )
+        parallel_group.add_argument(
+            "--b12x-virtual-tp-moe-intermediate-alignment",
+            **parallel_kwargs["b12x_virtual_tp_moe_intermediate_alignment"],
         )
         parallel_group.add_argument(
             "--decode-context-parallel-size",
@@ -1979,6 +2005,13 @@ class EngineArgs:
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
+            virtual_tp_sharding=self.virtual_tp_sharding,
+            b12x_virtual_tp_attention_head_alignment=(
+                self.b12x_virtual_tp_attention_head_alignment
+            ),
+            b12x_virtual_tp_moe_intermediate_alignment=(
+                self.b12x_virtual_tp_moe_intermediate_alignment
+            ),
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,
             data_parallel_rank=self.data_parallel_rank or 0,
