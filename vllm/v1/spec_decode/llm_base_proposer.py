@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from importlib.util import find_spec
+from inspect import signature
 from typing import Any, cast
 
 import numpy as np
@@ -54,6 +55,16 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _call_accepts_kwarg(method: Any, kwarg: str) -> bool:
+    try:
+        params = signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    return kwarg in params or any(
+        param.kind == param.VAR_KEYWORD for param in params.values()
+    )
 
 
 class SpecDecodeBaseProposer:
@@ -117,6 +128,9 @@ class SpecDecodeBaseProposer:
         self.use_local_argmax_reduction: bool = (
             self.speculative_config.use_local_argmax_reduction
         )
+        self._model_forward_accepts_spec_step_idx = False
+        self._compute_logits_accepts_spec_step_idx = False
+        self._get_top_tokens_accepts_spec_step_idx = False
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
 
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
@@ -399,11 +413,46 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
-    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _model_compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+    ) -> torch.Tensor:
+        if self._compute_logits_accepts_spec_step_idx:
+            return self.model.compute_logits(
+                hidden_states, spec_step_idx=spec_step_idx
+            )
+        return self.model.compute_logits(hidden_states)
+
+    def _model_get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+    ) -> torch.Tensor:
+        if self._get_top_tokens_accepts_spec_step_idx:
+            return self.model.get_top_tokens(
+                hidden_states, spec_step_idx=spec_step_idx
+            )
+        return self.model.get_top_tokens(hidden_states)
+
+    def _model_forward(
+        self,
+        model_kwargs: dict[str, Any],
+        spec_step_idx: int,
+    ) -> Any:
+        if spec_step_idx != 0 and self._model_forward_accepts_spec_step_idx:
+            return self.model(**model_kwargs, spec_step_idx=spec_step_idx)
+        return self.model(**model_kwargs)
+
+    def _greedy_sample(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+            return self._model_get_top_tokens(hidden_states, spec_step_idx)
+        return self._model_compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
 
     def _sample_from_logits(
         self,
@@ -422,10 +471,11 @@ class SpecDecodeBaseProposer:
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        spec_step_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
-            return self._greedy_sample(hidden_states), None
-        logits = self.model.compute_logits(hidden_states)
+            return self._greedy_sample(hidden_states, spec_step_idx), None
+        logits = self._model_compute_logits(hidden_states, spec_step_idx)
         return self._sample_from_logits(logits, sampling_metadata)
 
     def take_last_draft_probs(self) -> torch.Tensor | None:
@@ -501,7 +551,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**model_kwargs)
+            ret_hidden_states = self._model_forward(model_kwargs, spec_step_idx=0)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -513,7 +563,7 @@ class SpecDecodeBaseProposer:
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata
+                sample_hidden_states, sampling_metadata, spec_step_idx=0
             )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
@@ -534,7 +584,7 @@ class SpecDecodeBaseProposer:
             self.positions[:batch_size] = positions
 
         draft_token_ids, draft_probs = self._sample_draft_tokens(
-            sample_hidden_states, sampling_metadata
+            sample_hidden_states, sampling_metadata, spec_step_idx=0
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
 
@@ -612,6 +662,7 @@ class SpecDecodeBaseProposer:
                 inputs_embeds = None
 
             # Run the model.
+            spec_step_idx = token_index + 1
             model_kwargs = {
                 "input_ids": input_ids,
                 "positions": self._get_positions(input_batch_size),
@@ -628,7 +679,9 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
-                ret_hidden_states = self.model(**model_kwargs)
+                ret_hidden_states = self._model_forward(
+                    model_kwargs, spec_step_idx=spec_step_idx
+                )
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -637,7 +690,9 @@ class SpecDecodeBaseProposer:
 
             hidden_states = hidden_states[:batch_size]
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
+                last_hidden_states[:batch_size],
+                sampling_metadata,
+                spec_step_idx=spec_step_idx,
             )
             if draft_probs is not None:
                 assert draft_probs_list is not None
@@ -1148,13 +1203,20 @@ class SpecDecodeBaseProposer:
         Subclasses may override to apply additional config changes.
         """
         spec_cfg = self.speculative_config
-        base = self.vllm_config
+        config = replace(
+            self.vllm_config,
+            parallel_config=replace(
+                spec_cfg.draft_parallel_config,
+                rank=self.vllm_config.parallel_config.rank,
+            ),
+            model_config=spec_cfg.draft_model_config,
+        )
 
         if spec_cfg.moe_backend is not None:
-            base = replace(
-                base,
+            config = replace(
+                config,
                 kernel_config=replace(
-                    base.kernel_config,
+                    config.kernel_config,
                     moe_backend=spec_cfg.moe_backend,
                 ),
             )
@@ -1162,15 +1224,15 @@ class SpecDecodeBaseProposer:
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
         # unless explicitly specified in the speculative config.
-        base = replace(
-            base,
+        config = replace(
+            config,
             attention_config=replace(
-                base.attention_config,
+                config.attention_config,
                 backend=spec_cfg.attention_backend,
             ),
         )
 
-        return base
+        return config
 
     def _get_model(self) -> nn.Module:
         """
@@ -1197,6 +1259,16 @@ class SpecDecodeBaseProposer:
         )
 
         self.model = self._get_model()
+        self._model_forward_accepts_spec_step_idx = _call_accepts_kwarg(
+            self.model.forward, "spec_step_idx"
+        )
+        self._compute_logits_accepts_spec_step_idx = _call_accepts_kwarg(
+            self.model.compute_logits, "spec_step_idx"
+        )
+        if hasattr(self.model, "get_top_tokens"):
+            self._get_top_tokens_accepts_spec_step_idx = _call_accepts_kwarg(
+                self.model.get_top_tokens, "spec_step_idx"
+            )
 
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(
