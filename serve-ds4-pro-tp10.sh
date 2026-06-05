@@ -52,7 +52,7 @@ max_num_seqs="${MAX_NUM_SEQS:-6}"
 max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-2048}"
 max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-2048}"
 cudagraph_mode="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
-kv_cache_memory_bytes="${KV_CACHE_MEMORY_BYTES:-4000000000}"
+kv_cache_memory_bytes="${KV_CACHE_MEMORY_BYTES:-2500000000}"
 load_format="${LOAD_FORMAT:-instanttensor}"
 enable_flashinfer_autotune="${ENABLE_FLASHINFER_AUTOTUNE:-1}"
 
