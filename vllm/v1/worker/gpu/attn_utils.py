@@ -12,6 +12,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
+    CommonAttentionBatchTopology,
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import (
@@ -206,12 +207,15 @@ def _reshape_kv_cache(
                     kv_cache_spec.storage_block_size // kernel_block_size
                 )
                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                cache_dtype_str = (
+                    getattr(kv_cache_spec, "cache_dtype_str", None) or cache_dtype
+                )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
+                    cache_dtype_str=cache_dtype_str,
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -390,6 +394,7 @@ def build_attn_metadata(
     slot_mappings: torch.Tensor,
     kv_cache_config: KVCacheConfig,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    max_seq_len_upper_bound: int | None = None,
     dcp_local_seq_lens: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
@@ -404,6 +409,14 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    batch_topology = CommonAttentionBatchTopology(
+        query_start_loc_np=query_start_loc_cpu.numpy(),
+        num_reqs=num_reqs,
+        max_query_len=max_query_len,
+        max_seq_len_upper_bound=(
+            max_seq_len if max_seq_len_upper_bound is None else max_seq_len_upper_bound
+        ),
+    )
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -427,6 +440,7 @@ def build_attn_metadata(
             causal=causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
+            batch_topology=batch_topology,
             **common_attn_metadata_extra_kwargs,
         )
 

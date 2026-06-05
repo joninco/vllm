@@ -16,7 +16,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -163,6 +162,10 @@ class DeepseekSparseSWAMetadata:
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     decode_swa_indices: torch.Tensor | None = None  # [num_decode_tokens, window_size]
     decode_swa_lens: torch.Tensor | None = None  # [num_decode_tokens]
+    # Paged per-token SWA slot ids / window lengths for the prefill rows
+    # (b12x compressed-MLA prefill path; computed by the same kernel as decode).
+    prefill_swa_indices: torch.Tensor | None = None  # [num_prefill_tokens, 1, window]
+    prefill_swa_lens: torch.Tensor | None = None  # [num_prefill_tokens]
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -226,6 +229,25 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.decode_threshold = (
             self.reorder_batch_threshold + self.num_speculative_tokens
         )
+        self._skip_tile_scheduler_platform = (
+            current_platform.is_rocm()
+            or current_platform.is_xpu()
+            or current_platform.is_device_capability_family(120)
+        )
+        parallel_config = self.vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.pcp_world_size = parallel_config.prefill_context_parallel_size
+        self.cp_kv_cache_interleave_size = (
+            parallel_config.cp_kv_cache_interleave_size
+        )
+        self.dcp_rank = 0
+        if self.dcp_world_size > 1:
+            assert self.pcp_world_size == 1, (
+                "DeepseekSparseSWA metadata supports DCP but not PCP."
+            )
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
@@ -286,37 +308,74 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
-            split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.decode_threshold
+            common_attn_metadata.split_decodes_and_prefills(
+                decode_threshold=self.decode_threshold
             )
         )
 
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
-        query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+        if common_attn_metadata.batch_topology is not None:
+            x = torch.from_numpy(
+                common_attn_metadata.batch_topology.req_id_per_token_np
+            ).pin_memory()
+        else:
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
         token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
         token_to_req_indices.copy_(x, non_blocking=True)
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
-        is_valid_token.copy_(slot_mapping >= 0)
+        if self.dcp_world_size > 1:
+            # In DCP, slot_mapping is rank-local KV-write ownership. A -1 slot
+            # means this rank does not write the current token, not that the
+            # query row is padding; actual rows still need local KV reads.
+            num_query_tokens = int(token_to_req_indices.shape[0])
+            is_valid_token[:num_query_tokens].fill_(True)
+            is_valid_token[num_query_tokens:].fill_(False)
+        else:
+            is_valid_token.copy_(slot_mapping >= 0)
 
-        if num_decode_tokens > 0:
-            self.decode_swa_lens[num_decode_tokens:] = 0
-            _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
-                self.decode_swa_indices,
-                self.decode_swa_indices.stride(0),
-                self.decode_swa_lens,
-                self.window_size,
-                query_start_loc,
-                seq_lens,
-                token_to_req_indices,
-                is_valid_token,
-                block_table,
-                block_table.stride(0),
-                self.block_size,
-                TRITON_BLOCK_SIZE=1024,
-            )
+        # Compute paged SWA slot ids for ALL actual tokens (decode + prefill);
+        # the b12x compressed-MLA prefill path consumes the prefill slice. The
+        # kernel keys on the global token index, so one launch covers both. The
+        # FlashMLA path only reads the decode slice, so this is additive.
+        num_actual_tokens = num_decode_tokens + num_prefill_tokens
+        if num_actual_tokens > 0:
+            self.decode_swa_lens[num_actual_tokens:] = 0
+            if self.dcp_world_size > 1:
+                _compute_dcp_swa_indices_and_lens_kernel[(num_actual_tokens,)](
+                    self.decode_swa_indices,
+                    self.decode_swa_indices.stride(0),
+                    self.decode_swa_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    DCP_WORLD_SIZE=self.dcp_world_size,
+                    DCP_RANK=self.dcp_rank,
+                    CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+                    TRITON_BLOCK_SIZE=1024,
+                )
+            else:
+                _compute_swa_indices_and_lens_kernel[(num_actual_tokens,)](
+                    self.decode_swa_indices,
+                    self.decode_swa_indices.stride(0),
+                    self.decode_swa_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    TRITON_BLOCK_SIZE=1024,
+                )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
@@ -342,6 +401,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             token_to_req_indices=token_to_req_indices,
             decode_swa_indices=self.decode_swa_indices[:num_decode_tokens],
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
+            prefill_swa_indices=self.decode_swa_indices[
+                num_decode_tokens : num_decode_tokens + num_prefill_tokens
+            ],
+            prefill_swa_lens=self.decode_swa_lens[
+                num_decode_tokens : num_decode_tokens + num_prefill_tokens
+            ],
             block_size=self.block_size,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
@@ -372,11 +437,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
         }
-        if (
-            num_decode_tokens == 0
-            or current_platform.is_rocm()
-            or current_platform.is_xpu()
-        ):
+        # SM120 (consumer Blackwell) drives DSV4 MLA through b12x, which does not
+        # use the FlashMLA tile scheduler; skip the planner (and its _flashmla_C
+        # dependency, which is not built for sm_120a).
+        if num_decode_tokens == 0 or self._skip_tile_scheduler_platform:
             return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that
@@ -506,3 +570,76 @@ def _compute_swa_indices_and_lens_kernel(
             slot_ids,
             mask=offset < window_size,
         )
+
+
+@triton.jit
+def _compute_dcp_swa_indices_and_lens_kernel(
+    swa_indices_ptr,
+    swa_indices_stride,
+    swa_lens_ptr,
+    window_size,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    is_valid_token_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    is_valid_token = tl.load(is_valid_token_ptr + token_idx)
+    if not is_valid_token:
+        tl.store(swa_lens_ptr + token_idx, 0)
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    prefix_len = seq_len - query_len
+
+    pos = prefix_len + token_idx - query_start
+    start_pos = tl.maximum(pos - window_size + 1, 0)
+    end_pos = pos + 1
+
+    count = tl.zeros((), dtype=tl.int32)
+    virtual_block_size = block_size * DCP_WORLD_SIZE
+    for i in range(0, window_size, TRITON_BLOCK_SIZE):
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+        offset_mask = offset < window_size
+
+        pos_offset = start_pos + offset
+        in_window = pos_offset < end_pos
+        block_indices = pos_offset // virtual_block_size
+        block_numbers = tl.load(
+            block_table_ptr + req_idx * block_table_stride + block_indices,
+            mask=offset_mask & in_window,
+        ).to(tl.int64)
+
+        virtual_block_offsets = pos_offset - block_indices * virtual_block_size
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % DCP_WORLD_SIZE == DCP_RANK
+        local_block_offsets = (
+            virtual_block_offsets
+            // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+
+        slot_ids = block_numbers * block_size + local_block_offsets
+        valid = offset_mask & in_window & is_local
+        compact_pos = count + tl.cumsum(valid.to(tl.int32), 0) - 1
+        row_base = swa_indices_ptr + token_idx * swa_indices_stride
+        tl.store(row_base + offset, -1, mask=offset_mask)
+        tl.store(row_base + compact_pos, slot_ids, mask=valid)
+        count += tl.sum(valid.to(tl.int32), axis=0)
+
+    tl.store(swa_lens_ptr + token_idx, count)
