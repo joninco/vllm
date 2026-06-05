@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 
 export CUTE_DSL_ARCH=sm_120a
 export NCCL_IB_DISABLE=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export VLLM_USE_AOT_COMPILE=1
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0
@@ -52,7 +53,7 @@ max_num_seqs="${MAX_NUM_SEQS:-6}"
 max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-2048}"
 max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-2048}"
 cudagraph_mode="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
-kv_cache_memory_bytes="${KV_CACHE_MEMORY_BYTES:-2500000000}"
+kv_cache_memory_bytes="${KV_CACHE_MEMORY_BYTES:-2250000000}"
 load_format="${LOAD_FORMAT:-instanttensor}"
 enable_flashinfer_autotune="${ENABLE_FLASHINFER_AUTOTUNE:-1}"
 
