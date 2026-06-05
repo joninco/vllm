@@ -321,7 +321,15 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         token_to_req_indices.copy_(x, non_blocking=True)
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
-        is_valid_token.copy_(slot_mapping >= 0)
+        if self.dcp_world_size > 1:
+            # In DCP, slot_mapping is rank-local KV-write ownership. A -1 slot
+            # means this rank does not write the current token, not that the
+            # query row is padding; actual rows still need local KV reads.
+            num_query_tokens = int(token_to_req_indices.shape[0])
+            is_valid_token[:num_query_tokens].fill_(True)
+            is_valid_token[num_query_tokens:].fill_(False)
+        else:
+            is_valid_token.copy_(slot_mapping >= 0)
 
         # Compute paged SWA slot ids for ALL actual tokens (decode + prefill);
         # the b12x compressed-MLA prefill path consumes the prefill slice. The
