@@ -727,39 +727,6 @@ direct_register_custom_op(
 )
 
 
-def deepseek_v4_attention(
-    hidden_states: torch.Tensor,
-    positions: torch.Tensor,
-    out: torch.Tensor,
-    layer_name: str,
-) -> None:
-    # Opaque wrapper around the whole MLA attention. `out` is mutated in place;
-    # the layer is recovered from the forward context by name so the op stays a
-    # plain (non-method) custom op. See the call site in
-    # DeepseekV4MultiHeadLatentAttentionWrapper.forward for why this boundary is
-    # required for torch.compile + AOT piecewise correctness.
-    forward_context = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]
-    self.attention_impl(hidden_states, positions, out)
-
-
-def deepseek_v4_attention_fake(
-    hidden_states: torch.Tensor,
-    positions: torch.Tensor,
-    out: torch.Tensor,
-    layer_name: str,
-) -> None:
-    return None
-
-
-direct_register_custom_op(
-    op_name="deepseek_v4_attention",
-    op_func=deepseek_v4_attention,
-    mutates_args=["out"],
-    fake_impl=deepseek_v4_attention_fake,
-)
-
-
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
     def __init__(
         self,
