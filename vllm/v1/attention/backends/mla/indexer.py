@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -25,6 +26,23 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
+
+_B12X_COMPRESSED_INDEX_SUPERTILE_K_DEFAULT = 32768
+_B12X_COMPRESSED_INDEX_TILE_BLOCK_K = 512
+
+
+def _get_b12x_compressed_indexer_supertile_k() -> int:
+    raw = os.environ.get("B12X_COMPRESSED_INDEX_SUPERTILE_K")
+    if raw is None:
+        tokens = _B12X_COMPRESSED_INDEX_SUPERTILE_K_DEFAULT
+    else:
+        tokens = int(raw)
+    tokens = max(tokens, _B12X_COMPRESSED_INDEX_TILE_BLOCK_K)
+    return (
+        (tokens + _B12X_COMPRESSED_INDEX_TILE_BLOCK_K - 1)
+        // _B12X_COMPRESSED_INDEX_TILE_BLOCK_K
+        * _B12X_COMPRESSED_INDEX_TILE_BLOCK_K
+    )
 
 
 @triton.jit
@@ -636,13 +654,33 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 num_decodes : num_decodes + num_prefills
             ]
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-            chunk_specs = split_indexer_prefill_chunks(
-                compressed_seq_lens_cpu_np[num_decodes:],
-                prefill_query_lens_cpu,
-                self.max_prefill_buffer_size,
-                max_logits_bytes,
-                request_offset=num_decodes,
-            )
+            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+                chunk_specs = []
+                b12x_budget_seq_lens = np.array(
+                    [_get_b12x_compressed_indexer_supertile_k()],
+                    dtype=compressed_seq_lens_cpu_np.dtype,
+                )
+                for prefill_idx in range(num_prefills):
+                    req_idx = num_decodes + prefill_idx
+                    chunk_specs.extend(
+                        split_indexer_prefill_chunks(
+                            b12x_budget_seq_lens,
+                            prefill_query_lens_cpu[
+                                prefill_idx : prefill_idx + 1
+                            ],
+                            self.max_prefill_buffer_size,
+                            max_logits_bytes,
+                            request_offset=req_idx,
+                        )
+                    )
+            else:
+                chunk_specs = split_indexer_prefill_chunks(
+                    compressed_seq_lens_cpu_np[num_decodes:],
+                    prefill_query_lens_cpu,
+                    self.max_prefill_buffer_size,
+                    max_logits_bytes,
+                    request_offset=num_decodes,
+                )
 
             chunks = []
             for req_slice, query_slice in chunk_specs:

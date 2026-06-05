@@ -13,7 +13,7 @@ fi
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3,4,5,6,7,8}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3,4,5,6,7,8,9}"
 export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
@@ -59,30 +59,11 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 DCP_SIZE="${DCP_SIZE:-1}"
 TP_SIZE="${TP_SIZE:-8}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.96}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
-if [[ -z "${MAX_CUDAGRAPH_CAPTURE_SIZE+x}" ]]; then
-  case "${VLLM_USE_B12X_MOE,,}" in
-    1|true|yes|on)
-      # Native B12X MoE is currently capture-safe for decode-size graphs only.
-      # With MTP on, the uniform decode graph spans (num_speculative_tokens + 1)
-      # query tokens per sequence, and vLLM rounds every cudagraph capture size up
-      # to a multiple of that (compilation.py:adjust_cudagraph_sizes_for_spec_decode);
-      # a hardcoded 1 yields zero valid sizes and aborts engine init. Size up to the
-      # smallest valid decode graph = num_speculative_tokens + 1 (1 when MTP off).
-      if [[ "${GLM51_DISABLE_MTP:-0}" != "1" ]]; then
-        MAX_CUDAGRAPH_CAPTURE_SIZE=$(( ${NUM_SPECULATIVE_TOKENS:-3} + 1 ))
-      else
-        MAX_CUDAGRAPH_CAPTURE_SIZE=1
-      fi
-      ;;
-    *)
-      MAX_CUDAGRAPH_CAPTURE_SIZE=64
-      ;;
-  esac
-fi
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+MAX_CUDAGRAPH_CAPTURE_SIZE=16
+
 MOE_BACKEND="${MOE_BACKEND:-b12x}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-B12X_MLA_SPARSE}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
@@ -162,7 +143,6 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --async-scheduling \
   -cc.pass_config.fuse_allreduce_rms=True \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
-  --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --max-cudagraph-capture-size "${MAX_CUDAGRAPH_CAPTURE_SIZE}" \
