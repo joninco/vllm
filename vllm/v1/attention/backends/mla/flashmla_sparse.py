@@ -36,7 +36,6 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
-    split_decodes_and_prefills,
     split_prefill_chunks,
 )
 from vllm.v1.attention.ops.flashmla import (
@@ -258,6 +257,20 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         self.model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         self.device = device
+        self.storage_block_size = int(self.kv_cache_spec.storage_block_size)
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.pcp_world_size = parallel_config.prefill_context_parallel_size
+        self.cp_kv_cache_interleave_size = (
+            parallel_config.cp_kv_cache_interleave_size
+        )
+        self.dcp_rank = 0
+        if self.dcp_world_size > 1:
+            assert self.pcp_world_size == 1, (
+                "FlashMLASparseMetadataBuilder supports DCP but not PCP."
+            )
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
 
         # Classify single-token queries (plus num_speculative_tokens via
         # supports_spec_as_decode=True) as decodes; longer queries go to
@@ -426,8 +439,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         num_tokens = common_attn_metadata.num_actual_tokens
 
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
+            common_attn_metadata.split_decodes_and_prefills(
                 decode_threshold=self.reorder_batch_threshold or 1,
                 require_uniform=True,
             )
@@ -457,6 +469,12 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             assert seq_lens_cpu is not None
             seq_lens = common_attn_metadata.seq_lens
             query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            if common_attn_metadata.batch_topology is not None:
+                query_start_loc_np = (
+                    common_attn_metadata.batch_topology.query_start_loc_np
+                )
+            else:
+                query_start_loc_np = query_start_loc_cpu.numpy()
 
             prefill_seq_lens_cpu = seq_lens_cpu[num_decodes:]
             prefill_seq_lens = seq_lens[num_decodes:]
@@ -471,8 +489,8 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             for req_idx in range(num_prefills):
                 # Get query token range for this prefill request
                 global_req_idx = num_decodes + req_idx
-                req_query_start = query_start_loc_cpu[global_req_idx]
-                req_query_end = query_start_loc_cpu[global_req_idx + 1]
+                req_query_start = int(query_start_loc_np[global_req_idx])
+                req_query_end = int(query_start_loc_np[global_req_idx + 1])
                 prefill_request_id[req_query_start:req_query_end] = req_idx
 
             # will be adjusted by chunk loop
@@ -509,8 +527,8 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
 
                 chunk_seq_lens = prefill_seq_lens[chunk_start:chunk_end]
                 chunk_tot_seqlen = prefill_seq_lens_cpu[chunk_start:chunk_end].sum()
-                token_start = query_start_loc_cpu[num_decodes + chunk_start].item()
-                token_end = query_start_loc_cpu[num_decodes + chunk_end].item()
+                token_start = int(query_start_loc_np[num_decodes + chunk_start])
+                token_end = int(query_start_loc_np[num_decodes + chunk_end])
                 tokens_slice = slice(token_start, token_end)
 
                 # Create chunk view of gpu tensor
@@ -543,8 +561,13 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
 
         if num_decodes > 0:
             # Compute decode_query_len for spec decode (uniform due to require_uniform)
-            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-            decode_query_len = (query_start_loc_cpu[1] - query_start_loc_cpu[0]).item()
+            if common_attn_metadata.batch_topology is not None:
+                query_start_loc_np = (
+                    common_attn_metadata.batch_topology.query_start_loc_np
+                )
+            else:
+                query_start_loc_np = common_attn_metadata.query_start_loc_cpu.numpy()
+            decode_query_len = int(query_start_loc_np[1] - query_start_loc_np[0])
 
             # Use padded head count since that's what the kernel will see
             scheduler_metadata, _ = get_mla_metadata()
@@ -570,11 +593,15 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
     ) -> FlashMLASparseMetadata:
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
-        starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-        seg_lengths = np.diff(starts)
-        req_id_per_token = np.repeat(
-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
-        )
+        if cm.batch_topology is not None:
+            req_id_per_token = cm.batch_topology.req_id_per_token_np
+        else:
+            starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
+            seg_lengths = np.diff(starts)
+            req_id_per_token = np.repeat(
+                np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
+            )
+        actual_num_query_tokens = int(req_id_per_token.shape[0])
         # Zero-fill for cudagraphs
         self.req_id_per_token_buffer.fill_(0)
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
@@ -589,9 +616,12 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 common_attn_metadata.query_start_loc,
                 common_attn_metadata.seq_lens,
                 common_attn_metadata.block_table_tensor.clamp(min=0),
-                int(self.kv_cache_spec.storage_block_size),
+                self.storage_block_size,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
+                dcp_world_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
 
         fp8_extra_metadata: (
@@ -616,7 +646,11 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # Pre-compute C128A topk indices for DeepseekV4.
         c128a_fields = {}
         if self.is_deepseek_v4 and self.compress_ratio == 128:
-            c128a_fields = self._build_c128a_metadata(cm, req_id_per_token)
+            c128a_fields = self._build_c128a_metadata(
+                cm,
+                req_id_per_token,
+                actual_num_query_tokens,
+            )
 
         metadata = FlashMLASparseMetadata(
             num_reqs=cm.num_reqs,
@@ -640,6 +674,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         self,
         cm: CommonAttentionMetadata,
         req_id_per_token: torch.Tensor,
+        actual_num_query_tokens: int,
     ) -> dict[str, torch.Tensor | None]:
         """Pre-compute C128A topk indices for DeepseekV4 (compress_ratio >= 128)."""
         # Must match SWA's decode split (no `require_uniform=True`) so
@@ -647,8 +682,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # `_forward_decode`. The per-token C128A kernel handles non-uniform
         # query lengths.
         (num_decodes, _, num_decode_tokens, num_prefill_tokens) = (
-            split_decodes_and_prefills(
-                cm,
+            cm.split_decodes_and_prefills(
                 decode_threshold=self.reorder_batch_threshold or 1,
             )
         )
@@ -665,6 +699,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             cm.positions[:num_total],
             self.compress_ratio,
             num_decode_tokens,
+            actual_num_query_tokens,
             req_id_per_token,
             cm.block_table_tensor[:num_decodes],
             block_size,
@@ -673,6 +708,9 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             self.c128a_decode_lens_buffer,
             self.c128a_prefill_buffer,
             max_compressed_tokens=self.c128a_max_compressed,
+            dcp_world_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
         )
 
         result: dict[str, torch.Tensor | None] = {}
@@ -1033,6 +1071,7 @@ def build_c128a_topk_metadata(
     positions: torch.Tensor,
     compress_ratio: int,
     num_decode_tokens: int,
+    actual_num_query_tokens: int,
     token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
     block_size: int,
@@ -1041,6 +1080,9 @@ def build_c128a_topk_metadata(
     decode_lens_buffer: torch.Tensor,
     prefill_buffer: torch.Tensor,
     max_compressed_tokens: int = 8192,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single kernel for all C128A tokens (decode + prefill).
 
@@ -1070,11 +1112,15 @@ def build_c128a_topk_metadata(
         compress_ratio,
         max_compressed_tokens,
         num_decode_tokens,
+        actual_num_query_tokens,
         token_to_req_indices,
         block_table,
         block_table.stride(0),
         block_size,
         slot_mapping,
+        DCP_WORLD_SIZE=dcp_world_size,
+        DCP_RANK=dcp_rank,
+        CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,
         BLOCK_SIZE=1024,
     )
     return global_decode, decode_lens, prefill_local
@@ -1094,11 +1140,15 @@ def _build_c128a_topk_metadata_kernel(
     compress_ratio,
     max_compressed_tokens,
     num_decode_tokens,
+    actual_num_query_tokens,
     token_to_req_indices_ptr,
     block_table_ptr,
     block_table_stride,
     block_size,
     slot_mapping_ptr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -1109,28 +1159,56 @@ def _build_c128a_topk_metadata_kernel(
 
     if is_decode:
         # --- Decode: block-table lookup → global slot ids + count ---
-        is_valid_token = tl.load(slot_mapping_ptr + token_idx) >= 0
+        if DCP_WORLD_SIZE == 1:
+            is_valid_token = tl.load(slot_mapping_ptr + token_idx) >= 0
+        else:
+            is_valid_token = token_idx < actual_num_query_tokens
         req_idx = tl.load(token_to_req_indices_ptr + token_idx)
         count = tl.zeros((), dtype=tl.int32)
+        virtual_block_size = block_size * DCP_WORLD_SIZE
         for i in range(0, max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
             mask = offset < max_compressed_tokens
             is_valid = offset < num_compressed
 
-            block_indices = offset // block_size
-            block_numbers = tl.load(
-                block_table_ptr + req_idx * block_table_stride + block_indices,
-                mask=mask & is_valid,
-            )
-            block_offsets = offset % block_size
-            slot_ids = block_numbers * block_size + block_offsets
-            slot_ids = tl.where(is_valid, slot_ids, -1)
-            tl.store(
-                global_decode_ptr + token_idx * global_decode_stride + offset,
-                slot_ids,
-                mask=mask,
-            )
-            count += tl.sum(is_valid.to(tl.int32), axis=0)
+            if DCP_WORLD_SIZE == 1:
+                block_indices = offset // block_size
+                block_numbers = tl.load(
+                    block_table_ptr + req_idx * block_table_stride + block_indices,
+                    mask=mask & is_valid,
+                )
+                block_offsets = offset % block_size
+                slot_ids = block_numbers * block_size + block_offsets
+                slot_ids = tl.where(is_valid, slot_ids, -1)
+                tl.store(
+                    global_decode_ptr + token_idx * global_decode_stride + offset,
+                    slot_ids,
+                    mask=mask,
+                )
+                count += tl.sum(is_valid.to(tl.int32), axis=0)
+            else:
+                block_indices = offset // virtual_block_size
+                block_numbers = tl.load(
+                    block_table_ptr + req_idx * block_table_stride + block_indices,
+                    mask=mask & is_valid & is_valid_token,
+                ).to(tl.int64)
+                virtual_block_offsets = offset - block_indices * virtual_block_size
+                is_local = (
+                    virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+                ) % DCP_WORLD_SIZE == DCP_RANK
+                local_block_offsets = (
+                    virtual_block_offsets
+                    // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+                ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+                    virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+                )
+                slot_ids = block_numbers * block_size + local_block_offsets
+                valid = mask & is_valid & is_local & is_valid_token
+                compact_pos = count + tl.cumsum(valid.to(tl.int32), 0) - 1
+                row_base = global_decode_ptr + token_idx * global_decode_stride
+                tl.store(row_base + offset, -1, mask=mask)
+                tl.store(row_base + compact_pos, slot_ids, mask=valid)
+                count += tl.sum(valid.to(tl.int32), axis=0)
 
         tl.store(
             decode_lens_ptr + token_idx,
@@ -1139,11 +1217,12 @@ def _build_c128a_topk_metadata_kernel(
     else:
         # --- Prefill: write local indices ---
         pfx_idx = token_idx - num_decode_tokens
+        is_valid_token = token_idx < actual_num_query_tokens
         for i in range(0, max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
             mask = offset < max_compressed_tokens
             tl.store(
                 prefill_local_ptr + pfx_idx * prefill_local_stride + offset,
-                tl.where(offset < num_compressed, offset, -1),
+                tl.where((offset < num_compressed) & is_valid_token, offset, -1),
                 mask=mask,
             )
