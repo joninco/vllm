@@ -539,6 +539,19 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
+        parallel_config = vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = 0
+        if self.dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
+        self.total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        self.need_to_return_lse_for_decode = (
+            self.dcp_world_size > 1 and self.can_return_lse_for_decode
+        )
+
         scheduler_config = vllm_config.scheduler_config
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
         max_batched = int(scheduler_config.max_num_batched_tokens)

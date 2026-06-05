@@ -937,16 +937,10 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
-    num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
+    max_memory_usage_per_request = _max_memory_usage_bytes_from_groups(
+        vllm_config, kv_cache_config.kv_cache_groups
     )
-    max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
-        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
-    )
-    memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
-    )
+    memory_per_block = _pool_bytes_per_block(kv_cache_config.kv_cache_groups)
     num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     max_concurrency = kv_cache_config.num_blocks / num_block_per_request
     return max_concurrency
@@ -1487,15 +1481,17 @@ def group_and_unify_kv_cache_specs(
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
-        dict
-    )
-    # NOTE: Here we group SWA layers by (block_size, sliding_window), which separates
-    # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can
-    # be fragile with only block_size and sliding_window as keys, but fine for now.
+    grouped_swa_mla_specs: dict[
+        tuple[int, int, bool], dict[str, KVCacheSpec]
+    ] = defaultdict(dict)
+    # NOTE: Here we group SWA layers by (block_size, sliding_window,
+    # dcp_sharded), which separates SWA layers, C4I+C4A layers, and C128A
+    # layers into different groups.
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
-            grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
+            grouped_swa_mla_specs[
+                (spec.block_size, spec.sliding_window, spec.dcp_sharded)
+            ][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
 

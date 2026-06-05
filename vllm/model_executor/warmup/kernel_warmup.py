@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation.caching import aot_compile_hash_factors
@@ -55,6 +56,86 @@ def _resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
     return output_dir / "autotune_configs.json"
 
 
+def _is_flashinfer_backend(backend) -> bool:
+    try:
+        return backend.get_name() == "FLASHINFER"
+    except NotImplementedError:
+        return False
+
+
+def _is_flashinfer_object(obj: object) -> bool:
+    cls = obj.__class__
+    name = cls.__name__.lower()
+    module = cls.__module__.lower()
+    return "flashinfer" in name or "flashinfer" in module
+
+
+def _contains_flashinfer_object(
+    obj: object,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> bool:
+    if obj is None or isinstance(obj, (str, bytes, int, float, bool, torch.Tensor)):
+        return False
+    if _is_flashinfer_object(obj):
+        return True
+    if depth >= 3:
+        return False
+    if seen is None:
+        seen = set()
+    obj_id = id(obj)
+    if obj_id in seen:
+        return False
+    seen.add(obj_id)
+
+    if isinstance(obj, nn.Module):
+        return False
+    if isinstance(obj, dict):
+        values = obj.values()
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        values = obj
+    elif hasattr(obj, "__dict__"):
+        values = vars(obj).values()
+    else:
+        return False
+
+    return any(
+        _contains_flashinfer_object(value, depth=depth + 1, seen=seen)
+        for value in values
+    )
+
+
+def _uses_flashinfer_attention(runner: "GPUModelRunner") -> bool:
+    return bool(
+        runner.attn_groups
+        and any(
+            _is_flashinfer_backend(group.backend)
+            for groups in runner.attn_groups
+            for group in groups
+        )
+    )
+
+
+def _uses_flashinfer_model_kernels(model: nn.Module) -> bool:
+    for module in model.modules():
+        if _is_flashinfer_object(module):
+            return True
+        if any(
+            _contains_flashinfer_object(value)
+            for value in vars(module).values()
+            if not isinstance(value, nn.Module)
+        ):
+            return True
+    return False
+
+
+def _uses_flashinfer_compute_kernels(worker: "Worker") -> bool:
+    return _uses_flashinfer_attention(
+        worker.model_runner
+    ) or _uses_flashinfer_model_kernels(worker.get_model())
+
+
 def kernel_warmup(worker: "Worker"):
     # DSv4 mHC kernels run every decoder layer per token; warm them across
     # token sizes first so the first real request doesn't pay JIT cost. No-op
@@ -85,18 +166,23 @@ def kernel_warmup(worker: "Worker"):
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
-    elif has_flashinfer() and current_platform.has_device_capability(90):
+    elif not has_flashinfer():
+        logger.info("Skipping FlashInfer autotune because FlashInfer is unavailable.")
+    elif not current_platform.has_device_capability(90):
+        logger.info(
+            "Skipping FlashInfer autotune because the device capability is below 90."
+        )
+    elif not _uses_flashinfer_compute_kernels(worker):
+        logger.info(
+            "Skipping FlashInfer autotune because no FlashInfer compute kernels "
+            "are active."
+        )
+    else:
         flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
-    def _is_flashinfer_backend(backend):
-        try:
-            return backend.get_name() == "FLASHINFER"
-        except NotImplementedError:
-            return False
-
     if (
         not worker.model_runner.is_pooling_model
         and worker.model_runner.attn_groups

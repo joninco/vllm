@@ -34,18 +34,25 @@ if [[ -z "${HF_HOME:-}" && -L "${HOME}/.cache/huggingface" && ! -e "${HOME}/.cac
   fi
   mkdir -p "${HF_HOME}"
 fi
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+allocator_conf="${PYTORCH_CUDA_ALLOC_CONF:-}"
+if [[ "${allocator_conf}" != *"expandable_segments:"* ]]; then
+  allocator_conf="${allocator_conf:+${allocator_conf},}expandable_segments:True"
+fi
+export PYTORCH_CUDA_ALLOC_CONF="${allocator_conf}"
 model_path="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Pro}"
 served_model_name="${SERVED_MODEL_NAME:-DeepSeek-V4-Pro}"
 tp_size="${TP_SIZE:-10}"
 dcp_size="${DCP_SIZE:-1}"
 dcp_comm_backend="${DCP_COMM_BACKEND:-ag_rs}"
+moe_intermediate_alignment="${B12X_VIRTUAL_TP_MOE_INTERMEDIATE_ALIGNMENT:-16}"
 port="${PORT:-8000}"
-gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.92}"
-max_model_len="${MAX_MODEL_LEN:-65536}"
-max_num_seqs="${MAX_NUM_SEQS:-1}"
-max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-512}"
-max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-512}"
+gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.94}"
+max_model_len="${MAX_MODEL_LEN:-1000000}"
+max_num_seqs="${MAX_NUM_SEQS:-6}"
+max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-2048}"
+max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-2048}"
+cudagraph_mode="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
+kv_cache_memory_bytes="${KV_CACHE_MEMORY_BYTES:-3000000000}"
 load_format="${LOAD_FORMAT:-instanttensor}"
 enable_flashinfer_autotune="${ENABLE_FLASHINFER_AUTOTUNE:-1}"
 
@@ -83,6 +90,11 @@ else
   autotune_args+=(--no-enable-flashinfer-autotune)
 fi
 
+kv_cache_args=()
+if [[ "${kv_cache_memory_bytes}" != "auto" && "${kv_cache_memory_bytes}" != "0" ]]; then
+  kv_cache_args+=(--kv-cache-memory-bytes "${kv_cache_memory_bytes}")
+fi
+
 dcp_args=(--decode-context-parallel-size "${dcp_size}")
 if (( dcp_size > 1 )); then
   dcp_args+=(--dcp-comm-backend "${dcp_comm_backend}")
@@ -99,10 +111,12 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --tensor-parallel-size "${tp_size}" \
   "${dcp_args[@]}" \
   --virtual-tp-sharding b12x-padded \
-  --b12x-virtual-tp-moe-intermediate-alignment 128 \
+  --b12x-virtual-tp-attention-head-alignment 16 \
+  --b12x-virtual-tp-moe-intermediate-alignment "${moe_intermediate_alignment}" \
   --moe-backend b12x \
   --linear-backend b12x \
   --gpu-memory-utilization "${gpu_memory_utilization}" \
+  "${kv_cache_args[@]}" \
   --max-model-len "${max_model_len}" \
   --max-num-seqs "${max_num_seqs}" \
   --async-scheduling \
@@ -112,7 +126,7 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --attention-backend B12X_MLA_SPARSE \
   --enable-chunked-prefill \
   --enable-prefix-caching \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
+  --compilation-config '{"cudagraph_mode":"'"${cudagraph_mode}"'","custom_ops":["all"]}' \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \

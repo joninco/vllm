@@ -541,6 +541,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
+    dcp_sharded: bool = False
 
     def __post_init__(self):
         _apply_alignment_padding(self)
@@ -580,10 +581,13 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             max_num_batched_tokens = (
                 vllm_config.scheduler_config.max_num_batched_tokens
             )
-            max_blocks = self.max_admission_blocks_per_request(
-                max_num_batched_tokens=max_num_batched_tokens,
-                max_model_len=max_model_len,
+            block_size = self.block_size
+            if self.dcp_sharded:
+                block_size *= dcp_world_size
+            num_tokens = min(
+                self.sliding_window - 1 + max_num_batched_tokens, max_model_len
             )
+            max_blocks = cdiv(num_tokens, block_size) + 1
             return max_blocks * self.page_size_bytes
         return super().max_memory_usage_bytes(vllm_config)
 
@@ -599,6 +603,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
+        dcp_sharded_set = set(spec.dcp_sharded for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(dtype_set) == 1
@@ -606,10 +611,11 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
+            and len(dcp_sharded_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "dtype, quantization method, compress ratio, model version and "
-            "sliding window size."
+            "dtype, quantization method, compress ratio, model version, "
+            "sliding window size, and DCP sharding mode."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -622,6 +628,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            dcp_sharded=dcp_sharded_set.pop(),
         )
 
     def is_uniform_with_collection(
@@ -630,6 +637,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         return all(
             isinstance(spec, SlidingWindowMLASpec)
             and spec.sliding_window == self.sliding_window
+            and spec.dcp_sharded == self.dcp_sharded
             for spec in kv_cache_specs.values()
         )
 

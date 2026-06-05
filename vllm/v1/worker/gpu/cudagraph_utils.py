@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+import vllm.envs as envs
 from vllm.compilation.b12x_capture import (
     b12x_cuda_graph_prewarm_enabled,
     guard_b12x_kernel_resolution,
@@ -246,16 +248,29 @@ class CudaGraphManager:
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
+                    timing_enabled = envs.VLLM_CUDAGRAPH_CAPTURE_TIMING
+                    timing_start = time.perf_counter() if timing_enabled else 0.0
+                    captured_before = compilation_counter.num_cudagraph_captured
+
                     # Prepare inputs and get forward function
                     forward_fn, warmup_attn_state = create_forward_fn(desc, warmup=True)
 
                     # Warmup
+                    if timing_enabled:
+                        torch.accelerator.synchronize()
+                        warmup_start = time.perf_counter()
                     forward_fn(CUDAGraphMode.NONE)
+                    if timing_enabled:
+                        torch.accelerator.synchronize()
+                        warmup_elapsed = time.perf_counter() - warmup_start
 
                     # Capture
                     logger.debug(
                         "CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc
                     )
+                    if timing_enabled:
+                        torch.accelerator.synchronize()
+                        capture_start = time.perf_counter()
                     if desc.cg_mode == CUDAGraphMode.PIECEWISE:
                         attn_states[desc] = AttentionStatePair(
                             warmup_attn_state, warmup_attn_state
@@ -293,6 +308,26 @@ class CudaGraphManager:
                             get_offloader().join_after_forward()
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
+                    if timing_enabled:
+                        torch.accelerator.synchronize()
+                        capture_elapsed = time.perf_counter() - capture_start
+                        captured = (
+                            compilation_counter.num_cudagraph_captured
+                            - captured_before
+                        )
+                        logger.info(
+                            "CUDA graph descriptor capture: mode=%s "
+                            "tokens=%d reqs=%s uniform=%s warmup=%.3fs "
+                            "capture=%.3fs total=%.3fs graphs=%d",
+                            desc.cg_mode.name,
+                            desc.num_tokens,
+                            desc.num_reqs,
+                            desc.uniform_token_count,
+                            warmup_elapsed,
+                            capture_elapsed,
+                            time.perf_counter() - timing_start,
+                            captured,
+                        )
         self._graphs_captured = True
         return attn_states
 

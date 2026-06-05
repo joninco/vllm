@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import time
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -13,7 +14,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.b12x_capture import (
-    b12x_cuda_graph_prewarm_enabled,
+    b12x_cuda_graph_wrapper_prewarm_enabled,
     guard_b12x_kernel_resolution,
 )
 from vllm.compilation.counter import compilation_counter
@@ -231,6 +232,14 @@ class CUDAGraphWrapper:
     def cudagraph_wrapper(self) -> "CUDAGraphWrapper":
         return self
 
+    def _capture_timing_label(self) -> str:
+        index = getattr(self.runnable, "piecewise_compile_index", None)
+        total = getattr(self.runnable, "total_piecewise_compiles", None)
+        name = getattr(self.runnable, "submod_name", "")
+        if index is not None and total is not None:
+            return f"{index + 1}/{total} {name}"
+        return name or type(self.runnable).__name__
+
     def clear_graphs(self) -> None:
         self.concrete_cudagraph_entries.clear()
 
@@ -267,6 +276,9 @@ class CUDAGraphWrapper:
         entry = self.concrete_cudagraph_entries[batch_descriptor]
 
         if entry.cudagraph is None:
+            timing_enabled = envs.VLLM_CUDAGRAPH_CAPTURE_TIMING
+            timing_start = time.perf_counter() if timing_enabled else 0.0
+            prewarm_elapsed = 0.0
             if self.cudagraph_options.debug_log_enable:
                 # Since we capture cudagraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -313,19 +325,32 @@ class CUDAGraphWrapper:
                 # Ensure any pre-capture prefetches from offloader are complete.
                 get_offloader().sync_prev_onload()
 
-                if b12x_cuda_graph_prewarm_enabled():
+                if b12x_cuda_graph_wrapper_prewarm_enabled(
+                    is_piecewise=self.runtime_mode == CUDAGraphMode.PIECEWISE
+                ):
+                    if timing_enabled:
+                        torch.accelerator.synchronize()
+                        prewarm_start = time.perf_counter()
                     # Resolve exact B12X CuTe launcher contracts before CUDA
                     # graph capture. CUDAGraphWrapper captures the first call
-                    # for a descriptor, so B12X kernels in the runnable would
-                    # otherwise see their first exact launch during capture.
+                    # for a descriptor. PIECEWISE descriptors already run an
+                    # eager warmup forward immediately before capture, so the
+                    # per-subgraph prewarm is only enabled when explicitly
+                    # requested for debugging.
                     prewarm_output = self.runnable(*args, **kwargs)
                     get_offloader().join_after_forward()
                     del prewarm_output
                     get_offloader().sync_prev_onload()
+                    if timing_enabled:
+                        torch.accelerator.synchronize()
+                        prewarm_elapsed = time.perf_counter() - prewarm_start
 
                 # mind-exploding: carefully manage the reference and memory.
+                if timing_enabled:
+                    torch.accelerator.synchronize()
+                    capture_start = time.perf_counter()
                 with guard_b12x_kernel_resolution(
-                    "vLLM CUDAGraphWrapper capture after B12X warmup"
+                    "vLLM CUDAGraphWrapper capture after B12X eager warmup"
                 ), torch.cuda.graph(
                     cudagraph,
                     pool=self.graph_pool,
@@ -346,6 +371,19 @@ class CUDAGraphWrapper:
                         # the output of the last graph will not be used by
                         # any other cuda graph.
                         output = weak_ref_tensors(output)
+                if timing_enabled:
+                    torch.accelerator.synchronize()
+                    capture_elapsed = time.perf_counter() - capture_start
+                    logger.info(
+                        "CUDA graph subgraph capture: mode=%s desc=%s "
+                        "subgraph=%s prewarm=%.3fs capture=%.3fs total=%.3fs",
+                        self.runtime_mode.name,
+                        entry.batch_descriptor,
+                        self._capture_timing_label(),
+                        prewarm_elapsed,
+                        capture_elapsed,
+                        time.perf_counter() - timing_start,
+                    )
 
             # here we always use weak ref for the output
             # to save memory

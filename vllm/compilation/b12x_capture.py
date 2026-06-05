@@ -17,6 +17,14 @@ def b12x_cuda_graph_prewarm_enabled() -> bool:
     )
 
 
+def b12x_cuda_graph_wrapper_prewarm_enabled(is_piecewise: bool) -> bool:
+    if not b12x_cuda_graph_prewarm_enabled():
+        return False
+    if is_piecewise:
+        return envs.VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM
+    return True
+
+
 @contextmanager
 def guard_b12x_kernel_resolution(reason: str) -> Iterator[None]:
     if not b12x_cuda_graph_prewarm_enabled():
