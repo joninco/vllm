@@ -14,7 +14,6 @@ import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -37,8 +36,11 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.forward_context import get_forward_context
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -46,10 +48,12 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
@@ -153,9 +157,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         aux_stream_list: list[torch.cuda.Stream] | None = None,
     ) -> None:
         super().__init__()
+        self.vllm_config = vllm_config
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
+        self._use_b12x_wo = bool(envs.VLLM_USE_B12X_WO_PROJECTION)
+        self._b12x_wo_projection_weights: Any | None = None
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
 
@@ -220,6 +227,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_local_groups
+        if self._use_b12x_wo:
+            if not hasattr(self.wo_a, "weight_scale_inv"):
+                raise RuntimeError(
+                    "VLLM_USE_B12X_WO_PROJECTION requires FP8 wo_a.weight_scale_inv"
+                )
+            # Preserve checkpoint UE8M0 scales for the fused b12x WO kernel.
+            self.wo_a.weight_scale_inv.format_ue8m0 = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -228,6 +242,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return_bias=False,
             prefix=f"{prefix}.wo_b",
         )
+        if self._use_b12x_wo:
+            if not hasattr(self.wo_b, "weight_scale_inv"):
+                raise RuntimeError(
+                    "VLLM_USE_B12X_WO_PROJECTION requires FP8 wo_b.weight_scale_inv"
+                )
+            self.wo_a.b12x_skip_generic_block_fp8_linear = True
+            self.wo_b.b12x_skip_generic_block_fp8_linear = True
 
         # Initialize rotary embedding before the indexer/compressor consume it.
         self.rotary_emb = build_deepseek_v4_rope(
@@ -315,6 +336,136 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 k_cache_prefix=self.prefix,
             )
 
+    def _validate_wo_projection_tensors(self) -> tuple[int, int, int, int]:
+        if not hasattr(self.wo_a, "weight_scale_inv"):
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO path requires wo_a.weight_scale_inv"
+            )
+        if not hasattr(self.wo_b, "weight_scale_inv"):
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO path requires wo_b.weight_scale_inv"
+            )
+        if getattr(self.wo_a, "weight_scale_inv_is_cutlass_interleaved", False):
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO path requires canonical wo_a scales"
+            )
+        if getattr(self.wo_b, "weight_scale_inv_is_cutlass_interleaved", False):
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO path requires canonical wo_b scales"
+            )
+
+        groups = self.n_local_groups
+        heads_per_group = self.n_local_heads // groups
+        group_width = heads_per_group * self.head_dim
+        rank = self.o_lora_rank
+        hidden = self.hidden_size
+
+        wo_a_shape = (groups * rank, group_width)
+        wo_b_shape = (hidden, groups * rank)
+        wo_a_scale_shape = (groups * ((rank + 127) // 128), (group_width + 127) // 128)
+        wo_b_scale_shape = ((hidden + 127) // 128, (groups * rank + 127) // 128)
+
+        if tuple(self.wo_a.weight.shape) != wo_a_shape:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-A weight shape mismatch: "
+                f"expected {wo_a_shape}, got {tuple(self.wo_a.weight.shape)}"
+            )
+        if tuple(self.wo_b.weight.shape) != wo_b_shape:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-B weight shape mismatch: "
+                f"expected {wo_b_shape}, got {tuple(self.wo_b.weight.shape)}"
+            )
+        if tuple(self.wo_a.weight_scale_inv.shape) != wo_a_scale_shape:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-A scale shape mismatch: "
+                f"expected {wo_a_scale_shape}, "
+                f"got {tuple(self.wo_a.weight_scale_inv.shape)}"
+            )
+        if tuple(self.wo_b.weight_scale_inv.shape) != wo_b_scale_shape:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-B scale shape mismatch: "
+                f"expected {wo_b_scale_shape}, "
+                f"got {tuple(self.wo_b.weight_scale_inv.shape)}"
+            )
+        if self.wo_a.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-A weight must be torch.float8_e4m3fn, "
+                f"got {self.wo_a.weight.dtype}"
+            )
+        if self.wo_b.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO-B weight must be torch.float8_e4m3fn, "
+                f"got {self.wo_b.weight.dtype}"
+            )
+        return groups, group_width, rank, hidden
+
+    def setup_b12x_wo_projection(self) -> None:
+        if not self._use_b12x_wo or self._b12x_wo_projection_weights is not None:
+            return
+
+        groups, group_width, rank, hidden = self._validate_wo_projection_tensors()
+
+        from b12x.gemm.wo_projection import (
+            pack_wo_projection_fp8_block_scaled_weights_mxfp8,
+        )
+
+        self._b12x_wo_projection_weights = (
+            pack_wo_projection_fp8_block_scaled_weights_mxfp8(
+                self.wo_a.weight.detach(),
+                self.wo_a.weight_scale_inv.detach(),
+                self.wo_b.weight.detach(),
+                self.wo_b.weight_scale_inv.detach(),
+                groups=groups,
+                group_width=group_width,
+                rank=rank,
+                hidden=hidden,
+            )
+        )
+
+    def _apply_b12x_wo_projection(
+        self,
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        o_storage: torch.Tensor | None = None,
+        o_storage_offset: int = 0,
+        o_stride_0: int = 0,
+        o_stride_1: int = 0,
+        o_stride_2: int = 0,
+    ) -> torch.Tensor:
+        del o_storage, o_storage_offset, o_stride_0, o_stride_1, o_stride_2
+        num_tokens = int(o.shape[0])
+        if num_tokens == 0:
+            return torch.empty((0, self.hidden_size), dtype=o.dtype, device=o.device)
+        if o.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "DeepSeek V4 b12x WO projection requires bf16 attention output, "
+                f"got {o.dtype}"
+            )
+        if self._b12x_wo_projection_weights is None:
+            self.setup_b12x_wo_projection()
+        weights = self._b12x_wo_projection_weights
+        if weights is None:
+            raise RuntimeError("DeepSeek V4 b12x WO weights were not packed")
+
+        from b12x.gemm.wo_projection import wo_projection_inv_rope_mxfp8
+
+        # Functional chain: each step allocates + returns its own output, so no
+        # caller-owned scratch / bind is needed (and none can be mutated in the
+        # traced graph). Pass the runtime tensors directly.
+        out = wo_projection_inv_rope_mxfp8(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            weights,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+        )
+        if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
+            out = tensor_model_parallel_all_reduce(out)
+        return out
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -330,35 +481,38 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             device=hidden_states.device,
         )
 
-        # Metadata-independent input GEMMs + RMSNorm stay in the captured
-        # graph; the metadata-dependent rest (q up-proj + kv-insert, indexer,
-        # compressor, MLA attention) runs in the eager break.
-        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-            self.attn_gemm_parallel_execute(hidden_states)
-        )
-        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        qr, kv = fused_q_kv_rmsnorm(
-            qr,
-            kv,
-            self.q_norm.weight.data,
-            self.kv_norm.weight.data,
-            self.eps,
-        )
-
-        # attention_impl is wrapped with @eager_break_during_capture: this is
-        # where the breakable cudagraph capture breaks (the attention op runs
-        # eagerly between captured graph segments).
-        self.attention_impl(
+        # Attention runs inside a single `out`-mutating custom op (the
+        # torch.compile / breakable-cudagraph boundary). This is load-bearing:
+        # without it, `attention_impl` is traced inline and the o_padded buffer
+        # is threaded around the internal graph breaks (indexer / kv-cache
+        # update) as TWO aliasing outputs of its producer piece. The AOT
+        # piecewise runtime then merges that aliased pair into a single flat
+        # 1-D synthetic base (torch.empty((0,)).set_(storage)), so the WO
+        # consumer's assert_size_stride(o_padded, (tokens, heads, dim)) fails
+        # with "wrong number of dimensions". Wrapping the whole attention as one
+        # op makes o_padded the op's single mutated output, threaded cleanly
+        # across the boundary, and keeps the attention's internal CUDA streams /
+        # events out of the compiled artifact (so it stays serializable).
+        torch.ops.vllm.deepseek_v4_attention(
             hidden_states,
-            qr,
-            kv,
-            kv_score,
-            indexer_kv_score,
-            indexer_weights,
             positions,
             o_padded,
+            self.prefix,
         )
         o = o_padded[:, : self.n_local_heads, :]
+
+        if self._use_b12x_wo:
+            return torch.ops.vllm.deepseek_v4_b12x_wo_projection(
+                o,
+                positions,
+                self.prefix,
+                self.hidden_size,
+                o_padded,
+                0,
+                self.padded_heads * self.head_dim,
+                self.head_dim,
+                1,
+            )
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
@@ -423,7 +577,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
-    @eager_break_during_capture
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -617,6 +770,113 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
 
 
+def deepseek_v4_attention(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    # Opaque wrapper around the whole MLA attention path. The layer is recovered
+    # from the forward context by name so the op stays a plain custom op, while
+    # `out` is threaded across piecewise compile as a single mutated output.
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+
+    qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+        self.attn_gemm_parallel_execute(hidden_states)
+    )
+    qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+    qr, kv = fused_q_kv_rmsnorm(
+        qr,
+        kv,
+        self.q_norm.weight.data,
+        self.kv_norm.weight.data,
+        self.eps,
+    )
+    self.attention_impl(
+        hidden_states,
+        qr,
+        kv,
+        kv_score,
+        indexer_kv_score,
+        indexer_weights,
+        positions,
+        out,
+    )
+
+
+def deepseek_v4_attention_fake(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_attention",
+    op_func=deepseek_v4_attention,
+    mutates_args=["out"],
+    fake_impl=deepseek_v4_attention_fake,
+)
+
+
+def deepseek_v4_b12x_wo_projection(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    hidden_size: int,
+    o_storage: torch.Tensor,
+    o_storage_offset: int,
+    o_stride_0: int,
+    o_stride_1: int,
+    o_stride_2: int,
+) -> torch.Tensor:
+    del hidden_size
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    return self._apply_b12x_wo_projection(
+        o,
+        positions,
+        o_storage=o_storage,
+        o_storage_offset=o_storage_offset,
+        o_stride_0=o_stride_0,
+        o_stride_1=o_stride_1,
+        o_stride_2=o_stride_2,
+    )
+
+
+def deepseek_v4_b12x_wo_projection_fake(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    hidden_size: int,
+    o_storage: torch.Tensor,
+    o_storage_offset: int,
+    o_stride_0: int,
+    o_stride_1: int,
+    o_stride_2: int,
+) -> torch.Tensor:
+    del (
+        positions,
+        layer_name,
+        o_storage,
+        o_storage_offset,
+        o_stride_0,
+        o_stride_1,
+        o_stride_2,
+    )
+    return torch.empty((o.shape[0], hidden_size), dtype=o.dtype, device=o.device)
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_b12x_wo_projection",
+    op_func=deepseek_v4_b12x_wo_projection,
+    fake_impl=deepseek_v4_b12x_wo_projection_fake,
+)
+
+
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def __init__(
         self,
@@ -710,13 +970,19 @@ class DeepseekV4Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
 
-        self.max_model_len = (
-            vllm_config.model_config.max_model_len // self.compress_ratio
+        cp_size = (
+            vllm_config.parallel_config.prefill_context_parallel_size
+            * vllm_config.parallel_config.decode_context_parallel_size
+        )
+        self.max_model_len = cdiv(
+            vllm_config.model_config.max_model_len,
+            self.compress_ratio * cp_size,
         )
         self.prefix = prefix
 
-        self.max_total_seq_len = (
-            get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
+        self.max_total_seq_len = cdiv(
+            get_max_prefill_buffer_size(vllm_config),
+            self.compress_ratio * cp_size,
         )
 
         assert cache_config is not None, "Deepseek V4 indexer requires cache_config"
