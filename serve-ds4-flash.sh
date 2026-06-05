@@ -80,7 +80,12 @@ fi
 
 spec_args=()
 if [[ "${VLLM_ENABLE_MTP:-1}" == "1" ]]; then
-  spec_args=('--speculative-config' '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":true}')
+  if [[ -n "${DS4_SPEC_CONFIG_JSON:-}" ]]; then
+    spec_config_json="${DS4_SPEC_CONFIG_JSON}"
+  else
+    spec_config_json='{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":false}'
+  fi
+  spec_args=('--speculative-config' "${spec_config_json}")
 fi
 
 autotune_args=()
