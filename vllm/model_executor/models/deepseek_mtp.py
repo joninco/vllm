@@ -452,12 +452,22 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.quant_config = _maybe_disable_unserialized_modelopt_fp4_nextn(
             self.config, vllm_config, get_draft_quant_config(vllm_config)
         )
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self._exclude_unquantized_mtp_layers_from_quant_config()
         self.model = DeepSeekMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         # Set MoE hyperparameters
         self.set_moe_parameters()
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        return tuple(
+            f"model.layers.{layer_idx}."
+            for layer_idx in range(
+                self.config.num_hidden_layers,
+                self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
+            )
+        )
 
     def _exclude_unquantized_mtp_layers_from_quant_config(self) -> None:
         unquantized_prefixes = getattr(

@@ -48,6 +48,9 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.warmup.deepseek_v4_compressor_warmup import (
+    deepseek_v4_compressor_triton_warmup,
+)
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -378,6 +381,9 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            deepseek_v4_compressor_triton_warmup(
+                self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+            )
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -401,6 +407,9 @@ class Worker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+            deepseek_v4_compressor_triton_warmup(
+                self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+            )
 
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0
@@ -566,6 +575,10 @@ class Worker(WorkerBase):
         # because `initialize_kv_cache` will inject kv cache groups not
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+
+        deepseek_v4_compressor_triton_warmup(
+            self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+        )
 
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
