@@ -617,7 +617,12 @@ def resolve_kv_cache_block_sizes(
         bs = cache_config.block_size * dcp * pcp
         return bs, bs
 
+    is_deepseek_v4_dcp = is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
     if dcp != 1 or pcp != 1:
+        if is_deepseek_v4_dcp and dcp > 1 and pcp == 1:
+            group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+            scheduler_block_size = math.lcm(*group_block_sizes) * dcp
+            return scheduler_block_size, scheduler_block_size
         raise ValueError(
             "Hybrid KV cache groups with multiple block sizes do not "
             "support context parallelism (dcp_world_size/pcp_world_size > 1)."
@@ -654,6 +659,36 @@ def resolve_kv_cache_block_sizes(
             f"Got group block sizes={group_block_sizes}."
         )
     return scheduler_block_size, hash_block_size
+
+
+def is_deepseek_v4_hybrid_kv_cache_config(
+    kv_cache_config: KVCacheConfig,
+) -> bool:
+    """Return whether the KV layout is DeepSeek V4's MLA/SWA hybrid layout."""
+    if len(kv_cache_config.kv_cache_groups) <= 1:
+        return False
+
+    flattened_specs: list[KVCacheSpec] = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            flattened_specs.extend(spec.kv_cache_specs.values())
+        else:
+            flattened_specs.append(spec)
+
+    if not flattened_specs:
+        return False
+    has_deepseek_v4_swa = any(
+        isinstance(spec, SlidingWindowMLASpec)
+        and getattr(spec, "model_version", None) == "deepseek_v4"
+        for spec in flattened_specs
+    )
+    if not has_deepseek_v4_swa:
+        return False
+    return all(
+        isinstance(spec, MLAAttentionSpec | SlidingWindowMLASpec)
+        for spec in flattened_specs
+    )
 
 
 def get_request_block_hasher(
@@ -902,16 +937,10 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
-    num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
+    max_memory_usage_per_request = _max_memory_usage_bytes_from_groups(
+        vllm_config, kv_cache_config.kv_cache_groups
     )
-    max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
-        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
-    )
-    memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
-    )
+    memory_per_block = _pool_bytes_per_block(kv_cache_config.kv_cache_groups)
     num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     max_concurrency = kv_cache_config.num_blocks / num_block_per_request
     return max_concurrency
@@ -1441,15 +1470,17 @@ def group_and_unify_kv_cache_specs(
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
-        dict
-    )
-    # NOTE: Here we group SWA layers by (block_size, sliding_window), which separates
-    # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can
-    # be fragile with only block_size and sliding_window as keys, but fine for now.
+    grouped_swa_mla_specs: dict[
+        tuple[int, int, bool], dict[str, KVCacheSpec]
+    ] = defaultdict(dict)
+    # NOTE: Here we group SWA layers by (block_size, sliding_window,
+    # dcp_sharded), which separates SWA layers, C4I+C4A layers, and C128A
+    # layers into different groups.
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
-            grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
+            grouped_swa_mla_specs[
+                (spec.block_size, spec.sliding_window, spec.dcp_sharded)
+            ][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
 

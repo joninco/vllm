@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1465,6 +1466,102 @@ def test_get_max_concurrency_for_kv_cache_config():
     )
     assert num_tokens == max_concurrency_hybrid_model * max_model_len
     assert max_concurrency == max_concurrency_hybrid_model
+
+
+def test_dsv4_max_concurrency_uses_uniform_group_pool_math():
+    def dsv4_config(dcp: int):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                max_model_len=256000,
+                hf_config=SimpleNamespace(model_type="deepseek_v4"),
+            ),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=dcp,
+                prefill_context_parallel_size=1,
+            ),
+            cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        )
+
+    def full_mla_spec(compress_ratio: int):
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            cache_dtype_str="fp8_ds_mla",
+            compress_ratio=compress_ratio,
+            alignment=576,
+            model_version="deepseek_v4",
+        )
+
+    def indexer_spec():
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+            compress_ratio=4,
+            alignment=576,
+        )
+
+    def swa_cache_spec():
+        return SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            sliding_window=128,
+            cache_dtype_str="fp8_ds_mla",
+            alignment=576,
+            model_version="deepseek_v4",
+        )
+
+    def compressor_state_spec(compress_ratio: int):
+        overlap = compress_ratio == 4
+        return SlidingWindowMLASpec(
+            block_size=4 if overlap else 8,
+            num_kv_heads=1,
+            head_size=2 * (1 + overlap) * 512,
+            dtype=torch.float32,
+            sliding_window=(1 + overlap) * compress_ratio,
+            alignment=576,
+            dcp_sharded=True,
+        )
+
+    ratios = [128, 128] + [4, 128] * 29 + [4]
+    assert ratios.count(4) == 30
+    assert ratios.count(128) == 31
+
+    kv_cache_specs: dict[str, KVCacheSpec] = {}
+    for layer_idx, ratio in enumerate(ratios):
+        prefix = f"layers.{layer_idx}"
+        kv_cache_specs[f"{prefix}.mla_attn"] = full_mla_spec(ratio)
+        kv_cache_specs[f"{prefix}.swa_cache"] = swa_cache_spec()
+        kv_cache_specs[f"{prefix}.compressor.state_cache"] = (
+            compressor_state_spec(ratio)
+        )
+        if ratio == 4:
+            kv_cache_specs[f"{prefix}.indexer.k_cache"] = indexer_spec()
+            kv_cache_specs[f"{prefix}.indexer.compressor.state_cache"] = (
+                compressor_state_spec(ratio)
+            )
+
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(kv_cache_specs)
+    assert grouped_specs is not None
+    kv_cache_groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(
+        grouped_specs
+    )
+
+    for dcp, expected_request_blocks in [(5, 534), (10, 305)]:
+        vllm_config = dsv4_config(dcp)
+        kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+            vllm_config, kv_cache_groups, available_memory=4_500_000_000
+        )
+        assert kv_cache_config.num_blocks == 3036
+        assert get_max_concurrency_for_kv_cache_config(
+            vllm_config, kv_cache_config
+        ) == pytest.approx(3036 / expected_request_blocks)
 
 
 def test_allocate_with_lookahead():

@@ -109,6 +109,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer
+from vllm.v1.worker.workspace import lock_workspace
 
 logger = init_logger(__name__)
 
@@ -703,6 +704,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        lock_workspace()
         # This usually takes 5~20 seconds.
         logger.info(
             "Graph capturing finished in %.0f secs, took %.2f GiB",
@@ -823,7 +825,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
     def prepare_inputs(
-        self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_desc: BatchExecutionDescriptor,
+        max_query_len: int,
     ) -> InputBatch:
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
@@ -951,6 +956,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_scheduled_tokens,
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
+        max_seq_len_upper_bound = int(seq_lens_cpu_upper_bound_np[:num_reqs].max())
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
         max_seq_len_np = None
@@ -966,6 +972,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             expanded_idx_mapping=expanded_idx_mapping,
             expanded_local_pos=expanded_local_pos,
             num_scheduled_tokens=num_scheduled_tokens,
+            max_query_len=max_query_len,
             num_tokens=num_tokens,
             num_tokens_after_padding=num_tokens_after_padding,
             num_draft_tokens=total_num_draft_tokens,
@@ -974,6 +981,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len_upper_bound=max_seq_len_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
             num_computed_tokens_np=num_computed_tokens_np,
             prefill_len_np=prefill_len_np,
@@ -1131,7 +1139,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
-            input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            input_batch = self.prepare_inputs(
+                scheduler_output, batch_desc, max_query_len
+            )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
 
             if self.lora_config:

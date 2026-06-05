@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     KVCacheBlock,
+    is_deepseek_v4_hybrid_kv_cache_config,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -501,11 +502,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # different KV cache groups have different block sizes, the actual block size
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
-        assert all(
-            g.kv_cache_spec.block_size % hash_block_size == 0
-            for g in kv_cache_config.kv_cache_groups
-        ), "block_size must be divisible by hash_block_size"
-        assert dcp_world_size == 1, "DCP not support hybrid attn now."
+        self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
+        self.disable_prefix_cache_for_dsv4_dcp = (
+            enable_caching
+            and dcp_world_size > 1
+            and pcp_world_size == 1
+            and is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+        )
+        if not self.disable_prefix_cache_for_dsv4_dcp:
+            assert all(
+                g.kv_cache_spec.block_size % hash_block_size == 0
+                for g in kv_cache_config.kv_cache_groups
+            ), "block_size must be divisible by hash_block_size"
+        assert dcp_world_size == 1 or self.disable_prefix_cache_for_dsv4_dcp, (
+            "DCP not support hybrid attn now."
+        )
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
 
@@ -552,6 +564,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     self.single_type_managers[gid].use_eagle = True
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+        if self.disable_prefix_cache_for_dsv4_dcp:
+            return
+
         # Cache hits in this coordinator are always a multiple of
         # ``scheduler_block_size`` tokens (see ``find_longest_cache_hit``).
         # Within an aligned region, SWA groups may only consult a subset of blocks
@@ -601,6 +616,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 - A tuple of the cache hit blocks for each single type manager.
                 - The number of tokens of the longest cache hit.
         """
+        if self.disable_prefix_cache_for_dsv4_dcp:
+            blocks: tuple[list[KVCacheBlock], ...] = tuple(
+                [] for _ in range(len(self.kv_cache_config.kv_cache_groups))
+            )
+            return blocks, 0
 
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             if kv_cache_spec.block_size == self.hash_block_size:
