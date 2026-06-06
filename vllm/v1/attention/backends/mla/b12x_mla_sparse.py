@@ -302,6 +302,19 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            # DCP sparse-MLA metadata/scratch is not full-graph-stable yet.
+            # Keep attention outside full CUDA graph replay; the resolver will
+            # use PIECEWISE when VLLM_COMPILE attention splitting is available.
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,

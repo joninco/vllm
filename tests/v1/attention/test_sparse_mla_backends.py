@@ -36,7 +36,10 @@ if not current_platform.is_cuda():
     )
 
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseBackend
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+    B12xMLASparseBackend,
+    B12xMLASparseMetadataBuilder,
+)
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseBackend,
 )
@@ -46,6 +49,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
 )
 from vllm.v1.attention.backends.mla.indexer import split_indexer_prefill_chunks
 from vllm.v1.attention.backends.utils import split_prefill_chunks
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.ops import flashmla
 
 SPARSE_BACKEND_BATCH_SPECS = {
@@ -67,6 +71,27 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("dcp_size", "expected"),
+    [
+        (1, AttentionCGSupport.UNIFORM_BATCH),
+        (2, AttentionCGSupport.NEVER),
+        (4, AttentionCGSupport.NEVER),
+    ],
+)
+def test_b12x_sparse_mla_dcp_disables_full_cudagraph(dcp_size, expected):
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size)
+    )
+
+    assert (
+        B12xMLASparseMetadataBuilder.get_cudagraph_support(
+            vllm_config, kv_cache_spec=None  # type: ignore[arg-type]
+        )
+        == expected
+    )
 
 
 def _float_to_e8m0_truncate(f: float) -> float:
