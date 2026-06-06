@@ -351,6 +351,52 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += len(blocks)
 
+    def prepend(self, block: KVCacheBlock) -> None:
+        """Put a block at the front of the free list (next eviction).
+
+        Args:
+            block: The block to prepend.
+        """
+        first_block = self.fake_free_list_head.next_free_block
+        if first_block is None:
+            raise RuntimeError(
+                "next_free_block of fake_free_list_head should always exist"
+            )
+        self.fake_free_list_head.next_free_block = block
+        block.prev_free_block = self.fake_free_list_head
+        block.next_free_block = first_block
+        first_block.prev_free_block = block
+        self.num_free_blocks += 1
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Put a list of blocks at the front of the free list. The first
+        block in ``blocks`` becomes the new head (next to be popped),
+        preserving the input order: ``blocks[0]`` is evicted before
+        ``blocks[1]`` and so on.
+
+        Args:
+            blocks: The blocks to prepend.
+        """
+        if len(blocks) == 0:
+            return
+
+        old_first = self.fake_free_list_head.next_free_block
+        if old_first is None:
+            raise RuntimeError(
+                "next_free_block of fake_free_list_head should always exist"
+            )
+
+        prev = self.fake_free_list_head
+        for block in blocks:
+            block.prev_free_block = prev
+            prev.next_free_block = block
+            prev = block
+
+        prev.next_free_block = old_first
+        old_first.prev_free_block = prev
+
+        self.num_free_blocks += len(blocks)
+
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.
 
@@ -1459,9 +1505,9 @@ def group_and_unify_kv_cache_specs(
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[
-        tuple[int, int, bool], dict[str, KVCacheSpec]
-    ] = defaultdict(dict)
+    grouped_swa_mla_specs: dict[tuple[int, int, bool], dict[str, KVCacheSpec]] = (
+        defaultdict(dict)
+    )
     # NOTE: Here we group SWA layers by (block_size, sliding_window,
     # dcp_sharded), which separates SWA layers, C4I+C4A layers, and C128A
     # layers into different groups.

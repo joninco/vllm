@@ -274,14 +274,15 @@ def test_prefill(hash_fn):
 
     # All blocks should be available.
     assert free_block_queue.num_free_blocks == 10
-    # The order should be
+    # Uncached blocks freed by ``free_blocks`` are prepended to the head so
+    # they are reused before any cached prefix block is evicted, while
+    # cached prefix blocks land at the tail in LRU order.
+    # [unique_req1 (5), unique_req0 (4)]  uncached partial blocks (prepended)
     # [unallocated (6, 7, 8, 9, 10)]
-    # [unique_req0 (4)]
-    # [unique_req1 (5)]
-    # [common (3, 2, 1)]
+    # [common (3, 2, 1)]                  cached prefix blocks (appended LRU)
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [6, 7, 8, 9, 10, 4, 5, 3, 2, 1]
+    ] == [5, 4, 6, 7, 8, 9, 10, 3, 2, 1]
 
     # Cache hit in the common prefix when the original block is already free.
     # Incomplete 1 block (6 tokens)
@@ -295,7 +296,9 @@ def test_prefill(hash_fn):
     blocks = manager.allocate_slots(
         req2, num_new_tokens, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
-    assert blocks is not None and blocks.get_block_ids() == ([6],)
+    # Allocates the uncached head block (req1's old partial) instead of an
+    # unallocated never-used block.
+    assert blocks is not None and blocks.get_block_ids() == ([5],)
 
     # Although we only have 6 free blocks, we have 8 blocks in
     # the free block queue due to lazy removal.
@@ -313,9 +316,12 @@ def test_prefill(hash_fn):
     blocks = manager.allocate_slots(
         req3, 16 * 10, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
-    # This block ID order also checks the eviction order.
+    # This block ID order also checks the eviction order: uncached blocks
+    # (req2's old partial = 5, req0's old partial = 4) and never-used blocks
+    # come out first; cached prefix blocks (3, 2, 1) only get evicted after
+    # the uncached/untouched pool is drained.
     assert blocks is not None and blocks.get_block_ids() == (
-        [7, 8, 9, 10, 4, 5, 6, 3, 2, 1],
+        [5, 4, 6, 7, 8, 9, 10, 3, 2, 1],
     )
 
     assert free_block_queue.num_free_blocks == 0
@@ -1087,14 +1093,14 @@ def test_prefill_plp():
 
     # All blocks should be available.
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
-    # The order should be
+    # Uncached blocks freed by ``free_blocks`` are prepended to the head so
+    # they are reused before any cached prefix block is evicted.
+    # [unique_req1 (5), unique_req0 (4)]  uncached partial blocks (prepended)
     # [unallocated (6, 7, 8, 9, 10)]
-    # [unique_req0 (4)]
-    # [unique_req1 (5)]
-    # [common (3, 2, 1)]
+    # [common (3, 2, 1)]                  cached prefix blocks (appended LRU)
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [6, 7, 8, 9, 10, 4, 5, 3, 2, 1]
+    ] == [5, 4, 6, 7, 8, 9, 10, 3, 2, 1]
 
     # Request #2 is a prompt-logprobs request:
     # NO cache hit in the common prefix; duplicates request #0 cached blocks
@@ -1225,9 +1231,11 @@ def test_evict():
     manager.free(req0)
     manager.free(req1)
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
+    # Uncached block (req0 partial = 6) is prepended ahead of the
+    # never-allocated 10; cached prefix blocks follow at the LRU tail.
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [10, 6, 5, 4, 3, 2, 1, 9, 8, 7]
+    ] == [6, 10, 5, 4, 3, 2, 1, 9, 8, 7]
 
     # Touch the first 2 blocks.
     req2 = make_request("2", list(range(2 * 16 + 3)), block_size, sha256)
@@ -1237,7 +1245,9 @@ def test_evict():
     blocks = manager.allocate_slots(
         req2, 3, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
-    assert blocks is not None and blocks.get_block_ids() == ([10],)
+    # Allocates the head uncached block (req0's old partial = 6) instead of
+    # an unallocated never-used block.
+    assert blocks is not None and blocks.get_block_ids() == ([6],)
     assert manager.block_pool.free_block_queue.num_free_blocks == 7
 
 
@@ -1904,6 +1914,87 @@ def test_maybe_evict_cached_block():
     # Evict block3
     pool._maybe_evict_cached_block(block3)
     assert pool.cached_block_hash_to_block._cache == {}
+
+
+def test_free_blocks_uncached_first_policy():
+    """Uncached blocks freed alongside cached blocks must be allocated
+    before the cached ones, so rolling SWA/compressor scratch never evicts
+    cached prefix blocks while there are still uncached blocks available.
+    """
+    pool = BlockPool(num_gpu_blocks=5, enable_caching=True, hash_block_size=16)
+    # pool.blocks[0] is the null block; usable blocks start at index 1.
+    null = pool.blocks[0]
+    b1, b2, b3, b4 = pool.blocks[1:]
+
+    # Drain the initial free queue so we start from a known empty state.
+    # BlockPool.__init__ already removed the null block; pop the remaining
+    # usable blocks here.
+    while pool.free_block_queue.num_free_blocks > 0:
+        pool.free_block_queue.popleft()
+
+    # b1, b2 are cached prefix blocks (have a block_hash + hash table entry).
+    block_hash_a = make_block_hash_with_group_id(BlockHash(b"aa"), 1)
+    block_hash_b = make_block_hash_with_group_id(BlockHash(b"bb"), 2)
+    b1.block_hash = block_hash_a
+    pool.cached_block_hash_to_block.insert(block_hash_a, b1)
+    b2.block_hash = block_hash_b
+    pool.cached_block_hash_to_block.insert(block_hash_b, b2)
+
+    # b3, b4 are uncached scratch (e.g. rolling SWA decode tail).
+    b3.block_hash = None
+    b4.block_hash = None
+
+    for block in (b1, b2, b3, b4):
+        block.ref_cnt = 1  # pretend they are currently allocated
+
+    # Free in arbitrary "eviction priority" order. The uncached/cached split
+    # should override that ordering between the two classes.
+    pool.free_blocks([b1, b3, b2, b4])
+
+    order = pool.free_block_queue.get_all_free_blocks()
+    # Uncached (b3, b4) at the head, cached (b1, b2) at the tail. Within
+    # each class, the original input order is preserved.
+    assert order == [b3, b4, b1, b2]
+    # Sanity: null block is untouched.
+    assert null.is_null
+
+    # Next allocation pulls the uncached scratch first.
+    grabbed = pool.get_new_blocks(2)
+    assert [blk.block_id for blk in grabbed] == [b3.block_id, b4.block_id]
+    # Cached prefix blocks survive — still present in the hash table.
+    assert pool.cached_block_hash_to_block._cache == {
+        block_hash_a: b1,
+        block_hash_b: b2,
+    }
+
+
+def test_maybe_evict_cached_block_hoists_freed_block_to_head():
+    """When a still-queued cached block is evicted externally (e.g. via
+    ``evict_blocks`` from a KV connector), the now-uncached block must
+    be hoisted to the head of the free queue so the next allocation reuses
+    it before evicting any other cached block.
+    """
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
+    # blocks[0] is the null block; usable blocks are blocks[1..3].
+    b1, b2, b3 = pool.blocks[1:]
+
+    block_hash_1 = make_block_hash_with_group_id(BlockHash(b"11"), 10)
+    block_hash_2 = make_block_hash_with_group_id(BlockHash(b"22"), 20)
+    for blk, h in ((b1, block_hash_1), (b2, block_hash_2)):
+        blk.block_hash = h
+        pool.cached_block_hash_to_block.insert(h, blk)
+    # b3 stays uncached. All three sit in the free queue (ref_cnt == 0).
+    assert pool.free_block_queue.get_all_free_blocks() == [b1, b2, b3]
+
+    # Externally evict b2 (mid-queue cached block).
+    pool.evict_blocks({b2.block_id})
+
+    # b2 should now be at the head (next to be allocated).
+    assert pool.free_block_queue.get_all_free_blocks() == [b2, b1, b3]
+    # b2 is no longer in the prefix-cache hash table.
+    assert block_hash_2 not in pool.cached_block_hash_to_block._cache
+    # b1 still cached.
+    assert pool.cached_block_hash_to_block._cache[block_hash_1] is b1
 
 
 @pytest.mark.parametrize("blocks_to_cache", [2, 3, 10])

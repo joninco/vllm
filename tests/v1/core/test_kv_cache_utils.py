@@ -417,6 +417,63 @@ def test_free_kv_cache_block_queue_popleft_n():
         assert block.next_free_block is None
 
 
+def test_free_kv_cache_block_queue_prepend_n():
+    queue = FreeKVCacheBlockQueue([])
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+    # Prepend 0 blocks on empty queue is a no-op.
+    queue.prepend_n([])
+    assert queue.num_free_blocks == 0
+    assert queue.fake_free_list_head.next_free_block is queue.fake_free_list_tail
+
+    # Seed the queue with two appended blocks so prepend has to splice
+    # against existing entries.
+    # fake_head -> b4 -> b5 -> fake_tail
+    queue.append_n(blocks[4:6])
+
+    # Prepend 1 block.
+    # fake_head -> b0 -> b4 -> b5 -> fake_tail
+    queue.prepend_n(blocks[0:1])
+    assert queue.num_free_blocks == 3
+    assert queue.fake_free_list_head.next_free_block is blocks[0]
+    assert blocks[0].prev_free_block is queue.fake_free_list_head
+    assert blocks[0].next_free_block is blocks[4]
+    assert blocks[4].prev_free_block is blocks[0]
+
+    # Prepend 3 blocks; input order is preserved (b1 then b2 then b3).
+    # fake_head -> b1 -> b2 -> b3 -> b0 -> b4 -> b5 -> fake_tail
+    queue.prepend_n(blocks[1:4])
+    assert queue.num_free_blocks == 6
+    assert queue.fake_free_list_head.next_free_block is blocks[1]
+    assert blocks[1].next_free_block is blocks[2]
+    assert blocks[2].prev_free_block is blocks[1]
+    assert blocks[2].next_free_block is blocks[3]
+    assert blocks[3].next_free_block is blocks[0]
+    assert blocks[0].prev_free_block is blocks[3]
+    assert blocks[5].next_free_block is queue.fake_free_list_tail
+
+    # popleft order matches prepended input ordering: b1, b2, b3, then
+    # the originally prepended b0, then the appended b4, b5.
+    popped = [queue.popleft() for _ in range(6)]
+    assert popped == [blocks[1], blocks[2], blocks[3], blocks[0], blocks[4], blocks[5]]
+    assert queue.num_free_blocks == 0
+
+
+def test_free_kv_cache_block_queue_prepend_single():
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    new_block = KVCacheBlock(block_id=99)
+    queue.prepend(new_block)
+    assert queue.num_free_blocks == 4
+    assert queue.fake_free_list_head.next_free_block is new_block
+    assert new_block.next_free_block is blocks[0]
+    assert blocks[0].prev_free_block is new_block
+
+    # popleft picks the prepended block first.
+    assert queue.popleft() is new_block
+    assert queue.popleft() is blocks[0]
+
+
 def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Create a list of KVCacheBlock objects
     blocks = [KVCacheBlock(block_id=i) for i in range(5)]
@@ -1495,8 +1552,8 @@ def test_dsv4_max_concurrency_uses_uniform_group_pool_math():
         prefix = f"layers.{layer_idx}"
         kv_cache_specs[f"{prefix}.mla_attn"] = full_mla_spec(ratio)
         kv_cache_specs[f"{prefix}.swa_cache"] = swa_cache_spec()
-        kv_cache_specs[f"{prefix}.compressor.state_cache"] = (
-            compressor_state_spec(ratio)
+        kv_cache_specs[f"{prefix}.compressor.state_cache"] = compressor_state_spec(
+            ratio
         )
         if ratio == 4:
             kv_cache_specs[f"{prefix}.indexer.k_cache"] = indexer_spec()
@@ -1506,9 +1563,7 @@ def test_dsv4_max_concurrency_uses_uniform_group_pool_math():
 
     grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(kv_cache_specs)
     assert grouped_specs is not None
-    kv_cache_groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(
-        grouped_specs
-    )
+    kv_cache_groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
 
     for dcp, expected_request_blocks in [(5, 534), (10, 305)]:
         vllm_config = dsv4_config(dcp)

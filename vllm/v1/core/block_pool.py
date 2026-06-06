@@ -367,6 +367,11 @@ class BlockPool:
         If a block is cached in `cached_block_hash_to_block`, we reset its hash
         metadata and evict it from the cache.
 
+        If the block was sitting in the free queue (``ref_cnt == 0``), it is
+        relocated to the head so the next allocation consumes it before any
+        still-cached block, matching the uncached-first policy in
+        ``free_blocks``.
+
         Args:
             block: The block to evict.
 
@@ -388,6 +393,19 @@ class BlockPool:
             return False
 
         block.reset_hash()
+
+        # If the block is currently in the free queue, hoist it to the head
+        # so it is reused before still-cached blocks. ``get_new_blocks``
+        # already detached the block via ``popleft_n`` before calling here,
+        # in which case ``prev_free_block`` is ``None`` and we skip the move.
+        if (
+            block.ref_cnt == 0
+            and not block.is_null
+            and block.prev_free_block is not None
+            and block.next_free_block is not None
+        ):
+            self.free_block_queue.remove(block)
+            self.free_block_queue.prepend(block)
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
@@ -420,6 +438,13 @@ class BlockPool:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
+        Uncached blocks (no ``block_hash``) are prepended to the head of the
+        free queue so that subsequent allocations consume them before evicting
+        cached prefix blocks. Cached blocks keep the original LRU semantics
+        and are appended to the tail. This avoids prefix-cache eviction churn
+        when rolling SWA/compressor scratch blocks are freed every step but
+        cached prefix blocks would otherwise be at the front of the LRU queue.
+
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
@@ -428,9 +453,26 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+
+        newly_free = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        if not newly_free:
+            return
+
+        uncached: list[KVCacheBlock] = []
+        cached: list[KVCacheBlock] = []
+        for block in newly_free:
+            if block.block_hash is None:
+                uncached.append(block)
+            else:
+                cached.append(block)
+
+        # Uncached → head (allocate first). Cached → tail (LRU preserved).
+        if uncached:
+            self.free_block_queue.prepend_n(uncached)
+        if cached:
+            self.free_block_queue.append_n(cached)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
