@@ -380,15 +380,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
             self.compress_ratio = self.kv_cache_spec.compress_ratio
 
-        # Pre-allocate buffers for CUDA graph compatibility when
-        if self.compress_ratio > 1:
-            # compress_ratio > 1 (DeepseekV4)
-            # Compressed slot mapping output buffer
+        # DCP writes the indexer KV cache through rank-local pages even when
+        # compress_ratio == 1 (GLM/Kimi). Keep the mapped slots graph-stable.
+        if self.compress_ratio > 1 or self.dcp_world_size > 1:
             self.compressed_slot_mapping_buffer = torch.zeros(
                 (scheduler_config.max_num_batched_tokens,),
                 dtype=torch.int64,
                 device=self.device,
             )
+
+        # Pre-allocate buffers for CUDA graph compatibility when
+        if self.compress_ratio > 1:
+            # compress_ratio > 1 (DeepseekV4)
             # Buffer for compressed seq_lens in decode path
             self.expanded_seq_lens_buffer = torch.zeros(
                 (scheduler_config.max_num_batched_tokens,),
@@ -463,6 +466,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         use_native: bool,
         next_n: int,
         max_decode_len: int,
+        global_seq_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool]:
         """Expand seq_lens/block_table/decode_lens for the decode kernels.
 
@@ -494,6 +498,22 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     max_decode_len,
                     BLOCK_SIZE=1024,
                 )
+                if global_seq_lens is not None and self.dcp_world_size > 1:
+                    expanded_global = (
+                        global_seq_lens[:num_decodes].unsqueeze(1)
+                        - max_decode_len
+                        + 1
+                        + self.offsets_buffer[:max_decode_len]
+                    ).reshape(-1)
+                    self.decode_seq_lens_buffer[:num_decode_tokens].copy_(
+                        get_dcp_local_seq_lens(
+                            expanded_global,
+                            self.dcp_world_size,
+                            self.dcp_rank,
+                            self.cp_kv_cache_interleave_size,
+                        ),
+                        non_blocking=True,
+                    )
                 self.decode_seq_lens_buffer[num_decode_tokens:] = 0
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
                 block_table = self.expanded_block_table_buffer[:num_decode_tokens]
@@ -516,16 +536,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # Example: offsets = [7-0, 6-3, 8-4, 0-8] = [7, 3, 4, -8]
                 # expanded_offsets  = [7, 7, 7, 3, 4, 4, 4, 4]
                 # result            = [8, 9, 10, 7, 9, 10, 11, 12]
+                seq_lens_for_expansion = (
+                    global_seq_lens if global_seq_lens is not None else seq_lens
+                )
                 expanded_offsets = torch.repeat_interleave(
-                    seq_lens - decode_lens - query_start_loc,
+                    seq_lens_for_expansion - decode_lens - query_start_loc,
                     decode_lens,
                     output_size=actual_expanded,
                 )
 
                 # [8, 9, 10, 7, 9, 10, 11, 12, ...] where ... is unused buffer space
-                self.decode_seq_lens_buffer[:actual_expanded] = (
+                expanded_seq_lens = (
                     expanded_offsets + self.arange_buffer[:actual_expanded] + 1
                 )
+                if global_seq_lens is not None and self.dcp_world_size > 1:
+                    expanded_seq_lens = get_dcp_local_seq_lens(
+                        expanded_seq_lens,
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    )
+                self.decode_seq_lens_buffer[:actual_expanded] = expanded_seq_lens
                 self.decode_seq_lens_buffer[actual_expanded:] = 0
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
 
@@ -562,12 +593,23 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens_buffer = self.decode_seq_lens_buffer[
                     : num_decodes * max_decode_len
                 ].view(num_decodes, max_decode_len)
-                seq_lens_buffer[:] = (
-                    seq_lens.unsqueeze(1)
+                seq_lens_for_expansion = (
+                    global_seq_lens if global_seq_lens is not None else seq_lens
+                )
+                expanded_seq_lens = (
+                    seq_lens_for_expansion.unsqueeze(1)
                     - max_decode_len
                     + 1
                     + self.offsets_buffer[:max_decode_len]
                 )
+                if global_seq_lens is not None and self.dcp_world_size > 1:
+                    expanded_seq_lens = get_dcp_local_seq_lens(
+                        expanded_seq_lens.reshape(-1),
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    ).view(num_decodes, max_decode_len)
+                seq_lens_buffer[:] = expanded_seq_lens
                 seq_lens = seq_lens_buffer
             return seq_lens, block_table, decode_lens, num_decodes, requires_padding
 
@@ -606,7 +648,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         compressed_slot_mapping = slot_mapping
         logical_compressed_seq_lens = seq_lens
         compressed_seq_lens = seq_lens
-        if self.compress_ratio > 1:
+        if self.compress_ratio > 1 or self.dcp_world_size > 1:
             compressed_slot_mapping = get_compressed_slot_mapping(
                 num_tokens,
                 query_start_loc,
@@ -716,7 +758,19 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode_lens = self.decode_lens_buffer[:num_decodes]
             decode_lens_np = query_lens_np[:num_decodes]
 
-            seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+            global_decode_seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+            dcp_local_seq_lens = (
+                common_attn_metadata.dcp_local_seq_lens[:num_decodes]
+                if self.compress_ratio == 1
+                and self.dcp_world_size > 1
+                and common_attn_metadata.dcp_local_seq_lens is not None
+                else None
+            )
+            seq_lens = (
+                dcp_local_seq_lens
+                if dcp_local_seq_lens is not None
+                else global_decode_seq_lens
+            )
             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
 
             max_decode_len = int(decode_lens_np.max())
@@ -735,6 +789,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     use_native=use_native,
                     next_n=next_n,
                     max_decode_len=max_decode_len,
+                    global_seq_lens=global_decode_seq_lens
+                    if dcp_local_seq_lens is not None
+                    else None,
                 )
             )
 
@@ -779,7 +836,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                     self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
                     seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
-            elif self.dcp_world_size > 1:
+            elif self.dcp_world_size > 1 and dcp_local_seq_lens is None:
                 if seq_lens.dim() == 1:
                     seq_lens = get_dcp_local_seq_lens(
                         seq_lens,
