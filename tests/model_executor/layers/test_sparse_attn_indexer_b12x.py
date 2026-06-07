@@ -33,12 +33,12 @@ def _install_fake_b12x_indexer(
     calls: list[tuple],
 ):
     b12x_mod = types.ModuleType("b12x")
+    b12x_mod.__path__ = []
     attention_mod = types.ModuleType("b12x.attention")
-    attention_indexer_mod = types.ModuleType("b12x.attention.indexer")
+    attention_mod.__path__ = []
     integration_mod = types.ModuleType("b12x.integration")
     integration_mod.__path__ = []
-    compressed_indexer_mod = types.ModuleType("b12x.integration.compressed_indexer")
-    integration_indexer_mod = types.ModuleType("b12x.integration.indexer")
+    indexer_mod = types.ModuleType("b12x.attention.indexer")
 
     class _Caps:
         def __init__(self, **kwargs) -> None:
@@ -55,14 +55,16 @@ def _install_fake_b12x_indexer(
         def bind(self, scratch, **kwargs):
             return self._bind_impl(scratch, kwargs)
 
-    def plan_compressed_indexer_scratch(caps):
+    def plan_indexer_scratch(caps):
         calls.append(
             (
-                "compressed_plan",
+                "indexer_plan",
+                caps.source_layout,
+                caps.mode,
+                caps.shared_page_table,
                 caps.max_q_rows,
                 caps.max_page_table_width,
                 caps.topk,
-                caps.reserve_paged_logits,
             )
         )
         specs = (
@@ -73,10 +75,12 @@ def _install_fake_b12x_indexer(
         def bind_impl(scratch, kwargs):
             calls.append(
                 (
-                    "compressed_bind",
+                    "paged_bind",
                     tuple(kwargs["real_page_table"].shape),
                     tuple(kwargs["cache_seqlens_int32"].shape),
                     kwargs["expected_num_q_heads"],
+                    kwargs["shared_page_table"],
+                    kwargs["active_width"] is not None,
                 )
             )
             return types.SimpleNamespace(scratch=scratch, **kwargs)
@@ -86,9 +90,10 @@ def _install_fake_b12x_indexer(
     def index_topk_fp8(**kwargs):
         calls.append(
             (
-                "compressed_index_topk",
+                "paged_index_topk",
                 tuple(kwargs["q_fp8"].shape),
                 tuple(kwargs["index_k_cache"].shape),
+                tuple(kwargs["index_k_cache"].stride()),
                 kwargs["page_size"],
                 kwargs["expected_num_q_heads"],
             )
@@ -96,118 +101,50 @@ def _install_fake_b12x_indexer(
         kwargs["out_indices"].fill_(123)
         return kwargs["out_indices"]
 
-    def plan_indexer_extend_scratch(caps):
+    def uses_paged_mqa_schedule(*, q_rows: int, max_pages: int) -> bool:
+        calls.append(("uses_schedule", q_rows, max_pages))
+        return True
+
+    def build_paged_mqa_schedule_metadata(seq_lens, block_size, num_sms, *, out):
         calls.append(
             (
-                "extend_plan",
-                caps.max_q_rows,
-                caps.max_k_rows,
-                caps.topk,
-                caps.supertile_k,
-                caps.prefill_block_k,
+                "build_schedule",
+                tuple(seq_lens.tolist()),
+                block_size,
+                num_sms,
+                out is not None,
             )
         )
-        specs = (
-            ((caps.max_k_rows, 128), caps.k_dtype),
-            ((caps.max_k_rows, 4), torch.uint8),
-            ((caps.max_q_rows,), torch.int32),
-            ((caps.max_q_rows,), torch.int32),
-        )
+        out.fill_(7)
+        return out
 
-        def bind_impl(scratch, kwargs):
-            calls.append(
-                (
-                    "extend_bind",
-                    kwargs["gather_rows"],
-                    kwargs["topk"],
-                    kwargs["k_start"] is not None,
-                    kwargs["k_end"] is not None,
-                )
-            )
-            scratch_views = types.SimpleNamespace(
-                k_quant=scratch[0],
-                k_scale_bytes=scratch[1],
-                k_scale=scratch[1].view(torch.float32),
-                metadata_k_start=scratch[2],
-                metadata_k_end=scratch[3],
-            )
-            return types.SimpleNamespace(scratch=scratch_views, **kwargs)
-
-        return _Plan(specs, bind_impl)
-
-    def extend_tiled_topk(**kwargs):
-        binding = kwargs["binding"]
-        calls.append(
-            (
-                "extend_tiled_topk",
-                tuple(kwargs["q_fp8"].shape),
-                binding.gather_rows,
-                binding.topk,
-            )
-        )
-        output = torch.empty(
-            (kwargs["q_fp8"].shape[0], binding.topk),
-            dtype=torch.int32,
-            device=kwargs["q_fp8"].device,
-        )
-        output.fill_(7)
-        return output
-
-    compressed_indexer_mod.COMPRESSED_INDEX_PAGE_SIZE = 64
-    compressed_indexer_mod.B12XCompressedIndexerScratchCaps = _Caps
-    compressed_indexer_mod.plan_compressed_indexer_scratch = (
-        plan_compressed_indexer_scratch
+    indexer_mod.PAGED_INDEX_PAGE_SIZE = 64
+    indexer_mod.B12XIndexerScratchCaps = _Caps
+    indexer_mod.INDEXER_SOURCE_LAYOUT_PAGED = "paged"
+    indexer_mod.plan_indexer_scratch = plan_indexer_scratch
+    indexer_mod.index_topk_fp8 = index_topk_fp8
+    indexer_mod.uses_paged_mqa_schedule = uses_paged_mqa_schedule
+    indexer_mod.build_paged_mqa_schedule_metadata = (
+        build_paged_mqa_schedule_metadata
     )
-    compressed_indexer_mod.index_topk_fp8 = index_topk_fp8
-    integration_mod.B12XIndexerExtendScratchCaps = _Caps
-    integration_mod.plan_indexer_extend_scratch = plan_indexer_extend_scratch
-    integration_indexer_mod.extend_tiled_topk = extend_tiled_topk
 
     monkeypatch.setitem(sys.modules, "b12x", b12x_mod)
     monkeypatch.setitem(sys.modules, "b12x.attention", attention_mod)
-    monkeypatch.setitem(sys.modules, "b12x.attention.indexer", attention_indexer_mod)
-    monkeypatch.setitem(
-        sys.modules, "b12x.integration.compressed_indexer", compressed_indexer_mod
-    )
+    monkeypatch.setitem(sys.modules, "b12x.attention.indexer", indexer_mod)
     monkeypatch.setitem(sys.modules, "b12x.integration", integration_mod)
-    monkeypatch.setitem(
-        sys.modules, "b12x.integration.indexer", integration_indexer_mod
-    )
 
 
-def test_prefill_topk_normalization_converts_packed_indices_to_req_relative():
-    chunk = types.SimpleNamespace(
-        cu_seq_lens=torch.tensor([0, 3, 8], dtype=torch.int32),
-        token_to_seq=torch.tensor([0, 0, 0, 1, 1, 1, 1, 1], dtype=torch.int32),
-    )
-    topk_indices = torch.tensor(
-        [[0, 2, 3, -1], [4, 6, 7, 1]], dtype=torch.int32
-    )
-
-    indexer_mod._normalize_prefill_topk_to_req_relative(chunk, topk_indices)
-
-    assert topk_indices.tolist() == [[0, 2, 0, -1], [1, 3, 4, 1]]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_prefill_topk_normalization_cuda_converts_in_place():
-    chunk = types.SimpleNamespace(
-        cu_seq_lens=torch.tensor([0, 3, 8], dtype=torch.int32, device="cuda"),
-        token_to_seq=torch.tensor(
-            [0, 0, 0, 1, 1, 1, 1, 1], dtype=torch.int32, device="cuda"
-        ),
-    )
-    topk_indices = torch.tensor(
-        [[0, 2, 3, -1], [4, 6, 7, 1]], dtype=torch.int32, device="cuda"
-    )
-
-    indexer_mod._normalize_prefill_topk_to_req_relative(chunk, topk_indices)
-    torch.cuda.synchronize()
-
-    assert topk_indices.cpu().tolist() == [[0, 2, 0, -1], [1, 3, 4, 1]]
-
-
-def test_b12x_glm_decode_indexer_uses_compressed_indexer_plan(monkeypatch):
+@pytest.mark.parametrize(
+    "page_stride0",
+    [
+        64 * 132,
+        64 * 576,
+    ],
+)
+def test_b12x_decode_indexer_is_non_shared_for_fused_route(
+    monkeypatch,
+    page_stride0,
+):
     calls: list[tuple] = []
     _install_fake_b12x_indexer(monkeypatch, calls)
     workspace_manager = _FakeWorkspaceManager()
@@ -221,22 +158,26 @@ def test_b12x_glm_decode_indexer_uses_compressed_indexer_plan(monkeypatch):
     page_table_width = 10
     q_fp8 = torch.empty((q_rows, num_heads, 128), dtype=torch.uint8)
     weights = torch.empty((q_rows, num_heads, 1), dtype=torch.float32)
-    kv_cache = torch.empty(
-        (page_table_width, 64, 132), dtype=torch.uint8
-    ).contiguous()
+    kv_cache = torch.empty_strided(
+        (page_table_width, 64, 132),
+        (page_stride0, 132, 1),
+        dtype=torch.uint8,
+    )
     seq_lens = torch.tensor([600, 640], dtype=torch.int32)
     block_table = torch.arange(
         q_rows * page_table_width, dtype=torch.int32
     ).reshape(q_rows, page_table_width)
     topk_indices = torch.empty((q_rows, topk), dtype=torch.int32)
+    active_width = torch.tensor([8, 10], dtype=torch.int32)
 
-    result = indexer_mod._run_b12x_decode_topk(
+    result = indexer_mod._run_b12x_paged_topk(
         q_fp8=q_fp8,
         weights=weights,
         kv_cache=kv_cache,
         seq_lens=seq_lens,
         block_table=block_table,
         schedule_metadata=None,
+        active_width=active_width,
         topk_indices=topk_indices,
         topk_tokens=topk,
     )
@@ -248,92 +189,206 @@ def test_b12x_glm_decode_indexer_uses_compressed_indexer_plan(monkeypatch):
         ((q_rows,), torch.int32),
     )
     assert calls == [
-        ("compressed_plan", q_rows, page_table_width, topk, False),
-        ("compressed_bind", tuple(block_table.shape), tuple(seq_lens.shape), num_heads),
+        ("indexer_plan", "paged", "decode", False, q_rows, page_table_width, topk),
         (
-            "compressed_index_topk",
+            "paged_bind",
+            tuple(block_table.shape),
+            tuple(seq_lens.shape),
+            num_heads,
+            False,
+            True,
+        ),
+        (
+            "paged_index_topk",
             tuple(q_fp8.shape),
             (page_table_width, 64 * 132),
+            (page_stride0, 1),
             64,
             num_heads,
         ),
     ]
 
 
-def test_b12x_extend_binding_uses_plan_scratch(monkeypatch):
+def test_b12x_prefill_indexer_marks_shared_page_table(monkeypatch):
     calls: list[tuple] = []
     _install_fake_b12x_indexer(monkeypatch, calls)
     workspace_manager = _FakeWorkspaceManager()
     monkeypatch.setattr(
         indexer_mod, "current_workspace_manager", lambda: workspace_manager
     )
-    monkeypatch.setattr(indexer_mod, "_B12X_EXTEND_TOPK_SUPERTILE_K", 512)
 
     q_rows = 2
     num_heads = 1
     topk = 4
-    total_seq_lens = 1280
+    page_table_width = 10
     q_fp8 = torch.empty((q_rows, num_heads, 128), dtype=torch.uint8)
-    k_start = torch.zeros(q_rows, dtype=torch.int32)
-    k_end = torch.full((q_rows,), total_seq_lens, dtype=torch.int32)
+    weights = torch.empty((q_rows, num_heads, 1), dtype=torch.float32)
+    kv_cache = torch.empty((page_table_width, 64, 132), dtype=torch.uint8)
+    seq_lens = torch.tensor([600, 640], dtype=torch.int32)
+    base_block_table = torch.arange(page_table_width, dtype=torch.int32).reshape(
+        1, page_table_width
+    )
+    block_table = base_block_table.expand(q_rows, page_table_width)
+    topk_indices = torch.empty((q_rows, topk), dtype=torch.int32)
 
-    binding = indexer_mod._get_b12x_indexer_extend_binding(
+    result = indexer_mod._run_b12x_paged_topk(
         q_fp8=q_fp8,
+        weights=weights,
+        kv_cache=kv_cache,
+        seq_lens=seq_lens,
+        block_table=block_table,
+        schedule_metadata=None,
+        topk_indices=topk_indices,
         topk_tokens=topk,
-        total_seq_lens=total_seq_lens,
-        fp8_dtype=torch.uint8,
-        k_start=k_start,
-        k_end=k_end,
+        shared_page_table=True,
     )
 
-    assert binding.scratch.k_quant.shape == (total_seq_lens, 128)
-    assert binding.scratch.k_scale_bytes.shape == (total_seq_lens, 4)
-    assert binding.k_start is k_start
-    assert binding.k_end is k_end
-    assert workspace_manager.specs is not None
+    assert result is topk_indices
     assert workspace_manager.specs == (
-        ((total_seq_lens, 128), torch.uint8),
-        ((total_seq_lens, 4), torch.uint8),
-        ((q_rows,), torch.int32),
+        ((q_rows, topk), torch.int32),
         ((q_rows,), torch.int32),
     )
     assert calls == [
-        ("extend_plan", q_rows, total_seq_lens, topk, 512, 256),
-        ("extend_bind", total_seq_lens, topk, True, True),
+        ("indexer_plan", "paged", "prefill", True, q_rows, page_table_width, topk),
+        (
+            "paged_bind",
+            tuple(block_table.shape),
+            tuple(seq_lens.shape),
+            num_heads,
+            True,
+            False,
+        ),
+        (
+            "paged_index_topk",
+            tuple(q_fp8.shape),
+            (page_table_width, 64 * 132),
+            (64 * 132, 1),
+            64,
+            num_heads,
+        ),
     ]
 
 
-def test_b12x_extend_warmup_uses_bound_scratch(monkeypatch):
+@pytest.mark.parametrize(
+    "page_stride0",
+    [
+        64 * 132,
+        64 * 576,
+    ],
+)
+def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
+    monkeypatch,
+    page_stride0,
+):
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepSeekV32IndexerDecodeMetadata,
+        DeepseekV32IndexerMetadata,
+    )
+
     calls: list[tuple] = []
     _install_fake_b12x_indexer(monkeypatch, calls)
     workspace_manager = _FakeWorkspaceManager()
     monkeypatch.setattr(
         indexer_mod, "current_workspace_manager", lambda: workspace_manager
     )
-    monkeypatch.setattr(indexer_mod, "_B12X_EXTEND_TOPK_SUPERTILE_K", 512)
+    monkeypatch.setattr(
+        indexer_mod,
+        "_ensure_b12x_sparse_indexer_supported",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        indexer_mod.current_platform,
+        "fp8_dtype",
+        lambda: torch.uint8,
+        raising=False,
+    )
 
     q_rows = 2
+    num_heads = 1
     topk = 4
-    total_seq_lens = 1280
-    q_fp8 = torch.empty((q_rows, 1, 128), dtype=torch.uint8)
-    weights = torch.empty((q_rows, 1), dtype=torch.float32)
-
-    binding = indexer_mod._get_b12x_indexer_extend_binding(
-        q_fp8=q_fp8,
-        topk_tokens=topk,
-        total_seq_lens=total_seq_lens,
-        fp8_dtype=torch.uint8,
+    page_table_width = 10
+    seq_lens = torch.tensor([600, 640], dtype=torch.int32)
+    block_table = torch.arange(
+        q_rows * page_table_width, dtype=torch.int32
+    ).reshape(q_rows, page_table_width)
+    active_width = torch.tensor([10], dtype=torch.int32)
+    metadata = DeepseekV32IndexerMetadata(
+        seq_lens=seq_lens,
+        max_seq_len=640,
+        slot_mapping=torch.arange(q_rows, dtype=torch.int32),
+        num_decodes=q_rows,
+        num_decode_tokens=q_rows,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode=DeepSeekV32IndexerDecodeMetadata(
+            block_table=block_table,
+            seq_lens=seq_lens,
+            decode_lens=seq_lens,
+            requires_padding=False,
+            schedule_metadata=None,
+            active_width=active_width,
+        ),
+    )
+    layer_name = "layers.0.attn"
+    metadata_key = indexer_mod._resolve_layer_name(layer_name)
+    monkeypatch.setattr(
+        indexer_mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(attn_metadata={metadata_key: metadata}),
     )
 
-    indexer_mod._warmup_b12x_extend_indexer(
-        q_fp8=q_fp8,
-        weights=weights,
-        binding=binding,
+    hidden_states = torch.empty((q_rows, 128), dtype=torch.bfloat16)
+    kv_cache = torch.empty_strided(
+        (page_table_width, 64, 132),
+        (page_stride0, 132, 1),
+        dtype=torch.uint8,
+    )
+    q_quant = torch.empty((q_rows, num_heads, 128), dtype=torch.uint8)
+    k = torch.empty((q_rows, 128), dtype=torch.uint8)
+    weights = torch.empty((q_rows, num_heads, 1), dtype=torch.float32)
+    topk_indices_buffer = torch.empty((q_rows, topk), dtype=torch.int32)
+
+    result = indexer_mod.sparse_attn_indexer(
+        hidden_states,
+        layer_name,
+        kv_cache,
+        q_quant,
+        None,
+        k,
+        weights,
+        128,
+        None,
         topk_tokens=topk,
-        total_seq_lens=total_seq_lens,
+        head_dim=128,
+        max_model_len=4096,
+        total_seq_lens=1024,
+        topk_indices_buffer=topk_indices_buffer,
+        skip_k_cache_insert=True,
+        use_fp4_cache=False,
+        use_b12x_sparse_indexer=True,
     )
 
-    assert ("extend_tiled_topk", tuple(q_fp8.shape), total_seq_lens, topk) in calls
+    assert result is topk_indices_buffer
+    assert topk_indices_buffer.tolist() == [[123] * topk, [123] * topk]
+    assert calls == [
+        ("indexer_plan", "paged", "decode", False, q_rows, page_table_width, topk),
+        (
+            "paged_bind",
+            tuple(block_table.shape),
+            tuple(seq_lens.shape),
+            num_heads,
+            False,
+            True,
+        ),
+        (
+            "paged_index_topk",
+            tuple(q_quant.shape),
+            (page_table_width, 64 * 132),
+            (page_stride0, 1),
+            64,
+            num_heads,
+        ),
+    ]
 
 
 def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
@@ -405,27 +460,58 @@ def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
     )
 
     assert result is topk_indices_buffer
-    assert workspace_manager.specs is not None
-    assert ((total_seq_lens, 128), torch.uint8) in workspace_manager.specs
-    assert ((total_seq_lens, 4), torch.uint8) in workspace_manager.specs
-    assert any(call[0] == "extend_tiled_topk" for call in calls)
+    assert workspace_manager.specs == (
+        ((q_rows, topk), torch.int32),
+        ((q_rows,), torch.int32),
+    )
+    assert calls == [
+        ("indexer_plan", "paged", "decode", False, q_rows, total_seq_lens // 64, topk),
+        ("indexer_plan", "paged", "prefill", True, q_rows, total_seq_lens // 64, topk),
+    ]
 
 
-def test_b12x_extend_profile_rows_follow_logits_budget(monkeypatch):
+def test_b12x_paged_profile_rows_follow_logits_budget(monkeypatch):
     monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+    monkeypatch.delenv("B12X_PAGED_INDEX_SUPERTILE_K", raising=False)
 
     assert (
-        indexer_mod._get_b12x_indexer_extend_profile_q_rows(
-            q_rows=65536,
-            total_seq_lens=5_242_880,
-        )
-        == 25
+        indexer_mod._get_b12x_paged_indexer_profile_q_rows(q_rows=65536) == 4096
     )
 
     assert (
-        indexer_mod._get_b12x_indexer_extend_profile_q_rows(
-            q_rows=65536,
-            total_seq_lens=65_536,
-        )
-        == 2048
+        indexer_mod._get_b12x_paged_indexer_profile_q_rows(q_rows=1024) == 1024
     )
+
+
+def test_b12x_schedule_metadata_uses_canonical_indexer_import(monkeypatch):
+    calls: list[tuple] = []
+    _install_fake_b12x_indexer(monkeypatch, calls)
+
+    from vllm.v1.attention.backends.mla import indexer as mla_indexer_mod
+
+    monkeypatch.setattr(
+        mla_indexer_mod.envs,
+        "VLLM_USE_B12X_SPARSE_INDEXER",
+        True,
+    )
+    builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    builder.scheduler_metadata_buffer = torch.zeros((5, 2), dtype=torch.int32)
+    builder.storage_block_size = 64
+    builder.num_sms = 4
+
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)
+    block_table = torch.zeros((2, 3), dtype=torch.int32)
+
+    result = builder._maybe_build_b12x_schedule_metadata(
+        seq_lens=seq_lens,
+        block_table=block_table,
+        num_decode_tokens=2,
+        requires_padding=False,
+    )
+
+    assert result is builder.scheduler_metadata_buffer
+    assert result.tolist() == [[7, 7]] * 5
+    assert calls == [
+        ("uses_schedule", 2, 3),
+        ("build_schedule", (64, 128), 64, 4, True),
+    ]

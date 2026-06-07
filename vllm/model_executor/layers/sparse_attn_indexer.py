@@ -26,36 +26,36 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
-_B12X_COMPRESSED_INDEX_PAGE_SIZE = 64
-_B12X_COMPRESSED_INDEX_HEAD_DIM = 128
-_B12X_COMPRESSED_INDEX_SCALE_BYTES = 4
-_B12X_COMPRESSED_INDEX_PAGE_WIDTH = _B12X_COMPRESSED_INDEX_PAGE_SIZE * (
-    _B12X_COMPRESSED_INDEX_HEAD_DIM + _B12X_COMPRESSED_INDEX_SCALE_BYTES
+_B12X_PAGED_INDEX_PAGE_SIZE = 64
+_B12X_PAGED_INDEX_HEAD_DIM = 128
+_B12X_PAGED_INDEX_SCALE_BYTES = 4
+_B12X_PAGED_INDEX_PAGE_WIDTH = _B12X_PAGED_INDEX_PAGE_SIZE * (
+    _B12X_PAGED_INDEX_HEAD_DIM + _B12X_PAGED_INDEX_SCALE_BYTES
 )
-_B12X_COMPRESSED_INDEX_SUPERTILE_K_DEFAULT = 32768
-_B12X_COMPRESSED_INDEX_TILE_BLOCK_K = 512
+_B12X_PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
+_B12X_PAGED_INDEX_TILE_BLOCK_K = 512
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
 
-def _get_b12x_compressed_indexer_supertile_k() -> int:
-    raw = os.environ.get("B12X_COMPRESSED_INDEX_SUPERTILE_K")
+def _get_b12x_indexer_paged_supertile_k() -> int:
+    raw = os.environ.get("B12X_PAGED_INDEX_SUPERTILE_K")
     if raw is None:
-        tokens = _B12X_COMPRESSED_INDEX_SUPERTILE_K_DEFAULT
+        tokens = _B12X_PAGED_INDEX_SUPERTILE_K_DEFAULT
     else:
         tokens = int(raw)
-    tokens = max(tokens, _B12X_COMPRESSED_INDEX_TILE_BLOCK_K)
+    tokens = max(tokens, _B12X_PAGED_INDEX_TILE_BLOCK_K)
     return (
-        (tokens + _B12X_COMPRESSED_INDEX_TILE_BLOCK_K - 1)
-        // _B12X_COMPRESSED_INDEX_TILE_BLOCK_K
-        * _B12X_COMPRESSED_INDEX_TILE_BLOCK_K
+        (tokens + _B12X_PAGED_INDEX_TILE_BLOCK_K - 1)
+        // _B12X_PAGED_INDEX_TILE_BLOCK_K
+        * _B12X_PAGED_INDEX_TILE_BLOCK_K
     )
 
 
 def _get_b12x_paged_indexer_profile_q_rows(q_rows: int) -> int:
     """Return the largest q chunk the real prefill chunker can hand to b12x."""
     max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
-    tile_k = _get_b12x_compressed_indexer_supertile_k()
+    tile_k = _get_b12x_indexer_paged_supertile_k()
     max_q_rows = max(1, max_logits_elems // max(1, tile_k))
     return min(max(1, int(q_rows)), max_q_rows)
 
@@ -142,8 +142,8 @@ def kv_cache_as_quant_view(
 
 def _flatten_b12x_paged_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
     expected_shape_tail = (
-        _B12X_COMPRESSED_INDEX_PAGE_SIZE,
-        _B12X_COMPRESSED_INDEX_HEAD_DIM + _B12X_COMPRESSED_INDEX_SCALE_BYTES,
+        _B12X_PAGED_INDEX_PAGE_SIZE,
+        _B12X_PAGED_INDEX_HEAD_DIM + _B12X_PAGED_INDEX_SCALE_BYTES,
     )
 
     if kv_cache.ndim != 3 or kv_cache.dtype != torch.uint8:
@@ -166,7 +166,7 @@ def _flatten_b12x_paged_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
         )
 
     return kv_cache.as_strided(
-        (int(kv_cache.shape[0]), _B12X_COMPRESSED_INDEX_PAGE_WIDTH),
+        (int(kv_cache.shape[0]), _B12X_PAGED_INDEX_PAGE_WIDTH),
         (int(kv_cache.stride(0)), 1),
     )
 
@@ -184,39 +184,41 @@ def _run_b12x_paged_topk(
     active_width: torch.Tensor | None = None,
     shared_page_table: bool = False,
 ) -> torch.Tensor:
-    """Unified b12x paged indexer top-k for both DSV4 and GLM.
+    """Run b12x paged indexer top-k with caller-owned scratch.
 
-    Both compression modes read the identical page-64 FP8+scale index cache, so
-    one b12x-orchestrated entry serves both: b12x sizes the scratch
-    (plan_compressed_indexer_scratch), vLLM allocates it (get_simultaneous), and
-    index_topk_fp8 owns the internal scorer/top-k routing. ``active_width`` is
-    the builder-computed live window (a metadata tensor, not an in-kernel
-    reduction); when None, b12x falls back to the capacity cap.
+    b12x sizes scratch from indexer K-cache rows/pages. For compressed sources
+    such as C4, the metadata builder has already converted model context tokens
+    to indexer K rows before this call. ``active_width`` is the builder-computed
+    live K-row window (a metadata tensor, not an in-kernel reduction); when
+    None, b12x falls back to the capacity cap.
     """
-    from b12x.integration.compressed_indexer import (
-        COMPRESSED_INDEX_PAGE_SIZE,
-        B12XCompressedIndexerScratchCaps,
+    from b12x.attention.indexer import (
+        PAGED_INDEX_PAGE_SIZE,
+        B12XIndexerScratchCaps,
+        INDEXER_SOURCE_LAYOUT_PAGED,
         index_topk_fp8,
-        plan_compressed_indexer_scratch,
+        plan_indexer_scratch,
     )
 
-    if int(COMPRESSED_INDEX_PAGE_SIZE) != _B12X_COMPRESSED_INDEX_PAGE_SIZE:
+    if int(PAGED_INDEX_PAGE_SIZE) != _B12X_PAGED_INDEX_PAGE_SIZE:
         raise RuntimeError(
-            "b12x compressed indexer page-size contract changed, got "
-            f"{COMPRESSED_INDEX_PAGE_SIZE}; expected "
-            f"{_B12X_COMPRESSED_INDEX_PAGE_SIZE}."
+            "b12x paged indexer page-size contract changed, got "
+            f"{PAGED_INDEX_PAGE_SIZE}; expected "
+            f"{_B12X_PAGED_INDEX_PAGE_SIZE}."
         )
 
     index_k_cache = _flatten_b12x_paged_index_cache(kv_cache)
     expected_num_q_heads = int(q_fp8.shape[1])
-    plan = plan_compressed_indexer_scratch(
-        B12XCompressedIndexerScratchCaps(
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
             device=q_fp8.device,
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=expected_num_q_heads,
             max_q_rows=int(q_fp8.shape[0]),
             max_page_table_width=int(block_table.shape[1]),
             topk=int(topk_tokens),
-            reserve_paged_logits=False,
+            mode="prefill" if shared_page_table else "decode",
+            shared_page_table=bool(shared_page_table),
         )
     )
     scratch = current_workspace_manager().get_simultaneous(
@@ -236,7 +238,7 @@ def _run_b12x_paged_topk(
         weights=weights,
         index_k_cache=index_k_cache,
         binding=binding,
-        page_size=COMPRESSED_INDEX_PAGE_SIZE,
+        page_size=PAGED_INDEX_PAGE_SIZE,
         expected_num_q_heads=expected_num_q_heads,
         out_indices=topk_indices,
     )
@@ -247,28 +249,32 @@ def _reserve_b12x_paged_indexer_scratch(
     q_rows: int,
     num_q_heads: int,
     topk_tokens: int,
-    total_seq_lens: int,
+    total_k_rows: int,
     device: torch.device,
+    shared_page_table: bool = False,
 ) -> None:
-    from b12x.integration.compressed_indexer import (
-        COMPRESSED_INDEX_PAGE_SIZE,
-        B12XCompressedIndexerScratchCaps,
-        plan_compressed_indexer_scratch,
+    from b12x.attention.indexer import (
+        PAGED_INDEX_PAGE_SIZE,
+        B12XIndexerScratchCaps,
+        INDEXER_SOURCE_LAYOUT_PAGED,
+        plan_indexer_scratch,
     )
 
     page_table_width = max(
         1,
-        (max(1, int(total_seq_lens)) + int(COMPRESSED_INDEX_PAGE_SIZE) - 1)
-        // int(COMPRESSED_INDEX_PAGE_SIZE),
+        (max(1, int(total_k_rows)) + int(PAGED_INDEX_PAGE_SIZE) - 1)
+        // int(PAGED_INDEX_PAGE_SIZE),
     )
-    plan = plan_compressed_indexer_scratch(
-        B12XCompressedIndexerScratchCaps(
+    plan = plan_indexer_scratch(
+        B12XIndexerScratchCaps(
             device=device,
+            source_layout=INDEXER_SOURCE_LAYOUT_PAGED,
             num_q_heads=int(num_q_heads),
             max_q_rows=max(1, int(q_rows)),
             max_page_table_width=page_table_width,
             topk=int(topk_tokens),
-            reserve_paged_logits=False,
+            mode="prefill" if shared_page_table else "decode",
+            shared_page_table=bool(shared_page_table),
         )
     )
     current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
@@ -312,8 +318,17 @@ def sparse_attn_indexer(
                 q_rows=profile_q_rows,
                 num_q_heads=int(q_quant.shape[1]),
                 topk_tokens=int(topk_tokens),
-                total_seq_lens=total_seq_lens,
+                total_k_rows=total_seq_lens,
                 device=q_quant.device,
+                shared_page_table=False,
+            )
+            _reserve_b12x_paged_indexer_scratch(
+                q_rows=profile_q_rows,
+                num_q_heads=int(q_quant.shape[1]),
+                topk_tokens=int(topk_tokens),
+                total_k_rows=total_seq_lens,
+                device=q_quant.device,
+                shared_page_table=True,
             )
         else:
             # Reserve workspace for indexer during profiling run.
@@ -550,10 +565,9 @@ def sparse_attn_indexer(
             seq_lens = b12x_seq_lens[:num_decode_tokens]
             block_table = b12x_block_table[:num_decode_tokens]
             topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
-            # One unified b12x decode path for both DSV4 (compress_ratio>1) and
-            # GLM (compress_ratio==1): the kernel byte layout is identical, so
-            # compress_ratio only shapes the seq_lens/active_width the builder
-            # already prepared. b12x owns the scorer/top-k routing internally.
+            # b12x consumes indexer K-row metadata. DSV4/C4 seq_lens and
+            # active_width have already been compressed by the metadata builder;
+            # GLM passes one K row per context token.
             _run_b12x_paged_topk(
                 q_fp8=q_quant[:num_decode_tokens].contiguous(),
                 weights=weights[:num_decode_tokens].contiguous(),
@@ -764,7 +778,7 @@ class SparseAttnIndexer(CustomOp):
         if self.use_b12x_sparse_indexer:
             if self.use_fp4_cache:
                 raise RuntimeError(
-                    "B12X sparse indexer/top-k requires the FP8/C4 indexer "
+                    "B12X sparse indexer/top-k requires the FP8 paged index "
                     "cache; disable use_fp4_indexer_cache."
                 )
         elif current_platform.is_cuda() and not has_deep_gemm():
