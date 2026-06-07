@@ -27,21 +27,21 @@ from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
 
-_B12X_COMPRESSED_INDEX_SUPERTILE_K_DEFAULT = 32768
-_B12X_COMPRESSED_INDEX_TILE_BLOCK_K = 512
+_B12X_PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
+_B12X_PAGED_INDEX_TILE_BLOCK_K = 512
 
 
-def _get_b12x_compressed_indexer_supertile_k() -> int:
-    raw = os.environ.get("B12X_COMPRESSED_INDEX_SUPERTILE_K")
+def _get_b12x_paged_indexer_supertile_k() -> int:
+    raw = os.environ.get("B12X_PAGED_INDEX_SUPERTILE_K")
     if raw is None:
-        tokens = _B12X_COMPRESSED_INDEX_SUPERTILE_K_DEFAULT
+        tokens = _B12X_PAGED_INDEX_SUPERTILE_K_DEFAULT
     else:
         tokens = int(raw)
-    tokens = max(tokens, _B12X_COMPRESSED_INDEX_TILE_BLOCK_K)
+    tokens = max(tokens, _B12X_PAGED_INDEX_TILE_BLOCK_K)
     return (
-        (tokens + _B12X_COMPRESSED_INDEX_TILE_BLOCK_K - 1)
-        // _B12X_COMPRESSED_INDEX_TILE_BLOCK_K
-        * _B12X_COMPRESSED_INDEX_TILE_BLOCK_K
+        (tokens + _B12X_PAGED_INDEX_TILE_BLOCK_K - 1)
+        // _B12X_PAGED_INDEX_TILE_BLOCK_K
+        * _B12X_PAGED_INDEX_TILE_BLOCK_K
     )
 
 
@@ -415,7 +415,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if schedule_seq_lens.dim() != 1:
             return None
 
-        from b12x.integration.indexer import (
+        from b12x.attention.indexer import (
             build_paged_mqa_schedule_metadata,
             uses_paged_mqa_schedule,
         )
@@ -657,7 +657,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if envs.VLLM_USE_B12X_SPARSE_INDEXER:
                 chunk_specs = []
                 b12x_budget_seq_lens = np.array(
-                    [_get_b12x_compressed_indexer_supertile_k()],
+                    [_get_b12x_paged_indexer_supertile_k()],
                     dtype=compressed_seq_lens_cpu_np.dtype,
                 )
                 for prefill_idx in range(num_prefills):
