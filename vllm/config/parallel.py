@@ -14,10 +14,6 @@ from typing_extensions import Self
 
 import vllm.envs as envs
 from vllm.config.utils import config
-from vllm.config.virtual_tp import (
-    VIRTUAL_TP_SHARDING_OFF,
-    VirtualTPSharding,
-)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_ports_list
@@ -125,15 +121,6 @@ class ParallelConfig:
     """Number of pipeline parallel groups."""
     tensor_parallel_size: int = Field(default=1, ge=1)
     """Number of tensor parallel groups."""
-    virtual_tp_sharding: VirtualTPSharding = VIRTUAL_TP_SHARDING_OFF
-    """Virtual tensor-parallel sharding mode. ``b12x-padded`` pads selected
-    DeepSeek V4 dimensions to make native B12X TP shapes divisible while
-    zero-filling checkpoint tails during weight loading."""
-    b12x_virtual_tp_attention_head_alignment: int = Field(default=16, ge=1)
-    """Local attention-head alignment for ``virtual_tp_sharding=b12x-padded``."""
-    b12x_virtual_tp_moe_intermediate_alignment: int = Field(default=32, ge=1)
-    """Local MoE intermediate-size alignment for
-    ``virtual_tp_sharding=b12x-padded``."""
     prefill_context_parallel_size: int = Field(default=1, ge=1)
     """Number of prefill context parallel groups."""
     data_parallel_size: int = Field(default=1, ge=1)

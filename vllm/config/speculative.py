@@ -1089,13 +1089,6 @@ class SpeculativeConfig:
         draft_parallel_config = ParallelConfig(
             pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
-            virtual_tp_sharding=target_parallel_config.virtual_tp_sharding,
-            b12x_virtual_tp_attention_head_alignment=(
-                target_parallel_config.b12x_virtual_tp_attention_head_alignment
-            ),
-            b12x_virtual_tp_moe_intermediate_alignment=(
-                target_parallel_config.b12x_virtual_tp_moe_intermediate_alignment
-            ),
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
             disable_custom_all_reduce=target_parallel_config.disable_custom_all_reduce,
