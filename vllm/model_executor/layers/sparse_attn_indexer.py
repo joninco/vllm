@@ -34,8 +34,15 @@ _B12X_COMPRESSED_INDEX_PAGE_WIDTH = _B12X_COMPRESSED_INDEX_PAGE_SIZE * (
 )
 _B12X_COMPRESSED_INDEX_SUPERTILE_K_DEFAULT = 32768
 _B12X_COMPRESSED_INDEX_TILE_BLOCK_K = 512
+_B12X_EXTEND_TOPK_SUPERTILE_K = int(
+    os.environ.get("VLLM_B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "32768")
+)
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _b12x_indexer_prefill_mode() -> str:
+    return os.environ.get("VLLM_B12X_INDEXER_PREFILL_MODE", "extend").lower()
 
 
 def _get_b12x_compressed_indexer_supertile_k() -> int:
@@ -242,6 +249,43 @@ def _run_b12x_paged_topk(
     )
 
 
+def _get_b12x_indexer_extend_binding(
+    *,
+    q_fp8: torch.Tensor,
+    topk_tokens: int,
+    total_seq_lens: int,
+    fp8_dtype: torch.dtype,
+    k_start: torch.Tensor,
+    k_end: torch.Tensor,
+):
+    from b12x.integration import (
+        B12XIndexerExtendScratchCaps,
+        plan_indexer_extend_scratch,
+    )
+
+    plan = plan_indexer_extend_scratch(
+        B12XIndexerExtendScratchCaps(
+            device=q_fp8.device,
+            num_q_heads=int(q_fp8.shape[1]),
+            max_q_rows=max(1, int(q_fp8.shape[0])),
+            max_k_rows=max(1, int(total_seq_lens)),
+            topk=int(topk_tokens),
+            k_dtype=fp8_dtype,
+            supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
+        )
+    )
+    scratch = current_workspace_manager().get_simultaneous(
+        *plan.shapes_and_dtypes()
+    )
+    return plan.bind(
+        scratch=scratch,
+        k_start=k_start,
+        k_end=k_end,
+        gather_rows=max(1, int(total_seq_lens)),
+        topk=int(topk_tokens),
+    )
+
+
 def _reserve_b12x_paged_indexer_scratch(
     *,
     q_rows: int,
@@ -436,17 +480,69 @@ def sparse_attn_indexer(
                     int(q_slice.shape[0]),
                     int(chunk.block_table.shape[1]),
                 )
-                _run_b12x_paged_topk(
-                    q_fp8=q_slice.contiguous(),
-                    weights=weights_slice.contiguous(),
-                    kv_cache=kv_cache,
-                    seq_lens=seq_lens,
-                    block_table=block_table,
-                    schedule_metadata=None,
-                    topk_indices=topk_indices,
-                    topk_tokens=topk_tokens,
-                    shared_page_table=True,
-                )
+                q_slice_contig = q_slice.contiguous()
+                weights_slice_contig = weights_slice.contiguous()
+                prefill_mode = _b12x_indexer_prefill_mode()
+                if prefill_mode == "extend":
+                    from b12x.integration import extend_tiled_topk
+
+                    b12x_cu_seqlen_ks = torch.where(
+                        row_has_no_kv,
+                        torch.zeros_like(chunk.cu_seqlen_ks),
+                        chunk.cu_seqlen_ks,
+                    )
+                    b12x_cu_seqlen_ke = torch.where(
+                        row_has_no_kv,
+                        torch.ones_like(chunk.cu_seqlen_ke),
+                        chunk.cu_seqlen_ke,
+                    )
+                    binding = _get_b12x_indexer_extend_binding(
+                        q_fp8=q_slice_contig,
+                        topk_tokens=topk_tokens,
+                        total_seq_lens=chunk.total_seq_lens,
+                        fp8_dtype=fp8_dtype,
+                        k_start=b12x_cu_seqlen_ks,
+                        k_end=b12x_cu_seqlen_ke,
+                    )
+                    scratch = binding.scratch
+                    k_quant = scratch.k_quant[: chunk.total_seq_lens]
+                    k_scale_bytes = scratch.k_scale_bytes[: chunk.total_seq_lens]
+                    if not chunk.skip_kv_gather:
+                        ops.cp_gather_indexer_k_quant_cache(
+                            kv_cache,
+                            k_quant,
+                            k_scale_bytes,
+                            chunk.block_table,
+                            chunk.cu_seq_lens,
+                        )
+                    topk_indices.copy_(
+                        extend_tiled_topk(
+                            q_fp8=q_slice_contig,
+                            weights=weights_slice_contig,
+                            kv_fp8=(
+                                k_quant,
+                                scratch.k_scale[: chunk.total_seq_lens],
+                            ),
+                            binding=binding,
+                        )
+                    )
+                elif prefill_mode == "paged":
+                    _run_b12x_paged_topk(
+                        q_fp8=q_slice_contig,
+                        weights=weights_slice_contig,
+                        kv_cache=kv_cache,
+                        seq_lens=seq_lens,
+                        block_table=block_table,
+                        schedule_metadata=None,
+                        topk_indices=topk_indices,
+                        topk_tokens=topk_tokens,
+                        shared_page_table=True,
+                    )
+                else:
+                    raise RuntimeError(
+                        "Unsupported VLLM_B12X_INDEXER_PREFILL_MODE="
+                        f"{prefill_mode!r}; expected 'extend' or 'paged'."
+                    )
                 topk_indices.masked_fill_(row_has_no_kv[:, None], -1)
                 continue
 
