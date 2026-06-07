@@ -67,6 +67,7 @@ logger = init_logger(__name__)
 # mid_out/mid_lse scratch and the workspace ``max_chunks_per_row`` cap; b12x's
 # wave-balanced planner picks num_splits <= this cap.
 _DECODE_SPLIT_TILE = 64
+_DECODE_HEADS_PER_BLOCK = 8
 _PREFILL_HEADS_PER_BLOCK = 16
 
 
@@ -566,11 +567,24 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             _cdiv(self._workspace_num_heads, _PREFILL_HEADS_PER_BLOCK)
             * _PREFILL_HEADS_PER_BLOCK
         )
+        self._decode_num_heads = (
+            _cdiv(self._workspace_num_heads, _DECODE_HEADS_PER_BLOCK)
+            * _DECODE_HEADS_PER_BLOCK
+        )
+        self._decode_num_heads = max(
+            self._decode_num_heads, _DECODE_HEADS_PER_BLOCK
+        )
         if self._prefill_num_heads != self._workspace_num_heads:
             logger.info_once(
                 "Padding B12X_MLA_SPARSE prefill heads from %d to %d.",
                 self._workspace_num_heads,
                 self._prefill_num_heads,
+            )
+        if self._decode_num_heads != self._workspace_num_heads:
+            logger.info_once(
+                "Padding B12X_MLA_SPARSE decode heads from %d to %d.",
+                self._workspace_num_heads,
+                self._decode_num_heads,
             )
 
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
@@ -642,7 +656,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self._decode_plan = _make_plan(
             "decode",
             self._decode_max_rows,
-            self._workspace_num_heads,
+            self._decode_num_heads,
             self._decode_max_rows,
         )
         self._extend_plan = _make_plan(
@@ -754,19 +768,28 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 if attn_metadata.max_query_len <= 1
                 else attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
             )
+            decode_num_heads = self._decode_num_heads
+            if decode_num_heads == num_actual_heads:
+                decode_q = q_all
+            else:
+                decode_q = q_all.new_zeros(
+                    (num_actual_toks, decode_num_heads, self.q_head_dim)
+                )
+                decode_q[:, :num_actual_heads, :].copy_(q_all)
+
             # Eager bind: map the caller scratch into a views container (no
             # workspace) and call the kernel with binding=. forced_num_splits pins
             # a stable, width-derived split count so the merge's num_chunks matches
             # across every captured graph (the container seeds the same value).
             binding = self._decode_plan.bind(
                 scratch=scratch_storage,
-                q=q_all,
+                q=decode_q,
                 selected_indices=page_table_1,
                 cache_seqlens_int32=cache_seqlens,
                 nsa_cache_seqlens_int32=nsa_cache_seqlens,
             )
             if self.need_to_return_lse_for_decode:
-                return cast(
+                out, lse = cast(
                     tuple[torch.Tensor, torch.Tensor],
                     self._sparse_mla_decode_forward(
                         binding=binding,
@@ -778,6 +801,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         lse_scale="natural",
                     ),
                 )
+                if decode_num_heads != num_actual_heads:
+                    out = out[:, :num_actual_heads, :].contiguous()
+                    lse = lse[:, :num_actual_heads].contiguous()
+                return out, lse
             out = cast(
                 torch.Tensor,
                 self._sparse_mla_decode_forward(
@@ -788,6 +815,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     forced_num_splits=self._num_splits_cap,
                 ),
             )
+            if decode_num_heads != num_actual_heads:
+                out = out[:, :num_actual_heads, :].contiguous()
             return out, None
         else:
             # Extend / prefill -> single-pass unified prefill (no split-K
