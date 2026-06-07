@@ -36,6 +36,18 @@ _B12X_PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
 _B12X_PAGED_INDEX_TILE_BLOCK_K = 512
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+_B12X_PREFILL_PAGED_ROUTE = "packed_contiguous"
+
+
+def _assert_b12x_prefill_paged_route(obj: object, *, owner: str) -> None:
+    route = getattr(obj, "route", None)
+    if route is None:
+        route = getattr(getattr(obj, "layout", None), "route", None)
+    if route != _B12X_PREFILL_PAGED_ROUTE:
+        raise RuntimeError(
+            "B12X sparse prefill expected the b12x planner to resolve the paged "
+            f"source to {_B12X_PREFILL_PAGED_ROUTE!r}, got {route!r} from {owner}."
+        )
 
 
 def _get_b12x_indexer_paged_supertile_k() -> int:
@@ -221,6 +233,8 @@ def _run_b12x_paged_topk(
             shared_page_table=bool(shared_page_table),
         )
     )
+    if shared_page_table:
+        _assert_b12x_prefill_paged_route(plan, owner="scratch plan")
     scratch = current_workspace_manager().get_simultaneous(
         *plan.shapes_and_dtypes()
     )
@@ -233,6 +247,8 @@ def _run_b12x_paged_topk(
         expected_num_q_heads=expected_num_q_heads,
         shared_page_table=shared_page_table,
     )
+    if shared_page_table:
+        _assert_b12x_prefill_paged_route(binding, owner="binding")
     return index_topk_fp8(
         q_fp8=q_fp8,
         weights=weights,
@@ -277,6 +293,8 @@ def _reserve_b12x_paged_indexer_scratch(
             shared_page_table=bool(shared_page_table),
         )
     )
+    if shared_page_table:
+        _assert_b12x_prefill_paged_route(plan, owner="scratch reservation plan")
     current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
 
 

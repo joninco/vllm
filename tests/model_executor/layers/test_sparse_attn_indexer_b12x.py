@@ -31,6 +31,8 @@ class _FakeWorkspaceManager:
 def _install_fake_b12x_indexer(
     monkeypatch,
     calls: list[tuple],
+    *,
+    prefill_route: str = "packed_contiguous",
 ):
     b12x_mod = types.ModuleType("b12x")
     b12x_mod.__path__ = []
@@ -45,9 +47,10 @@ def _install_fake_b12x_indexer(
             self.__dict__.update(kwargs)
 
     class _Plan:
-        def __init__(self, specs, bind_impl) -> None:
+        def __init__(self, specs, bind_impl, *, route: str) -> None:
             self._specs = specs
             self._bind_impl = bind_impl
+            self.layout = types.SimpleNamespace(route=route)
 
         def shapes_and_dtypes(self):
             return self._specs
@@ -56,6 +59,11 @@ def _install_fake_b12x_indexer(
             return self._bind_impl(scratch, kwargs)
 
     def plan_indexer_scratch(caps):
+        route = (
+            prefill_route
+            if caps.shared_page_table or caps.mode == "prefill"
+            else "paged_fused"
+        )
         calls.append(
             (
                 "indexer_plan",
@@ -65,6 +73,7 @@ def _install_fake_b12x_indexer(
                 caps.max_q_rows,
                 caps.max_page_table_width,
                 caps.topk,
+                route,
             )
         )
         specs = (
@@ -83,9 +92,9 @@ def _install_fake_b12x_indexer(
                     kwargs["active_width"] is not None,
                 )
             )
-            return types.SimpleNamespace(scratch=scratch, **kwargs)
+            return types.SimpleNamespace(scratch=scratch, route=route, **kwargs)
 
-        return _Plan(specs, bind_impl)
+        return _Plan(specs, bind_impl, route=route)
 
     def index_topk_fp8(**kwargs):
         calls.append(
@@ -189,7 +198,16 @@ def test_b12x_decode_indexer_is_non_shared_for_fused_route(
         ((q_rows,), torch.int32),
     )
     assert calls == [
-        ("indexer_plan", "paged", "decode", False, q_rows, page_table_width, topk),
+        (
+            "indexer_plan",
+            "paged",
+            "decode",
+            False,
+            q_rows,
+            page_table_width,
+            topk,
+            "paged_fused",
+        ),
         (
             "paged_bind",
             tuple(block_table.shape),
@@ -249,7 +267,16 @@ def test_b12x_prefill_indexer_marks_shared_page_table(monkeypatch):
         ((q_rows,), torch.int32),
     )
     assert calls == [
-        ("indexer_plan", "paged", "prefill", True, q_rows, page_table_width, topk),
+        (
+            "indexer_plan",
+            "paged",
+            "prefill",
+            True,
+            q_rows,
+            page_table_width,
+            topk,
+            "packed_contiguous",
+        ),
         (
             "paged_bind",
             tuple(block_table.shape),
@@ -266,6 +293,55 @@ def test_b12x_prefill_indexer_marks_shared_page_table(monkeypatch):
             64,
             num_heads,
         ),
+    ]
+
+
+def test_b12x_prefill_indexer_requires_packed_contiguous_route(monkeypatch):
+    calls: list[tuple] = []
+    _install_fake_b12x_indexer(monkeypatch, calls, prefill_route="paged_tiled")
+    workspace_manager = _FakeWorkspaceManager()
+    monkeypatch.setattr(
+        indexer_mod, "current_workspace_manager", lambda: workspace_manager
+    )
+
+    q_rows = 2
+    num_heads = 1
+    topk = 4
+    page_table_width = 10
+    q_fp8 = torch.empty((q_rows, num_heads, 128), dtype=torch.uint8)
+    weights = torch.empty((q_rows, num_heads, 1), dtype=torch.float32)
+    kv_cache = torch.empty((page_table_width, 64, 132), dtype=torch.uint8)
+    seq_lens = torch.tensor([600, 640], dtype=torch.int32)
+    block_table = torch.arange(page_table_width, dtype=torch.int32).reshape(
+        1, page_table_width
+    ).expand(q_rows, page_table_width)
+    topk_indices = torch.empty((q_rows, topk), dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="packed_contiguous.*scratch plan"):
+        indexer_mod._run_b12x_paged_topk(
+            q_fp8=q_fp8,
+            weights=weights,
+            kv_cache=kv_cache,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            schedule_metadata=None,
+            topk_indices=topk_indices,
+            topk_tokens=topk,
+            shared_page_table=True,
+        )
+
+    assert workspace_manager.specs is None
+    assert calls == [
+        (
+            "indexer_plan",
+            "paged",
+            "prefill",
+            True,
+            q_rows,
+            page_table_width,
+            topk,
+            "paged_tiled",
+        )
     ]
 
 
@@ -371,7 +447,16 @@ def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
     assert result is topk_indices_buffer
     assert topk_indices_buffer.tolist() == [[123] * topk, [123] * topk]
     assert calls == [
-        ("indexer_plan", "paged", "decode", False, q_rows, page_table_width, topk),
+        (
+            "indexer_plan",
+            "paged",
+            "decode",
+            False,
+            q_rows,
+            page_table_width,
+            topk,
+            "paged_fused",
+        ),
         (
             "paged_bind",
             tuple(block_table.shape),
@@ -465,8 +550,26 @@ def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
         ((q_rows,), torch.int32),
     )
     assert calls == [
-        ("indexer_plan", "paged", "decode", False, q_rows, total_seq_lens // 64, topk),
-        ("indexer_plan", "paged", "prefill", True, q_rows, total_seq_lens // 64, topk),
+        (
+            "indexer_plan",
+            "paged",
+            "decode",
+            False,
+            q_rows,
+            total_seq_lens // 64,
+            topk,
+            "paged_fused",
+        ),
+        (
+            "indexer_plan",
+            "paged",
+            "prefill",
+            True,
+            q_rows,
+            total_seq_lens // 64,
+            topk,
+            "packed_contiguous",
+        ),
     ]
 
 
