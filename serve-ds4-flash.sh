@@ -93,7 +93,6 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --block-size 256 \
   --load-format "${load_format}" \
   --tensor-parallel-size "${tp_size}" \
-  --b12x-virtual-tp-moe-intermediate-alignment 32 \
   --moe-backend b12x \
   --linear-backend b12x \
   --gpu-memory-utilization "${gpu_memory_utilization}" \

@@ -7,11 +7,11 @@ from typing import Any, cast
 import pytest
 import torch
 
+import vllm.config.virtual_tp as virtual_tp
 from vllm.config import ParallelConfig, set_current_vllm_config
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.virtual_tp import (
     VIRTUAL_TP_PLAN_ATTR,
-    VIRTUAL_TP_SHARDING_B12X_PADDED,
     maybe_apply_b12x_virtual_tp_padding,
 )
 from vllm.model_executor.virtual_tp import (
@@ -100,6 +100,15 @@ class FakeUnsupportedModelConfig:
         )
 
 
+class FakeAlignedGlmDsaModelConfig(FakeGlmDsaModelConfig):
+    def __init__(self):
+        super().__init__()
+        self.hf_text_config.num_attention_heads = 96
+        self.hf_text_config.moe_intermediate_size = 2112
+        self.hf_text_config.vocab_size = 129408
+        self.model_arch_config = self.get_model_arch_config()
+
+
 def _fake_vllm_config(
     *,
     model_config: Any | None = None,
@@ -110,7 +119,6 @@ def _fake_vllm_config(
         model_config=model_config or FakeModelConfig(),
         parallel_config=ParallelConfig(
             tensor_parallel_size=tensor_parallel_size,
-            virtual_tp_sharding=VIRTUAL_TP_SHARDING_B12X_PADDED,
         ),
         kernel_config=SimpleNamespace(moe_backend=moe_backend),
         attention_config=SimpleNamespace(
@@ -158,6 +166,7 @@ def test_b12x_virtual_tp_padding_deepseek_v4_pro_tp10():
         "tp_size": 10,
         "local_size": 384,
     }
+    assert plan["shared_expert_intermediate_size"]["local_size"] % 128 == 0
     assert plan["vocab_size"] == {
         "original_size": 129280,
         "padded_size": 129280,
@@ -167,15 +176,39 @@ def test_b12x_virtual_tp_padding_deepseek_v4_pro_tp10():
     }
 
 
+def test_b12x_virtual_tp_padding_logs_when_triggered(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    vllm_config = _fake_vllm_config()
+    logs: list[str] = []
+
+    def warning(message: str, *args: Any) -> None:
+        logs.append(message % args)
+
+    monkeypatch.setattr(virtual_tp.logger, "warning", warning)
+    maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
+
+    assert any("Automatically enabled B12X virtual TP padding" in log for log in logs)
+    assert any("attention heads 128 -> 160" in log for log in logs)
+    assert any("MoE intermediate size 3072 -> 3200" in log for log in logs)
+
+
 def test_b12x_virtual_tp_vocab_padding_deepseek_v4_pro_tp3():
     vllm_config = _fake_vllm_config(tensor_parallel_size=3)
 
     maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
 
     text_config = vllm_config.model_config.hf_text_config
+    assert text_config.num_attention_heads == 144
     assert text_config.vocab_size == 129280
 
     plan = getattr(text_config, VIRTUAL_TP_PLAN_ATTR)
+    assert plan["attention_heads"] == {
+        "original_size": 128,
+        "padded_size": 144,
+        "tp_size": 3,
+        "local_size": 48,
+    }
     assert plan["vocab_size"] == {
         "original_size": 129280,
         "padded_size": 129408,
@@ -219,21 +252,21 @@ def test_b12x_virtual_tp_padding_glm_dsa_tp6():
     maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
 
     text_config = vllm_config.model_config.hf_text_config
-    assert text_config.num_attention_heads == 66
+    assert text_config.num_attention_heads == 96
     assert text_config.moe_intermediate_size == 2112
     assert text_config.vocab_size == 129280
     assert text_config.original_num_attention_heads == 64
     assert text_config.original_moe_intermediate_size == 2048
-    assert vllm_config.model_config.model_arch_config.total_num_attention_heads == 66
+    assert vllm_config.model_config.model_arch_config.total_num_attention_heads == 96
 
     plan = getattr(text_config, VIRTUAL_TP_PLAN_ATTR)
     assert "output_groups" not in plan
     assert "shared_expert_intermediate_size" not in plan
     assert plan["attention_heads"] == {
         "original_size": 64,
-        "padded_size": 66,
+        "padded_size": 96,
         "tp_size": 6,
-        "local_size": 11,
+        "local_size": 16,
     }
     assert plan["moe_intermediate_size"] == {
         "original_size": 2048,
@@ -259,37 +292,15 @@ def test_b12x_virtual_tp_padding_glm_dsa_draft_tp6():
         draft_model_config=draft_model_config,
         draft_parallel_config=ParallelConfig(
             tensor_parallel_size=6,
-            virtual_tp_sharding=VIRTUAL_TP_SHARDING_B12X_PADDED,
         ),
     )
 
     SpeculativeConfig._maybe_apply_virtual_tp_to_draft(cast(Any, spec_config))
 
     text_config = draft_model_config.hf_text_config
-    assert text_config.num_attention_heads == 66
+    assert text_config.num_attention_heads == 96
     assert text_config.moe_intermediate_size == 2112
-    assert draft_model_config.model_arch_config.total_num_attention_heads == 66
-
-
-def test_speculative_draft_parallel_config_preserves_virtual_tp_settings():
-    target_parallel_config = ParallelConfig(
-        tensor_parallel_size=6,
-        virtual_tp_sharding=VIRTUAL_TP_SHARDING_B12X_PADDED,
-        b12x_virtual_tp_attention_head_alignment=1,
-        b12x_virtual_tp_moe_intermediate_alignment=64,
-    )
-
-    draft_parallel_config = SpeculativeConfig.create_draft_parallel_config(
-        target_parallel_config,
-        speculative_draft_tensor_parallel_size=6,
-    )
-
-    assert (
-        draft_parallel_config.virtual_tp_sharding
-        == VIRTUAL_TP_SHARDING_B12X_PADDED
-    )
-    assert draft_parallel_config.b12x_virtual_tp_attention_head_alignment == 1
-    assert draft_parallel_config.b12x_virtual_tp_moe_intermediate_alignment == 64
+    assert draft_model_config.model_arch_config.total_num_attention_heads == 96
 
 
 def test_b12x_virtual_tp_padding_updates_distinct_hf_configs():
@@ -304,11 +315,26 @@ def test_b12x_virtual_tp_padding_updates_distinct_hf_configs():
     text_config = vllm_config.model_config.hf_text_config
     plan = getattr(text_config, VIRTUAL_TP_PLAN_ATTR)
 
-    assert root_config.num_attention_heads == 66
+    assert root_config.num_attention_heads == 96
     assert root_config.moe_intermediate_size == 2112
     assert root_config.vocab_size == 129280
     assert getattr(root_config, VIRTUAL_TP_PLAN_ATTR) is plan
     assert getattr(root_config.text_config, VIRTUAL_TP_PLAN_ATTR) is plan
+
+
+def test_b12x_virtual_tp_padding_skips_aligned_config():
+    vllm_config = _fake_vllm_config(
+        model_config=FakeAlignedGlmDsaModelConfig(),
+        tensor_parallel_size=6,
+    )
+
+    maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
+
+    text_config = vllm_config.model_config.hf_text_config
+    assert not hasattr(text_config, VIRTUAL_TP_PLAN_ATTR)
+    assert text_config.num_attention_heads == 96
+    assert text_config.moe_intermediate_size == 2112
+    assert text_config.vocab_size == 129408
 
 
 def test_b12x_virtual_tp_padding_rejects_flashinfer_moe():
@@ -318,11 +344,13 @@ def test_b12x_virtual_tp_padding_rejects_flashinfer_moe():
         maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
 
 
-def test_b12x_virtual_tp_padding_rejects_unsupported_models():
+def test_b12x_virtual_tp_padding_skips_unsupported_models():
     vllm_config = _fake_vllm_config(model_config=FakeUnsupportedModelConfig())
 
-    with pytest.raises(ValueError, match="DeepSeek V4 and sparse MLA/DSA"):
-        maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
+    maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
+
+    text_config = vllm_config.model_config.hf_text_config
+    assert not hasattr(text_config, VIRTUAL_TP_PLAN_ATTR)
 
 
 def test_virtual_tp_pad_or_narrow_weight_zero_fills_tail():
