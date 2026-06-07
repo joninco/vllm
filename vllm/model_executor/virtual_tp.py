@@ -7,10 +7,7 @@ from typing import Any
 
 import torch
 
-from vllm.config.virtual_tp import (
-    VIRTUAL_TP_PLAN_ATTR,
-    VIRTUAL_TP_SHARDING_B12X_PADDED,
-)
+from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 
 
 def get_current_virtual_tp_plan() -> dict[str, Any] | None:
@@ -25,7 +22,7 @@ def get_current_virtual_tp_plan() -> dict[str, Any] | None:
 
 def is_virtual_tp_padded_enabled() -> bool:
     plan = get_current_virtual_tp_plan()
-    return plan is not None and plan.get("sharding") == VIRTUAL_TP_SHARDING_B12X_PADDED
+    return plan is not None
 
 
 def get_virtual_tp_axis_local_size(axis_name: str, default: int) -> int:

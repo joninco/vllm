@@ -50,9 +50,6 @@ from vllm.config.utils import (
 )
 from vllm.config.virtual_tp import (
     VIRTUAL_TP_PLAN_ATTR,
-    VIRTUAL_TP_SHARDING_B12X_PADDED,
-    VIRTUAL_TP_SHARDING_OFF,
-    VirtualTPSharding,
 )
 from vllm.config.vllm import (
     VllmConfig,
@@ -134,9 +131,6 @@ __all__ = [
     "update_config",
     # From vllm.config.virtual_tp
     "VIRTUAL_TP_PLAN_ATTR",
-    "VIRTUAL_TP_SHARDING_B12X_PADDED",
-    "VIRTUAL_TP_SHARDING_OFF",
-    "VirtualTPSharding",
     # From vllm.config.vllm
     "VllmConfig",
     "get_cached_compilation_config",
