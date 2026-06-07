@@ -45,7 +45,6 @@ served_model_name="${SERVED_MODEL_NAME:-DeepSeek-V4-Pro}"
 tp_size="${TP_SIZE:-10}"
 dcp_size="${DCP_SIZE:-1}"
 dcp_comm_backend="${DCP_COMM_BACKEND:-ag_rs}"
-moe_intermediate_alignment="${B12X_VIRTUAL_TP_MOE_INTERMEDIATE_ALIGNMENT:-16}"
 port="${PORT:-8000}"
 gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.94}"
 max_model_len="${MAX_MODEL_LEN:-1000000}"
@@ -111,9 +110,6 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --load-format "${load_format}" \
   --tensor-parallel-size "${tp_size}" \
   "${dcp_args[@]}" \
-  --virtual-tp-sharding b12x-padded \
-  --b12x-virtual-tp-attention-head-alignment 16 \
-  --b12x-virtual-tp-moe-intermediate-alignment "${moe_intermediate_alignment}" \
   --moe-backend b12x \
   --linear-backend b12x \
   --gpu-memory-utilization "${gpu_memory_utilization}" \

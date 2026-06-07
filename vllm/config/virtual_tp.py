@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -19,17 +19,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-VirtualTPSharding = Literal["off", "b12x-padded"]
-
-VIRTUAL_TP_SHARDING_OFF: VirtualTPSharding = "off"
-VIRTUAL_TP_SHARDING_B12X_PADDED: VirtualTPSharding = "b12x-padded"
 VIRTUAL_TP_PLAN_ATTR = "vllm_virtual_tp_plan"
+_VIRTUAL_TP_PLAN_KIND_B12X_PADDED = "b12x-padded"
+_ATTENTION_HEAD_LOCAL_ALIGNMENT = 8
+_MOE_INTERMEDIATE_LOCAL_ALIGNMENT = 32
 _SHARED_EXPERT_FP8_LOCAL_ALIGNMENT = 128
 _VOCAB_GLOBAL_ALIGNMENT = 64
 
 
 def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
-    """Pad config dimensions for B12X virtual TP sharding.
+    """Automatically pad config dimensions for B12X virtual TP sharding.
 
     Some B12X target models have dimensions that are not divisible by an
     otherwise useful TP size.  Native B12X kernels can run a larger logical
@@ -38,16 +37,6 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
     verification and stores the original sizes in ``VIRTUAL_TP_PLAN_ATTR`` for
     weight loaders.
     """
-    parallel_config = vllm_config.parallel_config
-    if parallel_config.virtual_tp_sharding == VIRTUAL_TP_SHARDING_OFF:
-        return
-
-    if parallel_config.virtual_tp_sharding != VIRTUAL_TP_SHARDING_B12X_PADDED:
-        raise ValueError(
-            "Unsupported virtual TP sharding mode "
-            f"{parallel_config.virtual_tp_sharding!r}."
-        )
-
     model_config = vllm_config.model_config
     if model_config is None:
         return
@@ -56,29 +45,43 @@ def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
     if getattr(plan_config, VIRTUAL_TP_PLAN_ATTR, None) is not None:
         return
 
+    if not _is_supported_b12x_virtual_tp_config(model_config):
+        return
+    if not (_uses_b12x_attention(vllm_config) or _uses_native_b12x_moe(vllm_config)):
+        return
+
+    plan = _build_b12x_virtual_tp_plan(model_config, vllm_config.parallel_config)
+    if not _plan_requires_padding(plan):
+        return
+
     _validate_b12x_virtual_tp_config(vllm_config)
 
-    apply_b12x_virtual_tp_padding_to_model_config(model_config, parallel_config)
+    _apply_b12x_virtual_tp_plan(model_config, plan)
 
 
 def apply_b12x_virtual_tp_padding_to_model_config(
     model_config: ModelConfig,
     parallel_config: ParallelConfig,
 ) -> None:
-    """Pad model dimensions for a validated B12X virtual TP configuration."""
-    if parallel_config.virtual_tp_sharding == VIRTUAL_TP_SHARDING_OFF:
-        return
-
-    if parallel_config.virtual_tp_sharding != VIRTUAL_TP_SHARDING_B12X_PADDED:
-        raise ValueError(
-            "Unsupported virtual TP sharding mode "
-            f"{parallel_config.virtual_tp_sharding!r}."
-        )
-
+    """Pad model dimensions when B12X virtual TP alignment requires it."""
     plan_config = _get_plan_config(model_config)
     if getattr(plan_config, VIRTUAL_TP_PLAN_ATTR, None) is not None:
         return
 
+    if not _is_supported_b12x_virtual_tp_config(model_config):
+        return
+
+    plan = _build_b12x_virtual_tp_plan(model_config, parallel_config)
+    if not _plan_requires_padding(plan):
+        return
+
+    _apply_b12x_virtual_tp_plan(model_config, plan)
+
+
+def _build_b12x_virtual_tp_plan(
+    model_config: ModelConfig,
+    parallel_config: ParallelConfig,
+) -> dict[str, dict[str, int] | str]:
     attention_tp_size = parallel_config.tensor_parallel_size
     moe_tp_size = (
         parallel_config.tensor_parallel_size
@@ -86,17 +89,16 @@ def apply_b12x_virtual_tp_padding_to_model_config(
         * parallel_config.prefill_context_parallel_size
     )
 
-    configs = tuple(_iter_virtual_tp_configs(model_config))
     text_config = model_config.hf_text_config
     is_deepseek_v4 = _is_deepseek_v4_config(model_config)
 
     original_attention_heads = _require_int_attr(text_config, "num_attention_heads")
+    attention_axis = _make_virtual_axis(
+        original_attention_heads,
+        attention_tp_size,
+        _ATTENTION_HEAD_LOCAL_ALIGNMENT,
+    )
     if is_deepseek_v4:
-        attention_axis = _make_virtual_axis(
-            original_attention_heads,
-            attention_tp_size,
-            parallel_config.b12x_virtual_tp_attention_head_alignment,
-        )
         original_output_groups = _require_int_attr(text_config, "o_groups")
         output_group_axis = _make_virtual_output_group_axis(
             original_output_groups,
@@ -105,24 +107,13 @@ def apply_b12x_virtual_tp_padding_to_model_config(
             attention_tp_size,
         )
     else:
-        # Sparse MLA/DSA only needs the total query-head count to be divisible by
-        # the effective attention TP size.  The B12X sparse-MLA backend already
-        # pads local head blocks internally where its kernels need larger tiles.
-        attention_axis = _make_virtual_axis(original_attention_heads, attention_tp_size)
         output_group_axis = None
-
-    _set_all_config_attr(
-        configs, "original_num_attention_heads", original_attention_heads
-    )
-    _set_existing_config_attr(
-        configs, "num_attention_heads", attention_axis["padded_size"]
-    )
 
     moe_original_size = _require_int_attr(text_config, "moe_intermediate_size")
     moe_axis = _make_virtual_axis(
         moe_original_size,
         moe_tp_size,
-        parallel_config.b12x_virtual_tp_moe_intermediate_alignment,
+        _MOE_INTERMEDIATE_LOCAL_ALIGNMENT,
     )
     shared_expert_axis = None
     n_shared_experts = getattr(text_config, "n_shared_experts", None)
@@ -137,16 +128,8 @@ def apply_b12x_virtual_tp_padding_to_model_config(
         attention_tp_size,
     )
 
-    if output_group_axis is not None:
-        _set_all_config_attr(
-            configs, "original_o_groups", output_group_axis["original_size"]
-        )
-        _set_existing_config_attr(configs, "o_groups", output_group_axis["padded_size"])
-    _set_all_config_attr(configs, "original_moe_intermediate_size", moe_original_size)
-    _set_existing_config_attr(configs, "moe_intermediate_size", moe_axis["padded_size"])
-
-    plan = {
-        "sharding": VIRTUAL_TP_SHARDING_B12X_PADDED,
+    plan: dict[str, dict[str, int] | str] = {
+        "sharding": _VIRTUAL_TP_PLAN_KIND_B12X_PADDED,
         "attention_heads": attention_axis,
         "moe_intermediate_size": moe_axis,
         "vocab_size": vocab_axis,
@@ -155,6 +138,51 @@ def apply_b12x_virtual_tp_padding_to_model_config(
         plan["output_groups"] = output_group_axis
     if shared_expert_axis is not None:
         plan["shared_expert_intermediate_size"] = shared_expert_axis
+    return plan
+
+
+def _plan_requires_padding(plan: dict[str, dict[str, int] | str]) -> bool:
+    for axis in plan.values():
+        if not isinstance(axis, dict):
+            continue
+        original_size = axis.get("original_size")
+        padded_size = axis.get("padded_size")
+        if (
+            original_size is not None
+            and padded_size is not None
+            and int(original_size) != int(padded_size)
+        ):
+            return True
+    return False
+
+
+def _apply_b12x_virtual_tp_plan(
+    model_config: ModelConfig,
+    plan: dict[str, dict[str, int] | str],
+) -> None:
+    configs = tuple(_iter_virtual_tp_configs(model_config))
+    attention_axis = _require_axis(plan, "attention_heads")
+    moe_axis = _require_axis(plan, "moe_intermediate_size")
+    vocab_axis = _require_axis(plan, "vocab_size")
+    output_group_axis = _optional_axis(plan, "output_groups")
+    shared_expert_axis = _optional_axis(plan, "shared_expert_intermediate_size")
+
+    _set_all_config_attr(
+        configs, "original_num_attention_heads", attention_axis["original_size"]
+    )
+    _set_existing_config_attr(
+        configs, "num_attention_heads", attention_axis["padded_size"]
+    )
+
+    if output_group_axis is not None:
+        _set_all_config_attr(
+            configs, "original_o_groups", output_group_axis["original_size"]
+        )
+        _set_existing_config_attr(configs, "o_groups", output_group_axis["padded_size"])
+    _set_all_config_attr(
+        configs, "original_moe_intermediate_size", moe_axis["original_size"]
+    )
+    _set_existing_config_attr(configs, "moe_intermediate_size", moe_axis["padded_size"])
 
     for config in configs:
         setattr(config, VIRTUAL_TP_PLAN_ATTR, plan)
@@ -162,9 +190,10 @@ def apply_b12x_virtual_tp_padding_to_model_config(
     model_config.model_arch_config = model_config.get_model_arch_config()
 
     if output_group_axis is None:
-        logger.info(
-            "Enabled B12X virtual TP padding: attention heads %d -> %d, "
-            "MoE intermediate size %d -> %d, vocab size %d -> %d.",
+        logger.warning(
+            "Automatically enabled B12X virtual TP padding for B12X kernel "
+            "compatibility: attention heads %d -> %d, MoE intermediate "
+            "size %d -> %d, vocab size %d -> %d.",
             attention_axis["original_size"],
             attention_axis["padded_size"],
             moe_axis["original_size"],
@@ -173,10 +202,10 @@ def apply_b12x_virtual_tp_padding_to_model_config(
             vocab_axis["padded_size"],
         )
     else:
-        logger.info(
-            "Enabled B12X virtual TP padding: attention heads %d -> %d, "
-            "output groups %d -> %d, MoE intermediate size %d -> %d, "
-            "vocab size %d -> %d.",
+        logger.warning(
+            "Automatically enabled B12X virtual TP padding for B12X kernel "
+            "compatibility: attention heads %d -> %d, output groups %d -> %d, "
+            "MoE intermediate size %d -> %d, vocab size %d -> %d.",
             attention_axis["original_size"],
             attention_axis["padded_size"],
             output_group_axis["original_size"],
@@ -187,12 +216,30 @@ def apply_b12x_virtual_tp_padding_to_model_config(
             vocab_axis["padded_size"],
         )
     if shared_expert_axis is not None:
-        logger.info(
-            "Enabled B12X virtual TP padding for shared experts: "
+        logger.warning(
+            "Automatically enabled B12X virtual TP padding for shared experts: "
             "intermediate size %d -> %d.",
             shared_expert_axis["original_size"],
             shared_expert_axis["padded_size"],
         )
+
+
+def _require_axis(plan: dict[str, dict[str, int] | str], name: str) -> dict[str, int]:
+    axis = plan.get(name)
+    if not isinstance(axis, dict):
+        raise ValueError(f"B12X virtual TP plan missing axis {name!r}.")
+    return axis
+
+
+def _optional_axis(
+    plan: dict[str, dict[str, int] | str], name: str
+) -> dict[str, int] | None:
+    axis = plan.get(name)
+    if axis is None:
+        return None
+    if not isinstance(axis, dict):
+        raise ValueError(f"B12X virtual TP plan axis {name!r} is invalid.")
+    return axis
 
 
 def _validate_b12x_virtual_tp_config(vllm_config: VllmConfig) -> None:
@@ -202,37 +249,32 @@ def _validate_b12x_virtual_tp_config(vllm_config: VllmConfig) -> None:
 
     if not _is_supported_b12x_virtual_tp_config(model_config):
         raise ValueError(
-            "--virtual-tp-sharding=b12x-padded is currently supported only for "
+            "B12X virtual TP padding is currently supported only for "
             "DeepSeek V4 and sparse MLA/DSA models."
         )
 
     if parallel_config.enable_expert_parallel:
         raise ValueError(
-            "--virtual-tp-sharding=b12x-padded is incompatible with expert "
+            "B12X virtual TP padding is incompatible with expert "
             "parallelism. Use tensor parallelism for the B12X padded path."
         )
 
     if vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe":
         raise ValueError(
-            "--virtual-tp-sharding=b12x-padded is incompatible with DeepGEMM MegaMoE."
+            "B12X virtual TP padding is incompatible with DeepGEMM MegaMoE."
         )
 
     if not _uses_native_b12x_moe(vllm_config):
         raise ValueError(
-            "--virtual-tp-sharding=b12x-padded requires the native B12X MoE "
+            "B12X virtual TP padding requires the native B12X MoE "
             "backend. Pass --moe-backend b12x or set VLLM_USE_B12X_MOE=1."
         )
 
     if not _uses_b12x_attention(vllm_config):
         raise ValueError(
-            "--virtual-tp-sharding=b12x-padded requires the B12X MLA sparse "
+            "B12X virtual TP padding requires the B12X MLA sparse "
             "attention backend."
         )
-
-    if parallel_config.b12x_virtual_tp_attention_head_alignment <= 0:
-        raise ValueError("b12x_virtual_tp_attention_head_alignment must be > 0.")
-    if parallel_config.b12x_virtual_tp_moe_intermediate_alignment <= 0:
-        raise ValueError("b12x_virtual_tp_moe_intermediate_alignment must be > 0.")
 
 
 def _is_deepseek_v4_config(model_config: ModelConfig) -> bool:
@@ -358,8 +400,7 @@ def _require_int_attr(config: Any, attr: str) -> int:
     value = getattr(config, attr, None)
     if value is None:
         raise ValueError(
-            "--virtual-tp-sharding=b12x-padded requires config attribute "
-            f"{attr!r}."
+            f"B12X virtual TP padding requires config attribute {attr!r}."
         )
     return int(value)
 
