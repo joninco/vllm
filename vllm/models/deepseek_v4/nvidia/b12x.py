@@ -43,6 +43,7 @@ _DSV4_HEAD_DIM = 512
 _DSV4_V_HEAD_DIM = 512
 _DSV4_CACHE_BYTES_PER_TOKEN = 584
 _DECODE_SPLIT_TILE = 64
+_C128A_TOPK_ALIGNMENT = 128
 _VALIDATE_DCP_INDICES_ENV = "VLLM_DSV4_DCP_VALIDATE_INDICES"
 
 
@@ -405,6 +406,46 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
             "(kernel requires h_q in {16, 32, 64, 128})."
         )
 
+    def _reserve_dummy_compressed_mla_scratch(self, q: torch.Tensor) -> None:
+        from b12x.integration.compressed_scratch import (
+            B12XCompressedMLAScratchCaps,
+            plan_compressed_mla_scratch,
+        )
+        from b12x.integration.mla import compressed_mla_split_chunks_for_contract
+
+        indexed_width = 0
+        if self.compress_ratio == 4:
+            if self.topk_indices_buffer is not None:
+                indexed_width = int(self.topk_indices_buffer.shape[-1])
+            elif self.indexer is not None:
+                indexed_width = int(self.indexer.topk_tokens)
+        elif self.compress_ratio > 1:
+            indexed_width = _cdiv(self.max_model_len, self.compress_ratio)
+            indexed_width = _cdiv(indexed_width, _C128A_TOPK_ALIGNMENT)
+            indexed_width *= _C128A_TOPK_ALIGNMENT
+
+        width = max(int(self.window_size) + indexed_width, 1)
+        rows = max(int(self.max_num_batched_tokens), 1)
+        decode_split_cap = max(1, _cdiv(width, _DECODE_SPLIT_TILE))
+        num_splits_cap = compressed_mla_split_chunks_for_contract(
+            rows=rows,
+            width=width,
+            max_chunks=decode_split_cap,
+        )
+        plan = plan_compressed_mla_scratch(
+            B12XCompressedMLAScratchCaps(
+                device=q.device,
+                num_q_heads=int(q.shape[1]),
+                max_q_rows=rows,
+                max_width=width,
+                head_dim=_DSV4_HEAD_DIM,
+                v_head_dim=_DSV4_V_HEAD_DIM,
+                page_size=int(self.swa_cache_layer.block_size),
+                max_chunks_per_row=num_splits_cap,
+            )
+        )
+        current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+
     def forward_mqa(
         self,
         q: torch.Tensor,
@@ -433,9 +474,10 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            # Warmup dummy run: no metadata; the per-call binding allocates its
-            # own scratch, so nothing to pre-reserve. Zero and return.
+            # Warmup dummy run: no metadata, so reserve the largest compressed
+            # MLA scratch this layer can request before vLLM locks workspace.
             output.zero_()
+            self._reserve_dummy_compressed_mla_scratch(q)
             return
 
         assert isinstance(attn_metadata, dict)
