@@ -262,7 +262,7 @@ class Step3p5MTPProposer(EagleProposer):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
             if self.use_local_argmax_reduction:
-                return self.model.get_top_tokens(hidden_states), None
+                return self._model_get_top_tokens(hidden_states, spec_step_idx), None
             logits = self.model.compute_logits(
                 hidden_states, spec_step_idx=spec_step_idx
             )
