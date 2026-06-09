@@ -1058,6 +1058,82 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
+    elif mxfp4_backend in (
+        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
+        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+    ):
+        w13_weight = w13_weight.data
+        w2_weight = w2_weight.data
+        w13_weight_scale = w13_weight_scale.data
+        w2_weight_scale = w2_weight_scale.data
+        if w13_bias is not None:
+            w13_bias = w13_bias.data.to(torch.float32)
+        if w2_bias is not None:
+            w2_bias = w2_bias.data.to(torch.float32)
+
+        # Standard DeepSeek-V4 loading gives contiguous [w1/gate, w3/up].
+        # FlashInfer CUTLASS uses the opposite SwiGLU convention.
+        w1_weight = w13_weight[:, :intermediate_size, :]
+        w3_weight = w13_weight[:, intermediate_size:, :]
+        w13_weight = torch.cat([w3_weight, w1_weight], dim=1).contiguous()
+
+        w1_scale = w13_weight_scale[:, :intermediate_size, :]
+        w3_scale = w13_weight_scale[:, intermediate_size:, :]
+        w13_weight_scale = torch.cat([w3_scale, w1_scale], dim=1).contiguous()
+
+        if w13_bias is not None:
+            b1 = w13_bias[:, :intermediate_size]
+            b3 = w13_bias[:, intermediate_size:]
+            w13_bias = torch.cat([b3, b1], dim=1).contiguous()
+
+        if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8:
+            from flashinfer import block_scale_interleave
+
+            w13_shape = w13_weight_scale.shape
+            w13_weight_scale = (
+                block_scale_interleave(w13_weight_scale.view(torch.uint8))
+                .reshape(w13_shape)
+                .view(torch.float8_e4m3fn)
+            )
+
+            w2_shape = w2_weight_scale.shape
+            w2_weight_scale = (
+                block_scale_interleave(w2_weight_scale.view(torch.uint8))
+                .reshape(w2_shape)
+                .view(torch.float8_e4m3fn)
+            )
+
+            return (
+                w13_weight,
+                w2_weight,
+                w13_weight_scale,
+                w2_weight_scale,
+                w13_bias,
+                w2_bias,
+            )
+
+        from flashinfer.fused_moe import (
+            interleave_moe_scales_for_sm90_mixed_gemm,
+            interleave_moe_weights_for_sm90_mixed_gemm,
+        )
+
+        return (
+            interleave_moe_weights_for_sm90_mixed_gemm(
+                w13_weight.contiguous(), "fp4"
+            ),
+            interleave_moe_weights_for_sm90_mixed_gemm(
+                w2_weight.contiguous(), "fp4"
+            ),
+            interleave_moe_scales_for_sm90_mixed_gemm(
+                w13_weight_scale.to(torch.uint8)
+            ),
+            interleave_moe_scales_for_sm90_mixed_gemm(
+                w2_weight_scale.to(torch.uint8)
+            ),
+            w13_bias,
+            w2_bias,
+        )
+
     elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
         from vllm._aiter_ops import rocm_aiter_ops
 
@@ -1563,10 +1639,85 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend in (
+        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
+        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+    ):
+        w13_weight = w13_weight.data
+        w2_weight = w2_weight.data
+        w13_weight_scale = w13_weight_scale.data
+        w2_weight_scale = w2_weight_scale.data
+        if w13_bias is not None:
+            w13_bias = w13_bias.data.to(torch.float32)
+        if w2_bias is not None:
+            w2_bias = w2_bias.data.to(torch.float32)
+
+        # Standard DeepSeek-V4 loading gives contiguous [w1/gate, w3/up].
+        # FlashInfer CUTLASS uses the opposite SwiGLU convention.
+        w1_weight = w13_weight[:, :intermediate_size, :]
+        w3_weight = w13_weight[:, intermediate_size:, :]
+        w13_weight = torch.cat([w3_weight, w1_weight], dim=1).contiguous()
+
+        w1_scale = w13_weight_scale[:, :intermediate_size, :]
+        w3_scale = w13_weight_scale[:, intermediate_size:, :]
+        w13_weight_scale = torch.cat([w3_scale, w1_scale], dim=1).contiguous()
+
+        if w13_bias is not None:
+            b1 = w13_bias[:, :intermediate_size]
+            b3 = w13_bias[:, intermediate_size:]
+            w13_bias = torch.cat([b3, b1], dim=1).contiguous()
+
+        if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8:
+            from flashinfer import block_scale_interleave
+
+            w13_shape = w13_weight_scale.shape
+            w13_weight_scale = (
+                block_scale_interleave(w13_weight_scale.view(torch.uint8))
+                .reshape(w13_shape)
+                .view(torch.float8_e4m3fn)
+            )
+
+            w2_shape = w2_weight_scale.shape
+            w2_weight_scale = (
+                block_scale_interleave(w2_weight_scale.view(torch.uint8))
+                .reshape(w2_shape)
+                .view(torch.float8_e4m3fn)
+            )
+
+            return (
+                w13_weight,
+                w2_weight,
+                w13_weight_scale,
+                w2_weight_scale,
+                w13_bias,
+                w2_bias,
+            )
+
+        from flashinfer.fused_moe import (
+            interleave_moe_scales_for_sm90_mixed_gemm,
+            interleave_moe_weights_for_sm90_mixed_gemm,
+        )
+
+        return (
+            interleave_moe_weights_for_sm90_mixed_gemm(
+                w13_weight.contiguous(), "fp4"
+            ),
+            interleave_moe_weights_for_sm90_mixed_gemm(
+                w2_weight.contiguous(), "fp4"
+            ),
+            interleave_moe_scales_for_sm90_mixed_gemm(
+                w13_weight_scale.to(torch.uint8)
+            ),
+            interleave_moe_scales_for_sm90_mixed_gemm(
+                w2_weight_scale.to(torch.uint8)
+            ),
+            w13_bias,
+            w2_bias,
+        )
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
-            f"Expected TRTLLM, Triton, AITER, or XPU backend."
+            f"Expected TRTLLM, Triton, AITER, XPU, or FLASHINFER_CUTLASS backend."
         )
 
 
