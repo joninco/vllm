@@ -1401,6 +1401,10 @@ class DeepseekV2Model(nn.Module):
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        skip_dense_glm_indexer_weights = (
+            getattr(self.config, "model_type", None) == "glm_moe_dsa"
+            and os.environ.get("VLLM_GLM_FORCE_DENSE_MLA") == "1"
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1408,6 +1412,9 @@ class DeepseekV2Model(nn.Module):
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+
+            if skip_dense_glm_indexer_weights and ".self_attn.indexer." in name:
+                continue
 
             is_fusion_moe_shared_experts_layer = (
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
