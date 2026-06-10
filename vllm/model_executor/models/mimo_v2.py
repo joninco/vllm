@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -282,6 +283,9 @@ class MiMoV2Attention(nn.Module):
             },
         )
 
+        if os.getenv("VLLM_MIMO_DISABLE_ATTENTION_SINKS") == "1":
+            add_swa_attention_sink_bias = False
+
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
             if add_swa_attention_sink_bias
@@ -290,12 +294,25 @@ class MiMoV2Attention(nn.Module):
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
 
-        # Use DiffKV backend when V has a different head dim than K.
-        # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall
-        # back to TRITON_ATTN_DIFFKV.  Users can force a choice via
-        # `--attention-backend <FLASH_ATTN_DIFFKV|TRITON_ATTN_DIFFKV>`.
-        if self.v_head_dim != self.head_dim:
-            requested = get_current_vllm_config().attention_config.backend
+        configured_backend = get_current_vllm_config().attention_config.backend
+        configured_backend_name = (
+            configured_backend.name if configured_backend is not None else None
+        )
+        use_flashinfer = configured_backend_name == "FLASHINFER"
+        use_b12x_paged = configured_backend_name == "B12X_PAGED_ATTN"
+
+        attn_backend = None
+        attn_head_size_v = self.v_head_dim
+        self.pad_value_for_fa = False
+
+        # Use DiffKV when V has a different head dim than K, except for
+        # backends that accept the asymmetric V size through Attention.
+        if (
+            self.v_head_dim != self.head_dim
+            and not use_flashinfer
+            and not use_b12x_paged
+        ):
+            requested = configured_backend
             if requested is not None and requested.name.endswith("_DIFFKV"):
                 backend_enum = requested
             else:
@@ -311,8 +328,6 @@ class MiMoV2Attention(nn.Module):
             attn_backend = backend_enum.get_class()
             attn_backend.set_head_size_v(self.v_head_dim)
             logger.info_once("Using %s for attention.", attn_backend.get_name())
-        else:
-            attn_backend = None
 
         self.attn = Attention(
             self.num_heads,
@@ -326,7 +341,7 @@ class MiMoV2Attention(nn.Module):
             prefix=f"{prefix}.attn",
             sinks=self.attention_sink_bias,
             attn_backend=attn_backend,
-            head_size_v=self.v_head_dim,
+            head_size_v=attn_head_size_v,
         )
 
     def forward(
@@ -342,7 +357,18 @@ class MiMoV2Attention(nn.Module):
         if self.v_scale is not None:
             v = v * self.v_scale
 
+        if self.pad_value_for_fa:
+            v = torch.nn.functional.pad(
+                v.view(-1, self.num_kv_heads, self.v_head_dim),
+                [0, self.head_dim - self.v_head_dim],
+                value=0,
+            ).reshape(-1, self.num_kv_heads * self.head_dim)
+
         attn_output = self.attn(q, k, v)
+        if self.pad_value_for_fa:
+            attn_output = attn_output.view(-1, self.num_heads, self.head_dim)[
+                ..., : self.v_head_dim
+            ].reshape(-1, self.num_heads * self.v_head_dim)
 
         output, _ = self.o_proj(attn_output)
         return output
