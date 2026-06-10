@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -47,9 +48,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.attention.backends.flash_attn_diffkv import (
-    FlashAttentionDiffKVBackend,
-)
 
 from .interfaces import MixtureOfExperts, SupportsPP
 from .utils import (
@@ -284,6 +282,9 @@ class MiMoV2Attention(nn.Module):
             },
         )
 
+        if os.getenv("VLLM_MIMO_DISABLE_ATTENTION_SINKS") == "1":
+            add_swa_attention_sink_bias = False
+
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
             if add_swa_attention_sink_bias
@@ -292,13 +293,19 @@ class MiMoV2Attention(nn.Module):
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
 
-        # Use DiffKV backend when V has a different head dim than K
-        if self.v_head_dim != self.head_dim:
-            FlashAttentionDiffKVBackend.set_head_size_v(self.v_head_dim)
-            attn_backend = FlashAttentionDiffKVBackend
-            logger.info_once("Using FlashAttentionDiffKVBackend for attention.")
-        else:
-            attn_backend = None
+        # FA2 paged attention expects K and V caches to have the same head dim.
+        # MiMo has head_dim=192 and v_head_dim=128, so pad V for the FA path and
+        # slice the attention output back before o_proj, matching other vLLM
+        # asymmetric-V models. If the user explicitly selected FlashInfer, leave
+        # backend selection to Attention so a future DiffKV-capable FlashInfer
+        # path can handle the native layout.
+        configured_backend = get_current_vllm_config().attention_config.backend
+        use_flashinfer = (
+            configured_backend is not None and configured_backend.name == "FLASHINFER"
+        )
+        self.pad_value_for_fa = self.v_head_dim != self.head_dim and not use_flashinfer
+        attn_head_size_v = self.head_dim if self.pad_value_for_fa else self.v_head_dim
+        attn_backend = None
 
         self.attn = Attention(
             self.num_heads,
@@ -312,7 +319,7 @@ class MiMoV2Attention(nn.Module):
             prefix=f"{prefix}.attn",
             sinks=self.attention_sink_bias,
             attn_backend=attn_backend,
-            head_size_v=self.v_head_dim,
+            head_size_v=attn_head_size_v,
         )
 
     def forward(
@@ -328,7 +335,18 @@ class MiMoV2Attention(nn.Module):
         if self.v_scale is not None:
             v = v * self.v_scale
 
+        if self.pad_value_for_fa:
+            v = torch.nn.functional.pad(
+                v.view(-1, self.num_kv_heads, self.v_head_dim),
+                [0, self.head_dim - self.v_head_dim],
+                value=0,
+            ).reshape(-1, self.num_kv_heads * self.head_dim)
+
         attn_output = self.attn(q, k, v)
+        if self.pad_value_for_fa:
+            attn_output = attn_output.view(-1, self.num_heads, self.head_dim)[
+                ..., : self.v_head_dim
+            ].reshape(-1, self.num_heads * self.v_head_dim)
 
         output, _ = self.o_proj(attn_output)
         return output
