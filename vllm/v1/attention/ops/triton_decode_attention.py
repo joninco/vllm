@@ -500,10 +500,13 @@ def _decode_grouped_att_m_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
-    elif not is_hip_ and BLOCK_DMODEL >= 1024:
-        # Avoid shared memory overflow on NVIDIA when BLOCK_DMODEL is large
-        # like non-MLA D_QK=576, BLOCK_DMODEL=1024, BLOCK_H=16
-        # exceeds 101376 bytes limit
+    elif (
+        not is_hip_
+        and (BLOCK_DMODEL >= 1024 or (is_mla and BLOCK_DMODEL + BLOCK_DPE >= 576))
+    ):
+        # Avoid shared memory overflow on NVIDIA.  Dense GLM MLA decode has
+        # D_QK=576 split as BLOCK_DMODEL=512 + BLOCK_DPE=64, which exceeds the
+        # Blackwell 101376-byte shared memory limit with two stages.
         num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
