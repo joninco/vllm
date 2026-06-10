@@ -1434,6 +1434,101 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
+    elif mxfp4_backend in (
+        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
+        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+    ):
+        # Native GLM/DeepSeek/MiMo MXFP4 loading produces contiguous
+        # [w1/gate, w3/up] rows. FlashInfer Cutlass consumes the opposite
+        # SwiGLU order, so swap the two halves without GPT-OSS de-interleave.
+        logger.info_once(
+            "Using contiguous w13 layout for FlashInfer Cutlass MXFP4 MoE."
+        )
+        w13_w = w13_weight.data
+        w1_w = w13_w[:, :intermediate_size, :]
+        w3_w = w13_w[:, intermediate_size:, :]
+        w13_weight_swapped = torch.cat([w3_w, w1_w], dim=1)
+
+        if w13_bias is None:
+            w13_bias = torch.zeros(
+                num_experts,
+                2 * intermediate_size,
+                dtype=torch.float32,
+                device=w13_weight.device,
+            )
+        else:
+            w13_bias = w13_bias.data.to(torch.float32)
+        if w2_bias is None:
+            w2_bias = torch.zeros(
+                num_experts,
+                hidden_size,
+                dtype=torch.float32,
+                device=w2_weight.device,
+            )
+        else:
+            w2_bias = w2_bias.data.to(torch.float32)
+        b1 = w13_bias[:, :intermediate_size]
+        b3 = w13_bias[:, intermediate_size:]
+        w13_bias_swapped = torch.cat([b3, b1], dim=-1).to(torch.bfloat16)
+        w2_bias = w2_bias.to(torch.bfloat16)
+
+        w13_s = w13_weight_scale.data
+        s1 = w13_s[:, :intermediate_size, :]
+        s3 = w13_s[:, intermediate_size:, :]
+        w13_scale_swapped = torch.cat([s3, s1], dim=1)
+
+        if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8:
+            from flashinfer import block_scale_interleave
+
+            orig_shape = w13_scale_swapped.shape
+            w13_scale_interleaved = block_scale_interleave(
+                w13_scale_swapped.view(torch.uint8)
+            ).reshape(orig_shape)
+
+            w2_s = w2_weight_scale.data
+            orig_shape = w2_s.shape
+            w2_scale_interleaved = block_scale_interleave(
+                w2_s.view(torch.uint8)
+            ).reshape(orig_shape)
+
+            return (
+                w13_weight_swapped,
+                w2_weight.data,
+                w13_scale_interleaved,
+                w2_scale_interleaved,
+                w13_bias_swapped,
+                w2_bias,
+            )
+
+        assert mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16
+
+        from flashinfer.fused_moe import (
+            interleave_moe_scales_for_sm90_mixed_gemm,
+            interleave_moe_weights_for_sm90_mixed_gemm,
+        )
+
+        w13_weight_interleaved = interleave_moe_weights_for_sm90_mixed_gemm(
+            w13_weight_swapped.contiguous(), "fp4"
+        )
+        w2_weight_interleaved = interleave_moe_weights_for_sm90_mixed_gemm(
+            w2_weight.data.contiguous(), "fp4"
+        )
+        w31_scales_interleaved = interleave_moe_scales_for_sm90_mixed_gemm(
+            w13_scale_swapped.to(torch.uint8)
+        )
+        w2_scale_interleaved = interleave_moe_scales_for_sm90_mixed_gemm(
+            w2_weight_scale.data.to(torch.uint8)
+        )
+
+        return (
+            w13_weight_interleaved,
+            w2_weight_interleaved,
+            w31_scales_interleaved,
+            w2_scale_interleaved,
+            w13_bias_swapped,
+            w2_bias,
+        )
+
     elif mxfp4_backend in TRITON_BACKENDS:
         from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
@@ -1499,7 +1594,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
-            f"Expected TRTLLM, Triton, AITER, or XPU backend."
+            f"Expected TRTLLM, Triton, AITER, XPU, or FLASHINFER_CUTLASS backend."
         )
 
 
