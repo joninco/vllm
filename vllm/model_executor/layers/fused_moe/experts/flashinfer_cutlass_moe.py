@@ -94,7 +94,26 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         # - skip input activation quantization (kernel applies scaling)
         self.use_deepseek_fp8_block_scale = quant_config.is_block_quantized
         self.max_capture_size = moe_config.max_capture_size
+        self.model_type = getattr(
+            get_current_vllm_config().model_config.hf_config,
+            "model_type",
+            None,
+        )
+        self.gemm1_alpha: torch.Tensor | None = None
+        self.gemm1_beta: torch.Tensor | None = None
         self.gemm1_clamp_limit: torch.Tensor | None = None
+        if quant_config.gemm1_alpha is not None:
+            self.gemm1_alpha = torch.tensor(
+                [quant_config.gemm1_alpha] * self.num_experts,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if quant_config.gemm1_beta is not None:
+            self.gemm1_beta = torch.tensor(
+                [quant_config.gemm1_beta] * self.num_experts,
+                dtype=torch.float32,
+                device=self.device,
+            )
         if quant_config.gemm1_clamp_limit is not None:
             self.gemm1_clamp_limit = torch.tensor(
                 [quant_config.gemm1_clamp_limit] * self.num_experts,
@@ -103,25 +122,38 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             )
 
         if quant_config.weight_quant_dtype == "mxfp4":
-            # GPT-OSS supplies SwiGLU alpha/beta; DeepSeek-V4 does not.
-            self.gemm1_alpha = (
-                torch.tensor(
-                    [quant_config.gemm1_alpha] * self.num_experts,
+            # GPT-OSS uses a non-standard clamped SwiGLU.  Other MXFP4 MoE
+            # models (GLM/DeepSeek-style) should use the standard activation
+            # unless their quant config explicitly supplies parameters.
+            if self.model_type == "gpt_oss":
+                if self.gemm1_alpha is None:
+                    self.gemm1_alpha = torch.tensor(
+                        [1.702] * self.num_experts,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                if self.gemm1_beta is None:
+                    self.gemm1_beta = torch.tensor(
+                        [1.0] * self.num_experts,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+            if self.model_type == "gpt_oss" and self.gemm1_clamp_limit is None:
+                self.gemm1_clamp_limit = torch.tensor(
+                    [7.0] * self.num_experts,
                     dtype=torch.float32,
                     device=self.device,
                 )
-                if quant_config.gemm1_alpha is not None
-                else None
-            )
-            self.gemm1_beta = (
-                torch.tensor(
-                    [quant_config.gemm1_beta] * self.num_experts,
-                    dtype=torch.float32,
-                    device=self.device,
+            elif (
+                self.gemm1_alpha is None
+                and self.gemm1_beta is None
+                and self.gemm1_clamp_limit is None
+            ):
+                logger.info_once(
+                    "Using standard SwiGLU parameters for FlashInfer MXFP4 MoE "
+                    "(model_type=%s).",
+                    self.model_type,
                 )
-                if quant_config.gemm1_beta is not None
-                else None
-            )
             if quant_config.quant_dtype == "mxfp8":
                 self.fake_input_scale = torch.ones(
                     self.num_experts,
