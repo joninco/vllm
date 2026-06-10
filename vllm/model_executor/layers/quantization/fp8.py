@@ -205,11 +205,29 @@ class Fp8Config(QuantizationConfig):
             if self.store_dtype == "mxfp4":
                 from vllm.model_executor.layers.quantization.mxfp4 import (
                     GptOssMxfp4MoEMethod,
+                    Mxfp4MoEMethod,
                 )
 
+                moe_backend = layer.moe_config.moe_backend
+                if moe_backend in {
+                    "deep_gemm",
+                    "flashinfer_cutlass",
+                    "flashinfer_cutlass_afp8",
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_afp8",
+                }:
+                    logger.info_once(
+                        "Using DeepSeek-style MXFP4 MoE method for FP8 "
+                        "checkpoint with store_dtype=mxfp4 and "
+                        "moe_backend=%s.",
+                        moe_backend,
+                    )
+                    return Mxfp4MoEMethod(layer.moe_config)
+
                 logger.info_once(
-                    "Using MXFP4 MoE method for FP8 checkpoint with "
-                    "store_dtype=mxfp4."
+                    "Using GPT-OSS-style MXFP4 MoE method for FP8 "
+                    "checkpoint with store_dtype=mxfp4 and moe_backend=%s.",
+                    moe_backend,
                 )
                 return GptOssMxfp4MoEMethod(layer.moe_config)
             if self.is_checkpoint_fp8_serialized:
