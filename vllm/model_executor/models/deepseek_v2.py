@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -997,6 +998,15 @@ class DeepseekV2MLAAttention(nn.Module):
             self.scaling = self.scaling * mscale * mscale
 
         self.is_v32 = hasattr(config, "index_topk")
+        if (
+            self.is_v32
+            and getattr(config, "model_type", None) == "glm_moe_dsa"
+            and os.environ.get("VLLM_GLM_FORCE_DENSE_MLA") == "1"
+        ):
+            logger.info_once(
+                "Forcing dense MLA for GLM because VLLM_GLM_FORCE_DENSE_MLA=1."
+            )
+            self.is_v32 = False
 
         _skip_topk = False
         if self.is_v32:
