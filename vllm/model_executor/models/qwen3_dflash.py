@@ -40,7 +40,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
-    SlidingWindowSpec,
+    get_kv_quant_mode,
 )
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
@@ -102,18 +102,22 @@ class DFlashAttention(Attention):
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        spec = super().get_kv_cache_spec(vllm_config)
-        if isinstance(spec, SlidingWindowSpec):
+        if self.sliding_window is not None:
+            # Build the full spec directly instead of converting the parent's
+            # SlidingWindowSpec: Attention.get_kv_cache_spec asserts against
+            # MLA *target* models for sliding-window layers, which would
+            # reject DFlash drafts beside MLA targets (e.g. Kimi K2.6) even
+            # though the draft layer itself is not MLA.
+            assert self.attn_type == AttentionType.DECODER
             return FullAttentionSpec(
-                block_size=spec.block_size,
-                num_kv_heads=spec.num_kv_heads,
-                head_size=spec.head_size,
-                head_size_v=getattr(spec, "head_size_v", spec.head_size),
-                dtype=spec.dtype,
-                kv_quant_mode=spec.kv_quant_mode,
-                page_size_padded=spec.page_size_padded,
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             )
-        return spec
+        return super().get_kv_cache_spec(vllm_config)
 
 
 class DFlashQwen3Attention(nn.Module):
