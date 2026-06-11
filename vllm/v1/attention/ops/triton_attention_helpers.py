@@ -219,6 +219,17 @@ def compute_tile_loop_bounds(
         # Convert to tile indices and clamp
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+    elif SLIDING_WINDOW > 0 and not USE_MM_PREFIX:
+        # Non-causal sliding window (DFlash draft): the window only bounds
+        # how far BACK a query may look, while every later key (the rest of
+        # the draft block) stays visible. Prune the leading tiles that no
+        # query in this Q-block can see; keep tile_end at num_tiles. Without
+        # this, every draft step scans the full context and per-step cost
+        # grows linearly with context length instead of staying constant.
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        q_abs = context_len + qpos_lo
+        first_allowed_key = q_abs - SLIDING_WINDOW + 1
+        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
 
     if IS_3D:
         loop_lo = max(segm_idx_or_0 * tiles_per_segment_or_0, tile_start)
