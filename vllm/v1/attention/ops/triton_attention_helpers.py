@@ -152,6 +152,7 @@ def compute_tile_loop_bounds(
     num_queries_per_kv: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     USE_MM_PREFIX: tl.constexpr,
+    CAUSAL: tl.constexpr,
     IS_3D: tl.constexpr,
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
@@ -179,9 +180,11 @@ def compute_tile_loop_bounds(
         + (BLOCK_M - 1) // num_queries_per_kv
         + 1
     )
-    if USE_MM_PREFIX:
+    if not CAUSAL:
+        max_seq_prefix_len = seq_len
+    elif USE_MM_PREFIX:
         # image bidirectional attention ranges require a full range
-        # including q_block padding to make sure doc mask is correct
+        # including q_block padding to make sure doc mask is correct.
         max_seq_prefix_len = tl.maximum(max_seq_prefix_len, seq_len)
     else:
         max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
@@ -193,7 +196,7 @@ def compute_tile_loop_bounds(
     tile_start = 0
     tile_end = num_tiles
     # TODO(Isotr0py): sliding window pruning with image bidirectional mask
-    if SLIDING_WINDOW > 0 and not USE_MM_PREFIX:
+    if CAUSAL and SLIDING_WINDOW > 0 and not USE_MM_PREFIX:
         # Query rows covered by this Q-block
         qpos_lo = q_block_local_idx * BLOCK_Q
         qpos_hi = tl.minimum(
@@ -261,10 +264,12 @@ def store_segm_reduce_scalars(
 def compute_kv_seq_mask(
     query_abs_pos,
     seq_offset,
+    seq_len,
     seq_idx,
     mm_prefix_range_ptr,
     SLIDING_WINDOW: tl.constexpr,
     USE_MM_PREFIX: tl.constexpr,
+    CAUSAL: tl.constexpr,
     MAX_MM_RANGES: tl.constexpr,
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
@@ -280,19 +285,28 @@ def compute_kv_seq_mask(
     are non-default — the launcher zeros ``CHUNK_LOOKBACK`` whenever
     sliding window is disabled.
     """
-    # Compute attention mask: causal by default (key <= query)
-    seq_mask = seq_offset[None, :] <= query_abs_pos
+    # Compute attention mask: causal by default (key <= query). DFlash uses
+    # non-causal draft attention, where every query token may attend to the
+    # entire context + draft block.
+    if CAUSAL:
+        seq_mask = seq_offset[None, :] <= query_abs_pos
+    else:
+        seq_mask = seq_offset[None, :] < seq_len
 
     # Apply sliding window / chunked attention to base mask
     # BEFORE mm_prefix OR.
     # Order must match FlexAttention:
     #   (causal AND sliding_window) OR mm_prefix
-    if CHUNK_LOOKBACK > -1:
+    if CAUSAL and CHUNK_LOOKBACK > -1:
         seq_mask = seq_mask & (
             (query_abs_pos // CHUNK_SIZE - seq_offset[None, :] // CHUNK_SIZE)
             <= CHUNK_LOOKBACK
         )
     elif SLIDING_WINDOW > 0:
+        # In non-causal mode the window only bounds how far BACK a query may
+        # look (DFlash SWA: bidirectional inside the draft block, sliding
+        # window over the older context). Keys after the query have a
+        # negative distance and always pass this check.
         seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
 
     # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.

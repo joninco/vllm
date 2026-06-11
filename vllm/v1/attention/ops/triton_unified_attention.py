@@ -215,6 +215,7 @@ def kernel_unified_attention(
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
+    CAUSAL: tl.constexpr,  # bool
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,
@@ -388,6 +389,7 @@ def kernel_unified_attention(
         num_queries_per_kv,
         SLIDING_WINDOW,
         USE_MM_PREFIX,
+        CAUSAL,
         IS_3D,
         CHUNK_LOOKBACK,
         CHUNK_SIZE,
@@ -492,10 +494,12 @@ def kernel_unified_attention(
         seq_mask = compute_kv_seq_mask(
             query_abs_pos,
             seq_offset,
+            seq_len,
             seq_idx,
             mm_prefix_range_ptr,
             SLIDING_WINDOW,
             USE_MM_PREFIX,
+            CAUSAL,
             MAX_MM_RANGES,
             CHUNK_LOOKBACK,
             CHUNK_SIZE,
@@ -530,7 +534,7 @@ def kernel_unified_attention(
         M, L, P, alpha = softmax_step(S, M, L)
         acc = acc * alpha[:, None]
 
-        if SLIDING_WINDOW:
+        if CAUSAL and SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
             V = tl.where(
                 (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW,
@@ -802,7 +806,6 @@ def unified_attention(
     # disabling this flag costs nothing.
     use_td: bool = False,
 ):
-    assert causal, "Only causal attention is supported"
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
@@ -1003,6 +1006,7 @@ def unified_attention(
         USE_SOFTCAP=(softcap > 0),
         USE_SINKS=(sinks is not None),
         USE_MM_PREFIX=use_mm_prefix,
+        CAUSAL=causal,
         MAX_MM_RANGES=max_mm_ranges,
         mm_prefix_range_ptr=mm_prefix_range,
         SLIDING_WINDOW=(1 + window_size[0]),
