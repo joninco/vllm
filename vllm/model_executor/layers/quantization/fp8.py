@@ -209,7 +209,14 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 moe_backend = layer.moe_config.moe_backend
+                # FP8 checkpoints with store_dtype=mxfp4 (GLM/DeepSeek/MiMo
+                # style) use the standard SwiGLU. GptOssMxfp4MoEMethod
+                # hardcodes the GPT-OSS clamped activation
+                # (gemm1_alpha=1.702, beta=1.0, swiglu_limit=7.0); the B12X
+                # W4A16 kernel honors swiglu_limit and would clamp gate/up at
+                # +-7 in every MoE layer, distorting long generations.
                 if moe_backend in {
+                    "b12x",
                     "deep_gemm",
                     "flashinfer_cutlass",
                     "flashinfer_cutlass_afp8",
