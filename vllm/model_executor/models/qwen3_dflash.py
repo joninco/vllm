@@ -56,7 +56,21 @@ _DFLASH_VALID_LAYER_TYPES = frozenset({"full_attention", "sliding_attention"})
 
 
 def _get_dflash_layer_types(config: Qwen3Config) -> tuple[str, ...]:
+    dflash_config = getattr(config, "dflash_config", None) or {}
     layer_types = getattr(config, "layer_types", None)
+    if dflash_config.get("use_swa") and (
+        layer_types is None or set(layer_types) == {"full_attention"}
+    ):
+        sliding_window = getattr(config, "sliding_window", None) or dflash_config.get(
+            "swa_window_size"
+        )
+        if sliding_window is None:
+            raise ValueError(
+                "DFlash dflash_config.use_swa requires `sliding_window` or "
+                "`dflash_config.swa_window_size` in config."
+            )
+        config.sliding_window = sliding_window
+        return ("sliding_attention",) * config.num_hidden_layers
     if layer_types is None:
         return ("full_attention",) * config.num_hidden_layers
     if len(layer_types) != config.num_hidden_layers:
