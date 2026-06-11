@@ -50,7 +50,12 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from .interfaces import MixtureOfExperts, SupportsPP
+from .interfaces import (
+    EagleModelMixin,
+    MixtureOfExperts,
+    SupportsEagle3,
+    SupportsPP,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -62,6 +67,12 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+# Escape hatch for A/B testing the DFlash aux-feature fix: set to 1 to restore
+# the old behavior of capturing the last aux hidden state before final norm.
+_DFLASH_PRENORM_LAST_AUX = (
+    os.environ.get("VLLM_DFLASH_PRENORM_LAST_AUX", "0") == "1"
+)
 
 
 class MiMoV2MLP(nn.Module):
@@ -482,7 +493,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class MiMoV2Model(nn.Module):
+class MiMoV2Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -545,10 +556,26 @@ class MiMoV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        # The DFlash reference extracts HF `output_hidden_states` entries,
+        # where the entry after the FINAL layer is the post-final-norm hidden
+        # state (all other entries are raw residual-stream values). Mirror
+        # that: capture the last aux layer after self.norm below.
+        num_layers = len(self.layers)
+        post_norm_final_aux = (
+            num_layers in getattr(self, "aux_hidden_state_layers", ())
+            and not _DFLASH_PRENORM_LAST_AUX
+        )
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
         ):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if post_norm_final_aux and layer_idx + 1 == num_layers:
+                continue
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_idx + 1, hidden_states, residual
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -556,6 +583,11 @@ class MiMoV2Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if post_norm_final_aux:
+            aux_hidden_states.append(hidden_states)
+
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
 
         return hidden_states
 
@@ -693,7 +725,9 @@ class MiMoV2Model(nn.Module):
         return loaded_params
 
 
-class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
+class MiMoV2FlashForCausalLM(
+    nn.Module, SupportsPP, MixtureOfExperts, SupportsEagle3
+):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -729,6 +763,12 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.model.aux_hidden_state_layers
 
     def forward(
         self,

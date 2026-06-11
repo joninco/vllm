@@ -111,6 +111,16 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
+        if base.attention_config.backend is None:
+            target_backend = self.vllm_config.attention_config.backend
+            if target_backend is not None:
+                base = replace(
+                    base,
+                    attention_config=replace(
+                        base.attention_config,
+                        backend=target_backend,
+                    ),
+                )
         # The draft model is text-only — clear the target's multimodal
         # flag so flash_attn is not rejected for mm_prefix support.
         arch = base.model_config.model_arch_config
@@ -424,38 +434,20 @@ class DFlashProposer(SpecDecodeBaseProposer):
             for layer_name in attn_group.layer_names:
                 per_layer[layer_name] = attn_metadata
 
-            # DFlash layers consume attention metadata through the per-layer
-            # forward context. Keep the non-causal group metadata for
-            # group-level spec decode checks, and specialize only the SWA
-            # layers that need a causal sliding-window mask.
-            causal_layers = sliding_layer_names & set(attn_group.layer_names)
-            if causal_layers and not self.dflash_causal:
-                causal_attn_metadata = (
-                    attn_group.get_metadata_builder().build_for_drafting(
-                        common_attn_metadata=group_cad.replace(causal=True),
-                        draft_index=draft_index,
-                    )
-                )
-                for layer_name in causal_layers:
-                    per_layer[layer_name] = causal_attn_metadata
-
+        # DFlash draft attention is non-causal: every block slot attends to
+        # the full draft block bidirectionally. SWA layers additionally bound
+        # how far back into the context a query may look; the attention kernel
+        # applies that window on top of the non-causal mask, matching the
+        # reference DFlash semantics. (`sliding_layer_names` is kept for
+        # backends that need to identify SWA layers.)
+        del sliding_layer_names
         for layer_name, attn_metadata in per_layer.items():
-            if layer_name in sliding_layer_names:
-                assert getattr(attn_metadata, "causal", None) is True, (
-                    f"Attention metadata for sliding layer {layer_name} does not have"
-                    " causal support, which is required for DFlash SWA."
-                )
-                continue
-            if self.dflash_causal:
-                assert getattr(attn_metadata, "causal", None) is True, (
-                    f"Attention metadata for layer {layer_name} does not have"
-                    " causal support, which is required by DFlash causal mode."
-                )
-                continue
-            assert getattr(attn_metadata, "causal", None) is False, (
+            expected_causal = self.dflash_causal
+            assert getattr(attn_metadata, "causal", None) is expected_causal, (
                 f"Attention metadata for layer {layer_name} does not have"
-                " non-causal support, which is required for DFlash."
-                " Consider using a different attention backend, such as FlashAttention."
+                f" causal={expected_causal} support, which is required for"
+                " DFlash. Consider using a different attention backend, such"
+                " as FlashAttention or Triton."
             )
         return per_group, per_layer
 

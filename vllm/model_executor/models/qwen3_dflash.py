@@ -11,7 +11,10 @@ from transformers import Qwen3Config
 from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -133,6 +136,7 @@ class DFlashQwen3Attention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         sliding_window: int | None = None,
+        attention_sink_bias: bool = False,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
     ) -> None:
@@ -176,6 +180,11 @@ class DFlashQwen3Attention(nn.Module):
             max_position=max_position,
             rope_parameters=rope_parameters,
         )
+        self.attention_sink_bias = (
+            nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
+            if attention_sink_bias
+            else None
+        )
         self.attn = DFlashAttention(
             self.num_heads,
             self.head_dim,
@@ -186,6 +195,7 @@ class DFlashQwen3Attention(nn.Module):
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
+            sinks=self.attention_sink_bias,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -237,6 +247,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
         sliding_window = (
             config.sliding_window if layer_type == "sliding_attention" else None
         )
+        dflash_config = getattr(config, "dflash_config", None) or {}
+        attention_sink_bias = bool(dflash_config.get("attention_sink_bias", False))
 
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
@@ -249,6 +261,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             sliding_window=sliding_window,
+            attention_sink_bias=attention_sink_bias,
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
@@ -568,7 +581,21 @@ class DFlashQwen3Model(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                if name not in params_dict:
+                    if "attention_sink_bias" in name:
+                        continue
+                    raise KeyError(name)
                 param = params_dict[name]
+                if "attention_sink_bias" in name:
+                    tp_size = get_tensor_model_parallel_world_size()
+                    tp_rank = get_tensor_model_parallel_rank()
+                    heads_per_rank = loaded_weight.shape[0] // tp_size
+                    head_start = tp_rank * heads_per_rank
+                    param.data.copy_(
+                        loaded_weight.narrow(0, head_start, heads_per_rank)
+                    )
+                    loaded_params.add(name)
+                    continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
@@ -586,7 +613,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
         self.model = DFlashQwen3Model(
             vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
+            # Keep draft Attention layer names out of the target model's
+            # `model.layers.*` namespace. The Python module hierarchy remains
+            # `self.model`, so checkpoint parameter names are unchanged.
+            prefix=maybe_prefix(prefix, "dflash_model"),
             start_layer_id=target_layer_num,
         )
 

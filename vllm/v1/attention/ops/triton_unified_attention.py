@@ -497,8 +497,8 @@ def kernel_unified_attention(
         seq_mask = compute_kv_seq_mask(
             query_abs_pos,
             seq_offset,
-            seq_idx,
             seq_len,
+            seq_idx,
             mm_prefix_range_ptr,
             SLIDING_WINDOW,
             USE_MM_PREFIX,
@@ -542,18 +542,7 @@ def kernel_unified_attention(
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
             dist = context_len + qpos_lo - seq_offset[:, None]
-            if USE_PER_SEQ_CAUSAL:
-                is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
-                sw_mask_v = tl.where(
-                    is_causal_seq,
-                    dist < SLIDING_WINDOW,
-                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
-                )
-            elif USE_CAUSAL:
-                sw_mask_v = dist < SLIDING_WINDOW
-            else:
-                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
-            V = tl.where(sw_mask_v, V, 0.0)
+            V = tl.where(dist < SLIDING_WINDOW, V, 0.0)
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
