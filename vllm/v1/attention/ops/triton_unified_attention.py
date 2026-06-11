@@ -920,17 +920,21 @@ def unified_attention(
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
-    # 2. The batch includes at least one prefill request, or
-    # 3. The number of sequences exceeds the configured threshold, or
-    # 4. Batch invariance is enabled
+    # 2. The batch's query tokens do not fit the segment buffers (which are
+    #    indexed by global query-token row). This also keeps prefills and
+    #    large batches on the 2D path, whose launch grid is already large
+    #    enough for full GPU utilization. Small-query batches (single-token
+    #    decode, spec-decode verify, DFlash draft blocks) take the 3D path
+    #    so long-context KV scans are segment-parallel instead of running
+    #    on a handful of CTAs.
+    # 3. Batch invariance is enabled
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
+        or q.shape[0] > seq_threshold_3D
         or is_batch_invariant
     )
 
