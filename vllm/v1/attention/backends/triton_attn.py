@@ -72,6 +72,7 @@ class TritonAttentionMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
+    causal: bool
 
     seq_threshold_3D: int
     num_par_softmax_segments: int
@@ -349,6 +350,10 @@ class TritonAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
         return True
 
     @classmethod

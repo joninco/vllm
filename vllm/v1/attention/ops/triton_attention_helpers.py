@@ -169,7 +169,8 @@ def compute_tile_loop_bounds(
        sequence.
     2. Sliding-window pruning: narrows ``[tile_start, tile_end)`` to
        only tiles that can contain an allowed key under SWA.
-       For non-causal sequences, the window extends in both directions.
+       Non-causal sequences still bound old context by the window but
+       may attend to keys to the right within the current sequence.
     3. 3D scoping: when ``IS_3D`` is True, further narrows to the
        segment's slice via ``(segm_idx * tiles_per_segment,
        (segm_idx + 1) * tiles_per_segment)``.
@@ -215,11 +216,9 @@ def compute_tile_loop_bounds(
         else:
             first_allowed_key = q_abs - SLIDING_WINDOW + 1
         if USE_PER_SEQ_CAUSAL or (not USE_CAUSAL):
-            # Non-causal: keys can be AHEAD of query within the window
-            last_allowed_key = tl.minimum(
-                context_len + qpos_hi + SLIDING_WINDOW - 1,
-                seq_len - 1,
-            )
+            # Non-causal draft attention can see the whole draft block to
+            # the right; the per-element mask still bounds old context.
+            last_allowed_key = seq_len - 1
         else:
             last_allowed_key = context_len + qpos_hi
         # Convert to tile indices and clamp
@@ -270,8 +269,8 @@ def store_segm_reduce_scalars(
 def compute_kv_seq_mask(
     query_abs_pos,
     seq_offset,
-    seq_idx,
     seq_len,
+    seq_idx,
     mm_prefix_range_ptr,
     SLIDING_WINDOW: tl.constexpr,
     USE_MM_PREFIX: tl.constexpr,
@@ -314,21 +313,17 @@ def compute_kv_seq_mask(
     # BEFORE mm_prefix OR.
     # Order must match FlexAttention:
     #   (causal AND sliding_window) OR mm_prefix
-    if CHUNK_LOOKBACK > -1:
+    if USE_CAUSAL and CHUNK_LOOKBACK > -1:
         seq_mask = seq_mask & (
             (query_abs_pos // CHUNK_SIZE - seq_offset[None, :] // CHUNK_SIZE)
             <= CHUNK_LOOKBACK
         )
     elif SLIDING_WINDOW > 0:
-        sw_left = (query_abs_pos - seq_offset) < SLIDING_WINDOW
-        if USE_PER_SEQ_CAUSAL:
-            sw_right = (seq_offset[None, :] - query_abs_pos) < SLIDING_WINDOW
-            seq_mask = seq_mask & tl.where(is_causal, sw_left, sw_left & sw_right)
-        elif not USE_CAUSAL:
-            sw_right = (seq_offset[None, :] - query_abs_pos) < SLIDING_WINDOW
-            seq_mask = seq_mask & sw_left & sw_right
-        else:
-            seq_mask = seq_mask & sw_left
+        # In non-causal mode the window only bounds how far BACK a query may
+        # look (DFlash SWA: bidirectional inside the draft block, sliding
+        # window over the older context). Keys after the query have a
+        # negative distance and always pass this check.
+        seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
 
     # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
     # Applied AFTER sliding window so mm_prefix ranges override SW restriction.
