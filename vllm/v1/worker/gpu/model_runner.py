@@ -192,12 +192,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator = init_speculator(self.vllm_config, self.device)
 
             if self.speculative_config.method in ("eagle3", "dflash"):
-                # Drafting may require auxiliary hidden states from target model outputs
+                # EAGLE3/DFlash require auxiliary hidden states from target
+                # model outputs.
                 self.use_aux_hidden_state_outputs = True
                 if self.use_pp:
                     raise ValueError(
-                        f"{self.speculative_config.method} with pipeline parallel "
-                        "is not supported."
+                        f"{self.speculative_config.method} with pipeline "
+                        "parallel is not supported."
                     )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
