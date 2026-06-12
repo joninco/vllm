@@ -27,7 +27,7 @@ from vllm.models.deepseek_v4.common.ops import (
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4FlashMLAAttention,
-    DeepseekV4FlashMLASparseBackend,
+    DeepseekV4FlashMLABackend,
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
@@ -373,7 +373,7 @@ def _run_dcp_compressed_mla(
     output.copy_(reduced)
 
 
-class DeepseekV4B12xMLASparseBackend(DeepseekV4FlashMLASparseBackend):
+class DeepseekV4B12xMLASparseBackend(DeepseekV4FlashMLABackend):
     """b12x compressed sparse-MLA backend for DeepSeek-V4 (SM120 / SM121).
 
     Geometry is identical to the FlashMLA parent (``fp8_ds_mla`` 584 B page,

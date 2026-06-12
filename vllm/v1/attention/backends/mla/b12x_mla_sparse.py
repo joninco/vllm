@@ -243,6 +243,7 @@ class B12xMLASparseBackend(AttentionBackend):
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
         # Require an indexer-equipped (index_topk) model, same as SPARSE_MLA_SM120.
