@@ -2006,8 +2006,9 @@ class VllmConfig:
             elif speculative_config.method not in ("eagle", "eagle3", "mtp", "dflash"):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
-            # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle)
-            # DFlash uses parallel drafting natively in V2 via DFlashSpeculator.
+            # V2 EagleSpeculator does not support parallel_drafting (required
+            # by PEagle). DFlash has its own V2 speculator that drafts the
+            # whole block in one pass.
             if (
                 speculative_config.parallel_drafting
                 and speculative_config.method != "dflash"

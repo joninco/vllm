@@ -1,5 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""DFlash block-diffusion speculator for the V2 model runner.
+
+DFlash drafts a whole block of tokens in one draft forward: the block is
+[bonus_token, MASK, MASK, ...] and every mask slot predicts the token at
+its own position. Context comes from the target model's auxiliary hidden
+states, which are fc-combined, normed, projected to K/V by every draft
+layer, and written into the draft KV cache.
+"""
+import os
 from typing import Any
 
 import torch
@@ -31,6 +40,9 @@ logger = init_logger(__name__)
 class DFlashSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
+            "DFlash speculator does not support decode context parallelism yet."
+        )
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -41,6 +53,11 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Each request emits exactly (bonus + N mask) query tokens per step.
         self.num_query_per_req = 1 + self.num_speculative_steps
+        max_query_tokens = self.max_num_reqs * self.num_query_per_req
+        assert max_query_tokens <= self.max_num_tokens, (
+            "max_num_batched_tokens is too small for the DFlash draft block "
+            f"({max_query_tokens} > {self.max_num_tokens})."
+        )
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
@@ -116,7 +133,65 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        return load_dflash_model(target_model, self.vllm_config)
+        model = load_dflash_model(target_model, self.vllm_config)
+        self._maybe_load_mask_embedding(model)
+        return model
+
+    def _maybe_load_mask_embedding(self, model: nn.Module) -> None:
+        """Load a checkpoint-provided mask embedding into the embed table."""
+        mask_path = os.path.join(self.draft_model_config.model, "mask_embedding.pt")
+        if not os.path.exists(mask_path):
+            return
+        data = torch.load(mask_path, map_location="cpu", weights_only=True)
+        if isinstance(data, dict):
+            file_token_id = data.get("mask_token_id")
+            embedding = data.get("embedding")
+        else:
+            file_token_id = None
+            embedding = data
+        if embedding is None:
+            logger.warning("Ignoring %s: no 'embedding' entry found.", mask_path)
+            return
+        if file_token_id is not None and int(file_token_id) != int(
+            self.parallel_drafting_token_id
+        ):
+            logger.warning(
+                "mask_embedding.pt token id %s differs from configured "
+                "mask_token_id %s; using the file's token id.",
+                file_token_id,
+                self.parallel_drafting_token_id,
+            )
+        token_id = int(
+            file_token_id
+            if file_token_id is not None
+            else self.parallel_drafting_token_id
+        )
+        embedding = embedding.reshape(-1)
+
+        embed_tokens = model.model.embed_tokens
+        weight = embed_tokens.weight
+        shard_indices = getattr(embed_tokens, "shard_indices", None)
+        if shard_indices is not None:
+            start = shard_indices.org_vocab_start_index
+            end = shard_indices.org_vocab_end_index
+        else:
+            start, end = 0, weight.shape[0]
+        if start <= token_id < end:
+            row = weight.data[token_id - start]
+            embedding = embedding.to(device=row.device, dtype=row.dtype)
+            if embedding.shape != row.shape:
+                raise ValueError(
+                    "mask_embedding.pt shape "
+                    f"{tuple(embedding.shape)} does not match embedding row "
+                    f"shape {tuple(row.shape)}."
+                )
+            row.copy_(embedding)
+        logger.info_once(
+            "Loaded DFlash mask embedding for token %d from %s.",
+            token_id,
+            mask_path,
+            scope="local",
+        )
 
     def set_attn(
         self,
