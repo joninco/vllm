@@ -499,39 +499,51 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # (device, dtype, shape) tuple across ALL layers). attn_logits is
         # always allocated at MAX_NUM_KV_SPLITS so the same storage serves
         # every bucket; we pass a `[:num_kv_splits]` slice to the kernel.
-        assert B <= self._cg_max_tokens, (
-            f"forward_mqa: B={B} exceeds CG capture max {self._cg_max_tokens}"
-        )
-        o_buf = _get_shared_cg_buffer(
-            "o",
-            (self._cg_max_tokens, q_num_heads, self.kv_lora_rank),
-            q.dtype,
-            q.device,
-        )
-        lse_buf = _get_shared_cg_buffer(
-            "lse",
-            (self._cg_max_tokens, q_num_heads),
-            q.dtype,
-            q.device,
-        )
-        attn_logits_buf = _get_shared_cg_buffer(
-            "attn_logits",
-            (
-                self._cg_max_tokens,
-                q_num_heads,
-                MAX_NUM_KV_SPLITS,
-                # +1 stores the LSE that stage2 uses to merge partial outs
-                self.kv_lora_rank + 1,
-            ),
-            torch.float32,
-            q.device,
-        )
-        o = o_buf[:B]
-        lse = lse_buf[:B]
-        # Slice keeps parent strides — the kernel reads strides from this view
-        # and ignores the rest of the pool. This is what makes bucket-dependent
-        # num_kv_splits CG-safe.
-        attn_logits = attn_logits_buf[:B, :, :num_kv_splits, :]
+        if B <= self._cg_max_tokens:
+            o_buf = _get_shared_cg_buffer(
+                "o",
+                (self._cg_max_tokens, q_num_heads, self.kv_lora_rank),
+                q.dtype,
+                q.device,
+            )
+            lse_buf = _get_shared_cg_buffer(
+                "lse",
+                (self._cg_max_tokens, q_num_heads),
+                q.dtype,
+                q.device,
+            )
+            attn_logits_buf = _get_shared_cg_buffer(
+                "attn_logits",
+                (
+                    self._cg_max_tokens,
+                    q_num_heads,
+                    MAX_NUM_KV_SPLITS,
+                    # +1 stores the LSE that stage2 uses to merge partial outs
+                    self.kv_lora_rank + 1,
+                ),
+                torch.float32,
+                q.device,
+            )
+            o = o_buf[:B]
+            lse = lse_buf[:B]
+            # Slice keeps parent strides — the kernel reads strides from this
+            # view and ignores the rest of the pool. This is what makes
+            # bucket-dependent num_kv_splits CG-safe.
+            attn_logits = attn_logits_buf[:B, :, :num_kv_splits, :]
+        else:
+            # Oversized eager batch (e.g. kernel warmup with uniform
+            # spec-verify blocks larger than the CG capture limit). This is
+            # never reached inside CUDA-graph replay, which is capped at
+            # _cg_max_tokens, so transient allocations are safe here.
+            o = torch.empty(
+                (B, q_num_heads, self.kv_lora_rank), dtype=q.dtype, device=q.device
+            )
+            lse = torch.empty((B, q_num_heads), dtype=q.dtype, device=q.device)
+            attn_logits = torch.empty(
+                (B, q_num_heads, num_kv_splits, self.kv_lora_rank + 1),
+                dtype=torch.float32,
+                device=q.device,
+            )
 
         # Add a head dim of 1
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.unsqueeze(2)

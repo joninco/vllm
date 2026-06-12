@@ -38,9 +38,15 @@ def get_eagle3_aux_layers_from_config(
     if not (spec_config and spec_config.draft_model_config):
         return None
     hf_config = spec_config.draft_model_config.hf_config
-    if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
-        return None
-    layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
+    layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
     if layer_ids and isinstance(layer_ids, (list, tuple)):
         return tuple(layer_ids)
+    # DFlash stores 0-based target layer ids; the capture hook indexes the
+    # hidden state BEFORE each layer, hence the +1 (HF hidden_states[i + 1]
+    # semantics, matching the V1 proposer).
+    dflash_config = getattr(hf_config, "dflash_config", None)
+    if isinstance(dflash_config, dict):
+        target_layer_ids = dflash_config.get("target_layer_ids")
+        if target_layer_ids and isinstance(target_layer_ids, (list, tuple)):
+            return tuple(int(i) + 1 for i in target_layer_ids)
     return None
