@@ -19,6 +19,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
@@ -129,6 +130,7 @@ class MiniMaxM3SparseDecodeMetadata:
     """Per-decode state (cudagraph-safe). ``decode_query_len`` is the uniform
     per-request query length (1, or 1 + num_speculative_tokens)."""
 
+    cu_seqlens_q: torch.Tensor  # [num_decodes + 1] int32, decode-first starts at 0
     seq_lens: torch.Tensor  # [num_decodes] int32
     block_table: torch.Tensor
     decode_query_len: int
@@ -189,6 +191,7 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
+        qsl_cpu = common_attn_metadata.query_start_loc_cpu
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -237,7 +240,6 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
 
         decode_metadata: MiniMaxM3SparseDecodeMetadata | None = None
         if num_decodes > 0:
-            qsl_cpu = common_attn_metadata.query_start_loc_cpu
             query_lens_cpu = qsl_cpu[1 : num_decodes + 1] - qsl_cpu[:num_decodes]
             decode_query_len = int(query_lens_cpu[0].item())
             assert decode_query_len > 0
@@ -246,6 +248,7 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
             )
             assert num_decode_tokens == num_decodes * decode_query_len
             decode_metadata = MiniMaxM3SparseDecodeMetadata(
+                cu_seqlens_q=query_start_loc[: num_decodes + 1].to(torch.int32),
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
                 decode_query_len=decode_query_len,
@@ -380,10 +383,34 @@ def select_main_impl_cls(
 ) -> type[MiniMaxM3SparseImpl]:
     """Pick the main attend impl off the main KV-cache dtype.
 
-    bf16 on Blackwell (SM100) uses the MSA attend; fp8 or non-Blackwell falls
-    back to Triton. The MSA module is imported lazily so AMD/non-SM100 never
-    import fmha_sm100.
+    B12X MiniMax MSA is opt-in. Otherwise bf16 on Blackwell (SM100) uses the
+    NVIDIA MSA attend; fp8 or non-Blackwell falls back to Triton. MSA modules
+    are imported lazily so unsupported platforms never import their kernels.
     """
+    if envs.VLLM_USE_B12X_MINIMAX_M3_MSA:
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            raise RuntimeError(
+                "VLLM_USE_B12X_MINIMAX_M3_MSA requires CUDA SM120."
+            )
+        if topk_blocks != 16:
+            raise NotImplementedError(
+                "B12X MiniMax M3 MSA currently requires sparse_topk_blocks=16, "
+                f"got {topk_blocks}."
+            )
+        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+            raise NotImplementedError(
+                "B12X MiniMax M3 MSA supports auto, bfloat16, fp8, and "
+                f"fp8_e4m3 KV caches, got {kv_cache_dtype!r}."
+            )
+        from vllm.models.minimax_m3.nvidia.sparse_attention_b12x import (
+            MiniMaxM3SparseB12XImpl,
+        )
+
+        return MiniMaxM3SparseB12XImpl
+
     if (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)

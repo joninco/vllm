@@ -20,6 +20,7 @@ from typing import ClassVar
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.attention import IndexerKVDType
 from vllm.config.cache import CacheDType
@@ -342,6 +343,7 @@ class MiniMaxM3IndexerImpl(nn.Module):
         indexer_kv_dtype: IndexerKVDType = "bf16",
     ) -> None:
         super().__init__()
+        vllm_config = get_current_vllm_config()
         self.num_kv_heads = num_kv_heads
         self.scale = scale
         self.topk_blocks = topk_blocks
@@ -352,6 +354,29 @@ class MiniMaxM3IndexerImpl(nn.Module):
         self.num_index_heads = num_index_heads
         self.index_head_dim = index_head_dim
         self.indexer_kv_dtype = indexer_kv_dtype
+        if envs.VLLM_USE_B12X_MINIMAX_M3_MSA:
+            max_topk_rows = vllm_config.scheduler_config.max_num_batched_tokens
+            self.register_buffer(
+                "_decode_topk_buffer",
+                torch.empty(
+                    (num_index_heads, max_topk_rows, topk_blocks),
+                    dtype=torch.int32,
+                    device=vllm_config.device_config.device,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_prefill_topk_buffer",
+                torch.empty(
+                    (num_index_heads, max_topk_rows, topk_blocks),
+                    dtype=torch.int32,
+                    device=vllm_config.device_config.device,
+                ),
+                persistent=False,
+            )
+        else:
+            self._decode_topk_buffer = None
+            self._prefill_topk_buffer = None
         # Owns the side cache (registers itself in the static forward context).
         self.index_cache = MiniMaxM3IndexerCache(
             head_dim=index_head_dim,
@@ -367,6 +392,25 @@ class MiniMaxM3IndexerImpl(nn.Module):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Return ``(decode_topk, prefill_topk)``; implemented per kernel impl."""
         raise NotImplementedError
+
+    def _topk_out_buffer(
+        self,
+        kind: str,
+        total_q: int,
+    ) -> torch.Tensor | None:
+        buffer = (
+            self._decode_topk_buffer
+            if kind == "decode"
+            else self._prefill_topk_buffer
+        )
+        if buffer is None:
+            return None
+        if int(buffer.shape[1]) < total_q:
+            raise RuntimeError(
+                "MiniMax M3 persistent top-k buffer is too small: "
+                f"need {total_q}, have {int(buffer.shape[1])}."
+            )
+        return buffer
 
 
 class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
@@ -405,6 +449,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 self.num_kv_heads,
                 self.scale,
                 d.decode_query_len,
+                out=self._topk_out_buffer("decode", nd),
             )
         if index_md.num_prefills > 0:
             p = index_md.prefill
@@ -429,6 +474,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 self.topk_blocks,
                 self.init_blocks,
                 self.local_blocks,
+                out=self._topk_out_buffer("prefill", num_tokens - nd),
             )
         return decode_topk, prefill_topk
 

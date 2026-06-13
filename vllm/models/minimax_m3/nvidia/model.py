@@ -13,6 +13,7 @@ The MiniMax-M3-preview config selects a single set of branches:
 """
 
 from collections.abc import Iterable
+from itertools import islice
 
 import torch
 from torch import nn
@@ -21,7 +22,7 @@ from transformers import PretrainedConfig
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
@@ -56,20 +57,20 @@ from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
     SupportsMultiModal,
+    SupportsPP,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
-from vllm.models.minimax_m3.common.indexer import (
-    MiniMaxM3Indexer,
-    MiniMaxM3IndexerMetadata,
-)
+from vllm.models.minimax_m3.common.indexer import MiniMaxM3Indexer
 from vllm.models.minimax_m3.common.mm_preprocess import (
     MiniMaxM3VLDummyInputsBuilder,
     MiniMaxM3VLMultiModalProcessor,
@@ -78,11 +79,11 @@ from vllm.models.minimax_m3.common.mm_preprocess import (
 from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseBackend,
     MiniMaxM3SparseImpl,
-    MiniMaxM3SparseMetadata,
     select_main_impl_cls,
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -488,6 +489,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        self._fp8_kv = "fp8" in self.kv_cache_dtype
         # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
         # cache (--attention-config '{"indexer_kv_dtype": ...}').
         self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
@@ -546,22 +548,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         )
 
     def _insert_kv(
-        self, key: torch.Tensor, value: torch.Tensor, index_key: torch.Tensor
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        index_key: torch.Tensor,
+        main_slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor,
     ) -> None:
-        """Write main K/V and index-K into their paged caches.
-
-        No-op during the profiling run, where caches are not yet bound and
-        ``attn_metadata`` is None.
-        """
-        attn_metadata = get_forward_context().attn_metadata
-        if not isinstance(attn_metadata, dict):
-            return
-        main_meta = attn_metadata[self.layer_name]
-        index_meta = attn_metadata[self.indexer.index_cache.prefix]
-        assert isinstance(main_meta, MiniMaxM3SparseMetadata)
-        assert isinstance(index_meta, MiniMaxM3IndexerMetadata)
-
-        # Identity scale: unused for the bf16 cache, required arg of the op.
+        """Write main K/V and index-K into their paged caches."""
         key_cache, value_cache = self.kv_cache.unbind(1)
         scale = torch.ones((), device=key.device)
         ops.reshape_and_cache_flash(
@@ -569,7 +563,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             value.view(-1, self.num_kv_heads, self.head_dim),
             key_cache,
             value_cache,
-            main_meta.slot_mapping,
+            main_slot_mapping,
             self.kv_cache_dtype,
             scale,
             scale,
@@ -577,7 +571,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         # Index-key cache: single vector per token, scatter by slot.
         idx_cache = self.indexer.index_cache.kv_cache.view(-1, self.idx_head_dim)
-        idx_cache[index_meta.slot_mapping] = index_key.to(idx_cache.dtype)
+        idx_cache[index_slot_mapping] = index_key.to(idx_cache.dtype)
 
     def forward(
         self,
@@ -615,6 +609,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
         q = qkv.new_empty((num_tokens, self.q_size))
         index_q = qkv.new_empty((num_tokens, self.index_q_size))
+        insert_via_fused = not self._fp8_kv
         ops.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
             self.q_norm.weight,
@@ -630,12 +625,19 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.num_idx_heads,
             main_slot_mapping,
             index_slot_mapping,
-            self.kv_cache,
-            self.indexer.index_cache.kv_cache,
+            self.kv_cache if insert_via_fused else None,
+            self.indexer.index_cache.kv_cache if insert_via_fused else None,
             self.kv_cache.size(2),  # paged-cache block size
             q,
             index_q,
         )
+        if not insert_via_fused:
+            kv = self.num_kv_heads * self.head_dim
+            k = qkv[:, self.q_size : self.q_size + kv]
+            v = qkv[:, self.q_size + kv : self.q_size + 2 * kv]
+            ik0 = self.q_size + 2 * kv + self.index_q_size
+            index_k = qkv[:, ik0 : ik0 + self.num_idx_heads * self.idx_head_dim]
+            self._insert_kv(k, v, index_k, main_slot_mapping, index_slot_mapping)
 
         output = torch.empty_like(q)
         attn_output = self._run_attention(q, index_q, output)
@@ -649,8 +651,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         index_query: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        # Single eager break around both: their split-K kernels read per-request
-        # metadata and can't be captured into a cudagraph.
         topk_idx = self.indexer(index_query)
         return self.impl.forward(self, query, self.kv_cache, topk_idx, output)
 
@@ -793,7 +793,16 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
 
-        self.norm = MiniMAXGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
+        )
+
+        if get_pp_group().is_last_rank:
+            self.norm = MiniMAXGemmaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+        else:
+            self.norm = PPMissingLayer()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -802,20 +811,34 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
         else:
-            hidden_states = self.embed_input_ids(input_ids)
-        residual = None
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
 
         # EAGLE3 is not yet compatible with pipeline parallel
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
+            )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -825,12 +848,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Checkpoint experts use w1=gate, w2=down, w3=up.
+        # Checkpoint experts use gate_proj=gate, down_proj=down, up_proj=up.
         return fused_moe_make_expert_params_mapping(
             self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_local_experts,
         )
 
@@ -932,7 +955,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         return loaded_params
 
 
-class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
+class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -951,6 +974,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -959,10 +985,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions, inputs_embeds)
+        **kwargs: object,
+    ) -> torch.Tensor | IntermediateTensors:
+        return self.model(
+            input_ids,
+            positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
@@ -981,7 +1013,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
     dummy_inputs=MiniMaxM3VLDummyInputsBuilder,
 )
 class MiniMaxM3SparseForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsEagle3
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsEagle3
 ):
     """Top-level (VL) entry point for MiniMax M3.
 
@@ -997,10 +1029,32 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
+            "lm_head.": "language_model.lm_head.",
+            "model.language_model.": "language_model.model.",
+            "model.vision_tower.embeddings.proj.": (
+                "vision_tower.vision_model.embeddings.patch_embedding."
+            ),
+            "model.vision_tower.embeddings.": (
+                "vision_tower.vision_model.embeddings."
+            ),
+            "model.vision_tower.pre_layrnorm.": (
+                "vision_tower.vision_model.pre_layrnorm."
+            ),
+            "model.vision_tower.layers.": "vision_tower.vision_model.encoder.layers.",
+            "model.multi_modal_projector.merge_linear_1.": (
+                "vision_tower.patch_merge_mlp.linear_1."
+            ),
+            "model.multi_modal_projector.merge_linear_2.": (
+                "vision_tower.patch_merge_mlp.linear_2."
+            ),
+            "model.multi_modal_projector.": "vision_tower.multi_modal_projector.",
             "multi_modal_projector.": "vision_tower.multi_modal_projector.",
             "patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
         },
         orig_to_new_substr={
+            ".mlp.gate.": ".block_sparse_moe.gate.",
+            ".mlp.experts.": ".block_sparse_moe.experts.",
+            ".mlp.shared_experts.": ".block_sparse_moe.shared_experts.",
             ".mlp.fc1.": ".fc1.",
             ".mlp.fc2.": ".fc2.",
         },
@@ -1042,6 +1096,9 @@ class MiniMaxM3SparseForConditionalGeneration(
             hf_config=config.text_config,
             prefix=maybe_prefix(prefix, "language_model"),
             architectures=["MiniMaxM3SparseForCausalLM"],
+        )
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
         )
 
     # Expose language model / lm_head for EAGLE3 spec decode.
@@ -1161,10 +1218,18 @@ class MiniMaxM3SparseForConditionalGeneration(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        return self.language_model(input_ids, positions, inputs_embeds)
+        **kwargs: object,
+    ) -> torch.Tensor | IntermediateTensors:
+        if intermediate_tensors is not None:
+            inputs_embeds = None
+        return self.language_model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)

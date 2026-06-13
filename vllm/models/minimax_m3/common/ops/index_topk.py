@@ -328,7 +328,6 @@ def _decode_index_score_kernel(
 
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
     seq_len = tl.load(seq_lens + req_id)
     query_pos = seq_len - decode_query_len + q_offset
@@ -342,6 +341,8 @@ def _decode_index_score_kernel(
     chunk_start_block = pid_c * chunk_size_blocks
     chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
     if chunk_start_block >= chunk_end_block:
+        if USE_PDL:
+            tl.extra.cuda.gdc_launch_dependents()
         return
     off_k = tl.arange(0, BLOCK_SIZE_K)  # positions within a 128-block
     off_d = tl.arange(0, head_dim)
@@ -381,6 +382,9 @@ def _decode_index_score_kernel(
             + blk * stride_s_k,
             score,
         )
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 # ---------------------------------------------------------------------------
@@ -494,9 +498,6 @@ def _topk_index_partial_kernel(
                 topk_score, topk_idx.to(tl.int32), n_dims, True, n_dims
             )
 
-    if USE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
     # Extract first BLOCK_SIZE_T entries (top-K of this chunk after the sort).
     topk_mask_extract = tl.arange(0, BLOCK_SIZE_K // BLOCK_SIZE_T) == 0
     final_score = tl.sum(
@@ -528,6 +529,9 @@ def _topk_index_partial_kernel(
     )
     tl.store(ts_ptrs, final_score)
     tl.store(ti_ptrs, final_idx)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.heuristics(
@@ -570,7 +574,6 @@ def _topk_index_merge_kernel(
 
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
     seq_len = tl.load(seq_lens + req_id)
     query_pos = seq_len - decode_query_len + q_offset
@@ -632,6 +635,9 @@ def _topk_index_merge_kernel(
     tl.store(
         tif_ptrs, topk_idx_final.to(ti_final_ptr.dtype.element_ty), mask=store_mask
     )
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 # ---------------------------------------------------------------------------
@@ -707,16 +713,34 @@ def minimax_m3_index_topk(
     topk: int,
     init_blocks: int,
     local_blocks: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select index top-k from a precomputed score tensor."""
     num_idx_heads = score.shape[0]
     batch = cu_seqlens_q.shape[0] - 1
     total_q = score.shape[1]
-    topk_idx = torch.empty(
-        (num_idx_heads, total_q, topk),
-        dtype=torch.int32,
-        device=score.device,
-    )
+    if out is None:
+        topk_idx = torch.empty(
+            (num_idx_heads, total_q, topk),
+            dtype=torch.int32,
+            device=score.device,
+        )
+    else:
+        if out.dtype != torch.int32 or out.device != score.device:
+            raise TypeError("topk out buffer must be int32 on the score device")
+        if out.ndim != 3:
+            raise ValueError("topk out buffer must be rank-3")
+        if (
+            int(out.shape[0]) != num_idx_heads
+            or int(out.shape[1]) < total_q
+            or int(out.shape[2]) < topk
+        ):
+            raise ValueError(
+                "topk out buffer must have shape "
+                f"({num_idx_heads}, >={total_q}, >={topk}), got "
+                f"{tuple(out.shape)}"
+            )
+        topk_idx = out
     # block_size_q == 1 -> query blocks coincide with query tokens.
     grid_topk = (max_query_len, batch, num_idx_heads)
     _topk_index_kernel[grid_topk](
@@ -755,6 +779,7 @@ def minimax_m3_index_decode(
     num_kv_heads: int,
     sm_scale: float,
     decode_query_len: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
@@ -818,11 +843,28 @@ def minimax_m3_index_decode(
         **pdl_launch,
     )
 
-    topk_idx = torch.empty(
-        (num_idx_heads, total_q, topk),
-        dtype=torch.int32,
-        device=idx_q.device,
-    )
+    if out is None:
+        topk_idx = torch.empty(
+            (num_idx_heads, total_q, topk),
+            dtype=torch.int32,
+            device=idx_q.device,
+        )
+    else:
+        if out.dtype != torch.int32 or out.device != idx_q.device:
+            raise TypeError("decode topk out buffer must be int32 on the query device")
+        if out.ndim != 3:
+            raise ValueError("decode topk out buffer must be rank-3")
+        if (
+            int(out.shape[0]) != num_idx_heads
+            or int(out.shape[1]) < total_q
+            or int(out.shape[2]) < topk
+        ):
+            raise ValueError(
+                "decode topk out buffer must have shape "
+                f"({num_idx_heads}, >={total_q}, >={topk}), got "
+                f"{tuple(out.shape)}"
+            )
+        topk_idx = out
     # Chunk count is shape-constant (cudagraph-safe), capped so the merge sorts
     # pow2(num_topk_chunks * pow2(topk)) candidates.
     TOPK_TARGET_GRID = 64
