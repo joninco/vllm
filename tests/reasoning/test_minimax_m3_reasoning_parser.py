@@ -83,10 +83,18 @@ class MiniMaxM3Tokenizer:
         return "".join(tokens)
 
 
+class MiniMaxM3TextSplitTokenizer(MiniMaxM3Tokenizer):
+    """Tokenizer that exposes M3 tags in vocab but emits them as text tokens."""
+
+    def tokenize(self, text: str) -> list[str]:
+        return list(text)
+
+
 def make_parser(
     chat_template_kwargs: dict[str, str] | None = None,
+    tokenizer_cls: type[MiniMaxM3Tokenizer] = MiniMaxM3Tokenizer,
 ) -> tuple[MiniMaxM3ReasoningParser, MiniMaxM3Tokenizer]:
-    tokenizer = MiniMaxM3Tokenizer()
+    tokenizer = tokenizer_cls()
     return (
         MiniMaxM3ReasoningParser(tokenizer, chat_template_kwargs=chat_template_kwargs),
         tokenizer,
@@ -220,6 +228,36 @@ def test_streaming_reasoning_tags_are_not_returned():
 
 def test_streaming_boundary_can_emit_reasoning_and_content():
     parser, tokenizer = make_parser()
+
+    reasoning, content, end_states = run_streaming(
+        parser,
+        tokenizer,
+        ["<mm:think>plan</mm:think>answer"],
+    )
+
+    assert reasoning == "plan"
+    assert content == "answer"
+    assert end_states == [True]
+
+
+def test_streaming_text_tags_can_be_split_across_chunks():
+    parser, tokenizer = make_parser(tokenizer_cls=MiniMaxM3TextSplitTokenizer)
+
+    reasoning, content, end_states = run_streaming(
+        parser,
+        tokenizer,
+        ["<mm", ":think>", "plan", "</mm", ":think>", "answer"],
+    )
+
+    assert reasoning == "plan"
+    assert content == "answer"
+    assert "<mm:think>" not in (reasoning or "")
+    assert "<mm:think>" not in (content or "")
+    assert end_states == [False, False, False, False, True, True]
+
+
+def test_streaming_text_tags_can_share_boundary_chunk():
+    parser, tokenizer = make_parser(tokenizer_cls=MiniMaxM3TextSplitTokenizer)
 
     reasoning, content, end_states = run_streaming(
         parser,
