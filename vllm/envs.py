@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_FP8_GEMM: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
+    VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
@@ -1024,6 +1025,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_MOE": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_MOE", "0"))
+    ),
+    # Use b12x for MiniMax M3's block-sparse MSA attention.
+    # This is opt-in while page-128 MSA support is integrated.
+    "VLLM_USE_B12X_MINIMAX_M3_MSA": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_MINIMAX_M3_MSA", "0"))
     ),
     # Re-run every B12X piecewise subgraph eagerly immediately before capture.
     # PIECEWISE descriptors already receive an eager full-forward warmup before

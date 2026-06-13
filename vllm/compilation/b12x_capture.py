@@ -14,6 +14,7 @@ def b12x_cuda_graph_prewarm_enabled() -> bool:
         or envs.VLLM_USE_B12X_FP8_GEMM
         or envs.VLLM_USE_B12X_WO_PROJECTION
         or envs.VLLM_USE_B12X_MOE
+        or envs.VLLM_USE_B12X_MINIMAX_M3_MSA
     )
 
 
