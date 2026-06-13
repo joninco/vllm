@@ -223,6 +223,81 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
     )
 
 
+def _per_expert_input_scale(
+    scale: torch.Tensor,
+    num_experts: int,
+    name: str,
+) -> torch.Tensor:
+    scale = scale.to(torch.float32)
+    if scale.dim() == 0:
+        return scale.expand(num_experts).contiguous()
+    if scale.dim() == 1:
+        if scale.numel() != num_experts:
+            raise ValueError(
+                f"{name} must have {num_experts} elements, got {scale.numel()}"
+            )
+        return scale.contiguous()
+    if scale.dim() == 2:
+        if scale.size(0) != num_experts:
+            raise ValueError(
+                f"{name} first dimension must be {num_experts}, "
+                f"got {scale.size(0)}"
+            )
+        return scale.max(dim=1).values.contiguous()
+    raise ValueError(f"{name} must be scalar, 1D, or 2D, got {tuple(scale.shape)}")
+
+
+def prepare_nvfp4_moe_layer_for_b12x(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w13_scale_2: torch.Tensor,
+    a13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w2_scale_2: torch.Tensor,
+    a2_scale: torch.Tensor,
+    is_act_and_mul: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Prepare native B12X NVFP4 MoE metadata without repacking weights."""
+    num_experts = w13.shape[0]
+    a13_scale = _per_expert_input_scale(a13_scale, num_experts, "a13_scale")
+    a2_scale = _per_expert_input_scale(a2_scale, num_experts, "a2_scale")
+
+    if is_act_and_mul:
+        (
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+        ) = _pad_gated_nvfp4_moe_for_swizzled_scales(
+            w13, w13_scale, w2, w2_scale
+        )
+
+    w13_scale = swizzle_blockscale(w13_scale)
+    pad_size = w13_scale.size(1) - w13.size(1)
+    if pad_size > 0:
+        if is_act_and_mul:
+            raise NotImplementedError(
+                "Intermediate size padding for gated native B12X NvFp4 MoE "
+                "must be handled before scale swizzling."
+            )
+        w13 = torch.nn.functional.pad(w13, (0, 0, 0, pad_size))
+        w2 = torch.nn.functional.pad(w2, (0, pad_size // 2, 0, 0))
+        w2_scale = torch.nn.functional.pad(w2_scale, (0, pad_size // 16))
+
+    w2_scale = swizzle_blockscale(w2_scale)
+    return w13, w13_scale, w13_scale_2, a13_scale, w2, w2_scale, w2_scale_2, a2_scale
+
+
 def prepare_static_weights_for_trtllm_fp4_moe(
     # args_dequant,
     # args,

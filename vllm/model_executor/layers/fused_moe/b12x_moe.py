@@ -9,8 +9,8 @@ from typing import Any, cast
 import torch
 
 import vllm.envs as envs
-from vllm.logger import init_logger
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
@@ -63,6 +63,8 @@ def _plan_b12x_moe_fp4_scratch(
     prepared_w4a16: Any | None = None,
     apply_router_weight_on_input: bool = False,
     swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ):
     from b12x.integration.tp_moe import TPMoEScratchCaps, plan_tp_moe_scratch
 
@@ -87,6 +89,8 @@ def _plan_b12x_moe_fp4_scratch(
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             source_format=source_format,
             w13_layout=w13_layout,
             w4a16_weight_layout=w4a16_weight_layout,
@@ -148,6 +152,8 @@ def _run_b12x_moe_fp4(
     w13_layout: str,
     prepared_w4a16: Any,
     swiglu_limit: float | None,
+    swiglu_alpha: float | None,
+    swiglu_beta: float | None,
     plan: Any,
     scratch: torch.Tensor,
 ) -> None:
@@ -178,6 +184,8 @@ def _run_b12x_moe_fp4(
         w13_layout=w13_layout,
         prepared_w4a16=prepared_w4a16,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     b12x_moe_fp4(binding=binding)
 
@@ -185,9 +193,18 @@ def _run_b12x_moe_fp4(
 def _b12x_activation_name(activation: MoEActivation) -> str:
     if activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI):
         return "silu"
+    if activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+        return activation.value
     if activation == MoEActivation.RELU2:
         return "relu2"
     return activation.value
+
+
+def _first_not_none(*values: Any) -> Any | None:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def _prepare_b12x_e8m0_modelopt_moe_weights(**kwargs):
@@ -478,7 +495,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation in (MoEActivation.SILU, MoEActivation.SWIGLUOAI)
+        return activation in (
+            MoEActivation.SILU,
+            MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        )
 
     @staticmethod
     def _supports_parallel_config(
@@ -628,6 +649,27 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._prepared_fp4_moe_by_dtype[params_dtype] = prepared
         return prepared
 
+    def _b12x_swiglu_params(
+        self,
+        activation: MoEActivation,
+    ) -> tuple[float | None, float | None, float | None]:
+        swiglu_limit = _first_not_none(
+            getattr(self.quant_config, "gemm1_clamp_limit", None),
+            getattr(self.moe_config, "swiglu_limit", None),
+        )
+        if activation != MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            return swiglu_limit, None, None
+
+        swiglu_alpha = _first_not_none(
+            getattr(self.quant_config, "gemm1_alpha", None),
+            getattr(self.moe_config, "swiglu_alpha", None),
+        )
+        swiglu_beta = _first_not_none(
+            getattr(self.quant_config, "gemm1_beta", None),
+            getattr(self.moe_config, "swiglu_beta", None),
+        )
+        return swiglu_limit, swiglu_alpha, swiglu_beta
+
     def _lookup_prepared_w4a16(self) -> Any | None:
         for prepared in self._prepared_fp4_moe_by_dtype.values():
             w4a16 = getattr(prepared, "w4a16", None)
@@ -712,6 +754,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 "cuda", torch.cuda.current_device()
             )
         workspace_dtype = getattr(self.moe_config, "in_dtype", torch.bfloat16)
+        swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(
+            activation
+        )
+        if (
+            quant_mode != "w4a16"
+            and activation != MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        ):
+            swiglu_limit = None
         plan = _plan_b12x_moe_fp4_scratch(
             tokens=max(int(M), 1),
             weight_E=weight_E,
@@ -725,11 +775,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             source_format=self._source_format(),
             w13_layout=self._w13_layout(),
             prepared_w4a16=prepared_w4a16,
-            swiglu_limit=(
-                getattr(self.quant_config, "gemm1_clamp_limit", None)
-                if quant_mode == "w4a16"
-                else None
-            ),
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
         scratch_elements = max(
             1,
@@ -787,7 +835,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
             input_scales_static = True
             unit_scale_contract = True
-            swiglu_limit = getattr(self.quant_config, "gemm1_clamp_limit", None)
         else:
             if self.a1_gscale is None or self.a2_gscale is None:
                 raise RuntimeError(
@@ -808,6 +855,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             w2_alphas = prepared.w2_runtime_alphas
             input_scales_static = True
             unit_scale_contract = False
+        swiglu_limit, swiglu_alpha, swiglu_beta = self._b12x_swiglu_params(
+            activation
+        )
+        if (
+            quant_mode != "w4a16"
+            and activation != MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        ):
             swiglu_limit = None
         topk_ids = _normalize_b12x_moe_topk_ids(topk_ids)
         topk_weights = _normalize_b12x_moe_topk_weights(topk_weights)
@@ -830,6 +884,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 else False
             ),
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
         scratch = _workspace2_as_b12x_scratch(workspace2, plan)
 
@@ -860,6 +916,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             w13_layout=self._w13_layout(),
             prepared_w4a16=prepared_w4a16,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             plan=plan,
             scratch=scratch,
         )
