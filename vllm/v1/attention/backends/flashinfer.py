@@ -38,6 +38,7 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
     can_use_trtllm_attention,
+    supports_trtllm_attention,
     use_trtllm_attention,
 )
 from vllm.utils.math_utils import cdiv
@@ -425,6 +426,27 @@ class FlashInferBackend(AttentionBackend):
         return capability >= DeviceCapability(7, 5) and capability <= DeviceCapability(
             12, 1
         )
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        if (
+            block_size is not None
+            and block_size >= 128
+            and not supports_trtllm_attention()
+        ):
+            return "page size >= 128 requires trtllm-gen attention"
+        return None
 
     @classmethod
     def supports_sink(cls) -> bool:
