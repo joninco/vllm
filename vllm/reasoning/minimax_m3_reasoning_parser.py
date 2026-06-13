@@ -36,7 +36,8 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
     def __init__(self, tokenizer, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
-        self._initial_in_reasoning = chat_kwargs.get("thinking_mode") == "enabled"
+        self._thinking_mode = chat_kwargs.get("thinking_mode")
+        self._initial_in_reasoning = self._thinking_mode == "enabled"
         self._at_response_start = True
         self._stream_buffer = ""
         self._stream_in_reasoning = self._initial_in_reasoning
@@ -174,6 +175,13 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
             return False
         if self.start_token_id not in input_ids:
             return bool(input_ids)
+        return False
+
+    def is_reasoning_end_for_prompt(self, input_ids: Sequence[int]) -> bool:
+        if self._thinking_mode == "disabled":
+            return True
+        if self._thinking_mode == "enabled":
+            return False
         return False
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:

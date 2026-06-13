@@ -324,7 +324,7 @@ class OpenAIServingChat(OpenAIServing):
                     # non-reasoning outputs.
                     reasoning_ended = True
                 elif reasoning_parser:
-                    reasoning_ended = reasoning_parser.is_reasoning_end(
+                    reasoning_ended = reasoning_parser.is_reasoning_end_for_prompt(
                         prompt_token_ids or []
                     )
                 else:

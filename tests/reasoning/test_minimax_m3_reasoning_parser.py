@@ -6,7 +6,12 @@ from collections.abc import Sequence
 
 import pytest
 
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionToolsParam,
+    FunctionDefinition,
+)
+from vllm.parser import ParserManager
 from vllm.reasoning import ReasoningParserManager
 from vllm.reasoning.minimax_m3_reasoning_parser import MiniMaxM3ReasoningParser
 
@@ -142,6 +147,49 @@ def run_streaming(
         "".join(content_parts) or None,
         reasoning_end_states,
     )
+
+
+def run_unified_streaming(
+    parser,
+    tokenizer: MiniMaxM3Tokenizer,
+    chunks: list[str],
+    prompt_text: str,
+    request: ChatCompletionRequest | None = None,
+) -> tuple[str | None, str | None]:
+    request = request or ChatCompletionRequest(messages=[], model="test-model")
+    prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+    reasoning_parts: list[str] = []
+    content_parts: list[str] = []
+
+    for idx, chunk in enumerate(chunks):
+        delta = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=tokenizer.encode(chunk, add_special_tokens=False),
+            request=request,
+            prompt_token_ids=prompt_token_ids if idx == 0 else None,
+            finished=False,
+        )
+        if delta is not None:
+            if delta.reasoning is not None:
+                reasoning_parts.append(delta.reasoning)
+            if delta.content is not None:
+                content_parts.append(delta.content)
+
+    return "".join(reasoning_parts) or None, "".join(content_parts) or None
+
+
+def sample_tools() -> list[ChatCompletionToolsParam]:
+    return [
+        ChatCompletionToolsParam(
+            function=FunctionDefinition(
+                name="lookup",
+                parameters={
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            ),
+        )
+    ]
 
 
 def test_parser_registration():
@@ -341,6 +389,78 @@ def test_token_id_helpers():
     assert parser.extract_content_ids(open_reasoning_ids) == []
     assert parser.extract_content_ids(content_ids) == content_ids
     assert parser.count_reasoning_tokens(output_ids) == len(tokenizer.encode("abc"))
+
+
+def test_prompt_reasoning_end_uses_m3_thinking_mode():
+    parser, tokenizer = make_parser()
+    prompt_ids = tokenizer.encode("</mm:think>", add_special_tokens=False)
+
+    assert not parser.is_reasoning_end_for_prompt(prompt_ids)
+
+    parser, tokenizer = make_parser(chat_template_kwargs={"thinking_mode": "adaptive"})
+    prompt_ids = tokenizer.encode("</mm:think>", add_special_tokens=False)
+    assert not parser.is_reasoning_end_for_prompt(prompt_ids)
+
+    parser, tokenizer = make_parser(chat_template_kwargs={"thinking_mode": "enabled"})
+    prompt_ids = tokenizer.encode("<mm:think>", add_special_tokens=False)
+    assert not parser.is_reasoning_end_for_prompt(prompt_ids)
+
+    parser, tokenizer = make_parser(chat_template_kwargs={"thinking_mode": "disabled"})
+    prompt_ids = tokenizer.encode("</mm:think>", add_special_tokens=False)
+    assert parser.is_reasoning_end_for_prompt(prompt_ids)
+
+
+def test_unified_parser_adaptive_prompt_does_not_leak_start_tag():
+    tokenizer = MiniMaxM3Tokenizer()
+    parser_cls = ParserManager.get_parser(reasoning_parser_name="minimax_m3")
+    assert parser_cls is not None
+    parser = parser_cls(
+        tokenizer,
+        chat_template_kwargs={"thinking_mode": "adaptive"},
+    )
+
+    reasoning, content = run_unified_streaming(
+        parser,
+        tokenizer,
+        ["<mm:think>", "plan", "</mm:think>", "answer"],
+        prompt_text="old answer</mm:think>",
+    )
+
+    assert reasoning == "plan"
+    assert content == "answer"
+
+
+def test_unified_parser_with_m3_tool_parser_does_not_leak_start_tag():
+    pytest.importorskip("vllm._rust_tool_parser")
+    tokenizer = MiniMaxM3Tokenizer()
+    tools = sample_tools()
+    parser_cls = ParserManager.get_parser(
+        tool_parser_name="minimax_m3",
+        reasoning_parser_name="minimax_m3",
+        enable_auto_tools=True,
+    )
+    assert parser_cls is not None
+    parser = parser_cls(
+        tokenizer,
+        tools,
+        chat_template_kwargs={"thinking_mode": "adaptive"},
+    )
+    request = ChatCompletionRequest(
+        messages=[],
+        model="test-model",
+        tools=tools,
+    )
+
+    reasoning, content = run_unified_streaming(
+        parser,
+        tokenizer,
+        ["<mm:think>", "plan", "</mm:think>", "answer"],
+        prompt_text="old answer</mm:think>",
+        request=request,
+    )
+
+    assert reasoning == "plan"
+    assert content == "answer"
 
 
 def test_token_id_helpers_enabled_mode():
