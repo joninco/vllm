@@ -151,8 +151,14 @@ class KVCacheSpec:
             f"Unsupported KV cache spec type: {type(self)}. "
             "Please register it using @register_kv_cache_spec decorator."
         )
+        # Keep DCP-replicated layers (DFlash draft) out of a shared group with
+        # DCP-sharded layers (MLA target): one group carries a single cp_size.
+        # group_and_unify_kv_cache_specs then routes them as separate groups.
+        self_repl = getattr(self, "dcp_replicated", False)
         return all(
-            isinstance(spec, uniform_type_base_spec) for spec in kv_cache_specs.values()
+            isinstance(spec, uniform_type_base_spec)
+            and getattr(spec, "dcp_replicated", False) == self_repl
+            for spec in kv_cache_specs.values()
         )
 
 
@@ -219,6 +225,12 @@ class FullAttentionSpec(AttentionSpec):
     """
     attention_chunk_size: int | None = None
 
+    dcp_replicated: bool = False
+    """Replicate this group's KV cache on every DCP rank instead of
+    sharding it by token position. Used by draft layers whose attention
+    backend cannot reduce across DCP ranks (e.g. the DFlash draft); every
+    rank then stores and attends over the full context."""
+
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
@@ -229,7 +241,7 @@ class FullAttentionSpec(AttentionSpec):
         pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         # Note(hc): each dcp rank only need save
         # (max_model_len//dcp_world_size) tokens locally.
-        if dcp_world_size * pcp_world_size > 1:
+        if dcp_world_size * pcp_world_size > 1 and not self.dcp_replicated:
             max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
@@ -276,6 +288,7 @@ class FullAttentionSpec(AttentionSpec):
             page_size_padded=specs[0].page_size_padded,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
+            dcp_replicated=specs[0].dcp_replicated,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -769,6 +782,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+    @property
+    def dcp_replicated(self) -> bool:
+        return all(
+            getattr(spec, "dcp_replicated", False)
+            for spec in self.kv_cache_specs.values()
+        )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(

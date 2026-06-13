@@ -504,11 +504,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
+        # Prefix caching is unsupported for hybrid groups under DCP. Besides
+        # the DeepseekV4 MLA/SWA hybrid, this also covers an MLA target plus a
+        # DCP-replicated DFlash draft group (different block sizes / cp).
+        _has_dcp_replicated = any(
+            getattr(g.kv_cache_spec, "dcp_replicated", False)
+            for g in kv_cache_config.kv_cache_groups
+        )
         self.disable_prefix_cache_for_dsv4_dcp = (
             enable_caching
             and dcp_world_size > 1
             and pcp_world_size == 1
-            and is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+            and (
+                is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+                or _has_dcp_replicated
+            )
         )
         if not self.disable_prefix_cache_for_dsv4_dcp:
             assert all(

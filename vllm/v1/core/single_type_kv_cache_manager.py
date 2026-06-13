@@ -66,7 +66,15 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size * pcp_world_size > 1:
+        # Under (D)CP a request's cache is sharded across ranks, so one local
+        # block of `block_size` slots covers `block_size * cp` tokens of the
+        # global sequence -- scale the scheduler-visible block size to match.
+        # dcp_replicated groups (e.g. the DFlash draft) instead keep the full
+        # cache on every rank, so one block covers exactly `block_size` global
+        # tokens and must not be scaled.
+        if dcp_world_size * pcp_world_size > 1 and not getattr(
+            kv_cache_spec, "dcp_replicated", False
+        ):
             self.block_size *= dcp_world_size * pcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool

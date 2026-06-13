@@ -40,9 +40,9 @@ logger = init_logger(__name__)
 class DFlashSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
-        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
-            "DFlash speculator does not support decode context parallelism yet."
-        )
+        # DCP is supported by replicating the draft KV cache on every DCP
+        # rank (the draft spec sets dcp_replicated): every rank writes the
+        # full context KV and the block forward attends over it locally.
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device

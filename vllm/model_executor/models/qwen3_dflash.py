@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import dataclasses
 from collections.abc import Iterable, Mapping
 
 import torch
@@ -102,6 +103,11 @@ class DFlashAttention(Attention):
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # The draft attends over the full context with a backend that cannot
+        # reduce across DCP ranks; replicate the draft cache on every rank.
+        dcp_replicated = (
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
         if self.sliding_window is not None:
             # Build the full spec directly instead of converting the parent's
             # SlidingWindowSpec: Attention.get_kv_cache_spec asserts against
@@ -116,8 +122,12 @@ class DFlashAttention(Attention):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+                dcp_replicated=dcp_replicated,
             )
-        return super().get_kv_cache_spec(vllm_config)
+        spec = super().get_kv_cache_spec(vllm_config)
+        if dcp_replicated and isinstance(spec, FullAttentionSpec):
+            spec = dataclasses.replace(spec, dcp_replicated=True)
+        return spec
 
 
 class DFlashQwen3Attention(nn.Module):

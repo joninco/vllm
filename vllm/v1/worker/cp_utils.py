@@ -22,6 +22,17 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
             layer_impl = getattr(layer, "impl", None)
             if layer_impl is None:
                 continue
+            # Layers whose KV cache group is replicated across DCP ranks
+            # (e.g. the DFlash draft) attend over the full context locally
+            # and need no cross-rank LSE reduction.
+            get_spec = getattr(layer, "get_kv_cache_spec", None)
+            if get_spec is not None:
+                try:
+                    spec = get_spec(vllm_config)
+                except Exception:
+                    spec = None
+                if getattr(spec, "dcp_replicated", False):
+                    continue
             if vllm_config.speculative_config is not None and interleave_size > 1:
                 assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (
                     "MTP with cp_kv_cache_interleave_size > 1 is not "

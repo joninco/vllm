@@ -21,6 +21,7 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
+        group_cp_sizes: list[int] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -31,6 +32,14 @@ class BlockTables:
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_interleave = cp_interleave
+        # Per-group CP size: dcp_replicated groups keep their cache full on
+        # every rank (effective cp 1) while the rest shard by cp_size.
+        if group_cp_sizes is None:
+            group_cp_sizes = [cp_size] * len(block_sizes)
+        assert len(group_cp_sizes) == len(block_sizes)
+        self.group_cp_sizes = torch.tensor(
+            group_cp_sizes, dtype=torch.int32, device=device
+        )
 
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
@@ -158,6 +167,7 @@ class BlockTables:
             self.block_table_ptrs,
             self.block_table_strides,
             self.block_sizes_tensor,
+            self.group_cp_sizes,
             self.slot_mappings,
             self.slot_mappings.stride(0),
             self.cp_rank,
@@ -229,6 +239,7 @@ def _compute_slot_mappings_kernel(
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
     block_sizes,  # [num_kv_cache_groups]
+    group_cp_sizes,  # [num_kv_cache_groups]
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
@@ -256,6 +267,7 @@ def _compute_slot_mappings_kernel(
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
     block_size = tl.load(block_sizes + group_id)
+    group_cp_size = tl.load(group_cp_sizes + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
@@ -264,8 +276,8 @@ def _compute_slot_mappings_kernel(
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
 
-        block_indices = positions // (block_size * CP_SIZE)
-        block_offsets = positions % (block_size * CP_SIZE)
+        block_indices = positions // (block_size * group_cp_size)
+        block_offsets = positions % (block_size * group_cp_size)
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices
         )
@@ -274,13 +286,17 @@ def _compute_slot_mappings_kernel(
             # Common case: Context parallelism is not used.
             slot_ids = block_numbers * block_size + block_offsets
         else:
-            # Context parallelism is used.
-            is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-            rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
-            remainder = block_offsets % CP_INTERLEAVE
-            local_offsets = rounds * CP_INTERLEAVE + remainder
-            slot_ids = block_numbers * block_size + local_offsets
-            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+            # Context parallelism is used. dcp_replicated groups carry
+            # group_cp_size == 1 and store every token locally.
+            if group_cp_size == 1:
+                slot_ids = block_numbers * block_size + block_offsets
+            else:
+                is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
+                rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
+                remainder = block_offsets % CP_INTERLEAVE
+                local_offsets = rounds * CP_INTERLEAVE + remainder
+                slot_ids = block_numbers * block_size + local_offsets
+                slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
 
