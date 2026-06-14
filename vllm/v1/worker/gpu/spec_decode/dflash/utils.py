@@ -26,7 +26,13 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
-            vllm_config.attention_config, use_non_causal=not causal
+            vllm_config.attention_config,
+            use_non_causal=not causal,
+            # Honor the speculative-config attention backend for the draft
+            # (matches llm_base_proposer): otherwise auto-select picks
+            # FlashInfer, which downgrades the spec-decode cudagraph to
+            # PIECEWISE and cannot do non-causal prefill under DCP.
+            backend=speculative_config.attention_backend,
         ),
     )
     with set_model_tag("dflash_head"):
