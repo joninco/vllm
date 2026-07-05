@@ -919,6 +919,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                             int block_size, int block_stride,"
       "                             int entry_stride) -> ()");
 
+  ops.def(
+      "concat_and_cache_nvfp4_mla(Tensor kv_c, Tensor k_pe,"
+      "                           Tensor! kv_cache,"
+      "                           Tensor slot_mapping,"
+      "                           Tensor scale) -> ()");
+
   // Rotate Q and K, then write to kv cache for MLA
   ops.def(
       "concat_and_cache_mla_rope_fused("
@@ -1019,6 +1025,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("concat_and_cache_mla", TORCH_BOX(&concat_and_cache_mla));
   ops.impl("concat_and_cache_mla_grouped",
            TORCH_BOX(&concat_and_cache_mla_grouped));
+  ops.impl("concat_and_cache_nvfp4_mla",
+           TORCH_BOX(&concat_and_cache_nvfp4_mla));
   ops.impl("concat_and_cache_mla_rope_fused",
            TORCH_BOX(&concat_and_cache_mla_rope_fused));
   ops.impl("convert_fp8", TORCH_BOX(&convert_fp8));

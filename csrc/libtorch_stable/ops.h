@@ -601,6 +601,12 @@ void concat_and_cache_mla_grouped(torch::stable::Tensor& kv_c,
                                   int64_t block_size, int64_t block_stride,
                                   int64_t entry_stride);
 
+void concat_and_cache_nvfp4_mla(torch::stable::Tensor& kv_c,
+                                torch::stable::Tensor& k_pe,
+                                torch::stable::Tensor& kv_cache,
+                                torch::stable::Tensor& slot_mapping,
+                                torch::stable::Tensor& scale);
+
 // NOTE: k_pe and kv_c order is flipped compared to concat_and_cache_mla
 void concat_and_cache_mla_rope_fused(
     torch::stable::Tensor& positions, torch::stable::Tensor& q_pe,
