@@ -25,6 +25,11 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.model_executor.virtual_tp import (
+    get_virtual_tp_axis_shard_size,
+    is_virtual_tp_padded_enabled,
+    pad_or_narrow_weight,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
@@ -327,8 +332,8 @@ class RoutedExperts(PluggableLayer):
         scales are stored in the same loaded_weight tensor.
         """
         shard_size = param.shape[shard_dim]
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, shard_size * tp_rank, shard_size
+        loaded_weight = pad_or_narrow_weight(
+            loaded_weight, shard_dim, shard_size * tp_rank, shard_size
         )
         param.copy_(loaded_weight)
 
@@ -492,6 +497,7 @@ class RoutedExperts(PluggableLayer):
             shard_size = expert_data.shape[shard_dim] // 2
         else:
             shard_size = expert_data.shape[shard_dim]
+        loaded_weight_for_rank: torch.Tensor | None = loaded_weight
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
@@ -501,16 +507,21 @@ class RoutedExperts(PluggableLayer):
             # the *unpadded* per-rank size so that every TP rank lands at
             # the correct slice.
             tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
+            if is_virtual_tp_padded_enabled():
+                loaded_per_rank = get_virtual_tp_axis_shard_size(
+                    "moe_intermediate_size", shard_size
+                )
+            else:
+                loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
             start_offset = loaded_per_rank * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
-                # If there is no available weight to load for this TP rank
-                # (can happen on last TP rank with padding), we can skip
-                # loading and return early
-                return
-            narrow_size = min(loaded_per_rank, available)
-            loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+                loaded_weight_for_rank = None
+            else:
+                narrow_size = min(loaded_per_rank, available)
+                loaded_weight_for_rank = loaded_weight.narrow(
+                    shard_dim, start_offset, narrow_size
+                )
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
@@ -519,14 +530,20 @@ class RoutedExperts(PluggableLayer):
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+
+        if is_virtual_tp_padded_enabled():
+            expert_data.zero_()
+        if loaded_weight_for_rank is None:
+            return
+
         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
         expert_data = self._narrow_expert_data_for_padding(
             expert_data,
-            loaded_weight,
+            loaded_weight_for_rank,
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
+        expert_data.copy_(loaded_weight_for_rank)
 
     def _load_w2(
         self,
@@ -538,30 +555,42 @@ class RoutedExperts(PluggableLayer):
     ):
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
+        loaded_weight_for_rank: torch.Tensor | None = loaded_weight
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
         # and we're not loading the full weight
         if not load_full and loaded_weight.ndim > 0:
             # Same padding fix as _load_w13: use unpadded per-rank size.
             tp_size = self.moe_config.moe_parallel_config.tp_size
-            loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
-            start_offset = loaded_per_rank * tp_rank
+            if is_virtual_tp_padded_enabled():
+                loaded_per_rank = get_virtual_tp_axis_shard_size(
+                    "moe_intermediate_size", expert_data.shape[shard_dim]
+                )
+                start_offset = loaded_per_rank * tp_rank
+            else:
+                loaded_per_rank = loaded_weight.shape[shard_dim] // tp_size
+                start_offset = loaded_per_rank * tp_rank
             available = loaded_weight.shape[shard_dim] - start_offset
             if available <= 0:
-                # If there is no available weight to load for this TP rank
-                # (can happen on last TP rank with padding), we can skip
-                # loading and return early
-                return
-            narrow_size = min(loaded_per_rank, available)
-            loaded_weight = loaded_weight.narrow(shard_dim, start_offset, narrow_size)
+                loaded_weight_for_rank = None
+            else:
+                narrow_size = min(loaded_per_rank, available)
+                loaded_weight_for_rank = loaded_weight.narrow(
+                    shard_dim, start_offset, narrow_size
+                )
         # w2, down_proj: Load into only logical weight of w2.
+        if is_virtual_tp_padded_enabled():
+            expert_data.zero_()
+        if loaded_weight_for_rank is None:
+            return
+
         hidden_dim = self._get_hidden_dim(shard_dim, expert_data.ndim)
         expert_data = self._narrow_expert_data_for_padding(
             expert_data,
-            loaded_weight,
+            loaded_weight_for_rank,
             hidden_dim=hidden_dim,
             shard_dim=shard_dim,
         )
-        expert_data.copy_(loaded_weight)
+        expert_data.copy_(loaded_weight_for_rank)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int

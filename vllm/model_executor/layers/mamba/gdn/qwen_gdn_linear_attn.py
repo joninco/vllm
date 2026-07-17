@@ -44,6 +44,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.virtual_tp import get_virtual_tp_axis_original_size
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
@@ -373,6 +374,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
+        self.loaded_num_k_heads = get_virtual_tp_axis_original_size(
+            "linear_attention_key_heads",
+            self.num_k_heads,
+            config=config,
+        )
+        self.loaded_num_v_heads = get_virtual_tp_axis_original_size(
+            "linear_attention_value_heads",
+            self.num_v_heads,
+            config=config,
+        )
+        self.loaded_key_dim = self.head_k_dim * self.loaded_num_k_heads
+        self.loaded_value_dim = self.head_v_dim * self.loaded_num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
@@ -433,6 +446,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ],
             self.tp_size,
             self.tp_rank,
+            loaded_shard_sizes=[
+                self.loaded_key_dim,
+                self.loaded_key_dim,
+                self.loaded_value_dim,
+            ],
         )
 
         # selective projection used to make dt, B and C input dependent
@@ -508,12 +526,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if self.gqa_interleaved_layout
             else [key_dim, key_dim, value_dim, value_dim]
         )
+        loaded_output_sizes = (
+            [
+                sum(
+                    (
+                        self.loaded_key_dim,
+                        self.loaded_key_dim,
+                        self.loaded_value_dim,
+                        self.loaded_value_dim,
+                    )
+                )
+            ]
+            if self.gqa_interleaved_layout
+            else [
+                self.loaded_key_dim,
+                self.loaded_key_dim,
+                self.loaded_value_dim,
+                self.loaded_value_dim,
+            ]
+        )
         return MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=output_sizes,
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
+            loaded_output_sizes=loaded_output_sizes,
         )
 
     def create_ba_proj(
@@ -531,6 +569,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         output_sizes = (
             [num_v_heads * 2] if self.gqa_interleaved_layout else [num_v_heads] * 2
         )
+        loaded_output_sizes = (
+            [self.loaded_num_v_heads * 2]
+            if self.gqa_interleaved_layout
+            else [self.loaded_num_v_heads] * 2
+        )
         return MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=output_sizes,
@@ -538,6 +581,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             quant_config=quant_config,
             prefix=prefix,
             disable_tp=self.maybe_disable_tp(quant_config),
+            loaded_output_sizes=loaded_output_sizes,
         )
 
     def maybe_disable_tp(self, quant_config: QuantizationConfig | None) -> bool:

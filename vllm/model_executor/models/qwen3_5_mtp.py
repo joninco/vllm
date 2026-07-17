@@ -29,6 +29,7 @@ from vllm.model_executor.models.qwen3_next import (
     _all_gather_hidden_and_residual,
     _is_shared_expert_fse_compatible,
 )
+from vllm.model_executor.virtual_tp import get_virtual_tp_axis_padded_size
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
 from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
@@ -93,9 +94,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             if (quant_config and quant_config.get_name() == "modelopt_fp4")
             else quant_config
         )
+        self.fc_output_size = get_virtual_tp_axis_padded_size(
+            "mtp_projection_size",
+            self.config.hidden_size,
+            config=self.config,
+        )
         self.fc = ColumnParallelLinear(
             self.config.hidden_size * 2,
-            self.config.hidden_size,
+            self.fc_output_size,
             gather_output=True,
             bias=False,
             return_bias=False,
@@ -152,7 +158,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
             hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
+            hidden_states = self.fc(hidden_states)[..., : self.config.hidden_size]
             residual = None
         else:
             assert intermediate_tensors is not None

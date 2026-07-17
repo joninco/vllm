@@ -1372,6 +1372,24 @@ class SpeculativeConfig:
 
         return draft_parallel_config
 
+    def _maybe_apply_virtual_tp_to_draft(self) -> None:
+        if (
+            self.method not in ("mtp", "dspark")
+            or self.draft_model_config is None
+            or self.draft_parallel_config is None
+            or self.draft_model_config is self.target_model_config
+        ):
+            return
+
+        from vllm.config.virtual_tp import (
+            apply_b12x_virtual_tp_padding_to_model_config,
+        )
+
+        apply_b12x_virtual_tp_padding_to_model_config(
+            self.draft_model_config,
+            self.draft_parallel_config,
+        )
+
     @field_validator("attention_backend", mode="before")
     @classmethod
     def _parse_attention_backend(cls, value: Any) -> Any:
@@ -1420,6 +1438,7 @@ class SpeculativeConfig:
             )
 
         if self.draft_model_config:
+            self._maybe_apply_virtual_tp_to_draft()
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config
             )

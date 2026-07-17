@@ -48,6 +48,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.virtual_tp import get_virtual_tp_axis_original_size
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
@@ -171,6 +172,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 expert_gate=self.shared_expert_gate,
                 is_sequence_parallel=self.is_sequence_parallel,
                 prefix=f"{prefix}.shared_expert",
+                loaded_intermediate_size=get_virtual_tp_axis_original_size(
+                    "shared_expert_intermediate_size",
+                    config.shared_expert_intermediate_size,
+                    config=config,
+                ),
             )
 
         self.experts = FusedMoEFactory(
@@ -261,6 +267,16 @@ class Qwen3NextAttention(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        loaded_num_heads = get_virtual_tp_axis_original_size(
+            "attention_heads",
+            self.total_num_heads,
+            config=config,
+        )
+        loaded_num_kv_heads = get_virtual_tp_axis_original_size(
+            "kv_heads",
+            self.total_num_kv_heads,
+            config=config,
+        )
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -270,6 +286,8 @@ class Qwen3NextAttention(nn.Module):
             bias=getattr(config, "qkv_bias", False),
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            loaded_total_num_heads=loaded_num_heads * (1 + self.attn_output_gate),
+            loaded_total_num_kv_heads=loaded_num_kv_heads,
         )
 
         self.o_proj = RowParallelLinear(
@@ -461,6 +479,11 @@ class Qwen3NextDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                loaded_intermediate_size=get_virtual_tp_axis_original_size(
+                    "dense_intermediate_size",
+                    config.intermediate_size,
+                    config=config,
+                ),
             )
 
         self.input_layernorm = Qwen3NextRMSNorm(

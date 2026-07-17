@@ -23,6 +23,7 @@ from torch import nn
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.attention import IndexerKVDType
 from vllm.config.cache import CacheDType
+from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -215,6 +216,50 @@ class MiniMaxM3IndexerMetadata(AttentionMetadata):
     decode: MiniMaxM3IndexerDecodeMetadata | None = None
 
 
+def _get_minimax_m3_virtual_tp_index_heads(
+    vllm_config: VllmConfig,
+    tp_size: int,
+) -> int | None:
+    model_config = vllm_config.model_config
+    if model_config is None:
+        return None
+
+    hf_config = getattr(model_config, "hf_config", None)
+    for config in (
+        getattr(model_config, "hf_text_config", None),
+        hf_config,
+        getattr(hf_config, "text_config", None),
+    ):
+        plan = getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
+        if not isinstance(plan, dict) or plan.get("model_type") != "minimax_m3":
+            continue
+        axis = plan.get("index_heads")
+        if not isinstance(axis, dict):
+            raise ValueError("MiniMax M3 virtual TP plan missing 'index_heads'.")
+        if int(axis.get("tp_size", -1)) != tp_size:
+            continue
+        return int(axis["local_size"])
+    return None
+
+
+def _get_minimax_m3_indexer_num_heads(
+    vllm_config: VllmConfig,
+    total_index_heads: int,
+    tp_size: int,
+) -> int:
+    virtual_tp_index_heads = _get_minimax_m3_virtual_tp_index_heads(
+        vllm_config, tp_size
+    )
+    if virtual_tp_index_heads is not None:
+        return virtual_tp_index_heads
+
+    if total_index_heads >= tp_size:
+        assert total_index_heads % tp_size == 0
+    else:
+        assert tp_size % total_index_heads == 0
+    return max(1, total_index_heads // tp_size)
+
+
 class MiniMaxM3IndexerMetadataBuilder(
     AttentionMetadataBuilder[MiniMaxM3IndexerMetadata]
 ):
@@ -241,11 +286,9 @@ class MiniMaxM3IndexerMetadataBuilder(
         # Index-query head count from model config (cache spec has 1 vec/token).
         total_index_heads = sparse_cfg["sparse_num_index_heads"]
         tp_size = get_tensor_model_parallel_world_size()
-        if total_index_heads >= tp_size:
-            assert total_index_heads % tp_size == 0
-        else:
-            assert tp_size % total_index_heads == 0
-        self.num_index_heads = max(1, total_index_heads // tp_size)
+        self.num_index_heads = _get_minimax_m3_indexer_num_heads(
+            vllm_config, total_index_heads, tp_size
+        )
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         assert self.reorder_batch_threshold is not None
         self.max_decode_query_len = self.reorder_batch_threshold
