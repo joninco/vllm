@@ -20,6 +20,7 @@ def test_deepseek_v4_c128a_dynamic_topk_packed_buffers():
         positions=torch.tensor([255, 511], dtype=torch.int64, device=device),
         compress_ratio=128,
         num_decode_tokens=1,
+        actual_num_query_tokens=2,
         token_to_req_indices=torch.tensor([0, 0], dtype=torch.int32, device=device),
         block_table=torch.tensor([[3]], dtype=torch.int32, device=device),
         block_size=capacity_width,

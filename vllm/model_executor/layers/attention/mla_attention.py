@@ -202,6 +202,7 @@ return curr_o @ W_O
 import functools
 import itertools
 import math
+import os
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -307,6 +308,11 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def _extract_single_layer_index(layer_name: str) -> int | None:
+    int_vals = [int(part) for part in layer_name.split(".") if part.isdecimal()]
+    return int_vals[0] if len(int_vals) == 1 else None
 
 
 def _match_merge_strides(
@@ -1308,6 +1314,38 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        layer_id = _extract_single_layer_index(self.layer_name)
+        num_hidden_layers = getattr(
+            vllm_config.model_config.hf_config, "num_hidden_layers", None
+        )
+        shard_draft = os.environ.get("VLLM_DCP_SHARD_DRAFT", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        dcp_replicated = (
+            not shard_draft
+            and layer_id is not None
+            and num_hidden_layers is not None
+            and layer_id >= int(num_hidden_layers)
+        )
+        model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        target_model_config = getattr(speculative_config, "target_model_config", None)
+        target_model_type = (
+            getattr(target_model_config.hf_config, "model_type", None)
+            if target_model_config is not None
+            else None
+        )
+        glm_model_or_mtp = bool(
+            model_type == "glm_moe_dsa"
+            or (model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa")
+        )
+        glm_fp8_rope = bool(
+            os.environ.get("KV_FP8_ROPE", "0") == "1"
+            and self.kv_cache_dtype == "nvfp4_ds_mla"
+            and glm_model_or_mtp
+        )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -1316,6 +1354,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+            model_version="glm_fp8_rope" if glm_fp8_rope else None,
+            dcp_replicated=dcp_replicated,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):

@@ -43,7 +43,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import (
     empty_exponential_noise_like,
@@ -63,6 +67,7 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+from vllm.v1.worker.gpu.spec_decode.dflash.utils import maybe_load_mask_embedding
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -168,6 +173,8 @@ class SpecDecodeBaseProposer:
 
         self.draft_attn_groups: list[AttentionGroup] = []
         self.kv_cache_gid: int = -1
+        self._draft_layer_to_kv_cache_gid: dict[str, int] = {}
+        self._draft_kv_cache_group_ids: list[int] = []
         self.eagle3_use_aux_hidden_state: bool = (
             self._get_eagle3_use_aux_hidden_state_from_config()
         )
@@ -1335,38 +1342,46 @@ class SpecDecodeBaseProposer:
         Subclasses may override to apply additional config changes.
         """
         spec_cfg = self.speculative_config
-        base = self.vllm_config
+        config = replace(
+            self.vllm_config,
+            parallel_config=replace(
+                spec_cfg.draft_parallel_config,
+                rank=self.vllm_config.parallel_config.rank,
+            ),
+            model_config=spec_cfg.draft_model_config,
+        )
 
         if spec_cfg.moe_backend is not None:
-            base = replace(
-                base,
+            config = replace(
+                config,
                 kernel_config=replace(
-                    base.kernel_config,
+                    config.kernel_config,
                     moe_backend=spec_cfg.moe_backend,
+                ),
+            )
+
+        if spec_cfg.kv_cache_dtype is not None:
+            config = replace(
+                config,
+                cache_config=replace(
+                    config.cache_config,
+                    cache_dtype=spec_cfg.kv_cache_dtype,
                 ),
             )
 
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
         # unless explicitly specified in the speculative config.
-        base = replace(
-            base,
+        draft_backend = spec_cfg.attention_backend
+        config = replace(
+            config,
             attention_config=replace(
-                base.attention_config,
-                backend=spec_cfg.attention_backend,
+                config.attention_config,
+                backend=draft_backend,
             ),
         )
 
-        if spec_cfg.kv_cache_dtype is not None:
-            base = replace(
-                base,
-                cache_config=replace(
-                    base.cache_config,
-                    cache_dtype=spec_cfg.kv_cache_dtype,
-                ),
-            )
-
-        return base
+        return config
 
     def _get_model(self) -> nn.Module:
         """
@@ -1470,6 +1485,7 @@ class SpecDecodeBaseProposer:
 
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
+        self._maybe_load_parallel_drafting_mask_embedding()
 
         if (
             self.parallel_drafting
@@ -1485,6 +1501,15 @@ class SpecDecodeBaseProposer:
                 )
             else:
                 self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
+
+    def _maybe_load_parallel_drafting_mask_embedding(self) -> None:
+        if not self.parallel_drafting:
+            return
+        maybe_load_mask_embedding(
+            self.model,
+            self.draft_model_config.model,
+            self.parallel_drafting_token_id,
+        )
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
@@ -1783,6 +1808,9 @@ class SpecDecodeBaseProposer:
             == 1
         ), "All drafting layers should belong to the same kv cache group"
 
+    def allow_multiple_draft_kv_cache_groups(self) -> bool:
+        return False
+
     def initialize_attn_backend(
         self,
         kv_cache_config: KVCacheConfig,
@@ -1797,50 +1825,65 @@ class SpecDecodeBaseProposer:
             AttentionLayerBase,  # type: ignore[type-abstract]
         )
 
-        # Find which kv_cache_group the draft layers belong to
-        self.validate_same_kv_cache_group(kv_cache_config)
-        kv_cache_spec = None
-        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-            if self._draft_attn_layer_names & set(group.layer_names):
-                self.kv_cache_gid = gid
-                kv_cache_spec = group.kv_cache_spec
-                break
+        self._draft_layer_to_kv_cache_gid = {
+            layer_name: gid
+            for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+            if layer_name in self._draft_attn_layer_names
+        }
+        missing_layers = self._draft_attn_layer_names - set(
+            self._draft_layer_to_kv_cache_gid
+        )
+        assert not missing_layers, (
+            "Draft attention layers are missing from KV cache groups: "
+            f"{sorted(missing_layers)}"
+        )
+        self._draft_kv_cache_group_ids = sorted(
+            set(self._draft_layer_to_kv_cache_gid.values())
+        )
+        if not self.allow_multiple_draft_kv_cache_groups():
+            assert len(self._draft_kv_cache_group_ids) == 1, (
+                "All drafting layers should belong to the same kv cache group"
+            )
+        self.kv_cache_gid = self._draft_kv_cache_group_ids[0]
 
-        attention_groups: dict[tuple[str, str], AttentionGroup] = {}
-        if kv_cache_spec is not None:
-            # _draft_attn_layer_names is a set; iterate in sorted order so
-            # that attention_groups (and anything derived from its first
-            # element) is deterministic across processes.
-            for layer_name in sorted(self._draft_attn_layer_names):
-                attn_backend = all_attn_layers[layer_name].get_attn_backend()
-                backend_key = attn_backend.full_cls_name()
-                if backend_key not in attention_groups:
-                    layer_kv_cache_spec = kv_cache_spec
-                    if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                        layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
-                            layer_name
-                        ]
+        attention_groups: dict[
+            tuple[int, tuple[str, str], KVCacheSpec, tuple[Any, ...]], AttentionGroup
+        ] = {}
+        # _draft_attn_layer_names is a set; iterate in sorted order so group
+        # construction and the primary draft group are deterministic.
+        for layer_name in sorted(self._draft_attn_layer_names):
+            gid = self._draft_layer_to_kv_cache_gid[layer_name]
+            kv_cache_spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec
+            layer_kv_cache_spec = kv_cache_spec
+            if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-                    kernel_block_size = (
-                        kernel_block_sizes[self.kv_cache_gid]
-                        if kernel_block_sizes is not None
-                        and self.kv_cache_gid < len(kernel_block_sizes)
-                        else None
-                    )
-                    attn_group = AttentionGroup(
-                        backend=attn_backend,
-                        layer_names=[layer_name],
-                        kv_cache_spec=layer_kv_cache_spec,
-                        kv_cache_group_id=self.kv_cache_gid,
-                    )
-                    attn_group.create_metadata_builders(
-                        self.vllm_config,
-                        self.device,
-                        kernel_block_size=kernel_block_size,
-                    )
-                    attention_groups[backend_key] = attn_group
-                else:
-                    attention_groups[backend_key].layer_names.append(layer_name)
+            attn_layer = all_attn_layers[layer_name]
+            attn_backend = attn_layer.get_attn_backend()
+            backend_key = attn_backend.full_cls_name()
+            metadata_group_key = attn_backend.get_metadata_group_key(attn_layer)
+            group_key = (gid, backend_key, layer_kv_cache_spec, metadata_group_key)
+            if group_key not in attention_groups:
+                kernel_block_size = (
+                    kernel_block_sizes[gid]
+                    if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
+                    else None
+                )
+                attn_group = AttentionGroup(
+                    backend=attn_backend,
+                    layer_names=[layer_name],
+                    kv_cache_spec=layer_kv_cache_spec,
+                    kv_cache_group_id=gid,
+                )
+                attn_group.create_metadata_builders(
+                    self.vllm_config,
+                    self.device,
+                    kernel_block_size=kernel_block_size,
+                )
+                attention_groups[group_key] = attn_group
+            else:
+                attention_groups[group_key].layer_names.append(layer_name)
 
         self.draft_attn_groups = list(attention_groups.values())
         if kernel_block_sizes is not None and 0 <= self.kv_cache_gid < len(

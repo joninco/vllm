@@ -103,9 +103,8 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
         placeholders
     - aux_hidden_state_layer_ids (required): Layer indices from the target
         model whose intermediate hidden states are used as context for the
-        DFlash drafter. Mapped to both eagle_aux_hidden_state_layer_ids
-        (for gpu_model_runner) and dflash_config.target_layer_ids (for the
-        DFlash model).
+        DFlash drafter. Checkpoint indices are retained for the DFlash model
+        and shifted for the runner's hidden-state indexing convention.
     - sample_from_anchor: Whether to sample from the anchor position. Default
         False (anchor is a bonus token, only mask tokens predict, yielding
         block_size - 1 speculative tokens).
@@ -114,14 +113,26 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
     pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
     if config_dict.get("target_hidden_size") is not None:
         pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
+    for key in (
+        "layer_types",
+        "use_sliding_window",
+        "sliding_window",
+        "max_window_layers",
+    ):
+        if key in config_dict:
+            pre_trained_config[key] = config_dict[key]
 
+    # DFlash checkpoints store 0-based target layer ids (see #40727); keep
+    # them unchanged in dflash_config.target_layer_ids. The runner-facing
+    # eagle_aux_hidden_state_layer_ids use HF hidden_states indexing, where
+    # the output of layer i is hidden_states[i + 1], hence the +1 shift.
     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
-    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
-
-    # DFlash configs use different indexing for the target layers, see #40727
+    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = [
+        i + 1 for i in aux_layer_ids
+    ]
     pre_trained_config["dflash_config"] = {
         "mask_token_id": config_dict["mask_token_id"],
-        "target_layer_ids": [i - 1 for i in aux_layer_ids],
+        "target_layer_ids": list(aux_layer_ids),
         "sample_from_anchor": config_dict.get("sample_from_anchor", False),
     }
     # Enable causal masking in SWA for vllm-project/speculators models

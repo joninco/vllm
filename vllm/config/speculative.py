@@ -332,6 +332,17 @@ class SpeculativeConfig:
                 "eagle_aux_hidden_state_layer_ids",
                 None,
             )
+            if layer_ids is None:
+                # DFlash checkpoints declare 0-based target layer ids; the
+                # captured aux ids are shifted by one (hidden_states[0] is the
+                # embedding output), matching eagle3_utils.
+                dflash_config = (
+                    getattr(self.draft_model_config.hf_config, "dflash_config", None)
+                    or {}
+                )
+                target_layer_ids = dflash_config.get("target_layer_ids")
+                if target_layer_ids is not None:
+                    layer_ids = [int(i) + 1 for i in target_layer_ids]
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))

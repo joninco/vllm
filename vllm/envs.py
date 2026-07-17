@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS: int = 1024
     VLLM_DCP_A2A_MAX_TOKENS: int = 0
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
+    VLLM_DCP_SHARD_DRAFT: str | None = None
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1091,6 +1092,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DCP_A2A_LARGE_BACKEND": lambda: os.getenv(
         "VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs"
     ),
+    # Shard the draft model's DCP caches like the target model. Truthy values:
+    # "1"/"true"/"yes". Unset picks a per-call-site default: sharded for the
+    # target indexer cache and native MTP drafts, replicated for external
+    # (Eagle-style) drafts.
+    "VLLM_DCP_SHARD_DRAFT": lambda: os.getenv("VLLM_DCP_SHARD_DRAFT", None),
     # Under DCP, merge sparse-indexer candidates across ranks and select a
     # global top-k instead of retaining each rank's local top-k.
     "VLLM_DCP_GLOBAL_TOPK": lambda: (

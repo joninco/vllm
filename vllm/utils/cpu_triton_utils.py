@@ -219,6 +219,7 @@ def _copy_and_expand_dflash_inputs_kernel_impl(
     num_query_per_req,
     num_speculative_tokens,
     total_input_tokens,
+    PAD_SLOT_ID=-1,
     BLOCK_SIZE=None,
     HAS_NUM_REJECTED=False,
 ):
@@ -307,6 +308,9 @@ def _copy_and_expand_dflash_inputs_kernel_impl(
                 if query_off > 0:
                     sample_out_idx = req_idx * num_speculative_tokens + (query_off - 1)
                     out_token_indices_ptr[sample_out_idx] = query_out
+
+    context_slots = out_context_slot_mapping_i64[:total_input_tokens]
+    context_slots.masked_fill_(context_slots < block_size, PAD_SLOT_ID)
 
     if orig_ids_dtype != torch.int64:
         out_input_ids_ptr.copy_(out_ids_i64.to(orig_ids_dtype))

@@ -2621,6 +2621,14 @@ class GPUModelRunner(
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
+        dflash_drafter = (
+            self.drafter
+            if self.speculative_config and isinstance(self.drafter, DFlashProposer)
+            else None
+        )
+        if dflash_drafter is not None:
+            dflash_drafter.clear_draft_block_tables()
+
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
@@ -2635,6 +2643,11 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+
+            if dflash_drafter is not None:
+                dflash_drafter.set_draft_block_table(
+                    kv_cache_gid, cm.block_table_tensor
+                )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
@@ -5631,12 +5644,12 @@ class GPUModelRunner(
             eagle_config = getattr(hf_config, "eagle_config", None)
 
             if dflash_config and isinstance(dflash_config, dict):
-                # Add 1 to convert DFlash's aux layer id semantics
+                # Add 1 to convert DFlash's aux layer id semantics.
                 layer_ids = [
                     i + 1 for i in (dflash_config.get("target_layer_ids") or [])
                 ]
 
-            if eagle_config and isinstance(eagle_config, dict):
+            if not layer_ids and eagle_config and isinstance(eagle_config, dict):
                 layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):
