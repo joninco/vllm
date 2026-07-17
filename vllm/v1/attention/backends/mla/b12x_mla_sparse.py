@@ -324,6 +324,13 @@ class B12xMLASparseMetadata(AttentionMetadata):
     num_actual_tokens: int
     num_decode_tokens: int
     num_prefill_tokens: int
+    # Decode/prefill request counts and the prefill max seq len, part of the
+    # MLAAttention.forward_impl metadata contract. B12X routes every token
+    # through the top-k MQA path (supports_dense_mha_prefill = False), so
+    # prefill_max_seq_len only feeds the (dead) dense-MHA routing check.
+    num_decodes: int
+    num_prefills: int
+    prefill_max_seq_len: int
 
     query_start_loc: torch.Tensor
     slot_mapping: torch.Tensor
@@ -413,10 +420,12 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
         if cm.max_query_len <= 1 and num_tokens == cm.num_reqs:
+            num_decodes = cm.num_reqs
+            num_prefills = 0
             num_decode_tokens = num_tokens
             num_prefill_tokens = 0
         elif cm.batch_topology is not None:
-            _, _, num_decode_tokens, num_prefill_tokens = (
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 cm.batch_topology.split_decodes_and_prefills(
                     cm,
                     decode_threshold=1,
@@ -424,10 +433,12 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 )
             )
         else:
-            _, _, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
-                cm,
-                decode_threshold=1,
-                treat_short_extends_as_decodes=True,
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(
+                    cm,
+                    decode_threshold=1,
+                    treat_short_extends_as_decodes=True,
+                )
             )
         assert num_decode_tokens + num_prefill_tokens == num_tokens
 
@@ -557,6 +568,9 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             num_actual_tokens=num_tokens,
             num_decode_tokens=num_decode_tokens,
             num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            prefill_max_seq_len=cm.max_seq_len if num_prefills > 0 else 0,
             query_start_loc=cm.query_start_loc,
             slot_mapping=cm.slot_mapping,
             block_table=cm.block_table_tensor,
@@ -584,6 +598,9 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
     is_sparse: bool = True
     can_return_lse_for_decode: bool = True
+    # B12X handles decode and extend inside its own top-k MQA kernels; the
+    # generic dense-MHA prefill path assumes cache layouts it never validated.
+    supports_dense_mha_prefill: bool = False
     supports_dcp_project_before_merge: bool = True
     supports_dcp_gather_query_in_workspace: bool = True
     supports_dcp_project_before_merge_in_workspace: bool = True
