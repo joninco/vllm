@@ -223,6 +223,12 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+    VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
+    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
+    VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA: bool = True
+    VLLM_PCIE_ONESHOT_SINGLE_CHANNEL: bool = True
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
@@ -1785,6 +1791,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
         "auto",
         ["auto", "trtllm", "mnnvl"],
+    ),
+    # Opt in to the b12x PCIe oneshot custom allreduce path on PCIe-only GPUs.
+    "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
+    ),
+    "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
+        "VLLM_PCIE_ALLREDUCE_BACKEND",
+        "cpp",
+        ["b12x", "cpp"],
+    ),
+    # Max input size for the b12x PCIe oneshot allreduce dispatch.
+    # Accepts raw bytes or a KB/MB suffix (e.g. "84KB").
+    "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
+    ),
+    # Max input size for the b12x PCIe fused allreduce+add_rms_norm dispatch.
+    "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
+    ),
+    # Allow the b12x PCIe oneshot allreduce on cross-NUMA PCIe topologies.
+    "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA": lambda: (
+        os.getenv("VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA", "1") != "0"
+    ),
+    # Use a single channel for the b12x PCIe oneshot allreduce.
+    "VLLM_PCIE_ONESHOT_SINGLE_CHANNEL": lambda: (
+        os.getenv("VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", "1").strip().lower()
+        not in ("", "0", "false", "no", "off")
     ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
