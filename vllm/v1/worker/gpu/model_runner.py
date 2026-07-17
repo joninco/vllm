@@ -418,6 +418,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_speculative_tokens=self.decode_query_len,
                 use_fp64_gumbel=self.model_config.use_fp64_gumbel,
                 reasoning_config=self.vllm_config.reasoning_config,
+                seed=self.model_config.seed,
             )
             custom = self.model_state.custom_sampler(self.sampler)
 
@@ -595,6 +596,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 self.attn_groups,
             )
+            if hasattr(self.speculator, "set_num_cached_tokens"):
+                # DFlash/DSpark mask cache-restored tokens out of the draft's
+                # context (their draft context KV was never computed).
+                self.speculator.set_num_cached_tokens(
+                    self.req_states.num_cached_tokens.gpu,
+                    self.req_states.num_cached_tokens_np,
+                )
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
@@ -915,7 +923,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
-        for req_id in finished_req_ids:
+        # A set's order can differ across TP processes. Recycle slots in a
+        # deterministic order so request-to-slot state stays rank-aligned.
+        for req_id in sorted(finished_req_ids):
             self._remove_request(req_id)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
