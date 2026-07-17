@@ -186,6 +186,16 @@ class ParserEngine(Parser):
         """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
         return
 
+    def is_reasoning_end_for_prompt(self, input_ids: Sequence[int]) -> bool:
+        """See :meth:`ReasoningParser.is_reasoning_end_for_prompt`.
+
+        ParserEngine-backed parsers use the same default as ReasoningParser:
+        the rendered prompt is treated as proving reasoning has ended when the
+        normal generated-token state check says so. Parsers with adaptive
+        prompt templates can override this on the concrete engine class.
+        """
+        return self.is_reasoning_end(list(input_ids))
+
     def finish_streaming(self) -> DeltaMessage | None:
         events = self._engine.finish()
         if events or self._deferred_content:
