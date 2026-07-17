@@ -419,6 +419,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
         self.decode_threshold = 1 + self.num_speculative_tokens
         self.reorder_batch_threshold = None
+        self._skip_tile_scheduler_platform = (
+            current_platform.is_rocm()
+            or current_platform.is_xpu()
+            or current_platform.is_device_capability_family(120)
+        )
         parallel_config = self.vllm_config.parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
@@ -489,12 +494,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # DSpark draft: the block is non-causal (every query attends to the
         # trailing window of context PLUS all query tokens, including future ones),
-        # so its per-token index list is wider than `window_size`. The kernel pads
-        # the q-head count to B_TOPK (64/128), which requires the index width to be
-        # a multiple of 128.
+        # so its per-token index list is wider than `window_size`. SM120's FP8
+        # DSv4 kernels instantiate widths 128, 512, and 1024; the natural width
+        # for the released 128+5 block is 256, so pad it to the next supported
+        # width. decode_swa_lens keeps the padding out of the attention result.
         self.is_dspark = spec_config is not None and spec_config.use_dspark()
         self.noncausal_index_width = (
-            cdiv(self.window_size + self.num_speculative_tokens, 128) * 128
+            cdiv(self.window_size + self.num_speculative_tokens, 512) * 512
             if self.is_dspark
             else 0
         )
@@ -738,12 +744,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
         }
-        if (
-            num_decode_tokens == 0
-            or current_platform.is_rocm()
-            or current_platform.is_xpu()
-            or current_platform.is_device_capability_family(120)
-        ):
+        # SM120 (consumer Blackwell) drives DSV4 MLA through b12x, which does not
+        # use the FlashMLA tile scheduler; skip the planner (and its _flashmla_C
+        # dependency, which is not built for sm_120a).
+        if num_decode_tokens == 0 or self._skip_tile_scheduler_platform:
             return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that

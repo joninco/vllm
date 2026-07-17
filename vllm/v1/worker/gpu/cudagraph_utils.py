@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,6 +11,10 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+from vllm.compilation.b12x_capture import (
+    b12x_cuda_graph_prewarm_enabled,
+    guard_b12x_kernel_resolution,
+)
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -389,6 +394,12 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
+                        if b12x_cuda_graph_prewarm_enabled():
+                            # B12X kernels use caller-owned scratch views in
+                            # the CuTe launcher contract. Re-warm the exact
+                            # fresh state that FULL capture will use, so CUDA
+                            # graph capture only records resolved launches.
+                            forward_fn(CUDAGraphMode.NONE)
                         graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
@@ -398,6 +409,9 @@ class CudaGraphManager:
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
                         with (
+                            guard_b12x_kernel_resolution(
+                                "vLLM full CUDA graph capture after B12X warmup"
+                            ),
                             vllm_cudagraph_capture_scope(),
                             torch.cuda.graph(graph, self.pool),
                         ):
@@ -445,6 +459,8 @@ class CudaGraphManager:
             f"Expected FULL mode, got {desc.cg_mode}"
         )
         assert desc in self.graphs, f"No cudagraph for {desc}"
+        if os.getenv("VLLM_DEBUG_B12X_MINIMAX_M3_MSA", "0") == "1":
+            logger.warning("Replaying FULL CUDA graph: %s", desc)
         # Sync offloader before replay - needed when transitioning from
         # eager/piecewise to full cudagraph (e.g., prefill → decode).
         # The previous eager iteration's start_prefetch may have queued

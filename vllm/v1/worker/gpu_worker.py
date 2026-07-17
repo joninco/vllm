@@ -847,6 +847,8 @@ class Worker(WorkerBase):
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
 
+        os.environ["B12X_VLLM_ENGINE_STARTED"] = "1"
+
         activate_jit_monitor(
             mode=self.observability_config.jit_monitor_mode,
             verbose=self.observability_config.jit_monitor_verbose,

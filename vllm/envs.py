@@ -57,13 +57,23 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_USE_B12X_SPARSE_INDEXER: bool = False
+    VLLM_USE_B12X_MHC: bool = False
+    VLLM_USE_B12X_FP8_GEMM: bool = False
+    VLLM_USE_B12X_WO_PROJECTION: bool = False
+    VLLM_USE_B12X_MOE: bool = False
+    VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
+    VLLM_USE_B12X_DCP_A2A: bool = False
     VLLM_DCP_PROJECT_BEFORE_MERGE: bool = False
     VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS: int = 1024
+    VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE: bool = False
     VLLM_DCP_A2A_MAX_TOKENS: int = 0
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
+    VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
+    VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -1071,6 +1081,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Use b12x for the DeepSeek V4 C4 sparse indexer and its top-k selection.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
+    ),
+    # Use b12x for DeepSeek V4 mHC pre/post residual mixing.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_MHC": lambda: bool(int(os.getenv("VLLM_USE_B12X_MHC", "0"))),
+    # Use b12x for block-scaled FP8 linear GEMMs.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_FP8_GEMM": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_FP8_GEMM", "0"))
+    ),
+    # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
+    # This is separate from the generic FP8 linear switch for perf isolation.
+    "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_WO_PROJECTION", "0"))
+    ),
+    # Use b12x for FP4 MoE experts.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_MOE": lambda: bool(int(os.getenv("VLLM_USE_B12X_MOE", "0"))),
+    # Use b12x for MiniMax M3's block-sparse MSA attention.
+    # This is opt-in while page-128 MSA support is integrated.
+    "VLLM_USE_B12X_MINIMAX_M3_MSA": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_MINIMAX_M3_MSA", "0"))
+    ),
+    # Use b12x PCIe collectives for DCP query gather and output reduction.
+    "VLLM_USE_B12X_DCP_A2A": lambda: bool(int(os.getenv("VLLM_USE_B12X_DCP_A2A", "0"))),
     # Project rank-local sparse MLA partials before their DCP merge. This is
     # opt-in until the guarded TP4 path has been benchmarked against baseline.
     "VLLM_DCP_PROJECT_BEFORE_MERGE": lambda: bool(
@@ -1080,6 +1118,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CUDA graph capture size so the weight gather remains eager-only.
     "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS": lambda: int(
         os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS", "1024")
+    ),
+    # Reuse the B12X sparse-MLA query/scratch buffers for the guarded TP4/DCP4
+    # eager prefill path. The old name is retained for v1.3 compatibility.
+    "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE",
+                os.getenv("B12X_MLA_DCP_GATHER_IN_WORKSPACE", "0"),
+            )
+        )
     ),
     # Token cap for the low-latency DCP A2A exchange (0 = uncapped). Batches
     # with more tokens than this bypass the one-shot A2A/B12X path, which is
@@ -1107,6 +1155,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fail-closed in the model until the no-break path is validated.
     "VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE": lambda: bool(
         int(os.getenv("VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE", "0"))
+    ),
+    # Re-run every B12X piecewise subgraph eagerly immediately before capture.
+    # PIECEWISE descriptors already receive an eager full-forward warmup before
+    # capture, so this remains opt-in for debugging kernels that still need it.
+    "VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM": lambda: bool(
+        int(os.getenv("VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM", "0"))
+    ),
+    # Force DeepSeek V4 native MXFP4/E8M0 MoE weights through b12x's
+    # native/modelopt-layout W4A16 prep path.
+    "VLLM_B12X_MOE_FORCE_MODELOPT_PREP": lambda: bool(
+        int(os.getenv("VLLM_B12X_MOE_FORCE_MODELOPT_PREP", "0"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

@@ -20,17 +20,351 @@ Reference: https://arxiv.org/abs/2507.07120
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.common import mask_dcp_empty_shards_
 
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
     from vllm.v1.attention.ops.common import CPTritonContext
+
+
+logger = init_logger(__name__)
+
+_B12X_DCP_A2A_POOLS: dict[tuple[int, int, int, int, int, int], Any] = {}
+_B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
+
+
+@lru_cache(maxsize=1)
+def _load_b12x_dcp_a2a_pool() -> Any | None:
+    try:
+        from b12x.distributed import PCIeDCPA2APool
+    except Exception:
+        return None
+    return PCIeDCPA2APool
+
+
+def _b12x_dcp_init_failed(
+    cp_group: GroupCoordinator,
+    device: torch.device,
+    init_error: Exception | None,
+) -> bool:
+    """Reach consensus on pool initialization through its exchange group."""
+    failed = torch.tensor(
+        [int(init_error is not None)], dtype=torch.int32, device=device
+    )
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=cp_group.device_group)
+    return bool(failed.item())
+
+
+def _get_b12x_dcp_a2a_pool(
+    cp_group: GroupCoordinator,
+    *,
+    device: torch.device,
+    total_heads: int,
+    head_dim: int,
+    query_head_dim: int,
+    max_batch_size: int,
+) -> Any | None:
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    key = (
+        id(cp_group.device_group),
+        int(device_index),
+        int(total_heads),
+        int(head_dim),
+        int(query_head_dim),
+        int(max_batch_size),
+    )
+    if key in _B12X_DCP_A2A_DISABLED:
+        return None
+
+    pool = _B12X_DCP_A2A_POOLS.get(key)
+    if pool is not None:
+        return pool
+
+    # IPC allocation and handle exchange are not capture-safe. Dedicated
+    # kernel warmup normally initializes this channel before graph capture.
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    pool_cls = _load_b12x_dcp_a2a_pool()
+    if pool_cls is None:
+        _B12X_DCP_A2A_DISABLED.add(key)
+        return None
+
+    init_error: Exception | None = None
+    try:
+        pool = pool_cls.from_exchange_group(
+            exchange_group=cp_group.device_group,
+            device=device,
+            max_batch_size=max_batch_size,
+            total_heads=total_heads,
+            head_dim=head_dim,
+            query_head_dim=query_head_dim,
+            single_channel=True,
+        )
+        pool.for_stream()
+    except Exception as exc:
+        init_error = exc
+
+    # Keep the status collective ordered with the NCCL group used above for
+    # IPC-handle exchange. A separate Gloo group can be at a different startup
+    # sequence when vLLM initializes overlapping TP/DCP coordinators.
+    any_failed = _b12x_dcp_init_failed(cp_group, device, init_error)
+
+    if any_failed:
+        if pool is not None:
+            pool.close()
+        _B12X_DCP_A2A_DISABLED.add(key)
+        if init_error is not None:
+            logger.warning(
+                "B12X PCIe DCP collective initialization failed; falling "
+                "back to NCCL: %s",
+                init_error,
+            )
+        return None
+
+    assert pool is not None
+    _B12X_DCP_A2A_POOLS[key] = pool
+    logger.info(
+        "Using B12X PCIe DCP collectives "
+        "(world_size=%d, max_batch_size=%d, heads=%d, "
+        "query_head_dim=%d, output_head_dim=%d).",
+        cp_group.world_size,
+        max_batch_size,
+        total_heads,
+        query_head_dim,
+        head_dim,
+    )
+    return pool
+
+
+def _try_b12x_dcp_lse_reduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    return_lse: bool,
+    is_lse_base_on_e: bool,
+    max_batch_size: int | None,
+    query_head_dim: int | None,
+) -> torch.Tensor | None:
+    """Use the low-latency B12X PCIe path when its contract is satisfied."""
+    world_size = cp_group.world_size
+    if (
+        return_lse
+        or not cp_attn_out.is_cuda
+        or cp_attn_out.dtype not in (torch.float16, torch.bfloat16)
+        or cp_attn_lse.dtype != torch.float32
+        or world_size not in (2, 4, 8)
+        or cp_attn_out.ndim != 3
+        or cp_attn_lse.shape != cp_attn_out.shape[:2]
+    ):
+        return None
+
+    batch, total_heads, head_dim = cp_attn_out.shape
+    if total_heads % world_size != 0 or head_dim % 8 != 0:
+        return None
+
+    if max_batch_size is None:
+        max_batch_size = batch
+    max_batch_size = int(max_batch_size)
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    if token_cap > 0:
+        # Deliberate hybrid dispatch: batches above the cap take a pipelined
+        # NCCL collective instead, and the staging pool shrinks to the cap.
+        if batch > token_cap:
+            return None
+        max_batch_size = min(max_batch_size, token_cap)
+    if max_batch_size < 1:
+        return None
+    if query_head_dim is None:
+        query_head_dim = head_dim
+    query_head_dim = int(query_head_dim)
+    if query_head_dim <= 0 or query_head_dim % 8 != 0:
+        return None
+
+    pool = _get_b12x_dcp_a2a_pool(
+        cp_group,
+        device=cp_attn_out.device,
+        total_heads=total_heads,
+        head_dim=head_dim,
+        query_head_dim=query_head_dim,
+        max_batch_size=max_batch_size,
+    )
+    if pool is None:
+        return None
+
+    if batch > max_batch_size:
+        logger.warning_once(
+            "B12X PCIe DCP A2A received batch=%d beyond its configured "
+            "max_batch_size=%d; falling back to NCCL.",
+            batch,
+            max_batch_size,
+        )
+        return None
+
+    # Sparse MLA backends can return head-sliced views (e.g. GLM TP6 pads
+    # 64 -> 66 heads and slices the kernel output back), and the PCIe pool
+    # requires contiguous operands. The NCCL packers take explicit strides,
+    # so only this fast path needs the copy; LSE is tiny and the output is
+    # already contiguous on unpadded head counts.
+    if not cp_attn_out.is_contiguous():
+        cp_attn_out = cp_attn_out.contiguous()
+    if not cp_attn_lse.is_contiguous():
+        cp_attn_lse = cp_attn_lse.contiguous()
+
+    return pool.lse_reduce_scatter(
+        cp_attn_out,
+        cp_attn_lse,
+        is_lse_base_on_e=is_lse_base_on_e,
+    )
+
+
+def _try_b12x_dcp_all_gather_heads(
+    local_input: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    max_batch_size: int | None,
+    output_head_dim: int | None,
+) -> torch.Tensor | None:
+    """Gather rank-local query heads with the B12X PCIe channel."""
+    world_size = cp_group.world_size
+    if (
+        not local_input.is_cuda
+        or local_input.dtype not in (torch.float16, torch.bfloat16)
+        or world_size not in (2, 4, 8)
+        or local_input.ndim != 3
+        or not local_input.is_contiguous()
+    ):
+        return None
+
+    batch, local_heads, head_dim = local_input.shape
+    if local_heads <= 0 or head_dim % 8 != 0:
+        return None
+    if max_batch_size is None:
+        max_batch_size = batch
+    max_batch_size = int(max_batch_size)
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    if token_cap > 0:
+        if batch > token_cap:
+            return None
+        max_batch_size = min(max_batch_size, token_cap)
+    if max_batch_size < 1 or batch > max_batch_size:
+        return None
+    if output_head_dim is None:
+        output_head_dim = head_dim
+    output_head_dim = int(output_head_dim)
+    if output_head_dim <= 0 or output_head_dim % 8 != 0:
+        return None
+
+    pool = _get_b12x_dcp_a2a_pool(
+        cp_group,
+        device=local_input.device,
+        total_heads=local_heads * world_size,
+        head_dim=output_head_dim,
+        query_head_dim=head_dim,
+        max_batch_size=max_batch_size,
+    )
+    if pool is None:
+        return None
+    return pool.all_gather_heads(local_input)
+
+
+def dcp_b12x_all_gather_heads(
+    local_input: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    max_batch_size: int | None = None,
+    output_head_dim: int | None = None,
+) -> torch.Tensor:
+    """Gather query heads with B12X, falling back to the group backend."""
+    local_input = local_input.contiguous()
+    if envs.VLLM_USE_B12X_DCP_A2A:
+        result = _try_b12x_dcp_all_gather_heads(
+            local_input,
+            cp_group,
+            max_batch_size=max_batch_size,
+            output_head_dim=output_head_dim,
+        )
+        if result is not None:
+            return result
+    return cp_group.all_gather(local_input, dim=1)
+
+
+def warmup_b12x_dcp_a2a(
+    cp_group: GroupCoordinator,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    max_batch_size: int,
+    total_heads: int,
+    head_dim: int,
+    query_head_dim: int | None = None,
+) -> None:
+    """Create and exercise the B12X DCP channel before CUDA graph capture."""
+    if not envs.VLLM_USE_B12X_DCP_A2A:
+        return
+    if cp_group.world_size not in (2, 4, 8):
+        # The PCIe channel only exists for these world sizes. The runtime
+        # dispatchers already fall back to NCCL collectives per call, so an
+        # unsupported DCP size (e.g. TP6 with DCP3/DCP6) must not fail boot.
+        logger.warning_once(
+            "B12X PCIe DCP collectives support world sizes 2/4/8; "
+            "DCP world size %d uses NCCL collectives instead.",
+            cp_group.world_size,
+        )
+        return
+    if query_head_dim is None:
+        query_head_dim = head_dim
+    local_query = torch.empty(
+        (1, total_heads // cp_group.world_size, query_head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    gathered_query = _try_b12x_dcp_all_gather_heads(
+        local_query,
+        cp_group,
+        max_batch_size=max_batch_size,
+        output_head_dim=head_dim,
+    )
+    if gathered_query is None:
+        raise RuntimeError(
+            "B12X PCIe DCP query all-gather is unavailable for the configured "
+            "attention geometry"
+        )
+    partial_output = torch.empty(
+        (1, total_heads, head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    partial_lse = torch.zeros(
+        (1, total_heads),
+        device=device,
+        dtype=torch.float32,
+    )
+    result = _try_b12x_dcp_lse_reduce(
+        partial_output,
+        partial_lse,
+        cp_group,
+        return_lse=False,
+        is_lse_base_on_e=True,
+        max_batch_size=max_batch_size,
+        query_head_dim=query_head_dim,
+    )
+    if result is None:
+        raise RuntimeError(
+            "B12X PCIe DCP output reduction is unavailable for the configured "
+            "attention geometry"
+        )
 
 
 def _lse_weighted_combine(
@@ -488,6 +822,9 @@ def dcp_a2a_lse_reduce(
     is_lse_base_on_e: bool = True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    use_b12x: bool = False,
+    b12x_max_batch_size: int | None = None,
+    b12x_query_head_dim: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -504,6 +841,9 @@ def dcp_a2a_lse_reduce(
         is_lse_base_on_e: If True, LSE is base e; if False, base 2
         seq_lens: Local KV lengths. Empty shards contribute zero weight.
         query_start_loc: Cumulative query-token offsets for each request.
+        use_b12x: Try the low-latency B12X PCIe path before NCCL A2A
+        b12x_max_batch_size: Configured token capacity for B12X staging
+        b12x_query_head_dim: Query width when it differs from output width
 
     Returns:
         Combined output [B, H/N, D] (head-scattered)
@@ -515,6 +855,20 @@ def dcp_a2a_lse_reduce(
         if return_lse:
             return cp_attn_out, cp_attn_lse
         return cp_attn_out
+
+    if use_b12x and envs.VLLM_USE_B12X_DCP_A2A:
+        mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
+        b12x_result = _try_b12x_dcp_lse_reduce(
+            cp_attn_out,
+            cp_attn_lse,
+            cp_group,
+            return_lse=return_lse,
+            is_lse_base_on_e=is_lse_base_on_e,
+            max_batch_size=b12x_max_batch_size,
+            query_head_dim=b12x_query_head_dim,
+        )
+        if b12x_result is not None:
+            return b12x_result
 
     B, H, D = cp_attn_out.shape
     if H % world_size != 0:

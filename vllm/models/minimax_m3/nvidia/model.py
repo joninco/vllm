@@ -24,6 +24,7 @@ from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
@@ -41,6 +42,8 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
+    MinimaxM3IndexerQKParallelLinear,
+    MinimaxM3QKVParallelLinear,
     MinimaxM3QKVParallelLinearWithIndexer,
     QKVParallelLinear,
     RowParallelLinear,
@@ -103,6 +106,33 @@ from vllm.v1.kv_cache_interface import (
 )
 
 
+def _resolve_quant_algo(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> str | None:
+    resolver = getattr(quant_config, "_resolve_quant_algo", None)
+    if not callable(resolver):
+        return None
+    return resolver(prefix)
+
+
+def _should_split_mxfp8_indexer_projection(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> bool:
+    """Use a BF16 indexer projection for mixed checkpoints.
+
+    MiniMax M3 mixed MXFP8 checkpoints quantize the main q/k/v projection but
+    leave the sparse indexer q/k projections in BF16. A single fused projection
+    cannot represent that mixed dtype faithfully.
+    """
+    if _resolve_quant_algo(quant_config, f"{prefix}.qkv_proj") != "MXFP8":
+        return False
+    index_q_algo = _resolve_quant_algo(quant_config, f"{prefix}.indexer.q_proj")
+    index_k_algo = _resolve_quant_algo(quant_config, f"{prefix}.indexer.k_proj")
+    return index_q_algo is None and index_k_algo is None
+
+
 def _enable_minimax_m3_torch_compile(vllm_config: VllmConfig) -> bool:
     del vllm_config
     return (
@@ -130,10 +160,36 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     return moe_layer_freq[layer_id] != 0
 
 
+def _get_minimax_m3_virtual_tp_plan(config: PretrainedConfig):
+    plan = getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
+    if isinstance(plan, dict) and plan.get("model_type") == "minimax_m3":
+        return plan
+    return None
+
+
+def _get_minimax_m3_virtual_tp_axis_local_size(
+    config: PretrainedConfig,
+    axis_name: str,
+) -> int:
+    plan = _get_minimax_m3_virtual_tp_plan(config)
+    if plan is None:
+        raise ValueError("MiniMax M3 virtual TP plan is not active.")
+    axis = plan.get(axis_name)
+    if not isinstance(axis, dict):
+        raise ValueError(f"MiniMax M3 virtual TP plan missing {axis_name!r}.")
+    return int(axis["local_size"])
+
+
 def _get_minimax_m3_local_attention_heads(
     config: PretrainedConfig,
     tp_size: int,
 ) -> tuple[int, int]:
+    if _get_minimax_m3_virtual_tp_plan(config) is not None:
+        return (
+            _get_minimax_m3_virtual_tp_axis_local_size(config, "attention_heads"),
+            _get_minimax_m3_virtual_tp_axis_local_size(config, "kv_heads"),
+        )
+
     total_num_heads = config.num_attention_heads
     assert total_num_heads % tp_size == 0
     num_heads = total_num_heads // tp_size
@@ -491,7 +547,12 @@ class MiniMaxM3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
+        qkv_linear_cls = (
+            MinimaxM3QKVParallelLinear
+            if _get_minimax_m3_virtual_tp_plan(config) is not None
+            else QKVParallelLinear
+        )
+        self.qkv_proj = qkv_linear_cls(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
@@ -606,23 +667,55 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # identically -- including replication when tp_size > num_key_value_heads.
         sparse_cfg = config.sparse_attention_config
         self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
-        self.num_idx_heads = self.num_kv_heads
+        self.num_idx_heads = (
+            _get_minimax_m3_virtual_tp_axis_local_size(config, "index_heads")
+            if _get_minimax_m3_virtual_tp_plan(config) is not None
+            else self.num_kv_heads
+        )
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
         self.index_q_size = self.num_idx_heads * self.idx_head_dim
 
-        # Single fused projection: q, k, v, index_q, index_k in one GEMM.
-        self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            self.total_idx_heads,
-            self.idx_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+        self.split_indexer_projection = _should_split_mxfp8_indexer_projection(
+            quant_config, prefix
         )
-        self.indexer_qk_proj = None
+        if self.split_indexer_projection:
+            qkv_linear_cls = (
+                MinimaxM3QKVParallelLinear
+                if _get_minimax_m3_virtual_tp_plan(config) is not None
+                else QKVParallelLinear
+            )
+            self.qkv_proj = qkv_linear_cls(
+                self.hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.indexer_qk_proj = MinimaxM3IndexerQKParallelLinear(
+                self.hidden_size,
+                self.total_num_kv_heads,
+                self.total_idx_heads,
+                self.idx_head_dim,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.indexer_qk_proj",
+            )
+        else:
+            # Single fused projection: q, k, v, index_q, index_k in one GEMM.
+            self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
+                self.hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                self.total_idx_heads,
+                self.idx_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+            self.indexer_qk_proj = None
         # reduce_results=False: the attention all-reduce is fused with the
         # following post_attention_layernorm (GemmaRMSNorm) in the decoder layer
         # via fused_allreduce_gemma_rms_norm.
@@ -1279,6 +1372,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # Keep the indexer-specific keys before the generic q/k mappings.
         stacked_params_mapping: list[tuple[str, str, int | str]] = [
             # (param_name, shard_name, shard_id)
+            (".indexer_qk_proj", ".indexer.q_proj", "index_q"),
+            (".indexer_qk_proj", ".indexer.k_proj", "index_k"),
+            (".indexer_qk_proj", ".index_q_proj", "index_q"),
+            (".indexer_qk_proj", ".index_k_proj", "index_k"),
             (".qkv_proj", ".indexer.q_proj", "index_q"),
             (".qkv_proj", ".indexer.k_proj", "index_k"),
             (".qkv_proj", ".index_q_proj", "index_q"),

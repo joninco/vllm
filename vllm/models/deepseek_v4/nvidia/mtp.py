@@ -180,7 +180,19 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        if self.mtp_block._should_run_b12x_mhc(int(hidden_states.shape[0])):
+            from b12x.integration.residual import b12x_mhc_post
+
+            hidden_states = b12x_mhc_post(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+            )
+        else:
+            hidden_states = mhc_post_tilelang(
+                hidden_states, residual, post_mix, res_mix
+            )
         if self.mtp_block.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
         # Return the flat pre-hc_head residual so it can be re-fed as the

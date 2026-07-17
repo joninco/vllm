@@ -77,6 +77,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import (
     SparseAttnIndexer,
     fused_indexer_q_rope_quant,
+    use_b12x_sparse_indexer,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -96,6 +97,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.indexer import (
+    B12xNonCompressedIndexerBackend,
     DeepseekV32IndexerBackend,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -463,6 +465,7 @@ class DeepseekV2Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
         reduce_results: bool = True,
+        topk_scores_buffer: torch.Tensor | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -482,6 +485,9 @@ class DeepseekV2Attention(nn.Module):
         assert topk_indices_buffer is None, (
             "topk_indices_buffer is not \
         supported for DeepseekV2Attention"
+        )
+        assert topk_scores_buffer is None, (
+            "topk_scores_buffer is not supported for DeepseekV2Attention"
         )
 
         if self.q_lora_rank is not None:
@@ -652,6 +658,8 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> AttentionBackend:
+        if use_b12x_sparse_indexer():
+            return B12xNonCompressedIndexerBackend
         return DeepseekV32IndexerBackend
 
 
@@ -665,6 +673,7 @@ class Indexer(nn.Module):
         quant_config: QuantizationConfig | None,
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
+        topk_scores_buffer: torch.Tensor | None = None,
         prefix: str = "",
         is_inplace_rope: bool = False,
     ):
@@ -702,6 +711,21 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
+        self.topk_scores_buffer = topk_scores_buffer
+        attention_backend = vllm_config.attention_config.backend
+        attention_backend_name = (
+            attention_backend
+            if isinstance(attention_backend, str)
+            else getattr(attention_backend, "name", None)
+        )
+        # The GLM b12x MLA backend and its non-compressed paged indexer share a
+        # native flat-physical-slot contract when the KV cache is not sharded.
+        # Under DCP, keep logical token ids until the attention backend can map
+        # the globally selected top-k to each rank's local physical cache slots.
+        self.output_physical_slots = (
+            attention_backend_name == "B12X_MLA_SPARSE"
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+        )
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -726,6 +750,9 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            topk_scores_buffer=self.topk_scores_buffer,
+            output_physical_slots=self.output_physical_slots,
+            num_q_heads=self.n_head,
         )
 
         self.is_inplace_rope = is_inplace_rope
@@ -739,9 +766,18 @@ class Indexer(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions,
+        rotary_emb,
+        kw: torch.Tensor | None = None,
+        q_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
+        if q_raw is None:
+            q, _ = self.wq_b(qr)
+        else:
+            q = q_raw
         q = q.view(-1, self.n_head, self.head_dim)
 
         if current_platform.is_rocm() and self.is_inplace_rope:
@@ -752,7 +788,8 @@ class Indexer(nn.Module):
             # In pytorch-native rope for inductor fusion, rotated q/k tensors
             # are not mutated inplace but returned as new tensors.
             # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
@@ -763,7 +800,8 @@ class Indexer(nn.Module):
             )
         elif self.use_fused_indexer_q and q.dtype == torch.bfloat16:
             # fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
@@ -795,7 +833,8 @@ class Indexer(nn.Module):
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
             # Fused wk + weights_proj: one GEMM, then split
-            kw, _ = self.wk_weights_proj(hidden_states)
+            if kw is None:
+                kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
@@ -1063,6 +1102,7 @@ class DeepseekV2MLAAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
         reduce_results: bool = True,
         non_causal_multi_token_decode: bool = False,
@@ -1214,6 +1254,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config,
                 cache_config,
                 topk_indices_buffer,
+                topk_scores_buffer,
                 f"{prefix}.indexer",
                 is_inplace_rope=self.indexer_rope_emb.enabled(),
             )
@@ -1278,6 +1319,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
         quant_config: QuantizationConfig | None = None,
         layer_idx_override: int | None = None,
         is_nextn: bool = False,
@@ -1351,6 +1393,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
             reduce_results=not self.use_sequence_parallel_moe,
+            topk_scores_buffer=topk_scores_buffer,
         )
         if attn_cls is DeepseekV2MLAAttention:
             attn_kwargs["layer_idx"] = layer_idx
@@ -1475,8 +1518,20 @@ class DeepseekV2Model(nn.Module):
                 dtype=torch.int32,
                 device=self.device,
             )
+            topk_scores_buffer = None
+            if (
+                vllm_config.parallel_config.decode_context_parallel_size > 1
+                and use_b12x_sparse_indexer()
+            ):
+                topk_scores_buffer = torch.empty(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    topk_tokens,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
         else:
             topk_indices_buffer = None
+            topk_scores_buffer = None
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1493,6 +1548,7 @@ class DeepseekV2Model(nn.Module):
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                topk_scores_buffer=topk_scores_buffer,
             ),
             prefix=f"{prefix}.layers",
         )

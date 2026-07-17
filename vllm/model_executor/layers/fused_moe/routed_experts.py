@@ -345,6 +345,8 @@ class RoutedExperts(PluggableLayer):
         loaded_weight: torch.Tensor,
         tp_rank: int,
         load_full_w2: bool = False,
+        virtual_tp_scale_group_size: int | None = None,
+        virtual_tp_logical_shard_size: int | None = None,
     ):
         """
         Load grouped weight scales for group quantization or model weights
@@ -366,6 +368,8 @@ class RoutedExperts(PluggableLayer):
                 expert_data=expert_data,
                 tp_rank=tp_rank,
                 load_full=load_full_w2,
+                virtual_tp_scale_group_size=virtual_tp_scale_group_size,
+                virtual_tp_logical_shard_size=virtual_tp_logical_shard_size,
             )
         elif shard_id in ("w1", "w3"):
             self._load_w13(
@@ -552,6 +556,8 @@ class RoutedExperts(PluggableLayer):
         loaded_weight: torch.Tensor,
         tp_rank: int,
         load_full: bool = False,
+        virtual_tp_scale_group_size: int | None = None,
+        virtual_tp_logical_shard_size: int | None = None,
     ):
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
@@ -561,7 +567,26 @@ class RoutedExperts(PluggableLayer):
         if not load_full and loaded_weight.ndim > 0:
             # Same padding fix as _load_w13: use unpadded per-rank size.
             tp_size = self.moe_config.moe_parallel_config.tp_size
-            if is_virtual_tp_padded_enabled():
+            if virtual_tp_scale_group_size is not None:
+                group_size = int(virtual_tp_scale_group_size)
+                logical_shard_size = int(
+                    virtual_tp_logical_shard_size
+                    if virtual_tp_logical_shard_size is not None
+                    else expert_data.shape[shard_dim] * group_size
+                )
+                if is_virtual_tp_padded_enabled():
+                    loaded_per_rank_elements = get_virtual_tp_axis_shard_size(
+                        "moe_intermediate_size", logical_shard_size
+                    )
+                else:
+                    loaded_per_rank_elements = logical_shard_size
+                start_element = loaded_per_rank_elements * tp_rank
+                offset_in_group = start_element % group_size
+                start_offset = start_element // group_size
+                loaded_per_rank = (
+                    offset_in_group + loaded_per_rank_elements + group_size - 1
+                ) // group_size
+            elif is_virtual_tp_padded_enabled():
                 loaded_per_rank = get_virtual_tp_axis_shard_size(
                     "moe_intermediate_size", expert_data.shape[shard_dim]
                 )
@@ -712,6 +737,16 @@ class RoutedExperts(PluggableLayer):
             shard_dim += 1
 
         expert_data = param.data if full_load else param.data[expert_id]
+        virtual_tp_scale_group_size = getattr(
+            param,
+            "b12x_mxfp4_w2_scale_group_size",
+            None,
+        )
+        virtual_tp_logical_shard_size = getattr(
+            param,
+            "b12x_mxfp4_w2_logical_k",
+            None,
+        )
 
         if "bias" in weight_name:
             self._loaded_expert_biases.add(weight_name.rsplit(".", 1)[-1])
@@ -841,6 +876,8 @@ class RoutedExperts(PluggableLayer):
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=self.moe_config.tp_rank,
+                    virtual_tp_scale_group_size=virtual_tp_scale_group_size,
+                    virtual_tp_logical_shard_size=virtual_tp_logical_shard_size,
                 )
             return True if return_success else None
 
@@ -871,6 +908,8 @@ class RoutedExperts(PluggableLayer):
                     expert_data=expert_data,
                     tp_rank=self.moe_config.tp_rank,
                     load_full_w2=getattr(param, "load_full_w2", False),
+                    virtual_tp_scale_group_size=virtual_tp_scale_group_size,
+                    virtual_tp_logical_shard_size=virtual_tp_logical_shard_size,
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 self._load_per_tensor_weight_scale(
@@ -902,6 +941,8 @@ class RoutedExperts(PluggableLayer):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=self.moe_config.tp_rank,
+                virtual_tp_scale_group_size=virtual_tp_scale_group_size,
+                virtual_tp_logical_shard_size=virtual_tp_logical_shard_size,
             )
             return True if return_success else None
 

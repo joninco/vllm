@@ -293,8 +293,15 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import sanitize_dcp_attn_empty_rows
+from vllm.v1.attention.ops.common import (
+    cp_lse_ag_out_rs,
+    cp_lse_ag_out_rs_into,
+)
+from vllm.v1.attention.ops.dcp_alltoall import (
+    dcp_a2a_lse_reduce,
+    dcp_b12x_all_gather_heads,
+    sanitize_dcp_attn_empty_rows,
+)
 from vllm.v1.attention.ops.dcp_utils import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
@@ -308,6 +315,31 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def _can_use_b12x_dcp_prefill_workspace(
+    *,
+    enabled: bool,
+    project_before_merge: bool,
+    dcp_use_b12x: bool,
+    num_tokens: int,
+    max_num_tokens: int,
+    non_dbo_workspace: bool,
+    is_sparse_impl: bool,
+    backend_name: str,
+    is_capturing: bool,
+) -> bool:
+    """Gate the B12X eager-prefill workspace contract."""
+    return (
+        enabled
+        and project_before_merge
+        and not dcp_use_b12x
+        and 1025 <= num_tokens <= max_num_tokens
+        and non_dbo_workspace
+        and is_sparse_impl
+        and backend_name == "B12X_MLA_SPARSE"
+        and not is_capturing
+    )
 
 
 def _extract_single_layer_index(layer_name: str) -> int | None:
@@ -376,7 +408,16 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
-    if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
+    if backend_name == "B12X_MLA_SPARSE" and kv_cache_dtype == "nvfp4_ds_mla":
+        # B12X reads the packed 432B NVFP4 MLA record natively; do NOT coerce
+        # it to fp8_ds_mla. [nvfp4_reader_port]
+        return "nvfp4_ds_mla"
+    if backend_name in (
+        "FLASHMLA_SPARSE",
+        "B12X_MLA_SPARSE",
+    ) and is_quantized_kv_cache(kv_cache_dtype):
+        # NOTE: nvfp4_ds_mla deliberately falls through to fp8_ds_mla for
+        # FLASHMLA_SPARSE (no NVFP4 reader there).
         return "fp8_ds_mla"
     if backend_name == "FLASHINFER_MLA_SPARSE_SM120" and kv_cache_dtype in (
         "auto",
@@ -628,6 +669,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 use_pcp=self.use_pcp,
             )
         self.dcp_a2a = self.dcp_manager is not None and self.dcp_manager.use_a2a
+        self.dcp_b12x = (
+            self.dcp_a2a
+            and not self.use_pcp
+            and envs.VLLM_USE_B12X_DCP_A2A
+            and self.attn_backend.get_name() == "B12X_MLA_SPARSE"
+            # The B12X PCIe DCP channel only exists for world sizes 2/4/8;
+            # other DCP sizes (e.g. TP6 with DCP3/DCP6) use NCCL collectives.
+            and parallel_config.decode_context_parallel_size in (2, 4, 8)
+        )
         self.dcp_project_before_merge = (
             self.dcp_manager is not None
             and not self.use_pcp
@@ -654,7 +704,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 "be at least the maximum cudagraph capture size "
                 f"({max_capture_size})."
             )
-        # Hybrid DCP dispatch: the one-shot A2A exchange is
+        self.dcp_max_batch_size = int(
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        # Hybrid DCP dispatch: the one-shot A2A/B12X exchange is
         # latency-optimal for small decode batches but loses to pipelined
         # NCCL collectives on large prefill/extend batches. Batches with more
         # tokens than the cap take VLLM_DCP_A2A_LARGE_BACKEND instead
@@ -854,7 +907,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
+        if fp8_attention and self.kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         assert (
@@ -1011,9 +1064,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
+            dcp_use_b12x = False
             use_ag_rs_fallback = False
             project_before_merge = False
-            # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
+            workspace_gather_used = False
             if self.impl.dcp_world_size > 1:
                 assert self.dcp_manager is not None
                 if not self.impl.can_return_lse_for_decode:
@@ -1038,6 +1092,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     and not self.use_pcp
                     and (not self.dcp_a2a or use_ag_rs_fallback)
                 )
+                dcp_use_b12x = self.dcp_b12x and dcp_small_batch
+                workspace_gather_eligible = (
+                    not qrep_decode
+                    and _can_use_b12x_dcp_prefill_workspace(
+                        enabled=envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE,
+                        project_before_merge=project_before_merge,
+                        dcp_use_b12x=dcp_use_b12x,
+                        num_tokens=num_mqa_tokens,
+                        max_num_tokens=getattr(self.impl, "_max_batched", 0),
+                        non_dbo_workspace=getattr(
+                            self.impl, "dcp_workspace_non_dbo", False
+                        ),
+                        is_sparse_impl=is_sparse_impl,
+                        backend_name=self.attn_backend.get_name(),
+                        is_capturing=torch.cuda.is_current_stream_capturing(),
+                    )
+                )
 
                 if self.use_pcp:
                     if self.impl.dcp_world_size > self.impl.pcp_world_size:
@@ -1045,12 +1116,40 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             mqa_q = torch.cat(mqa_q, dim=-1)
                         mqa_q = get_tp_group().all_gather(mqa_q, dim=1)
                 else:
-                    if isinstance(mqa_q, tuple):
-                        # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                    if isinstance(mqa_q, tuple) and not workspace_gather_eligible:
                         mqa_q = torch.cat(mqa_q, dim=-1)
                     if not qrep_decode:
-                        assert self.dcp_manager.query_gather is not None
-                        mqa_q = self.dcp_manager.query_gather(mqa_q)
+                        if dcp_use_b12x:
+                            mqa_q = dcp_b12x_all_gather_heads(
+                                mqa_q,
+                                get_dcp_group(),
+                                max_batch_size=self.dcp_max_batch_size,
+                                output_head_dim=self.kv_lora_rank,
+                            )
+                        elif workspace_gather_eligible:
+                            workspace_gather = getattr(
+                                self.impl,
+                                "dcp_all_gather_query_in_workspace",
+                                None,
+                            )
+                            if not getattr(
+                                self.impl,
+                                "supports_dcp_gather_query_in_workspace",
+                                False,
+                            ) or not callable(workspace_gather):
+                                raise RuntimeError(
+                                    f"{type(self.impl).__name__} does not support "
+                                    "the enabled workspace DCP query gather"
+                                )
+                            mqa_q = workspace_gather(mqa_q)
+                            workspace_gather_used = True
+                            logger.info_once(
+                                "Using borrowed B12X workspaces for sparse MLA "
+                                "DCP prefill"
+                            )
+                        else:
+                            assert self.dcp_manager.query_gather is not None
+                            mqa_q = self.dcp_manager.query_gather(mqa_q)
 
             # call decode attn
             if not self.impl.is_sparse:
@@ -1117,22 +1216,76 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             f"{tuple(w_uv_dcp.shape)} on "
                             f"{w_uv_dcp.device}/{w_uv_dcp.dtype}."
                         )
-                    projected = attn_out.new_empty(
-                        attn_out.shape[0], attn_out.shape[1], self.v_head_dim
-                    )
-                    self._v_up_proj_bmm_chunked(attn_out, projected, w_uv_dcp)
-                    attn_out = projected
-                if project_before_merge or use_ag_rs_fallback:
-                    if project_before_merge:
-                        sanitize_dcp_attn_empty_rows(attn_out, lse, valid_counts)
-                    attn_out = cp_lse_ag_out_rs(
+                    if workspace_gather_used:
+                        workspace_project = getattr(
+                            self.impl,
+                            "dcp_project_before_merge_in_workspace",
+                            None,
+                        )
+                        if not getattr(
+                            self.impl,
+                            "supports_dcp_project_before_merge_in_workspace",
+                            False,
+                        ) or not callable(workspace_project):
+                            raise RuntimeError(
+                                f"{type(self.impl).__name__} does not support "
+                                "workspace DCP projection"
+                            )
+                        attn_out = workspace_project(attn_out, lse, w_uv_dcp)
+                    else:
+                        projected = attn_out.new_empty(
+                            attn_out.shape[0], attn_out.shape[1], self.v_head_dim
+                        )
+                        self._v_up_proj_bmm_chunked(attn_out, projected, w_uv_dcp)
+                        attn_out = projected
+                if dcp_use_b12x:
+                    attn_out = dcp_a2a_lse_reduce(
                         attn_out,
                         lse,
                         get_dcp_group(),
                         is_lse_base_on_e=self.impl.lse_base_on_e,
+                        use_b12x=dcp_use_b12x,
+                        b12x_max_batch_size=self.dcp_max_batch_size,
+                        b12x_query_head_dim=(self.kv_lora_rank + self.qk_rope_head_dim),
                         seq_lens=seq_lens,
                         query_start_loc=query_start_loc,
                     )
+                elif project_before_merge or use_ag_rs_fallback:
+                    if project_before_merge:
+                        sanitize_dcp_attn_empty_rows(attn_out, lse, valid_counts)
+                    if workspace_gather_used:
+                        workspace_output = getattr(
+                            self.impl,
+                            "dcp_reduce_scatter_output_in_workspace",
+                            None,
+                        )
+                        if not getattr(
+                            self.impl,
+                            "supports_dcp_reduce_scatter_output_in_workspace",
+                            False,
+                        ) or not callable(workspace_output):
+                            raise RuntimeError(
+                                f"{type(self.impl).__name__} does not support "
+                                "workspace DCP reduce-scatter output"
+                            )
+                        attn_out = cp_lse_ag_out_rs_into(
+                            attn_out,
+                            lse,
+                            get_dcp_group(),
+                            output_provider=workspace_output,
+                            is_lse_base_on_e=self.impl.lse_base_on_e,
+                            seq_lens=seq_lens,
+                            query_start_loc=query_start_loc,
+                        )
+                    else:
+                        attn_out = cp_lse_ag_out_rs(
+                            attn_out,
+                            lse,
+                            get_dcp_group(),
+                            is_lse_base_on_e=self.impl.lse_base_on_e,
+                            seq_lens=seq_lens,
+                            query_start_loc=query_start_loc,
+                        )
                 else:
                     attn_out = self.dcp_manager.combine(
                         attn_out,
@@ -1144,7 +1297,30 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
             if project_before_merge:
-                mqa_output_slice.copy_(attn_out.reshape(mqa_output_slice.shape))
+                if workspace_gather_used:
+                    expected_shape = (
+                        num_mqa_tokens,
+                        self.num_heads,
+                        self.v_head_dim,
+                    )
+                    expected_stride = (
+                        self.v_head_dim,
+                        num_mqa_tokens * self.v_head_dim,
+                        1,
+                    )
+                    if (
+                        tuple(attn_out.shape) != expected_shape
+                        or tuple(attn_out.stride()) != expected_stride
+                        or not attn_out.movedim(0, 1).is_contiguous()
+                    ):
+                        raise RuntimeError(
+                            "Workspace DCP reduce-scatter returned an invalid "
+                            f"layout: shape={tuple(attn_out.shape)}, "
+                            f"stride={tuple(attn_out.stride())}"
+                        )
+                    mqa_output_slice.view(expected_shape).copy_(attn_out)
+                else:
+                    mqa_output_slice.copy_(attn_out.reshape(mqa_output_slice.shape))
             else:
                 self._v_up_proj(attn_out, out=mqa_output_slice)
 

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Literal, Union
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.config.kernel import MoEBackend
 from vllm.config.quantization import QuantizationConfigArgs
@@ -100,6 +101,8 @@ def _pack_deepgemm_mxfp4_scales(
 
 class Mxfp4MoeBackend(Enum):
     NONE = "None"
+    # B12X native MXFP4 W4A16 backend (SM120)
+    B12X = "B12X"
     # DeepGEMM FP8xFP4 backend (SM100+)
     DEEPGEMM_MXFP4 = "DEEPGEMM_MXFP4"
     # FlashInfer TRTLLM backends
@@ -153,7 +156,13 @@ TRITON_BACKENDS = (
 def backend_to_kernel_cls(
     backend: Mxfp4MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
-    if backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
+    if backend == Mxfp4MoeBackend.B12X:
+        from vllm.model_executor.layers.fused_moe.b12x_ep_moe import B12xEPExperts
+        from vllm.model_executor.layers.fused_moe.b12x_moe import B12xExperts
+
+        return [B12xEPExperts, B12xExperts]
+
+    elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
             DeepGemmFP4Experts,
         )
@@ -277,6 +286,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
     via ``activation_key`` and ``is_supported_config``.
     """
     mapping: dict[str, list[Mxfp4MoeBackend]] = {
+        "b12x": [Mxfp4MoeBackend.B12X],
         "deep_gemm": [Mxfp4MoeBackend.DEEPGEMM_MXFP4],
         "flashinfer_trtllm": [
             Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
@@ -584,6 +594,15 @@ def select_deepseek_v4_mxfp4_moe_backend(
     # Honor explicit moe_backend (e.g. "marlin", "triton_unfused") before
     # falling back to the auto priority list.
     runner_backend = config.moe_backend
+    if runner_backend == "auto" and envs.VLLM_USE_B12X_MOE:
+        return _return_or_raise(
+            Mxfp4MoeBackend.B12X,
+            config,
+            kMxfp4Static,
+            None,
+            activation_format,
+            scope="local",
+        )
     if runner_backend != "auto":
         requested_backends = map_mxfp4_backend(runner_backend)
         if activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
@@ -644,6 +663,8 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     activation: MoEActivation | None = None,
 ) -> tuple[int, int]:
     """Round up hidden_size and intermediate_size based on backend requirements."""
+    if backend == Mxfp4MoeBackend.B12X:
+        return hidden_size, intermediate_size
     if backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and activation == MoEActivation.SITU:
         # K3's AITER A16W4 SiTU kernel handles K3's native intermediate size
         # (moe_intermediate 3072; e.g. 384/partition at TP8). Align to 128 (a
@@ -709,6 +730,16 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
     torch.Tensor | None,
 ]:
     """Convert loaded weights into backend-specific kernel format."""
+
+    if mxfp4_backend == Mxfp4MoeBackend.B12X:
+        return (
+            w13_weight.data,
+            w2_weight.data,
+            w13_weight_scale.data,
+            w2_weight_scale.data,
+            w13_bias,
+            w2_bias,
+        )
 
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         w13_weight_scale, w2_weight_scale = _pack_deepgemm_mxfp4_scales(
@@ -1292,6 +1323,16 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 
         is_gfx1250 = on_gfx1250()
 
+    if mxfp4_backend == Mxfp4MoeBackend.B12X:
+        return (
+            w13_weight.data,
+            w2_weight.data,
+            w13_weight_scale.data,
+            w2_weight_scale.data,
+            w13_bias,
+            w2_bias,
+        )
+
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         w13_weight_scale, w2_weight_scale = _pack_deepgemm_mxfp4_scales(
             w13_weight,
@@ -1836,6 +1877,7 @@ def make_mxfp4_moe_quant_config(
             gemm1_clamp_limit=swiglu_limit,
         )
     elif mxfp4_backend in (
+        Mxfp4MoeBackend.B12X,
         Mxfp4MoeBackend.MARLIN,
         Mxfp4MoeBackend.BATCHED_MARLIN,
         Mxfp4MoeBackend.TRITON,

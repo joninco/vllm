@@ -201,6 +201,25 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="moe_forward_shared",
     op_func=_moe_forward_shared,
+    mutates_args=["hidden_states"],
+    fake_impl=_moe_forward_shared_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="b12x_moe_forward",
+    op_func=_moe_forward,
+    mutates_args=["hidden_states"],
+    fake_impl=_moe_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="b12x_moe_forward_shared",
+    op_func=_moe_forward_shared,
+    mutates_args=["hidden_states"],
     fake_impl=_moe_forward_shared_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
@@ -301,6 +320,13 @@ class MoERunner(MoERunnerInterface):
             # Note: CPU doesn't require wrapped _forward_impl.
             return _moe_forward if self._shared_experts is None else _moe_forward_shared
 
+        if self._uses_b12x_moe_kernel:
+            return (
+                torch.ops.vllm.b12x_moe_forward
+                if self._shared_experts is None
+                else torch.ops.vllm.b12x_moe_forward_shared
+            )
+
         return (
             torch.ops.vllm.moe_forward
             if self._shared_experts is None
@@ -343,6 +369,17 @@ class MoERunner(MoERunnerInterface):
     @property
     def _quant_method(self) -> FusedMoEMethodBase:
         return self.routed_experts.quant_method
+
+    @property
+    def _uses_b12x_moe_kernel(self) -> bool:
+        moe_kernel = getattr(self._quant_method, "moe_kernel", None)
+        fused_experts = getattr(moe_kernel, "fused_experts", None)
+        if fused_experts is None:
+            return False
+
+        from vllm.model_executor.layers.fused_moe.b12x_moe import B12xExperts
+
+        return isinstance(fused_experts, B12xExperts)
 
     def apply_routed_input_transform(
         self,

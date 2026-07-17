@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import sys
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -141,6 +142,15 @@ from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 from vllm.v1.worker.workspace import lock_workspace
 
 logger = init_logger(__name__)
+
+
+def _maybe_save_b12x_moe_activation_amax() -> None:
+    b12x_moe = sys.modules.get("vllm.model_executor.layers.fused_moe.b12x_moe")
+    if b12x_moe is None:
+        return
+    maybe_save = getattr(b12x_moe, "maybe_save_b12x_moe_activation_amax", None)
+    if maybe_save is not None:
+        maybe_save()
 
 
 def _profile_cg_mode(cg_mode: CUDAGraphMode) -> str:
@@ -1646,6 +1656,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            _maybe_save_b12x_moe_activation_amax()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         num_spec_tokens_to_schedule = execute_model_state.num_spec_tokens_to_schedule
@@ -1814,6 +1825,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         with record_function_or_nullcontext(f"vllm:v2/target/{phase}/kv_post_forward"):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+
+        _maybe_save_b12x_moe_activation_amax()
 
         return async_output
 

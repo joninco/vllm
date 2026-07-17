@@ -311,8 +311,16 @@ class MiMoV2Attention(nn.Module):
             configured_backend.name if configured_backend is not None else None
         )
         use_flashinfer = configured_backend_name == "FLASHINFER"
+        use_b12x_paged = configured_backend_name == "B12X_ATTN"
 
-        attn_backend = None
+        if use_b12x_paged:
+            from vllm.v1.attention.backends.b12x_attn import (
+                get_b12x_paged_attention_backend,
+            )
+
+            attn_backend = get_b12x_paged_attention_backend(self.v_head_dim)
+        else:
+            attn_backend = None
 
         # MiMo has asymmetric K/V dims (head_dim=192, v_head_dim=128). Keep
         # the historical Triton/FA cache layout by padding V to head_dim and
@@ -320,7 +328,11 @@ class MiMoV2Attention(nn.Module):
         # is valid for target-only serving, but it changes DFlash long-context
         # performance substantially because the target and draft paths no
         # longer use the same unified attention kernels.
-        self.pad_value_for_fa = self.v_head_dim != self.head_dim and not use_flashinfer
+        self.pad_value_for_fa = (
+            self.v_head_dim != self.head_dim
+            and not use_flashinfer
+            and not use_b12x_paged
+        )
         attn_head_size_v = self.head_dim if self.pad_value_for_fa else self.v_head_dim
 
         self.attn = Attention(

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.models.minimax_m3.nvidia.model import MiniMaxM3SparseAttention
@@ -21,7 +22,11 @@ logger = init_logger(__name__)
 def _supports_minimax_m3_msa_warmup() -> bool:
     if not current_platform.is_cuda():
         return False
-    return current_platform.is_device_capability_family(100)
+    if envs.VLLM_USE_B12X_MINIMAX_M3_MSA:
+        return current_platform.is_device_capability_family(120)
+    return current_platform.is_device_capability_family(
+        100
+    ) or current_platform.is_device_capability_family(120)
 
 
 def _dense_attention_backend_names(worker: "Worker") -> set[str]:
