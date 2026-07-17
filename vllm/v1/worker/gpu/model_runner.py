@@ -134,6 +134,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.workspace import lock_workspace
 
 logger = init_logger(__name__)
 
@@ -821,11 +822,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.speculator is not None:
                 self.speculator.capture()
+            self._zero_cudagraph_capture_kv_blocks()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        lock_workspace()
         # This usually takes 5~20 seconds.
         logger.info(
             "Graph capturing finished in %.0f secs, took %.2f GiB",
@@ -833,6 +836,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    def _zero_cudagraph_capture_kv_blocks(self) -> None:
+        if self.kv_block_zeroer is None:
+            self._init_kv_zero_meta()
+        assert self.kv_block_zeroer is not None
+        self.kv_block_zeroer.zero_block_ids([0])
+        torch.accelerator.synchronize()
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
