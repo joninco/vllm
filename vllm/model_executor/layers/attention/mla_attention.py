@@ -307,6 +307,26 @@ logger = init_logger(__name__)
 _FP8_DTYPE = current_platform.fp8_dtype()
 
 
+def _match_merge_strides(
+    prefix_output: torch.Tensor, suffix_output: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Give both partial-attention outputs identical strides.
+
+    The merge_attn_states CUDA kernel computes one source offset from the
+    prefix strides and reads BOTH prefix and suffix with it. The FA prefill
+    backend returns padded-V views (head stride > head_size) while merged
+    chunk outputs are contiguous, so once the chunked-context loop runs more
+    than one iteration (context > workspace, i.e. > 64k tokens) the two
+    sides disagree and the kernel reads the suffix at wrong offsets.
+    """
+    if prefix_output.stride() != suffix_output.stride():
+        if not prefix_output.is_contiguous():
+            prefix_output = prefix_output.contiguous()
+        if not suffix_output.is_contiguous():
+            suffix_output = suffix_output.contiguous()
+    return prefix_output, suffix_output
+
+
 def _detect_output_quant_key(
     output: torch.Tensor,
     output_scale: torch.Tensor | None,
@@ -2442,12 +2462,15 @@ def accumulate_mla_context_chunk(
     if chunk.is_continuation:
         init_start = chunk.continuation_token_end
         num_merged = init_start - token_start
+        prefix_output, suffix_output = _match_merge_strides(
+            output[token_start:init_start], attn_output[:num_merged]
+        )
         merge_attn_states(
             output=output[token_start:init_start],
             output_lse=output_lse[:, token_start:init_start],
-            prefix_output=output[token_start:init_start],
+            prefix_output=prefix_output,
             prefix_lse=output_lse[:, token_start:init_start],
-            suffix_output=attn_output[:num_merged],
+            suffix_output=suffix_output,
             suffix_lse=attn_softmax_lse[:, :num_merged],
         )
     if init_start < token_end:
@@ -2607,7 +2630,6 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     v=v,
                 )
             )
-
             if output is None:
                 if (
                     len(chunked_context.chunks) == 1
@@ -2830,6 +2852,9 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             suffix_output = suffix_output[..., : self.v_head_dim]
 
             output = output.view(-1, self.num_heads, self.v_head_dim)
+            context_output, suffix_output = _match_merge_strides(
+                context_output, suffix_output
+            )
             merge_attn_states(
                 output=output,
                 prefix_output=context_output,
