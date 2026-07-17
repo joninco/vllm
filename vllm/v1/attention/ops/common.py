@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
+
 import torch
 
 from vllm.distributed.parallel_state import GroupCoordinator
@@ -277,6 +279,45 @@ def cp_lse_ag_out_rs(
         query_start_loc=query_start_loc,
     )
     out = cp_group.reduce_scatter(out, dim=1)
+
+    if return_lse:
+        cp_num_heads = lse.shape[1] // cp_group.world_size
+        cp_rank = cp_group.rank_in_group
+        lse = lse[:, cp_num_heads * cp_rank : cp_num_heads * (cp_rank + 1)]
+        return out, lse
+    return out
+
+
+def cp_lse_ag_out_rs_into(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    output_provider: Callable[[torch.Tensor], torch.Tensor],
+    ctx: CPTritonContext | None = None,
+    return_lse: bool = False,
+    is_lse_base_on_e: bool = True,
+    seq_lens: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+):
+    """Correct DCP partials and reduce-scatter into borrowed output storage."""
+    if cp_group.world_size <= 1:
+        raise RuntimeError("cp_lse_ag_out_rs_into requires DCP world size > 1")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("cp_lse_ag_out_rs_into is eager-only")
+
+    out, lse = _cp_lse_common(
+        cp_attn_out,
+        cp_attn_lse,
+        cp_group,
+        ctx=ctx,
+        is_lse_base_on_e=is_lse_base_on_e,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+    )
+    output = output_provider(out)
+    if not isinstance(output, torch.Tensor):
+        raise TypeError("DCP output provider must return a tensor")
+    out = cp_group.reduce_scatter_into(out, output, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size

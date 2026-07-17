@@ -34,6 +34,9 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_dcp_local_topk_to_global,
+)
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -43,6 +46,10 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _dcp_global_topk_requested() -> bool:
+    return envs.VLLM_DCP_GLOBAL_TOPK
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -368,6 +375,9 @@ def sparse_attn_indexer(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+    # DCP scalars arrive as op arguments (resolved once at layer construction),
+    # not through per-step metadata.
+    dcp_global_topk = _dcp_global_topk_requested() and dcp_world_size > 1
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -517,15 +527,24 @@ def sparse_attn_indexer(
                     topk_tokens,
                 )
 
-            _merge_dcp_topk_global(
-                logits,
-                topk_indices,
-                topk_tokens,
-                dcp_rank,
-                dcp_world_size,
-                cp_kv_cache_interleave_size,
-                row_starts=chunk.cu_seqlen_ks,
-            )
+            if dcp_global_topk:
+                _merge_dcp_topk_global(
+                    logits,
+                    topk_indices,
+                    topk_tokens,
+                    dcp_rank,
+                    dcp_world_size,
+                    cp_kv_cache_interleave_size,
+                    row_starts=chunk.cu_seqlen_ks,
+                )
+            elif dcp_world_size > 1:
+                triton_convert_dcp_local_topk_to_global(
+                    topk_indices,
+                    None,
+                    dcp_world_size=dcp_world_size,
+                    dcp_rank=dcp_rank,
+                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -665,14 +684,23 @@ def sparse_attn_indexer(
             )
 
         if decode_metadata.global_seq_lens is not None:
-            _merge_dcp_topk_global(
-                logits,
-                topk_indices,
-                topk_tokens,
-                dcp_rank,
-                dcp_world_size,
-                cp_kv_cache_interleave_size,
-            )
+            if dcp_global_topk:
+                _merge_dcp_topk_global(
+                    logits,
+                    topk_indices,
+                    topk_tokens,
+                    dcp_rank,
+                    dcp_world_size,
+                    cp_kv_cache_interleave_size,
+                )
+            else:
+                triton_convert_dcp_local_topk_to_global(
+                    topk_indices,
+                    None,
+                    dcp_world_size=dcp_world_size,
+                    dcp_rank=dcp_rank,
+                    cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

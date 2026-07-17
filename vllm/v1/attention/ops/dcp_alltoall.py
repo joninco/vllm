@@ -111,6 +111,89 @@ def _dcp_a2a_lse_pack_dim(output_dtype: torch.dtype) -> int:
     raise ValueError(f"Cannot pack fp32 LSE into output dtype {output_dtype}.")
 
 
+def _validate_dcp_valid_counts(
+    valid_counts: torch.Tensor | None,
+    cp_attn_out: torch.Tensor,
+) -> None:
+    if valid_counts is None:
+        return
+    expected_shape = (cp_attn_out.shape[0],)
+    if valid_counts.shape != expected_shape:
+        raise ValueError(
+            f"valid_counts must have shape {expected_shape}, got "
+            f"{tuple(valid_counts.shape)}."
+        )
+    if valid_counts.dtype != torch.int32:
+        raise TypeError(
+            f"valid_counts must have dtype torch.int32, got {valid_counts.dtype}."
+        )
+    if valid_counts.device != cp_attn_out.device:
+        raise ValueError(
+            "valid_counts and attention output must be on the same device, got "
+            f"{valid_counts.device} and {cp_attn_out.device}."
+        )
+
+
+@triton.jit
+def _sanitize_dcp_empty_rows_kernel(
+    out_ptr,
+    lse_ptr,
+    valid_counts_ptr,
+    out_stride_B,
+    out_stride_H,
+    out_stride_D,
+    lse_stride_B,
+    lse_stride_H,
+    valid_counts_stride_B,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    batch_idx = tl.program_id(0).to(tl.int64)
+    head_idx = tl.program_id(1).to(tl.int64)
+    d_offsets = tl.arange(0, BLOCK_D)
+    d_mask = d_offsets < HEAD_DIM
+    row_is_valid = tl.load(valid_counts_ptr + batch_idx * valid_counts_stride_B) > 0
+    out_offsets = (
+        batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
+    )
+    values = tl.load(out_ptr + out_offsets, mask=d_mask)
+    tl.store(out_ptr + out_offsets, tl.where(row_is_valid, values, 0.0), mask=d_mask)
+    lse_offset = batch_idx * lse_stride_B + head_idx * lse_stride_H
+    lse = tl.load(lse_ptr + lse_offset)
+    tl.store(lse_ptr + lse_offset, tl.where(row_is_valid, lse, -float("inf")))
+
+
+def sanitize_dcp_attn_empty_rows(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    valid_counts: torch.Tensor | None,
+) -> None:
+    """Force locally empty DCP rows to the neutral ``(0, -inf)`` state."""
+    _validate_dcp_valid_counts(valid_counts, cp_attn_out)
+    if valid_counts is None or cp_attn_out.shape[0] == 0:
+        return
+    if cp_attn_out.ndim != 3 or cp_attn_lse.shape != cp_attn_out.shape[:2]:
+        raise ValueError(
+            "Expected attention output [B,H,D] and LSE [B,H], got "
+            f"{tuple(cp_attn_out.shape)} and {tuple(cp_attn_lse.shape)}."
+        )
+    head_dim = cp_attn_out.shape[2]
+    grid = (cp_attn_out.shape[0], cp_attn_out.shape[1], 1)
+    _sanitize_dcp_empty_rows_kernel[grid](
+        cp_attn_out,
+        cp_attn_lse,
+        valid_counts,
+        cp_attn_out.stride(0),
+        cp_attn_out.stride(1),
+        cp_attn_out.stride(2),
+        cp_attn_lse.stride(0),
+        cp_attn_lse.stride(1),
+        valid_counts.stride(0),
+        HEAD_DIM=head_dim,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+    )
+
+
 def _dcp_a2a_send_recv_buffers(
     shape: tuple[int, ...],
     device: torch.device,

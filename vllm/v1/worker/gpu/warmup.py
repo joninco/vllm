@@ -85,19 +85,47 @@ def run_mixed_prefill_decode_warmup(
     """Run a V2 mixed prefill+decode step through normal scheduler inputs."""
     if model_runner.is_pooling_model or model_runner.max_num_reqs < 2 or num_tokens < 3:
         return False
+    if model_runner.scheduler_config.max_num_seqs < 2:
+        logger.warning(
+            "Skipping V2 mixed prefill+decode warmup because max_num_seqs=%d "
+            "cannot hold both the warmup decode and prefill requests.",
+            model_runner.scheduler_config.max_num_seqs,
+        )
+        return False
 
     decode_req_id = f"{req_id_prefix}_decode_"
     prefill_req_id = f"{req_id_prefix}_prefill_"
-    decode_prompt_len = 2
     decode_scheduled_tokens = 1
-    prefill_len = num_tokens - decode_scheduled_tokens
-    decode_token_ids = list(range(decode_prompt_len))
-    prefill_token_ids = list(range(prefill_len))
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
     block_count = _warmup_block_counter(model_runner)
     kv_cache_specs = [g.kv_cache_spec for g in kv_cache_groups]
+
+    # Under DCP, the sparse decode kernels expect every DCP rank to have a
+    # non-empty local KV range. A two-token synthetic decode prompt can occupy
+    # only the first cache block, leaving later DCP ranks with zero local slots
+    # during mixed prefill+decode autotune. Span one block per DCP rank so the
+    # warmup exercises a valid DCP decode shape.
+    dcp_size = max(1, getattr(model_runner, "dcp_size", 1))
+    cp_interleave = max(1, getattr(model_runner, "cp_interleave", 1))
+    min_dcp_decode_prompt_len = (
+        max(s.block_size for s in kv_cache_specs) * dcp_size * cp_interleave
+    )
+    decode_prompt_len = max(2, min_dcp_decode_prompt_len)
+    if decode_prompt_len > model_runner.scheduler_config.max_num_batched_tokens:
+        logger.warning(
+            "Skipping V2 mixed prefill+decode warmup because DCP decode prompt "
+            "length %d exceeds max_num_batched_tokens=%d.",
+            decode_prompt_len,
+            model_runner.scheduler_config.max_num_batched_tokens,
+        )
+        return False
+
+    prefill_len = num_tokens - decode_scheduled_tokens
+    decode_token_ids = list(range(decode_prompt_len))
+    prefill_token_ids = list(range(prefill_len))
+
     decode_prefill_block_counts = [
         block_count(decode_prompt_len, s) for s in kv_cache_specs
     ]
@@ -216,8 +244,15 @@ def warmup_kernels(
     decode_query_len = model_runner.decode_query_len
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
     # length exceeds decode_query_len, preventing it from being misclassified as
-    # a uniform decode batch.
-    prompt_len = decode_query_len + 1
+    # a uniform decode batch. Under DCP, also make the synthetic prompt span all
+    # KV shards; some sparse MLA backends do not support warmup batches where a
+    # DCP rank receives zero local KV tokens.
+    min_dcp_prompt_len = max(
+        1,
+        getattr(model_runner, "dcp_size", 1)
+        * getattr(model_runner, "cp_interleave", 1),
+    )
+    prompt_len = max(decode_query_len + 1, min_dcp_prompt_len)
     prompt_token_ids = list(range(prompt_len))
     # Upper bound on the decode steps built in `decode_steps` below.
     num_decode_steps = 1

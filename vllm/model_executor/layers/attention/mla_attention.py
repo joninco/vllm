@@ -292,6 +292,8 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import sanitize_dcp_attn_empty_rows
 from vllm.v1.attention.ops.dcp_utils import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
@@ -619,6 +621,45 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 is_lse_base_on_e=self.impl.lse_base_on_e,
                 use_pcp=self.use_pcp,
             )
+        self.dcp_a2a = self.dcp_manager is not None and self.dcp_manager.use_a2a
+        self.dcp_project_before_merge = (
+            self.dcp_manager is not None
+            and not self.use_pcp
+            and envs.VLLM_DCP_PROJECT_BEFORE_MERGE
+            and getattr(self.impl, "supports_dcp_project_before_merge", False)
+        )
+        self.dcp_project_before_merge_min_prefill_tokens = (
+            envs.VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS
+        )
+        if self.dcp_project_before_merge_min_prefill_tokens < 0:
+            raise ValueError(
+                "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS must be "
+                "non-negative, got "
+                f"{self.dcp_project_before_merge_min_prefill_tokens}."
+            )
+        max_capture_size = max(compilation_config.cudagraph_capture_sizes, default=0)
+        if (
+            self.dcp_project_before_merge
+            and self.dcp_project_before_merge_min_prefill_tokens < max_capture_size
+        ):
+            raise ValueError(
+                "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS "
+                f"({self.dcp_project_before_merge_min_prefill_tokens}) must "
+                "be at least the maximum cudagraph capture size "
+                f"({max_capture_size})."
+            )
+        # Hybrid DCP dispatch: the one-shot A2A exchange is
+        # latency-optimal for small decode batches but loses to pipelined
+        # NCCL collectives on large prefill/extend batches. Batches with more
+        # tokens than the cap take VLLM_DCP_A2A_LARGE_BACKEND instead
+        # (0 = uncapped, pure A2A).
+        self.dcp_a2a_max_tokens = envs.VLLM_DCP_A2A_MAX_TOKENS if self.dcp_a2a else 0
+        self.dcp_a2a_large_backend = envs.VLLM_DCP_A2A_LARGE_BACKEND
+        if self.dcp_a2a and self.dcp_a2a_large_backend not in ("ag_rs", "a2a"):
+            raise ValueError(
+                "VLLM_DCP_A2A_LARGE_BACKEND must be 'ag_rs' or 'a2a', got "
+                f"{self.dcp_a2a_large_backend!r}."
+            )
 
         self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
 
@@ -839,6 +880,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 num_mqa_tokens = q.size(0)
                 num_mha_tokens = 0
 
+        ondemand_w_uv_capable = (
+            getattr(self, "dcp_project_before_merge", False)
+            and self.impl.dcp_world_size > 1
+            and self.impl.is_sparse
+            and getattr(self.impl, "supports_dcp_project_before_merge", False)
+            and hasattr(self, "W_UV")
+            and self.W_UV.dtype == torch.bfloat16
+        )
+        project_before_merge_min_tokens = getattr(
+            self,
+            "dcp_project_before_merge_min_prefill_tokens",
+            1024,
+        )
+        use_ondemand_w_uv = (
+            ondemand_w_uv_capable
+            and attn_metadata.max_query_len > 1
+            and num_mqa_tokens > project_before_merge_min_tokens
+        )
         mha_use_quant_output = (
             quant_key is not None
             and self.prefill_backend is not None
@@ -943,9 +1002,34 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
+            use_ag_rs_fallback = False
+            project_before_merge = False
             # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
             if self.impl.dcp_world_size > 1:
                 assert self.dcp_manager is not None
+                if not self.impl.can_return_lse_for_decode:
+                    raise NotImplementedError(
+                        f"{type(self.impl).__name__} cannot use DCP because it "
+                        "does not return decode softmax LSE."
+                    )
+                self.impl.need_to_return_lse_for_decode = True
+
+                dcp_small_batch = (
+                    self.dcp_a2a_max_tokens <= 0
+                    or num_mqa_tokens <= self.dcp_a2a_max_tokens
+                )
+                use_ag_rs_fallback = (
+                    self.dcp_a2a
+                    and not self.use_pcp
+                    and not dcp_small_batch
+                    and self.dcp_a2a_large_backend == "ag_rs"
+                )
+                project_before_merge = (
+                    use_ondemand_w_uv
+                    and not self.use_pcp
+                    and (not self.dcp_a2a or use_ag_rs_fallback)
+                )
+
                 if self.use_pcp:
                     if self.impl.dcp_world_size > self.impl.pcp_world_size:
                         if isinstance(mqa_q, tuple):
@@ -966,7 +1050,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
-                assert lse is not None
+                if lse is None:
+                    raise RuntimeError(
+                        f"{type(self.impl).__name__} did not return decode "
+                        "softmax LSE required by DCP."
+                    )
                 assert self.dcp_manager is not None
                 seq_lens = (
                     attn_metadata.decode.seq_lens
@@ -978,17 +1066,78 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 query_start_loc = attn_metadata.query_start_loc[
                     : attn_metadata.num_decodes + 1
                 ]
-                attn_out = self.dcp_manager.combine(
-                    attn_out,
-                    lse,
-                    seq_lens=seq_lens,
-                    query_start_loc=query_start_loc,
-                )
+                valid_counts = None
+                if project_before_merge:
+                    valid_counts_tensor = getattr(
+                        attn_metadata, "nsa_cache_seqlens", None
+                    )
+                    if (
+                        not isinstance(valid_counts_tensor, torch.Tensor)
+                        or valid_counts_tensor.ndim != 1
+                        or valid_counts_tensor.numel() < num_mqa_tokens
+                        or valid_counts_tensor.dtype != torch.int32
+                        or valid_counts_tensor.device != attn_out.device
+                    ):
+                        raise RuntimeError(
+                            "Projected DCP merge requires a one-dimensional "
+                            f"int32 nsa_cache_seqlens tensor with at least "
+                            f"{num_mqa_tokens} rows on {attn_out.device}."
+                        )
+                    valid_counts = valid_counts_tensor[:num_mqa_tokens]
+                    if not valid_counts.is_contiguous():
+                        raise RuntimeError(
+                            "Projected DCP valid counts must be contiguous."
+                        )
+                    local_w_uv = self.W_UV.contiguous()
+                    w_uv_dcp = get_dcp_group().all_gather(local_w_uv, dim=0)
+                    expected_shape = (
+                        self.num_heads * get_dcp_group().world_size,
+                        self.kv_lora_rank,
+                        self.v_head_dim,
+                    )
+                    if (
+                        w_uv_dcp.shape != expected_shape
+                        or w_uv_dcp.dtype != local_w_uv.dtype
+                        or w_uv_dcp.device != local_w_uv.device
+                        or not w_uv_dcp.is_contiguous()
+                    ):
+                        raise RuntimeError(
+                            "Invalid rank-major DCP W_UV gather: expected "
+                            f"contiguous {expected_shape} on "
+                            f"{local_w_uv.device}/{local_w_uv.dtype}, got "
+                            f"{tuple(w_uv_dcp.shape)} on "
+                            f"{w_uv_dcp.device}/{w_uv_dcp.dtype}."
+                        )
+                    projected = attn_out.new_empty(
+                        attn_out.shape[0], attn_out.shape[1], self.v_head_dim
+                    )
+                    self._v_up_proj_bmm_chunked(attn_out, projected, w_uv_dcp)
+                    attn_out = projected
+                if project_before_merge or use_ag_rs_fallback:
+                    if project_before_merge:
+                        sanitize_dcp_attn_empty_rows(attn_out, lse, valid_counts)
+                    attn_out = cp_lse_ag_out_rs(
+                        attn_out,
+                        lse,
+                        get_dcp_group(),
+                        is_lse_base_on_e=self.impl.lse_base_on_e,
+                        seq_lens=seq_lens,
+                        query_start_loc=query_start_loc,
+                    )
+                else:
+                    attn_out = self.dcp_manager.combine(
+                        attn_out,
+                        lse,
+                        seq_lens=seq_lens,
+                        query_start_loc=query_start_loc,
+                    )
                 if self.use_pcp:
                     attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
-            # v_up projection
-            self._v_up_proj(attn_out, out=mqa_output_slice)
+            if project_before_merge:
+                mqa_output_slice.copy_(attn_out.reshape(mqa_output_slice.shape))
+            else:
+                self._v_up_proj(attn_out, out=mqa_output_slice)
 
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks
@@ -1192,6 +1341,82 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
             torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+
+    def _v_up_proj_bmm(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        w_uv: torch.Tensor,
+    ) -> None:
+        """Project BF16 DCP partials with rank-major gathered W_UV."""
+        if x.ndim != 3 or out.ndim != 3 or w_uv.ndim != 3:
+            raise ValueError("DCP projection expects rank-three tensors.")
+        num_tokens, num_heads, latent_dim = x.shape
+        expected_out_shape = (num_tokens, num_heads, self.v_head_dim)
+        expected_weight_shape = (
+            num_heads,
+            self.kv_lora_rank,
+            self.v_head_dim,
+        )
+        if (
+            latent_dim != self.kv_lora_rank
+            or out.shape != expected_out_shape
+            or w_uv.shape != expected_weight_shape
+        ):
+            raise ValueError(
+                "DCP projection geometry mismatch: "
+                f"x={tuple(x.shape)}, out={tuple(out.shape)}, "
+                f"w_uv={tuple(w_uv.shape)}."
+            )
+        if (
+            x.dtype != torch.bfloat16
+            or out.dtype != x.dtype
+            or w_uv.dtype != x.dtype
+            or out.device != x.device
+            or w_uv.device != x.device
+            or not w_uv.is_contiguous()
+        ):
+            raise ValueError(
+                "DCP projection requires contiguous BF16 weights and matching "
+                "BF16 inputs/outputs on one device."
+            )
+        x_head_major = x.transpose(0, 1).contiguous()
+        projected_head_major = torch.empty(
+            (num_heads, num_tokens, self.v_head_dim),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        torch.bmm(x_head_major, w_uv, out=projected_head_major)
+        out.copy_(projected_head_major.transpose(0, 1))
+
+    def _v_up_proj_bmm_chunked(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        w_uv: torch.Tensor,
+    ) -> None:
+        """Bound temporary BF16 DCP projection storage to 144 MiB."""
+        if x.ndim != 3 or out.ndim != 3 or w_uv.ndim != 3:
+            raise ValueError(
+                "DCP projection expects rank-three tensors: "
+                f"x={tuple(x.shape)}, out={tuple(out.shape)}, "
+                f"w_uv={tuple(w_uv.shape)}."
+            )
+        num_tokens, num_heads, latent_dim = x.shape
+        if latent_dim != self.kv_lora_rank or w_uv.shape[0] != num_heads:
+            raise ValueError(
+                "DCP projection geometry mismatch: "
+                f"x={tuple(x.shape)}, w_uv={tuple(w_uv.shape)}."
+            )
+
+        temp_budget_bytes = 144 * 1024 * 1024
+        temp_bytes_per_token = (
+            num_heads * (self.kv_lora_rank + self.v_head_dim) * x.element_size()
+        )
+        max_chunk_tokens = max(1, temp_budget_bytes // temp_bytes_per_token)
+        for start in range(0, num_tokens, max_chunk_tokens):
+            end = min(start + max_chunk_tokens, num_tokens)
+            self._v_up_proj_bmm(x[start:end], out[start:end], w_uv)
 
 
 def unified_mla_kv_cache_update(

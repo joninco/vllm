@@ -57,6 +57,11 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_DCP_PROJECT_BEFORE_MERGE: bool = False
+    VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS: int = 1024
+    VLLM_DCP_A2A_MAX_TOKENS: int = 0
+    VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
+    VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -1063,6 +1068,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    # Project rank-local sparse MLA partials before their DCP merge. This is
+    # opt-in until the guarded TP4 path has been benchmarked against baseline.
+    "VLLM_DCP_PROJECT_BEFORE_MERGE": lambda: bool(
+        int(os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE", "0"))
+    ),
+    # Strict lower bound on actual prefill/extend rows. Keep it above every
+    # CUDA graph capture size so the weight gather remains eager-only.
+    "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS", "1024")
+    ),
+    # Token cap for the low-latency DCP A2A exchange (0 = uncapped). Batches
+    # with more tokens than this bypass the one-shot A2A/B12X path, which is
+    # latency-optimal for small decode batches but loses to pipelined NCCL
+    # collectives on large prefill/extend batches. Also bounds the B12X DCP
+    # IPC staging allocation, which scales linearly with this value.
+    "VLLM_DCP_A2A_MAX_TOKENS": lambda: int(os.getenv("VLLM_DCP_A2A_MAX_TOKENS", "0")),
+    # Collective pattern used for DCP batches above VLLM_DCP_A2A_MAX_TOKENS:
+    # "ag_rs" (default) routes them through the AllGather+ReduceScatter path;
+    # "a2a" keeps the NCCL all-to-all exchange (without B12X staging).
+    "VLLM_DCP_A2A_LARGE_BACKEND": lambda: os.getenv(
+        "VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs"
+    ),
+    # Under DCP, merge sparse-indexer candidates across ranks and select a
+    # global top-k instead of retaining each rank's local top-k.
+    "VLLM_DCP_GLOBAL_TOPK": lambda: (
+        os.getenv("VLLM_DCP_GLOBAL_TOPK", "1").lower() in ("1", "true", "yes", "on")
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

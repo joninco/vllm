@@ -735,6 +735,43 @@ class GroupCoordinator:
         else:
             return self._reduce_scatter_out_place(input_, dim)
 
+    def reduce_scatter_into(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """Run eager reduce-scatter into caller-provided CUDA storage."""
+        if self.world_size <= 1 or dim != 1:
+            raise RuntimeError("reduce_scatter_into requires DCP heads on dim 1")
+        if input_.ndim != 3 or output.ndim != 3:
+            raise ValueError("reduce_scatter_into requires rank-3 tensors")
+        if input_.device != output.device or input_.device.type != "cuda":
+            raise ValueError("reduce_scatter_into requires one CUDA device")
+        if (
+            input_.shape[0] != output.shape[0]
+            or input_.shape[1] != self.world_size * output.shape[1]
+            or input_.shape[2:] != output.shape[2:]
+        ):
+            raise ValueError("reduce_scatter_into shape mismatch")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("reduce_scatter_into is eager-only")
+        if self.device_communicator is None:
+            raise RuntimeError("reduce_scatter_into requires a device communicator")
+
+        reduce_scatter_into = getattr(
+            self.device_communicator, "reduce_scatter_into", None
+        )
+        if not callable(reduce_scatter_into):
+            raise RuntimeError(
+                f"{type(self.device_communicator).__name__} does not support "
+                "reduce_scatter_into"
+            )
+        result = reduce_scatter_into(input_, output, dim)
+        if result is not output:
+            raise RuntimeError("reduce_scatter_into did not preserve output identity")
+        return output
+
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ) -> torch.Tensor:
@@ -1471,7 +1508,16 @@ def graph_capture(
     context = graph_capture_context or GraphCaptureContext(
         torch.cuda.Stream(device=device)
     )
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+    maybe_dcp_capture = (
+        get_dcp_group().graph_capture(context)
+        if _DCP is not None and get_dcp_group().world_size > 1
+        else nullcontext()
+    )
+    with (
+        get_tp_group().graph_capture(context),
+        get_pp_group().graph_capture(context),
+        maybe_dcp_capture,
+    ):
         yield context
 
 
