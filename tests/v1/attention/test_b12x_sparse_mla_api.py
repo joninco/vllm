@@ -35,9 +35,12 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
     B12xMLASparseMetadata,
     B12xMLASparseMetadataBuilder,
+    _global_causal_lens_for_ckv_gather,
+    _is_glm_next_ckv_source_layout,
     _is_speculative_decode_batch,
     _max_speculative_decode_query_len,
     _selected_index_block_stride_rows,
+    _use_b12x_full_ckv_gather,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import _remap_tiling
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -258,6 +261,52 @@ def test_b12x_glm5_next_accepts_dcp_with_speculation(monkeypatch) -> None:
     assert invalid_reasons == []
 
 
+@pytest.mark.parametrize(
+    ("max_query_len", "is_spec_decode", "num_tokens", "expected"),
+    [
+        (1, False, 32, False),
+        (6, True, 192, False),
+        (6, False, 192, True),
+        (128, False, 8192, True),
+        (128, False, 600000, False),
+    ],
+)
+def test_b12x_full_ckv_gather_excludes_decode_and_mtp_batches(
+    max_query_len: int,
+    is_spec_decode: bool,
+    num_tokens: int,
+    expected: bool,
+) -> None:
+    assert (
+        _use_b12x_full_ckv_gather(
+            enabled=True,
+            is_glm_next=True,
+            dcp_world_size=4,
+            max_query_len=max_query_len,
+            num_tokens=num_tokens,
+            is_spec_decode=is_spec_decode,
+            min_tokens=16,
+            max_tokens=524288,
+        )
+        is expected
+    )
+
+
+def test_b12x_full_ckv_gather_uses_global_causal_lengths() -> None:
+    global_seq_lens = torch.tensor([5, 12], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
+    req_id_per_token = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32)
+
+    actual = _global_causal_lens_for_ckv_gather(
+        global_seq_lens,
+        query_start_loc,
+        req_id_per_token,
+        num_actual_tokens=5,
+    )
+
+    assert actual.tolist() == [4, 5, 10, 11, 12]
+
+
 def test_b12x_glm5_next_accepts_dcp_with_prefix_caching(monkeypatch) -> None:
     monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
     with set_current_vllm_config(
@@ -341,6 +390,8 @@ def test_b12x_glm5_next_selected_indices_use_physical_slots() -> None:
         )
         == 64
     )
+    assert _is_glm_next_ckv_source_layout(cache, page_size=64)
+    assert not _is_glm_next_ckv_source_layout(cache[:, :, ::2], page_size=64)
 
 
 def test_sparse_index_remap_tiling_covers_glm5_next_width() -> None:

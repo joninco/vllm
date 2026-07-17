@@ -909,6 +909,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 mqa_q = q[:num_mqa_tokens]
                 qrep_decode = False
+            full_ckv_dcp = self.impl.uses_full_ckv_dcp(  # type: ignore[attr-defined]
+                attn_metadata, num_mqa_tokens
+            )
             mqa_output_slice = output[:num_mqa_tokens]
 
             mqa_q_nope, mqa_q_pe = mqa_q.split(
@@ -998,7 +1001,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     if isinstance(mqa_q, tuple):
                         # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                         mqa_q = torch.cat(mqa_q, dim=-1)
-                    if not qrep_decode:
+                    if not qrep_decode and not full_ckv_dcp:
                         assert self.dcp_manager.query_gather is not None
                         mqa_q = self.dcp_manager.query_gather(mqa_q)
 
@@ -1008,7 +1011,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
             # correct dcp attn_out with lse.
-            if self.impl.dcp_world_size > 1:
+            if self.impl.dcp_world_size > 1 and not full_ckv_dcp:
                 assert lse is not None
                 assert self.dcp_manager is not None
                 decode_metadata = getattr(attn_metadata, "decode", None)
