@@ -1069,15 +1069,39 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             use_ag_rs_fallback = False
             project_before_merge = False
             workspace_gather_used = False
+            ckv_gather_used = False
             if self.impl.dcp_world_size > 1:
                 assert self.dcp_manager is not None
-                if not self.impl.can_return_lse_for_decode:
+                ckv_gather_selector = getattr(
+                    self.impl, "dcp_prefill_ckv_gather_eligible", None
+                )
+                ckv_gather_used = bool(
+                    not self.use_pcp
+                    and not qrep_decode
+                    and callable(ckv_gather_selector)
+                    and ckv_gather_selector(attn_metadata, num_mqa_tokens)
+                )
+                if not ckv_gather_used:
+                    if not self.impl.can_return_lse_for_decode:
+                        raise NotImplementedError(
+                            f"{type(self.impl).__name__} cannot use DCP because it "
+                            "does not return decode softmax LSE."
+                        )
+                    self.impl.need_to_return_lse_for_decode = True
+                if (
+                    fp8_attention
+                    and isinstance(mqa_q, torch.Tensor)
+                    and not getattr(self.impl, "supports_dcp_quant_query_input", False)
+                ):
                     raise NotImplementedError(
-                        f"{type(self.impl).__name__} cannot use DCP because it "
-                        "does not return decode softmax LSE."
+                        f"{type(self.impl).__name__} does not declare support for "
+                        "DCP with FP8 KV cache and pre-quantized query input."
                     )
-                self.impl.need_to_return_lse_for_decode = True
-
+                # Hybrid dispatch on the per-step token count. This is
+                # CUDA-graph safe: under capture the branch sees the padded
+                # capture size, so every graph bakes in one path, and eager
+                # prefill re-evaluates per step. All DCP ranks run the same
+                # batch, so the choice is uniform across the group.
                 dcp_small_batch = (
                     self.dcp_a2a_max_tokens <= 0
                     or num_mqa_tokens <= self.dcp_a2a_max_tokens
@@ -1092,10 +1116,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     use_ondemand_w_uv
                     and not self.use_pcp
                     and (not self.dcp_a2a or use_ag_rs_fallback)
+                    and not ckv_gather_used
                 )
                 dcp_use_b12x = self.dcp_b12x and dcp_small_batch
                 workspace_gather_eligible = (
                     not qrep_decode
+                    and not ckv_gather_used
                     and _can_use_b12x_dcp_prefill_workspace(
                         enabled=envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE,
                         project_before_merge=project_before_merge,
@@ -1117,10 +1143,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             mqa_q = torch.cat(mqa_q, dim=-1)
                         mqa_q = get_tp_group().all_gather(mqa_q, dim=1)
                 else:
-                    if isinstance(mqa_q, tuple) and not workspace_gather_eligible:
+                    if (
+                        isinstance(mqa_q, tuple)
+                        and not workspace_gather_eligible
+                        and not ckv_gather_used
+                    ):
                         mqa_q = torch.cat(mqa_q, dim=-1)
                     if not qrep_decode:
-                        if dcp_use_b12x:
+                        if ckv_gather_used:
+                            logger.info_once(
+                                "Keeping local query heads for transient full-CKV "
+                                "B12X sparse MLA prefill"
+                            )
+                        elif dcp_use_b12x:
                             mqa_q = dcp_b12x_all_gather_heads(
                                 mqa_q,
                                 get_dcp_group(),
@@ -1155,10 +1190,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # call decode attn
             if not self.impl.is_sparse:
                 assert attn_metadata.decode is not None
+            if ckv_gather_used:
+                ckv_setter = getattr(self.impl, "set_ckv_current_chunk_kv", None)
+                if callable(ckv_setter):
+                    ckv_setter(k_c_normed, k_pe)
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
             # correct dcp attn_out with lse.
-            if self.impl.dcp_world_size > 1:
+            if self.impl.dcp_world_size > 1 and not ckv_gather_used:
                 if lse is None:
                     raise RuntimeError(
                         f"{type(self.impl).__name__} did not return decode "
