@@ -32,6 +32,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.math_utils import next_power_of_2
 
+HAS_CUTEDSL = has_cutedsl()
+
 
 @triton.jit
 def quantize_and_insert_k_kernel(
@@ -409,7 +411,7 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
+    if HAS_CUTEDSL and not torch.compiler.is_compiling():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,
@@ -526,6 +528,7 @@ def _compute_global_topk_indices_and_lens_kernel(
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    safe_req_idx = tl.where(is_valid_token, req_idx, 0)
 
     count = tl.zeros((), dtype=tl.int32)
     for i in range(0, topk, TRITON_BLOCK_SIZE):
@@ -541,7 +544,7 @@ def _compute_global_topk_indices_and_lens_kernel(
 
         block_indices = local_idx // block_size
         block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
+            block_table_ptr + safe_req_idx * block_table_stride + block_indices,
             mask=mask & is_valid,
         )
         block_offsets = local_idx % block_size

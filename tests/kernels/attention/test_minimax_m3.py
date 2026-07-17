@@ -258,6 +258,7 @@ def test_prefill_index_topk_correctness():
         max_query_len=q_lens.max().item(),
         max_seq_len=max_seq_len,
         num_kv_heads=num_idx_heads,
+        sm_scale=head_dim**-0.5,
     )
     actual = minimax_m3_index_topk(
         score,
@@ -278,6 +279,7 @@ def test_prefill_index_topk_correctness():
         topk,
         init_blocks,
         local_blocks,
+        head_dim**-0.5,
     )
     _assert_topk_indices_equal_unordered(actual, expected)
 
@@ -608,6 +610,7 @@ def test_decode_index_topk_correctness(
         init_blocks=init_blocks,
         local_blocks=local_blocks,
         num_kv_heads=num_idx_heads,
+        sm_scale=head_dim**-0.5,
         decode_query_len=decode_query_len,
         max_decode_query_len=max_decode_query_len,
     )
@@ -623,6 +626,7 @@ def test_decode_index_topk_correctness(
         topk,
         init_blocks,
         local_blocks,
+        head_dim**-0.5,
     )
     _assert_topk_indices_equal_unordered(actual, expected)
 

@@ -385,9 +385,6 @@ def _gqa_sparse_decode_kernel(
         m_i = m_ij
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
 
-    if USE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
     # Empty chunks for active rows must store zero output; otherwise the merge
     # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
@@ -410,6 +407,9 @@ def _gqa_sparse_decode_kernel(
         order=(0,),
     )
     tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.heuristics(
@@ -440,7 +440,6 @@ def _merge_topk_attn_out_kernel(
     # NOTE: assume seq_lens is safe to load before gdc_wait()
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
     off_c = tl.arange(0, NUM_TOPK_CHUNKS)
     off_d = tl.arange(0, BLOCK_SIZE_D)
@@ -463,6 +462,9 @@ def _merge_topk_attn_out_kernel(
         out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
     )
     tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=off_d < head_dim)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 # ---------------------------------------------------------------------------

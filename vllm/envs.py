@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
     VLLM_DCP_GLOBAL_TOPK: bool = True
+    VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -1101,6 +1102,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # global top-k instead of retaining each rank's local top-k.
     "VLLM_DCP_GLOBAL_TOPK": lambda: (
         os.getenv("VLLM_DCP_GLOBAL_TOPK", "1").lower() in ("1", "true", "yes", "on")
+    ),
+    # Diagnostic flag retained for local experiments. MiniMax M3 compile is
+    # fail-closed in the model until the no-break path is validated.
+    "VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE": lambda: bool(
+        int(os.getenv("VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE", "0"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

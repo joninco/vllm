@@ -28,11 +28,14 @@ from vllm.model_executor.layers.attention.mla_attention import (
     QueryLenSupport,
     _DecodeConcatQuantFP8,
 )
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SparseMLACommonImpl,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.attention.backend import CommonAttentionMetadata, SparseMLAAttentionImpl
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
 from vllm.v1.attention.backends.mla import flashmla as flashmla_module
 from vllm.v1.attention.backends.mla import tokenspeed_mla as tokenspeed_mla_module
@@ -551,7 +554,7 @@ class MockSparseMLAAttentionLayer:
 
 
 def test_sparse_mla_profile_skips_dense_prefill_workspace(monkeypatch):
-    class ProfileSparseImpl(SparseMLAAttentionImpl):
+    class ProfileSparseImpl(SparseMLACommonImpl):
         def __init__(self) -> None:
             self.dcp_world_size = 1
             self.supports_quant_query_input = False
@@ -613,7 +616,7 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
         def all_gather(self, x, dim):
             return torch.cat((x, x), dim=dim)
 
-    class FakeSparseImpl(SparseMLAAttentionImpl):
+    class FakeSparseImpl(SparseMLACommonImpl):
         can_return_lse_for_decode = True
         supports_quant_query_input = False
 
@@ -650,6 +653,8 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     impl = FakeSparseImpl()
     layer.impl = impl
     layer.dcp_a2a = False
+    layer.dcp_a2a_max_tokens = 0
+    layer.dcp_a2a_large_backend = "ag_rs"
     layer.kv_cache_dtype = "fp8_ds_mla"
     layer.num_heads = 2
     layer.qk_nope_head_dim = 4
@@ -673,7 +678,13 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     k_pe = torch.empty((1, 1, 2), dtype=torch.bfloat16)
     kv_cache = torch.empty((0,), dtype=torch.uint8)
     output = torch.empty((1, 6), dtype=torch.bfloat16)
-    attn_metadata = SimpleNamespace(num_actual_tokens=1)
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        num_decodes=1,
+        num_prefills=0,
+        num_decode_tokens=1,
+        max_query_len=1,
+    )
 
     result = MLAAttention.forward_impl(
         layer,
@@ -697,7 +708,7 @@ def test_fp8_dcp_quantized_query_requires_backend_opt_in(monkeypatch):
         world_size = 2
         rank_in_group = 0
 
-    class FakeQuantImpl(SparseMLAAttentionImpl):
+    class FakeQuantImpl(SparseMLACommonImpl):
         can_return_lse_for_decode = True
         supports_quant_query_input = True
 
@@ -739,7 +750,13 @@ def test_fp8_dcp_quantized_query_requires_backend_opt_in(monkeypatch):
     k_pe = torch.empty((1, 1, 2), dtype=torch.bfloat16)
     kv_cache = torch.empty((0,), dtype=torch.uint8)
     output = torch.empty((1, 6), dtype=torch.bfloat16)
-    attn_metadata = SimpleNamespace(num_actual_tokens=1)
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        num_decodes=1,
+        num_prefills=0,
+        num_decode_tokens=1,
+        max_query_len=1,
+    )
 
     with pytest.raises(NotImplementedError, match="pre-quantized query input"):
         MLAAttention.forward_impl(

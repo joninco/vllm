@@ -52,6 +52,9 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.warmup.deepseek_v4_compressor_warmup import (
+    deepseek_v4_compressor_triton_warmup,
+)
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
@@ -476,6 +479,9 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            deepseek_v4_compressor_triton_warmup(
+                self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+            )
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -503,6 +509,9 @@ class Worker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+            deepseek_v4_compressor_triton_warmup(
+                self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+            )
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -662,6 +671,10 @@ class Worker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
+        deepseek_v4_compressor_triton_warmup(
+            self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+        )
+
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
@@ -777,10 +790,10 @@ class Worker(WorkerBase):
                 f"{format_gib(self.peak_activation_memory)} GiB "
                 f"for peak activation, and {format_gib(cuda_graph_memory_bytes)} "
                 f"GiB for CUDAGraph memory. Replace gpu_memory_utilization "
-                f"config with `--kv-cache-memory="
+                f"config with `--kv-cache-memory-bytes="
                 f"{kv_cache_memory_bytes_to_requested_limit}` "
                 f"({format_gib(kv_cache_memory_bytes_to_requested_limit)} GiB) to fit "
-                f"into requested memory, or `--kv-cache-memory="
+                f"into requested memory, or `--kv-cache-memory-bytes="
                 f"{kv_cache_memory_bytes_to_gpu_limit}` "
                 f"({format_gib(kv_cache_memory_bytes_to_gpu_limit)} GiB) to fully "
                 f"utilize gpu memory. Current kv cache memory in use is "
@@ -1339,7 +1352,9 @@ class Worker(WorkerBase):
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
-            model_runner.shutdown()
+            shutdown = getattr(model_runner, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
 
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to

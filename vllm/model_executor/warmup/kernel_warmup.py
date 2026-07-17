@@ -33,6 +33,9 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
 from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
     kimi_k3_triton_warmup,
 )
+from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+    minimax_m3_msa_warmup,
+)
 from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup,
@@ -180,10 +183,6 @@ def _uses_flashinfer_compute_kernels(worker: "Worker") -> bool:
 
 
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
-    from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
-        minimax_m3_msa_warmup,
-    )
-
     if not worker.use_v2_model_runner:
         # Pooling models do not use the generation slot-mapping path.
         if not worker.model_runner.is_pooling_model:
@@ -193,8 +192,16 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
         if zeroer is not None:
             zeroer.warmup(worker.model_runner.kv_cache_config.num_blocks)
-
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+
+    compilation_config = worker.vllm_config.compilation_config
+    cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+    mhc_warmup_token_sizes = list(cudagraph_capture_sizes)
+    max_num_scheduled_tokens = getattr(
+        worker.scheduler_config, "max_num_scheduled_tokens", None
+    )
+    if max_num_scheduled_tokens is not None:
+        mhc_warmup_token_sizes.append(max_num_scheduled_tokens)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
@@ -202,9 +209,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     deepseek_v4_mhc_warmup(
         worker.get_model(),
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
-        cudagraph_capture_sizes=(
-            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
-        ),
+        cudagraph_capture_sizes=mhc_warmup_token_sizes,
     )
 
     # Run next so input-prep kernels JIT against pristine runner state.

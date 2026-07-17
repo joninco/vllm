@@ -22,7 +22,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -172,10 +171,8 @@ class DeepseekSparseSWAMetadata:
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     decode_swa_indices: torch.Tensor | None = None  # [num_decode_tokens, window_size]
     decode_swa_lens: torch.Tensor | None = None  # [num_decode_tokens]
-    # Paged-coordinate prefill SWA indices/lens (FP8 paged-direct prefill).
-    prefill_swa_indices: torch.Tensor | None = (
-        None  # [num_prefill_tokens, 1, window_size]
-    )
+    # Paged-coordinate per-token SWA slot ids / lengths for prefill rows.
+    prefill_swa_indices: torch.Tensor | None = None
     prefill_swa_lens: torch.Tensor | None = None  # [num_prefill_tokens]
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
@@ -400,6 +397,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
     reorder_batch_threshold: int | None = None
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_exact_metadata_reuse: bool = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -413,19 +411,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
 
-        # Handle MTP: adjust decode_threshold like the indexer does
+        # Keep the split aligned with target verification. DSpark verifies the
+        # sampled token plus K draft tokens, even though it drafts in parallel.
         spec_config = self.vllm_config.speculative_config
         self.num_speculative_tokens = (
             spec_config.num_speculative_tokens if spec_config else 0
         )
-        # Decode can have query_len up to
-        #   1 + (2 if parallel drafting else 1) * num_speculative_tokens.
-        # sparse_swa has no MQA-vs-dense-MHA routing, so multi-token queries take
-        # the prefill path and the decode/prefill split stays at that width.
-        spec_mult = (
-            2 if (spec_config is not None and spec_config.parallel_drafting) else 1
-        )
-        self.decode_threshold = 1 + spec_mult * self.num_speculative_tokens
+        self.decode_threshold = 1 + self.num_speculative_tokens
         self.reorder_batch_threshold = None
         parallel_config = self.vllm_config.parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
@@ -454,6 +446,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_indices = torch.zeros(
+            max_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.req_ids_arange = torch.arange(
             max_tokens,
             dtype=torch.int32,
             device=self.device,
@@ -518,6 +515,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         For prefill, we use chunked prefill to align with the indexer's chunking.
         """
+        num_reqs = common_attn_metadata.num_reqs
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
         query_start_loc = common_attn_metadata.query_start_loc
@@ -527,16 +525,26 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
-            split_decodes_and_prefills(
-                common_attn_metadata, decode_threshold=self.decode_threshold
+            common_attn_metadata.split_decodes_and_prefills(
+                decode_threshold=self.decode_threshold
             )
         )
 
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
-        token_to_req_indices = common_attn_metadata.token_to_req_indices(
-            self.token_to_req_indices
-        )
+        if num_prefill_tokens == 0 and num_decode_tokens == num_reqs:
+            token_to_req_indices = self.req_ids_arange[:num_decode_tokens]
+        elif common_attn_metadata.batch_topology is not None:
+            x = torch.from_numpy(
+                common_attn_metadata.batch_topology.req_id_per_token_np
+            ).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
+        else:
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         if self.dcp_world_size > 1:

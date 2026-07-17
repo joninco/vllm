@@ -15,7 +15,6 @@ from vllm.model_executor.models.deepseek_v2 import _try_load_fp8_indexer_wk
 
 
 class _LoadedParam:
-
     def __init__(self):
         self.loaded_weight = None
         self.loaded_shard_id = None
@@ -69,9 +68,11 @@ def test_try_load_fp8_indexer_wk_preserves_fp8_weight_scale_inv_path():
     loaded_params: set[str] = set()
     pending = {}
 
-    weight_fp8 = torch.linspace(-2.0, 2.0, 32 * 64, dtype=torch.float32).view(
-        32, 64
-    ).to(torch.float8_e4m3fn)
+    weight_fp8 = (
+        torch.linspace(-2.0, 2.0, 32 * 64, dtype=torch.float32)
+        .view(32, 64)
+        .to(torch.float8_e4m3fn)
+    )
     scale_inv = torch.full((1, 2), 0.25, dtype=torch.float32)
 
     assert _try_load_fp8_indexer_wk(
@@ -101,6 +102,49 @@ def test_try_load_fp8_indexer_wk_preserves_fp8_weight_scale_inv_path():
             weight_fp8,
             scale_inv,
             group_shape=GroupShape(32, 32),
+            out_dtype=torch.bfloat16,
+        ),
+    )
+
+
+def test_try_load_fp8_indexer_wk_preserves_per_channel_scale_inv_path():
+    prefix = "layers.0.self_attn.indexer"
+    param = _LoadedParam()
+    params_dict = {f"{prefix}.wk_weights_proj.weight": param}
+    loaded_params: set[str] = set()
+    pending = {}
+
+    weight_fp8 = (
+        torch.linspace(-2.0, 2.0, 4 * 64, dtype=torch.float32)
+        .view(4, 64)
+        .to(torch.float8_e4m3fn)
+    )
+    scale_inv = torch.linspace(0.125, 0.5, 4, dtype=torch.float32)
+
+    assert _try_load_fp8_indexer_wk(
+        f"{prefix}.wk.weight",
+        weight_fp8,
+        pending,
+        params_dict,
+        loaded_params,
+        [],
+    )
+    assert _try_load_fp8_indexer_wk(
+        f"{prefix}.wk.weight_scale_inv",
+        scale_inv,
+        pending,
+        params_dict,
+        loaded_params,
+        [],
+    )
+
+    assert pending == {}
+    torch.testing.assert_close(
+        param.loaded_weight,
+        scaled_dequantize(
+            weight_fp8,
+            scale_inv,
+            group_shape=GroupShape(1, weight_fp8.shape[1]),
             out_dtype=torch.bfloat16,
         ),
     )

@@ -400,6 +400,31 @@ class MiniMaxM3IndexerImpl(nn.Module):
         """Return ``(decode_topk, prefill_topk)``; implemented per kernel impl."""
         raise NotImplementedError
 
+    def forward_with_cache(
+        self,
+        index_query: torch.Tensor,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return top-k indices using an explicit index KV cache."""
+        raise NotImplementedError
+
+    def _topk_out_buffer(
+        self,
+        kind: str,
+        total_q: int,
+    ) -> torch.Tensor | None:
+        buffer = (
+            self._decode_topk_buffer if kind == "decode" else self._prefill_topk_buffer
+        )
+        if buffer is None:
+            return None
+        if int(buffer.shape[1]) < total_q:
+            raise RuntimeError(
+                "MiniMax M3 persistent top-k buffer is too small: "
+                f"need {total_q}, have {int(buffer.shape[1])}."
+            )
+        return buffer
+
 
 class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
     """Triton indexer score + top-k for both prefill and decode."""
@@ -407,6 +432,13 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
     def forward(
         self,
         index_query: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.forward_with_cache(index_query, self.index_cache.kv_cache)
+
+    def forward_with_cache(
+        self,
+        index_query: torch.Tensor,
+        kv_cache: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
@@ -418,7 +450,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
         iq = index_query[:num_tokens].view(
             -1, self.num_index_heads, self.index_head_dim
         )
-        kv = self.index_cache.kv_cache
+        kv = kv_cache
 
         # Both sides write into the single shared persistent topk_indices_buffer
         # (decode at [:, :nd], prefill at [:, nd:]) and return views into it; the
@@ -442,6 +474,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 self.init_blocks,
                 self.local_blocks,
                 self.num_kv_heads,
+                self.scale,
                 d.decode_query_len,
                 d.max_decode_query_len,
                 out=buf_htk,
@@ -459,6 +492,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 p.max_query_len,
                 p.max_seq_len,
                 self.num_kv_heads,
+                self.scale,
             )
             prefill_topk = minimax_m3_index_topk(
                 score,
@@ -584,3 +618,10 @@ class MiniMaxM3Indexer(nn.Module):
         index_query: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         return self.impl(index_query)
+
+    def forward_with_cache(
+        self,
+        index_query: torch.Tensor,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.impl.forward_with_cache(index_query, kv_cache)

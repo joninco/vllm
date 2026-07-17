@@ -18,6 +18,7 @@ The MiniMax-M3-preview config selects a single set of branches:
 """
 
 from collections.abc import Iterable
+from itertools import islice
 
 import torch
 from torch import nn
@@ -1133,7 +1134,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         # EAGLE3 is not yet compatible with pipeline parallel
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
@@ -1361,12 +1365,32 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
+            "lm_head.": "language_model.lm_head.",
+            "model.language_model.": "language_model.model.",
+            "model.vision_tower.embeddings.proj.": (
+                "vision_tower.vision_model.embeddings.patch_embedding."
+            ),
+            "model.vision_tower.embeddings.": ("vision_tower.vision_model.embeddings."),
+            "model.vision_tower.pre_layrnorm.": (
+                "vision_tower.vision_model.pre_layrnorm."
+            ),
+            "model.vision_tower.layers.": "vision_tower.vision_model.encoder.layers.",
+            "model.multi_modal_projector.merge_linear_1.": (
+                "vision_tower.patch_merge_mlp.linear_1."
+            ),
+            "model.multi_modal_projector.merge_linear_2.": (
+                "vision_tower.patch_merge_mlp.linear_2."
+            ),
+            "model.multi_modal_projector.": "vision_tower.multi_modal_projector.",
             "multi_modal_projector.": "vision_tower.multi_modal_projector.",
             "patch_merge_mlp.": "vision_tower.patch_merge_mlp.",
         },
         orig_to_new_substr={
-            ".mlp.fc1": ".fc1",
-            ".mlp.fc2": ".fc2",
+            ".mlp.gate.": ".block_sparse_moe.gate.",
+            ".mlp.experts.": ".block_sparse_moe.experts.",
+            ".mlp.shared_experts.": ".block_sparse_moe.shared_experts.",
+            ".mlp.fc1.": ".fc1.",
+            ".mlp.fc2.": ".fc2.",
         },
     )
 
