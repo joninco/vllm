@@ -191,17 +191,22 @@ class BlockTables:
         positions: torch.Tensor,
         num_tokens_padded: int,
         out: torch.Tensor | None = None,
+        is_padding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.num_kv_cache_groups == 0:
             return (self.slot_mappings if out is None else out)[:, :num_tokens_padded]
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
+        apply_padding_mask = is_padding is not None
+        if is_padding is None:
+            is_padding = slot_mappings
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
             slot_mappings.shape[1],
             idx_mapping,
             query_start_loc,
             positions,
+            is_padding,
             self.block_table_ptrs,
             self.block_table_strides,
             self.num_blocks.gpu,
@@ -214,6 +219,7 @@ class BlockTables:
             CP_SIZE=self.cp_size,
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
+            APPLY_PADDING_MASK=apply_padding_mask,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
         return slot_mappings[:, :num_tokens_padded]
@@ -283,6 +289,7 @@ def _compute_slot_mappings_kernel(
     idx_mapping,  # [num_reqs]
     query_start_loc,  # [num_reqs + 1]
     pos,  # [num_tokens]
+    is_padding,  # [num_tokens]
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
     num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs]
@@ -295,6 +302,7 @@ def _compute_slot_mappings_kernel(
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
+    APPLY_PADDING_MASK: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     # kv cache group id
@@ -352,6 +360,9 @@ def _compute_slot_mappings_kernel(
                 local_offsets = rounds * CP_INTERLEAVE + remainder
                 slot_ids = block_numbers * block_size + local_offsets
                 slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+        if APPLY_PADDING_MASK:
+            padding = tl.load(is_padding + offset, mask=offset < end_idx, other=True)
+            slot_ids = tl.where(padding, PAD_ID, slot_ids)
 
         slot_ids = tl.where(valid_block, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)

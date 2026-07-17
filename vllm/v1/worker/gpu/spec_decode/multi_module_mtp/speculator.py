@@ -201,6 +201,7 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
             num_reqs,
             input_batch.num_tokens_after_padding,
             uniform_token_count,
+            max_req_tokens=None,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,

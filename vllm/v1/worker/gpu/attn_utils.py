@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVQuantMode,
     MambaSpec,
+    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -336,7 +337,9 @@ def _reshape_kv_cache(
                 # quantized cache dtype's (possibly packed) layout.
                 layer_cache_dtype = (
                     "auto"
-                    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                    if cache_dtype != "fp8_ds_mla"
+                    and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                    and not isinstance(kv_cache_spec, TQFullAttentionSpec)
                     else cache_dtype
                 )
                 cache_dtype_str = (
@@ -419,11 +422,21 @@ def _align_mixed_attention_kv_cache_views(
             continue
         if group.kv_cache_group_id >= len(kernel_block_sizes):
             continue
+        layer_cache_dtype = (
+            "auto"
+            if cache_dtype != "fp8_ds_mla"
+            and kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+            and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+            else cache_dtype
+        )
+        cache_dtype_str = (
+            getattr(kv_cache_spec, "cache_dtype_str", None) or layer_cache_dtype
+        )
         block_dim = group.backend.get_kv_cache_block_dim(
             kernel_block_sizes[group.kv_cache_group_id],
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=cache_dtype_str,
         )
         for layer_name in group.layer_names:
             if layer_name in kv_caches:
@@ -536,6 +549,7 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    max_req_tokens: int = 0,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -594,6 +608,7 @@ def build_attn_metadata(
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
             batch_topology=batch_topology,
+            max_req_tokens=max_req_tokens,
             **common_attn_metadata_extra_kwargs,
         )
 

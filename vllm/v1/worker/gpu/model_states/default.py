@@ -144,13 +144,20 @@ class DefaultModelState(ModelState):
             input_batch.query_start_loc_np[: num_reqs + 1]
         )
         query_start_loc_gpu = input_batch.query_start_loc[: num_reqs + 1]
-        max_query_len = input_batch.max_query_len
+        max_query_len = (
+            input_batch.max_req_tokens or input_batch.num_scheduled_tokens.max().item()
+        )
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         if for_capture:
             # Capture with worst-case max_seq_len so the graph is valid at any replay.
             max_seq_len = self.max_model_len
         else:
             max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)
+        if num_reqs != input_batch.num_reqs:
+            padded_is_prefilling = torch.zeros(num_reqs, dtype=torch.bool)
+            padded_is_prefilling[: input_batch.num_reqs] = is_prefilling
+            is_prefilling = padded_is_prefilling
         req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
         if (
             self.supports_mm_inputs
@@ -178,9 +185,10 @@ class DefaultModelState(ModelState):
             max_seq_len_upper_bound=input_batch.max_seq_len_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             positions=input_batch.positions,
-            is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            is_prefilling=is_prefilling,
+            max_req_tokens=input_batch.max_req_tokens or 0,
         )
         return attn_metadata
