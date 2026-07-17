@@ -1935,7 +1935,7 @@ def initialize_model_parallel(
     # {0,2,4,6} (dcp_rank=0) and {1,3,5,7} (dcp_rank=1).
     global _QUERY_SPLIT
     assert _QUERY_SPLIT is None, "query split group is already initialized"
-    if decode_context_model_parallel_size > 1:
+    if decode_context_model_parallel_size > 1 and envs.VLLM_DCP_QUERY_SPLIT:
         query_split_ranks: list[list[int]] = []
         for dcp_rank_idx in range(decode_context_model_parallel_size):
             query_split_ranks.append([grp[dcp_rank_idx] for grp in group_ranks])
@@ -1953,7 +1953,7 @@ def initialize_model_parallel(
     # communicator from two streams is unsupported. Same ranks as ``_DCP``.
     global _DCP_CKV_PREFETCH
     assert _DCP_CKV_PREFETCH is None, "DCP ckv prefetch group is already initialized"
-    if decode_context_model_parallel_size > 1:
+    if decode_context_model_parallel_size > 1 and envs.VLLM_B12X_MLA_CKV_GATHER:
         _DCP_CKV_PREFETCH = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
