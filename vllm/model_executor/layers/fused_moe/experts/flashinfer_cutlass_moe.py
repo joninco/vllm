@@ -4,6 +4,7 @@
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -96,6 +97,11 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         # - pass per-block weight scales to the kernel
         # - skip input activation quantization (kernel applies scaling)
         self.use_deepseek_fp8_block_scale = quant_config.is_block_quantized
+        self.model_type = getattr(
+            get_current_vllm_config().model_config.hf_config,
+            "model_type",
+            None,
+        )
 
         def _per_expert(value: float | None) -> torch.Tensor | None:
             if value is None:
@@ -112,14 +118,26 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         self.gemm1_beta = _per_expert(quant_config.gemm1_beta)
 
         if quant_config.weight_quant_dtype == "mxfp4":
-            # This value is used specifically for gpt-oss,
-            # Need to revisit this for other models
-            if self.gemm1_alpha is None:
-                self.gemm1_alpha = _per_expert(1.702)
-            if self.gemm1_beta is None:
-                self.gemm1_beta = _per_expert(1.0)
-            if self.gemm1_clamp_limit is None:
-                self.gemm1_clamp_limit = _per_expert(7.0)
+            # GPT-OSS uses a non-standard clamped SwiGLU. Other MXFP4 MoE
+            # models should use the standard activation unless their quant
+            # config explicitly supplies these parameters.
+            if self.model_type == "gpt_oss":
+                if self.gemm1_alpha is None:
+                    self.gemm1_alpha = _per_expert(1.702)
+                if self.gemm1_beta is None:
+                    self.gemm1_beta = _per_expert(1.0)
+                if self.gemm1_clamp_limit is None:
+                    self.gemm1_clamp_limit = _per_expert(7.0)
+            elif (
+                self.gemm1_alpha is None
+                and self.gemm1_beta is None
+                and self.gemm1_clamp_limit is None
+            ):
+                logger.info_once(
+                    "Using standard SwiGLU parameters for FlashInfer MXFP4 MoE "
+                    "(model_type=%s).",
+                    self.model_type,
+                )
             if quant_config.quant_dtype == "mxfp8":
                 self.fake_input_scale = torch.ones(
                     self.num_experts,
@@ -324,9 +342,6 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         elif self.weight_quant_dtype == "mxfp4":
             assert self.w1_scale is not None and self.w2_scale is not None
             assert w1.is_contiguous() and w2.is_contiguous()
-            assert self.gemm1_alpha is not None
-            assert self.gemm1_beta is not None
-            assert self.gemm1_clamp_limit is not None
             assert topk_ids.is_contiguous()
 
             fc1_expert_biases = self.w1_bias

@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,7 +17,12 @@ from tests.quantization.utils import (
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm._custom_ops import scaled_fp4_quant
-from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.config.quantization import QuantizationConfigArgs
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.online import base as online_base
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerBlockOnlineLinearMethod,
     Fp8PerBlockOnlineMoEMethod,
@@ -32,6 +38,9 @@ from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
     Mxfp4OnlineMoEMethod,
 )
+from vllm.model_executor.layers.quantization.online.mxfp8 import (
+    is_shared_expert_projection,
+)
 from vllm.model_executor.layers.quantization.online.nvfp4 import (
     Nvfp4OnlineMoEMethod,
     _quantize_moe_weight_to_nvfp4,
@@ -40,6 +49,7 @@ from vllm.model_executor.layers.quantization.utils import quant_utils
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     amax_for_moe_weight_quant,
     amax_for_tp_weight_quant,
+    kMxfp8Dynamic,
     weight_amax,
 )
 from vllm.platforms import current_platform
@@ -57,6 +67,67 @@ else:
 
 
 DEVICE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "model.layers.3.mlp.shared_experts.gate_proj",
+        "model.layers.3.mlp.shared_experts.up_proj",
+        "model.layers.3.mlp.shared_experts.gate_up_proj",
+        "model.layers.3.mlp.shared_experts.down_proj",
+        "model.layers.3.mlp.shared_expert.down_proj",
+    ],
+)
+def test_shared_expert_projection_match(prefix: str):
+    assert is_shared_expert_projection(prefix)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "model.layers.3.mlp.experts.gate_up_proj",
+        "model.layers.3.mlp.shared_experts.router",
+        "model.layers.3.mlp.shared_experts.attention.up_proj",
+        "model.layers.3.self_attn.up_proj",
+        "model.layers.3.mlp.shared_experts",
+    ],
+)
+def test_shared_expert_projection_rejects_other_layers(prefix: str):
+    assert not is_shared_expert_projection(prefix)
+
+
+def test_online_quantization_targets_only_shared_expert_projections(monkeypatch):
+    sentinel = object()
+    monkeypatch.setitem(
+        online_base._ONLINE_LINEAR_METHODS,
+        kMxfp8Dynamic,
+        lambda: sentinel,
+    )
+    config = OnlineQuantizationConfig(QuantizationConfigArgs(shared_experts="mxfp8"))
+    linear = Mock(spec=LinearBase)
+
+    method = config.get_quant_method(
+        linear, "model.layers.3.mlp.shared_experts.gate_up_proj"
+    )
+    assert method is sentinel
+
+    broad_config = OnlineQuantizationConfig(QuantizationConfigArgs(linear="mxfp8"))
+    assert (
+        broad_config.get_quant_method(
+            linear, "model.layers.3.mlp.shared_experts.gate_up_proj"
+        )
+        is sentinel
+    )
+
+    for prefix in (
+        "model.layers.3.mlp.shared_experts.router",
+        "model.layers.3.mlp.experts.gate_up_proj",
+        "model.layers.3.self_attn.qkv_proj",
+    ):
+        assert isinstance(
+            config.get_quant_method(linear, prefix), UnquantizedLinearMethod
+        )
 
 
 @pytest.mark.skipif(

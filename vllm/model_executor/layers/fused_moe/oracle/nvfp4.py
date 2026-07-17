@@ -310,6 +310,7 @@ def convert_to_nvfp4_moe_kernel_format(
     w2_scale_2: torch.Tensor,
     a2_scale: torch.Tensor | None,
     is_act_and_mul: bool,
+    use_a16: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -477,6 +478,7 @@ def make_nvfp4_moe_quant_config(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     layer: torch.nn.Module | None = None,
+    use_a16: bool = False,
 ) -> FusedMoEQuantConfig:
     if backend == NvFp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -497,9 +499,11 @@ def make_nvfp4_moe_quant_config(
             g2_alphas=w2_scale_2,
             w1_scale=w13_scale,
             w2_scale=w2_scale,
+            gemm1_alpha=swiglu_alpha,
+            gemm1_beta=swiglu_beta,
             gemm1_clamp_limit=swiglu_limit,
         )
-    elif backend == NvFp4MoeBackend.EMULATION:
+    if backend == NvFp4MoeBackend.EMULATION:
         return nvfp4_moe_quant_config(
             g1_alphas=w13_scale_2,
             g2_alphas=w2_scale_2,
