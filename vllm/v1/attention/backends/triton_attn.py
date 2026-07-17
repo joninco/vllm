@@ -299,10 +299,6 @@ class TritonAttentionBackend(AttentionBackend):
 
     forward_includes_kv_cache_update: bool = False
 
-    @classmethod
-    def supports_non_causal(cls) -> bool:
-        return True
-
     @staticmethod
     def get_name() -> str:
         return "TRITON_ATTN"

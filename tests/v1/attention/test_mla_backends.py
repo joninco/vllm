@@ -653,6 +653,8 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     impl = FakeSparseImpl()
     layer.impl = impl
     layer.dcp_a2a = False
+    layer.dcp_b12x = False
+    layer.attn_backend = SimpleNamespace(get_name=lambda: "FLASHMLA_SPARSE")
     layer.dcp_a2a_max_tokens = 0
     layer.dcp_a2a_large_backend = "ag_rs"
     layer.kv_cache_dtype = "fp8_ds_mla"

@@ -16,7 +16,6 @@ Lookup falls back to the analytical heuristic if a key is not present.
 
 from bisect import bisect_right
 
-
 TUNED_KV_CONFIGS: dict[tuple[int, int, int], dict] = {
 
     (16, 16000, 1): {"num_kv_splits": 64, "BLOCK_N": 32, "BLOCK_H": 8, "num_stages": 3, "num_warps": 4},  # geomean=0.016 ms=0.01/0.01/0.01/0.02/0.02

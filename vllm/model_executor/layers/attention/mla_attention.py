@@ -917,6 +917,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         num_mqa_tokens = attn_metadata.num_decode_tokens
         num_mha_tokens = q.size(0) - num_mqa_tokens
+        is_sparse_impl = self.impl.is_sparse
 
         if self.impl.is_sparse and num_mha_tokens > 0:
             prefill = getattr(attn_metadata, "prefill", None)
