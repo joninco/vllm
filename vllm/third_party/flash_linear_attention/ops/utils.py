@@ -7,7 +7,6 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
-import contextlib
 import functools
 import logging
 import os
@@ -106,12 +105,10 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
                     tensor = value
                     break
 
-        if tensor is not None:
-            ctx = torch.accelerator.device_index(tensor.device.index)
-        else:
-            ctx = contextlib.nullcontext()
+        if tensor is None or torch.compiler.is_compiling():
+            return fn(*contiguous_args, **contiguous_kwargs)
 
-        with ctx:
+        with torch.accelerator.device_index(tensor.device.index):
             return fn(*contiguous_args, **contiguous_kwargs)
 
     return wrapper
