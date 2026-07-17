@@ -979,7 +979,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
     def prepare_inputs(
-        self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_desc: BatchExecutionDescriptor,
+        max_query_len: int,
     ) -> InputBatch:
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
@@ -1113,6 +1116,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_scheduled_tokens,
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
+        max_seq_len_upper_bound = int(seq_lens_cpu_upper_bound_np[:num_reqs].max())
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
         max_seq_len_np = None
@@ -1134,6 +1138,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             expanded_idx_mapping=expanded_idx_mapping,
             expanded_local_pos=expanded_local_pos,
             num_scheduled_tokens=num_scheduled_tokens,
+            max_query_len=max_query_len,
             num_tokens=num_tokens,
             num_tokens_after_padding=num_tokens_after_padding,
             num_draft_tokens=total_num_draft_tokens,
@@ -1142,6 +1147,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len_upper_bound=max_seq_len_upper_bound,
             dcp_local_seq_lens=dcp_local_seq_lens,
             num_computed_tokens_np=num_computed_tokens_np,
             prefill_len_np=prefill_len_np,
@@ -1315,7 +1321,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
-            input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            input_batch = self.prepare_inputs(
+                scheduler_output, batch_desc, max_query_len
+            )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and

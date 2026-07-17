@@ -223,13 +223,12 @@ class MambaHybridModelState(DefaultModelState):
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
-        max_query_len = input_batch.num_scheduled_tokens.max().item()
+        max_query_len = input_batch.max_query_len
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         if for_capture:
-            # Capture with worst-case max_seq_len so the graph is valid at any replay.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+            max_seq_len = input_batch.max_seq_len_upper_bound
 
         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
@@ -280,6 +279,7 @@ class MambaHybridModelState(DefaultModelState):
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len_upper_bound=input_batch.max_seq_len_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,

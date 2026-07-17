@@ -516,6 +516,7 @@ class PCPManager:
                 num_local_reqs, dtype=torch.int32, device=self.device
             ),
             num_scheduled_tokens=local_num_scheduled_tokens,
+            max_query_len=int(local_num_scheduled_tokens.max()),
             num_tokens=num_local_tokens,
             num_tokens_after_padding=num_local_tokens_padded,
             num_draft_tokens=0,
@@ -524,6 +525,7 @@ class PCPManager:
             query_start_loc_np=local_query_start_loc_np[: num_local_reqs + 1],
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=torch.from_numpy(seq_lens_cpu_upper_bound_np),
+            max_seq_len_upper_bound=int(seq_lens_cpu_upper_bound_np.max()),
             dcp_local_seq_lens=dcp_local_seq_lens,
             num_computed_tokens_np=local_start_pos_np,
             prefill_len_np=local_prefill_len_np,
