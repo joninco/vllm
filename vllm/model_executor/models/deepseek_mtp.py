@@ -14,6 +14,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_gather
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -51,6 +52,8 @@ from .utils import (
     get_spec_layer_idx_from_weight_name,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 
 def _resolve_cached_hf_model_path(model_path: str | None) -> str | None:
