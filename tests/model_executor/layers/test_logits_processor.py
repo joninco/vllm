@@ -21,7 +21,9 @@ class _StaticLogitsMethod:
         return self.logits.clone()
 
 
-def test_get_top_tokens_masks_padding_and_maps_added_vocab(monkeypatch):
+def test_get_top_tokens_masks_padding_and_maps_added_vocab(
+    monkeypatch, default_vllm_config
+):
     monkeypatch.setattr(
         logits_processor_module,
         "get_tensor_model_parallel_world_size",
