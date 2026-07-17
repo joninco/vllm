@@ -907,6 +907,13 @@ class VllmConfig:
         ):
             return
 
+        if (
+            speculative_config.uses_acceptance_length_adaptation()
+            and not speculative_config.uses_batch_size_dynamic_speculative_decoding()
+            and self.use_v2_model_runner
+        ):
+            return
+
         logger.warning_once(
             "Dynamic speculative decoding changes the target verification "
             "length at runtime. Overriding cudagraph_mode from %s to "

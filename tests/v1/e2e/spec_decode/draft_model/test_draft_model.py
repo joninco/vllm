@@ -246,6 +246,35 @@ def test_draft_model_moe_backend_override(monkeypatch: pytest.MonkeyPatch):
     assert tgt_config.kernel_config.moe_backend == target_moe_backend
 
 
+def test_v1_draft_loader_moe_backend_override():
+    """The V1 draft-model loader must also instantiate under the draft backend.
+
+    FusedMoE reads the current VllmConfig during module construction, so passing
+    only model_config to get_model is not enough for unquantized draft MoEs.
+    """
+    from vllm.v1.worker.gpu.spec_decode.eagle.utils import _create_draft_vllm_config
+
+    engine_args = EngineArgs(
+        model="Qwen/Qwen3-1.7B",
+        tensor_parallel_size=1,
+        attention_backend="B12X_MLA_SPARSE",
+        moe_backend="b12x",
+        speculative_config={
+            "model": "Qwen/Qwen3-0.6B",
+            "method": "draft_model",
+            "num_speculative_tokens": 3,
+            "moe_backend": "flashinfer_cutlass",
+        },
+    )
+    tgt_config: VllmConfig = engine_args.create_engine_config()
+
+    draft_config = _create_draft_vllm_config(tgt_config)
+    assert draft_config.kernel_config.moe_backend == "flashinfer_cutlass"
+    assert draft_config.attention_config.backend == tgt_config.attention_config.backend
+    assert draft_config.model_config is tgt_config.speculative_config.draft_model_config
+    assert tgt_config.kernel_config.moe_backend == "b12x"
+
+
 def test_draft_model_moe_backend_inherits_target(monkeypatch: pytest.MonkeyPatch):
     """When moe_backend is not set in speculative_config, the draft should
     inherit the target's moe_backend."""

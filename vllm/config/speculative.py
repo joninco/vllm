@@ -184,6 +184,12 @@ class SpeculativeConfig:
     inclusive batch-size range.
     """
 
+    adaptive_speculative_tokens_window: int | None = Field(default=None, ge=1)
+    """Number of speculative verification steps to average before adapting the
+    batch-wide speculative-token count from accepted draft lengths. ``None``
+    disables acceptance-length adaptation. ``num_speculative_tokens`` is the
+    initial value and upper bound."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
@@ -780,6 +786,27 @@ class SpeculativeConfig:
 
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
+
+        if self.adaptive_speculative_tokens_window is not None:
+            unsupported_methods = {
+                "ngram",
+                "ngram_gpu",
+                "suffix",
+                "custom_class",
+            }
+            if self.method in unsupported_methods:
+                raise ValueError(
+                    "adaptive_speculative_tokens_window is only supported with "
+                    "model-backed speculative decoding methods."
+                )
+            if (
+                self.target_model_config is not None
+                and self.target_model_config.is_diffusion
+            ):
+                raise ValueError(
+                    "adaptive_speculative_tokens_window is not supported with "
+                    "diffusion models."
+                )
 
         if self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided
@@ -1463,8 +1490,26 @@ class SpeculativeConfig:
     def use_dspark(self) -> bool:
         return self.method == "dspark"
 
-    def uses_dynamic_speculative_decoding(self) -> bool:
+    def requires_host_draft_token_ids(self) -> bool:
+        """Whether async scheduling needs the actual draft ids on the host.
+
+        Fixed-width speculators can use scheduler placeholders and keep draft
+        ids on the worker. Block speculators may return a shorter prefix using
+        ``-1`` sentinels, so the scheduler must receive their real draft ids.
+        """
+        return self.method in ("dflash", "dspark")
+
+    def uses_batch_size_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
+
+    def uses_acceptance_length_adaptation(self) -> bool:
+        return self.adaptive_speculative_tokens_window is not None
+
+    def uses_dynamic_speculative_decoding(self) -> bool:
+        return (
+            self.uses_batch_size_dynamic_speculative_decoding()
+            or self.uses_acceptance_length_adaptation()
+        )
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

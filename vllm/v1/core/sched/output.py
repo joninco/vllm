@@ -282,6 +282,10 @@ class SchedulerOutput:
             free_encoder_mm_hashes=[],
         )
 
+    def resolve_num_spec_tokens_to_schedule(self, default: int) -> int:
+        """Resolve the speculative depth for real and synthetic outputs."""
+        return self.num_spec_tokens_to_schedule or default
+
 
 @dataclass
 class GrammarOutput:

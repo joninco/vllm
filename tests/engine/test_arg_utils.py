@@ -469,6 +469,19 @@ def test_attention_config():
         engine_args.create_engine_config()
 
 
+def test_b12x_virtual_tp_cli_args_removed():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--virtual-tp-sharding", "b12x-padded"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--b12x-allow-odd-tp"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--b12x-virtual-tp-attention-head-alignment", "8"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--b12x-virtual-tp-moe-intermediate-alignment", "32"])
+
+
 def test_prefix_cache_default():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     args = parser.parse_args([])

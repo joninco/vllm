@@ -170,6 +170,11 @@ class EngineCore:
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
         )
+        speculative_config = vllm_config.speculative_config
+        self.requires_host_draft_token_ids = (
+            speculative_config is not None
+            and speculative_config.requires_host_draft_token_ids()
+        )
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
@@ -606,17 +611,33 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+        if (
+            self.requires_host_draft_token_ids
+            and self.async_scheduling
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            self._update_draft_token_ids_from_output(model_output)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
+    def _update_draft_token_ids_from_executor(self) -> None:
+        draft_token_ids = self.model_executor.take_draft_token_ids()
+        if draft_token_ids is not None:
+            self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    def _update_draft_token_ids_from_output(
+        self, model_output: ModelRunnerOutput
+    ) -> None:
+        draft_token_ids = model_output.draft_token_ids
+        if draft_token_ids is None:
+            raise RuntimeError(
+                "Async variable-length speculation did not return draft token ids"
+            )
+        self.scheduler.update_draft_token_ids(draft_token_ids)
+
     def post_step(self, model_executed: bool) -> None:
-        # When using async scheduling we can't get draft token ids in advance,
-        # so we update draft token ids in the worker process and don't
-        # need to update draft token ids here.
         if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
-            draft_token_ids = self.model_executor.take_draft_token_ids()
-            if draft_token_ids is not None:
-                self.scheduler.update_draft_token_ids(draft_token_ids)
+            self._update_draft_token_ids_from_executor()
 
     def step_with_batch_queue(
         self,
@@ -708,6 +729,12 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+        if (
+            self.requires_host_draft_token_ids
+            and self.async_scheduling
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            self._update_draft_token_ids_from_output(model_output)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -716,7 +743,9 @@ class EngineCore:
             # When draft tokens are used with structured output, validate them
             # before computing the grammar bitmask for the deferred request.
             if self.check_for_draft_tokens:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
+                draft_token_ids = model_output.draft_token_ids
+                if draft_token_ids is None:
+                    draft_token_ids = self.model_executor.take_draft_token_ids()
                 if draft_token_ids is not None:
                     # Update the draft token ids in the scheduler output to
                     # filter out the invalid spec tokens, which will be padded

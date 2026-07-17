@@ -16,6 +16,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     init_attn_backend,
@@ -24,6 +25,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode.utils import draft_gumbel_pos
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -60,6 +62,7 @@ class BaseSpeculator(ABC):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
+        num_speculative_tokens: int | None = None,
         num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
@@ -268,23 +271,24 @@ class DraftModelSpeculator(BaseSpeculator):
             out=draft_seq_lens_cpu_upper_bound[:num_reqs],
         )
         draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
-        attn_metadata = build_attn_metadata(
-            attn_groups=self.attn_groups,
-            num_reqs=num_reqs_padded,
-            num_tokens=num_tokens_padded,
-            query_start_loc_gpu=self.input_buffers.query_start_loc[
-                : num_reqs_padded + 1
-            ],
-            query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=max_query_len,
-            seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
-            max_seq_len=self.draft_max_seq_len,
-            block_tables=block_tables,
-            slot_mappings=slot_mappings,
-            kv_cache_config=self.kv_cache_config,
-            causal=causal,
-            seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
-        )
+        with record_function_or_nullcontext("vllm:v2/speculator/build_attn_metadata"):
+            attn_metadata = build_attn_metadata(
+                attn_groups=self.attn_groups,
+                num_reqs=num_reqs_padded,
+                num_tokens=num_tokens_padded,
+                query_start_loc_gpu=self.input_buffers.query_start_loc[
+                    : num_reqs_padded + 1
+                ],
+                query_start_loc_cpu=query_start_loc_cpu,
+                max_query_len=max_query_len,
+                seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
+                max_seq_len=self.draft_max_seq_len,
+                block_tables=block_tables,
+                slot_mappings=slot_mappings,
+                kv_cache_config=self.kv_cache_config,
+                causal=causal,
+                seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+            )
         return attn_metadata
 
     def _validate_local_argmax_reduction(self) -> None:
@@ -324,14 +328,12 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
-            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
-            # used for draft and target sampling.
             return gumbel_sample(
                 logits,
                 idx_mapping,
                 temperature,
                 seeds,
-                positions + 1,
+                draft_gumbel_pos(positions),
                 apply_temperature=True,
                 logits_cache=draft_logits,
                 logits_cache_col=draft_step,
