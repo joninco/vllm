@@ -122,10 +122,8 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
         if key in config_dict:
             pre_trained_config[key] = config_dict[key]
 
-    # DFlash checkpoints store 0-based target layer ids (see #40727); keep
-    # them unchanged in dflash_config.target_layer_ids. The runner-facing
-    # eagle_aux_hidden_state_layer_ids use HF hidden_states indexing, where
-    # the output of layer i is hidden_states[i + 1], hence the +1 shift.
+    # Checkpoints store zero-based target layer ids. Hidden-state extraction
+    # indexes the embedding output first, so its ids need a one-based shift.
     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
     pre_trained_config["eagle_aux_hidden_state_layer_ids"] = [
         i + 1 for i in aux_layer_ids
