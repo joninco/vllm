@@ -213,6 +213,9 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    num_scheduled_prompt_tokens: int = 0
+    """Prompt/context tokens scheduled for model execution in this step."""
+
 
 @dataclass
 class RequestStateStats:

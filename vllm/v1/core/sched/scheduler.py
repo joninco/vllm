@@ -61,7 +61,7 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
-from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.utils import compute_iteration_details, record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
@@ -2047,6 +2047,9 @@ class Scheduler(SchedulerInterface):
                 kv_connector_stats,
                 cudagraph_stats,
                 perf_stats,
+                num_scheduled_prompt_tokens=compute_iteration_details(
+                    scheduler_output
+                ).num_ctx_tokens,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -2509,6 +2512,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        num_scheduled_prompt_tokens: int = 0,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -2539,6 +2543,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            num_scheduled_prompt_tokens=num_scheduled_prompt_tokens,
         )
 
     def make_spec_decoding_stats(
