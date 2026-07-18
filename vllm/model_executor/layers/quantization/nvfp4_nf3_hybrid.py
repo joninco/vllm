@@ -836,8 +836,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
     ) -> dict[str, torch.Tensor]:
         """Borrow serial-path buffers; the two decode paths never overlap."""
         specs = (
-            ("fc1", "intermediate_cache13", torch.bfloat16, (32, 1024)),
-            ("activated", "intermediate_cache2", torch.bfloat16, (32, 512)),
+            # Flat 1-D views: the unified hybrid op compiles against flat
+            # intermediate buffers ([m*topk rows] x fc1_cols / intermediate).
+            ("fc1", "intermediate_cache13", torch.bfloat16, (32 * 1024,)),
+            ("activated", "intermediate_cache2", torch.bfloat16, (32 * 512,)),
             ("fc1_c_tmp", "fc1_c_tmp", torch.float32, (scratch_elements,)),
             ("fc2_c_tmp", "fc2_c_tmp", torch.float32, (scratch_elements,)),
         )
@@ -871,7 +873,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         return borrowed
 
     def _prepare_grid188(self, layer: "RoutedExperts", topk: int) -> None:
-        """Arm the exact NF3 Grid188 path during the eager profile forward."""
+        """Arm the b12x hybrid one-grid decode during the eager profile forward."""
         state: _HybridLayerState = layer.hybrid_state
         runtime = self.quant_config.shared_runtime
         if state.grid188_ready or runtime.grid188_disabled_reason is not None:
@@ -912,40 +914,52 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 getattr(props, "shared_memory_per_block_optin", 101_376)
             )
             if runtime.grid188_launch is None:
+                from b12x.moe.fused.w4a16.host import (
+                    packed_gemm_scratch_elements,
+                )
                 from b12x.moe.fused.w4a16.kernel import (
-                    compile_w4a16_hybrid_mapped_grid188,
+                    compile_w4a16_fused_moe_hybrid,
                 )
 
-                launch = compile_w4a16_hybrid_mapped_grid188(
+                launch = compile_w4a16_fused_moe_hybrid(
                     size_m=_GRID188_M,
                     hidden_size=_GRID188_HIDDEN,
                     intermediate_size=_GRID188_INTERMEDIATE,
-                    nv_num_experts=_GRID188_NUM_KEPT,
-                    nf_num_experts=_GRID188_NUM_NF3,
+                    tier0_num_experts=_GRID188_NUM_KEPT,
+                    tier1_num_experts=_GRID188_NUM_NF3,
                     top_k=_GRID188_TOPK,
                     activation="silu",
+                    map_slots=_GRID188_NUM_KEPT + _GRID188_NUM_NF3,
                     element_dtype="bf16",
                     fast_math=True,
                     sms=sms,
                     max_shared_mem=max_shared_mem,
                     force_tile_config=_B12X_TILES,
+                    schedule_whole_tiles=True,
                 )
+                # Grid sizing is b12x launch policy now; admission here is
+                # geometry plus the spill-free codegen contract (b12x already
+                # refuses spilling kernels at compile, -1 = cache reload).
                 if (
-                    int(launch.grid_x) != 188
+                    int(launch.size_m) != _GRID188_M
                     or int(launch.blocks_per_sm) != 1
-                    or int(launch.size_m) != _GRID188_M
                     or int(launch.shared_memory_bytes) != 45_184
-                    or int(launch.route_slots) != _GRID188_M * _GRID188_TOPK
                     or int(launch.map_slots) != _GRID188_NUM_KEPT + _GRID188_NUM_NF3
+                    or int(launch.local_memory_bytes) > 0
                 ):
-                    raise RuntimeError("compiled Grid188 launch failed admission")
-                if not hasattr(torch.ops.b12x, "w4a16_hybrid_mapped_grid188_launch"):
-                    raise RuntimeError("Grid188 custom op is unavailable")
+                    raise RuntimeError("compiled hybrid launch failed admission")
+                if not hasattr(torch.ops.b12x, "w4a16_fused_moe_hybrid_launch"):
+                    raise RuntimeError("hybrid one-grid custom op is unavailable")
                 runtime.grid188_scratch = self._borrow_grid188_scratch(
                     runtime.buffers,
                     device=prep_kept.w13.device,
-                    scratch_elements=int(launch.scratch_elements),
-                    workspace_words=int(launch.workspace_words),
+                    scratch_elements=packed_gemm_scratch_elements(
+                        size_n=max(2 * _GRID188_INTERMEDIATE, _GRID188_HIDDEN),
+                        route_slots=_GRID188_M * _GRID188_TOPK,
+                        moe_block_size=8,
+                        sms=sms,
+                    ),
+                    workspace_words=sms * 4 + 2,
                 )
                 runtime.grid188_sms = sms
                 runtime.grid188_max_shared_mem = max_shared_mem
@@ -971,7 +985,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             state.grid188_output = output
             state.grid188_ready = True
             logger.info_once(
-                "nvfp4_nf3_hybrid: armed exact TP4 Grid188 one-grid decode"
+                "nvfp4_nf3_hybrid: armed hybrid one-grid decode (m<=%d)",
+                _GRID188_M,
             )
         except Exception as exc:
             runtime.grid188_disabled_reason = f"{type(exc).__name__}: {exc}"
@@ -997,38 +1012,47 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         assert state.grid188_weight_views is not None
         assert state.grid188_tier_map is not None
         assert state.grid188_output is not None
-        torch.ops.b12x.w4a16_hybrid_mapped_grid188_launch(
+        m = int(x.shape[0])
+        torch.ops.b12x.w4a16_fused_moe_hybrid_launch(
             x,
             *state.grid188_weight_views,
-            topk_ids,
+            topk_ids.view(-1),
             state.grid188_tier_map,
             scratch["fc1"],
             scratch["activated"],
-            state.grid188_output,
+            state.grid188_output.view(-1),
             topk_weights,
             scratch["fc1_c_tmp"],
             scratch["fc2_c_tmp"],
             scratch["workspace"],
-            _GRID188_M,
+            m,
             int(launch.size_m),
             int(launch.hidden_size),
             int(launch.intermediate_size),
-            int(launch.nv_num_experts),
-            int(launch.nf_num_experts),
+            int(launch.tier0_num_experts),
+            int(launch.tier1_num_experts),
             int(launch.top_k),
             launch.activation,
+            int(launch.map_slots),
+            int(launch.moe_block_size),
             launch.element_dtype,
             bool(launch.fast_math),
             runtime.grid188_sms,
             runtime.grid188_max_shared_mem,
+            launch.tier0_weight_layout,
+            launch.tier0_scale_format,
+            launch.tier0_w13_layout,
+            launch.tier1_weight_layout,
+            launch.tier1_scale_format,
+            launch.tier1_w13_layout,
             int(launch.fc1_tile_k),
             int(launch.fc1_tile_n),
             int(launch.fc2_tile_k),
             int(launch.fc2_tile_n),
-            int(launch.grid_x),
+            bool(launch.schedule_whole_tiles),
             int(torch.cuda.current_stream(x.device).cuda_stream),
         )
-        return state.grid188_output
+        return state.grid188_output[:m]
 
     def _ensure_runtime(self, layer: "RoutedExperts", m: int, topk: int) -> None:
         """First-apply init: per-tier preplanned launches plus ONE shared
@@ -1216,7 +1240,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         )
         if not weights.is_contiguous():
             weights = weights.contiguous()
-        if state.grid188_ready and m == _GRID188_M:
+        if state.grid188_ready and 1 <= m <= _GRID188_M:
+            # The unified hybrid launch takes dynamic m up to the compiled
+            # capacity, so every small decode bucket (not just the exact MTP
+            # batch) rides the one-grid path.
             grid_ids = (
                 topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
             )
@@ -1225,15 +1252,13 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             if (
                 x.dtype == torch.bfloat16
                 and x.is_contiguous()
-                and grid_ids.numel() == _GRID188_M * _GRID188_TOPK
+                and grid_ids.numel() == m * _GRID188_TOPK
                 and grid_ids.is_cuda
                 and grid_ids.device == x.device
                 and grid_ids.data_ptr() % 16 == 0
-                and weights.numel() == _GRID188_M * _GRID188_TOPK
+                and weights.numel() == m * _GRID188_TOPK
             ):
-                logger.info_once(
-                    "nvfp4_nf3_hybrid: executing TP4 Grid188 one-grid decode"
-                )
+                logger.info_once("nvfp4_nf3_hybrid: executing hybrid one-grid decode")
                 return self._run_grid188(layer, x, weights, grid_ids)
         if state.num_nf3 == 0:
             # Uniform-NVFP4 layer (e.g. MTP head): single-tier launch.
