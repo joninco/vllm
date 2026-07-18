@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import _warmup_layer_mhc
+from vllm.models.deepseek_v4.nvidia import dspark as dspark_module
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4DecoderLayer
 
 
@@ -165,3 +166,79 @@ def test_b12x_mhc_warmup_uses_broadcast_pre_contract() -> None:
 
     assert pre_sizes == [1, 3]
     assert post_sizes == [1, 1, 3, 3]
+
+
+def test_b12x_dspark_keeps_initial_embeddings_rank_two(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs_embeds = torch.ones(2, 4)
+
+    class FakeB12xLayer(torch.nn.Module):
+        _use_b12x_mhc = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.hidden_size = 4
+            self.hc_mult = 4
+            self.hc_attn_fn = torch.arange(24 * 16).reshape(24, 16)
+            self.hc_attn_fn_broadcast = None
+            self.refreshed = False
+
+        def refresh_b12x_mhc_bf16_weights(self) -> None:
+            self.refreshed = True
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            positions: torch.Tensor,
+            input_ids: torch.Tensor,
+            post_mix: torch.Tensor | None,
+            res_mix: torch.Tensor | None,
+            residual: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            del positions, input_ids
+            assert hidden_states is inputs_embeds
+            assert post_mix is None
+            assert res_mix is None
+            assert residual is None
+            residual = hidden_states.unsqueeze(1).expand(-1, 4, -1).clone()
+            post_mix = torch.zeros(hidden_states.shape[0], 4)
+            res_mix = torch.zeros(hidden_states.shape[0], 4, 4)
+            return hidden_states, residual, post_mix, res_mix
+
+    model = object.__new__(dspark_module.DSparkDeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model.hc_mult = 4
+    model.hc_eps = 1e-6
+    model.rms_norm_eps = 1e-6
+    model.use_sequence_parallel = False
+    model.layers = torch.nn.ModuleList([FakeB12xLayer()])
+    model.hc_head_fn = torch.ones(4, 16)
+    model.hc_head_scale = torch.ones(1)
+    model.hc_head_base = torch.zeros(4)
+    model.finalize_mhc_weights()
+
+    def mhc_post(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        del hidden_states, post_mix, res_mix
+        return residual
+
+    def hc_head(hidden_states: torch.Tensor, *args: object) -> torch.Tensor:
+        del args
+        return hidden_states.mean(dim=1)
+
+    monkeypatch.setattr(dspark_module, "mhc_post_tilelang", mhc_post)
+    monkeypatch.setattr(dspark_module, "hc_head_fused_kernel_tilelang", hc_head)
+
+    output = model(torch.arange(2), torch.arange(2), inputs_embeds)
+
+    assert output.shape == inputs_embeds.shape
+    layer = model.layers[0]
+    assert isinstance(layer, FakeB12xLayer)
+    assert layer.refreshed
+    expected_broadcast = layer.hc_attn_fn.view(24, 4, 4).sum(dim=1)
+    torch.testing.assert_close(layer.hc_attn_fn_broadcast, expected_broadcast)

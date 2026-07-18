@@ -210,7 +210,7 @@ if [[ "${enable_dspark}" == 1 ]] && ((num_speculative_tokens > 0)); then
   draft_attention_json=
   if [[ "${dspark_draft_attention_backend}" != auto ]]; then
     draft_attention_json=$(printf \
-      ',"draft_attention_backend":"%s"' \
+      ',"attention_backend":"%s"' \
       "${dspark_draft_attention_backend}")
   fi
   speculative_config=$(printf \
