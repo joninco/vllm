@@ -46,7 +46,8 @@ gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.88}"
 max_model_len="${MAX_MODEL_LEN:-auto}"
 max_num_seqs="${MAX_NUM_SEQS:-32}"
 max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-4096}"
-max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-256}"
+num_speculative_tokens="${NUM_SPECULATIVE_TOKENS:-5}"
+max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-$((max_num_seqs * (num_speculative_tokens + 1)))}"
 load_format="${LOAD_FORMAT:-instanttensor}"
 enable_flashinfer_autotune="${ENABLE_FLASHINFER_AUTOTUNE:-1}"
 
@@ -74,7 +75,10 @@ fi
 
 spec_args=()
 if [[ "${VLLM_ENABLE_MTP:-1}" == "1" ]]; then
-  spec_args=('--speculative-config' '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":true}')
+  speculative_config=$(printf \
+    '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"probabilistic","draft_attention_backend":"B12X_MLA_SPARSE"}' \
+    "${num_speculative_tokens}")
+  spec_args=(--speculative-config "${speculative_config}")
 fi
 
 autotune_args=()
