@@ -215,7 +215,7 @@ start() {
     VLLM_DCP_A2A_LARGE_BACKEND="${dcp_a2a_large_backend}" \
     ENABLE_PREFIX_CACHING="${enable_prefix_caching}" \
     KV_CACHE_MEMORY_BYTES="${kv_cache_memory_bytes}" \
-    "${REMOTE_VLLM_ROOT}/serve-ds4-flash.sh"
+    "${REMOTE_VLLM_ROOT}/serve-ds4-flash-spark.sh"
   ssh "${REMOTE_HOST}" \
     "mkdir -p '${LOG_DIR}'; rm -f '${WORKER_LOG}' '${WORKER_PID_FILE}'; ${remote_command}"
   sleep 3
@@ -243,7 +243,7 @@ start() {
     VLLM_DCP_A2A_LARGE_BACKEND="${dcp_a2a_large_backend}" \
     ENABLE_PREFIX_CACHING="${enable_prefix_caching}" \
     KV_CACHE_MEMORY_BYTES="${kv_cache_memory_bytes}" \
-    "${VLLM_ROOT}/serve-ds4-flash.sh"
+    "${VLLM_ROOT}/serve-ds4-flash-spark.sh"
   sleep 3
   if ! unit_active_local "${HEAD_UNIT}"; then
     ssh "${REMOTE_HOST}" \

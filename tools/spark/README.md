@@ -11,6 +11,9 @@ dependencies, checkpoint revisions, and CUDA architecture remain pinned in
 `versions.env`. Every build records the exact live source state and package
 provenance in `.spark-artifacts/manifest.json`.
 
+The cluster workflow uses `serve-ds4-flash-spark.sh`. The repository-root
+`serve-ds4-flash.sh` remains the local workstation launcher.
+
 ## Initial setup
 
 ```bash
