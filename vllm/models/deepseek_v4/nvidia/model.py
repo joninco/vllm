@@ -1101,7 +1101,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor,
         norm_eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         from b12x.integration.residual import b12x_mhc_pre
 
         norm_weight = self._require_b12x_mhc_norm_weight(norm_weight)
@@ -1120,8 +1120,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 block_k=self._b12x_mhc_block_k,
             )
 
-        tokens, hc_mult, hidden_size = residual.shape
+        tokens, hidden_size = residual.shape
+        hc_mult = self.hc_mult
         expected_m = int(tokens)
+        residual_out = torch.empty(
+            (tokens, hc_mult, hidden_size),
+            dtype=residual.dtype,
+            device=residual.device,
+        )
         layer_input = torch.empty(
             (tokens, hidden_size), dtype=residual.dtype, device=residual.device
         )
@@ -1139,6 +1145,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             y=layer_input,
             post=post_mix,
             comb=res_mix,
+            out=residual_out,
         )
         return b12x_mhc_pre(
             residual,
@@ -1322,10 +1329,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_norm_weight = self.attn_norm.weight.data
             attn_norm_eps = self.attn_norm.variance_epsilon
             if residual is None:
-                residual = x
-                x, post_mix, res_mix = self.hc_pre(
-                    residual,
-                    self.hc_attn_fn,
+                assert x.dim() == 2
+                assert self.hc_attn_fn_broadcast is not None
+                residual, post_mix, res_mix, x = self.hc_pre(
+                    x,
+                    self.hc_attn_fn_broadcast,
                     self.hc_attn_scale,
                     self.hc_attn_base,
                     norm_weight=attn_norm_weight,

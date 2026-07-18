@@ -24,9 +24,10 @@ def test_b12x_mhc_requires_fused_norm_weight() -> None:
     assert layer._require_b12x_mhc_norm_weight(norm_weight) is norm_weight
 
 
-def test_b12x_forward_only_passes_bf16_fn_to_post_pre() -> None:
+def test_b12x_forward_broadcasts_initial_residual() -> None:
     layer = _make_b12x_layer()
     layer._use_b12x_mhc = True
+    layer.hc_mult = 4
     layer.attn_norm = SimpleNamespace(
         weight=SimpleNamespace(data=torch.ones(4)),
         variance_epsilon=1e-6,
@@ -36,6 +37,7 @@ def test_b12x_forward_only_passes_bf16_fn_to_post_pre() -> None:
         variance_epsilon=1e-6,
     )
     layer.hc_attn_fn = torch.ones(24, 16)
+    layer.hc_attn_fn_broadcast = torch.ones(24, 4)
     layer.hc_attn_scale = torch.ones(3)
     layer.hc_attn_base = torch.zeros(24)
     layer.hc_ffn_fn = torch.ones(24, 16)
@@ -52,11 +54,14 @@ def test_b12x_forward_only_passes_bf16_fn_to_post_pre() -> None:
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor,
         norm_eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         calls.append(("pre", None))
+        assert x.shape == (2, 4)
+        assert hc_fn is self.hc_attn_fn_broadcast
+        residual = x.unsqueeze(1).expand(-1, 4, -1).clone()
         post_mix = torch.zeros(x.shape[0], 4)
         res_mix = torch.zeros(x.shape[0], 4, 4)
-        return x, post_mix, res_mix
+        return residual, post_mix, res_mix, x
 
     def hc_post_pre(
         self: DeepseekV4DecoderLayer,
@@ -82,5 +87,10 @@ def test_b12x_forward_only_passes_bf16_fn_to_post_pre() -> None:
     x = torch.ones(2, 4)
     out = DeepseekV4DecoderLayer.forward(layer, x, torch.arange(2), None)
 
-    assert [tuple(t.shape) for t in out] == [(2, 4), (2, 4), (2, 4), (2, 4, 4)]
+    assert [tuple(t.shape) for t in out] == [
+        (2, 4),
+        (2, 4, 4),
+        (2, 4),
+        (2, 4, 4),
+    ]
     assert calls == [("pre", None), ("post_pre", layer.hc_ffn_fn_bf16)]
