@@ -6,6 +6,7 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import _warmup_layer_mhc
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4DecoderLayer
 
 
@@ -94,3 +95,73 @@ def test_b12x_forward_broadcasts_initial_residual() -> None:
         (2, 4, 4),
     ]
     assert calls == [("pre", None), ("post_pre", layer.hc_ffn_fn_bf16)]
+
+
+def test_b12x_mhc_warmup_uses_broadcast_pre_contract() -> None:
+    hidden_size = 4
+    hc_mult = 4
+    full_fn = torch.ones(24, hc_mult * hidden_size)
+    broadcast_fn = torch.ones(24, hidden_size)
+    norm = SimpleNamespace(
+        weight=SimpleNamespace(data=torch.ones(hidden_size)),
+        variance_epsilon=1e-6,
+    )
+    pre_sizes: list[int] = []
+    post_sizes: list[int] = []
+
+    def hc_pre(
+        x: torch.Tensor,
+        fn: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del scale, base, norm_weight, norm_eps
+        assert fn is broadcast_fn
+        assert x.shape == (x.shape[0], hidden_size)
+        pre_sizes.append(x.shape[0])
+        residual = x.unsqueeze(1).expand(-1, hc_mult, -1).clone()
+        post = torch.zeros(x.shape[0], hc_mult)
+        comb = torch.zeros(x.shape[0], hc_mult, hc_mult)
+        return residual, post, comb, x
+
+    def hc_post_pre(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        fn: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del fn, scale, base, norm_weight, norm_eps
+        assert residual.shape == (x.shape[0], hc_mult, hidden_size)
+        post_sizes.append(x.shape[0])
+        return residual, post, comb, x
+
+    layer = SimpleNamespace(
+        _use_b12x_mhc=True,
+        hidden_size=hidden_size,
+        hc_mult=hc_mult,
+        hc_attn_fn=full_fn,
+        hc_attn_fn_broadcast=broadcast_fn,
+        hc_attn_scale=torch.ones(3),
+        hc_attn_base=torch.zeros(24),
+        hc_ffn_fn=full_fn.clone(),
+        hc_ffn_scale=torch.ones(3),
+        hc_ffn_base=torch.zeros(24),
+        attn_norm=norm,
+        ffn_norm=norm,
+        hc_pre=hc_pre,
+        hc_post_pre=hc_post_pre,
+    )
+
+    _warmup_layer_mhc(layer, [1, 3])
+
+    assert pre_sizes == [1, 3]
+    assert post_sizes == [1, 1, 3, 3]

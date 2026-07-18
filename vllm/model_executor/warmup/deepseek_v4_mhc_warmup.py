@@ -135,24 +135,43 @@ def _warmup_layer_mhc(
     hidden_size = int(layer.hidden_size)
     hc_mult = int(layer.hc_mult)
     device = layer.hc_attn_fn.device
-    residual = torch.zeros(
-        max_tokens,
-        hc_mult,
-        hidden_size,
-        dtype=torch.bfloat16,
-        device=device,
-    )
+    use_b12x_mhc = bool(getattr(layer, "_use_b12x_mhc", False))
+    if use_b12x_mhc:
+        pre_fn = getattr(layer, "hc_attn_fn_broadcast", None)
+        if pre_fn is None:
+            raise RuntimeError(
+                "DeepSeek V4 b12x mHC warmup requires broadcast weights."
+            )
+        pre_input = torch.zeros(
+            max_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+    else:
+        pre_fn = layer.hc_attn_fn
+        pre_input = torch.zeros(
+            max_tokens,
+            hc_mult,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
 
     for size in token_sizes:
-        residual_work = residual[:size]
-        layer_input, post_mix, comb_mix = layer.hc_pre(
+        residual_work = pre_input[:size]
+        pre_outputs = layer.hc_pre(
             residual_work,
-            layer.hc_attn_fn,
+            pre_fn,
             layer.hc_attn_scale,
             layer.hc_attn_base,
             norm_weight=layer.attn_norm.weight.data,
             norm_eps=layer.attn_norm.variance_epsilon,
         )
+        if use_b12x_mhc:
+            residual_work, post_mix, comb_mix, layer_input = pre_outputs
+        else:
+            layer_input, post_mix, comb_mix = pre_outputs
         for fn, scale, base, norm in (
             (
                 layer.hc_ffn_fn,
