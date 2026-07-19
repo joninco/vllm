@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -217,6 +218,65 @@ def test_scheduler_reports_allocation_failure(request_runner):
     # Two attempts: once while running (block becomes full during prefill),
     # once from finished_req_ids on the next step.
     assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 2
+
+
+@pytest.mark.parametrize("missing_metadata", ["block_ids", "offload_keys"])
+@pytest.mark.parametrize("blocks_per_chunk", [1, 2])
+def test_store_defers_chunk_until_metadata_is_ready(
+    request_runner, missing_metadata: str, blocks_per_chunk: int
+):
+    """Store only the common key/block prefix, then retry the deferred chunk."""
+    block_size = 4
+    num_chunks = 3
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=10,
+        async_scheduling=True,
+        blocks_per_chunk=blocks_per_chunk,
+    )
+    num_tokens = block_size * blocks_per_chunk * num_chunks
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    req_status = runner.connector_scheduler._req_status["0"]
+    req_status.update_offload_keys()
+    group_state = req_status.group_states[0]
+    all_block_ids = list(range(1, blocks_per_chunk * num_chunks + 1))
+    group_state.block_ids.extend(all_block_ids)
+    assert len(group_state.offload_keys) == num_chunks
+
+    pending_block_id = (
+        group_state.block_ids.pop() if missing_metadata == "block_ids" else None
+    )
+    pending_offload_key = (
+        group_state.offload_keys.pop() if missing_metadata == "offload_keys" else None
+    )
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"0": num_tokens}
+    first_jobs = runner.connector_scheduler._build_store_jobs(scheduler_output)
+
+    assert len(first_jobs) == 1
+    assert (
+        next(iter(first_jobs.values())).src_spec.block_ids.tolist()
+        == all_block_ids[: 2 * blocks_per_chunk]
+    )
+    assert group_state.next_stored_chunk_idx == 2
+
+    if missing_metadata == "block_ids":
+        assert pending_block_id is not None
+        group_state.block_ids.append(pending_block_id)
+    else:
+        assert pending_offload_key is not None
+        group_state.offload_keys.append(pending_offload_key)
+    second_jobs = runner.connector_scheduler._build_store_jobs(scheduler_output)
+
+    assert len(second_jobs) == 1
+    second_block_ids = next(iter(second_jobs.values())).src_spec.block_ids.tolist()
+    assert second_block_ids == all_block_ids[2 * blocks_per_chunk :]
+    assert group_state.next_stored_chunk_idx == 3
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
