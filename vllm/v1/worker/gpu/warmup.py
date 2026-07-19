@@ -526,18 +526,49 @@ def _profile_sps_curve(
         count *= 2
     req_counts.append(max_reqs)
 
+    # Sub-depth single-request points: without them the interpolated curve is
+    # CLAMPED FLAT below one full-width request (decode_query_len tokens), so
+    # at low concurrency the theta-argmax sees zero marginal verify cost and
+    # never prunes. Measure one request at each varlen bucket below full
+    # depth; a full step at (1 req, t tokens) is exactly the cost of a gated
+    # step with capacity t-1 (the draft always runs full width).
+    sweep_points = [(t, t) for t in range(1, decode_query_len)]
+    sweep_points.extend(
+        (num_reqs * decode_query_len, decode_query_len) for num_reqs in req_counts
+    )
+
+    import os
+
+    sps_debug_level = int(os.environ.get("VLLM_DSPARK_SPS_DEBUG", "0") or "0")
+    sps_debug = sps_debug_level >= 1
+    # Spread dummy MoE routing during profiling: real verify tokens route to
+    # ~topk distinct experts each, and the curve must price that weight
+    # traffic. Restored after the sweep.
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    InputBatch.dummy_input_ids_random_high = model_runner.model_config.get_vocab_size()
     step_ms = []
     step_ms_samples: list[list[float]] = []
-    for num_reqs in req_counts:
-        num_tokens = num_reqs * decode_query_len
+    for num_tokens, query_len in sweep_points:
+        if sps_debug:
+            model_runner._sps_debug_events = []
+        uniform_query_len = query_len if query_len != decode_query_len else None
         for _ in range(warmup_iters):
-            model_runner._dummy_run(num_tokens, uniform_decode=True)
+            model_runner._dummy_run(
+                num_tokens,
+                uniform_decode=True,
+                uniform_query_len=uniform_query_len,
+            )
         torch.accelerator.synchronize()
         samples = []
         for _ in range(timed_rounds):
             start = time.perf_counter()
             for _ in range(timed_iters):
-                model_runner._dummy_run(num_tokens, uniform_decode=True)
+                model_runner._dummy_run(
+                    num_tokens,
+                    uniform_decode=True,
+                    uniform_query_len=uniform_query_len,
+                )
             torch.accelerator.synchronize()
             samples.append((time.perf_counter() - start) * 1000.0 / timed_iters)
         # A lazy kernel initialization or a transient host stall must not become
@@ -545,7 +576,47 @@ def _profile_sps_curve(
         # make those events visible, and the median rejects an isolated one.
         step_ms_samples.append(samples)
         step_ms.append(_stable_sps_step_ms(samples))
+        if sps_debug:
+            events = model_runner._sps_debug_events
+            model_runner._sps_debug_events = None
+            # Skip the warmup iters; report mean verify/draft GPU ms.
+            timed = events[warmup_iters:]
+            if timed:
+                verify = sum(e[0].elapsed_time(e[1]) for e in timed) / len(timed)
+                draft = sum(e[1].elapsed_time(e[2]) for e in timed) / len(timed)
+                logger.info(
+                    "SPS debug (tokens=%d, qlen=%d): verify %.3f ms, "
+                    "draft %.3f ms, gpu total %.3f ms",
+                    num_tokens,
+                    query_len,
+                    verify,
+                    draft,
+                    verify + draft,
+                )
+        if sps_debug_level >= 2:
+            from torch.profiler import ProfilerActivity, profile
 
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                model_runner._dummy_run(
+                    num_tokens,
+                    uniform_decode=True,
+                    uniform_query_len=uniform_query_len,
+                )
+            torch.accelerator.synchronize()
+            rows = sorted(
+                prof.key_averages(),
+                key=lambda e: -e.self_device_time_total,
+            )[:14]
+            logger.info(
+                "SPS kernel profile (tokens=%d): %s",
+                num_tokens,
+                [
+                    (r.key[:72], round(r.self_device_time_total / 1000.0, 3), r.count)
+                    for r in rows
+                ],
+            )
+
+    InputBatch.dummy_input_ids_random_high = 0
     timings = torch.tensor(step_ms, dtype=torch.float64, device=model_runner.device)
     tp_group = get_tp_group()
     if tp_group.world_size > 1:
@@ -555,8 +626,8 @@ def _profile_sps_curve(
     assert model_runner.speculative_config is not None
     overhead_ms = model_runner.speculative_config.dspark_sps_overhead_ms
     sps_curve = [
-        (num_reqs * decode_query_len, 1000.0 / (ms + overhead_ms))
-        for num_reqs, ms in zip(req_counts, step_ms)
+        (num_tokens, 1000.0 / (ms + overhead_ms))
+        for (num_tokens, _), ms in zip(sweep_points, step_ms)
     ]
     assert model_runner.speculator is not None
     model_runner.speculator.set_sps_curve(sps_curve)
@@ -574,8 +645,8 @@ def _profile_sps_curve(
     logger.info(
         "DSpark SPS profile windows (tokens, ms/step samples): %s",
         [
-            (num_reqs * decode_query_len, [round(ms, 3) for ms in samples])
-            for num_reqs, samples in zip(req_counts, step_ms_samples)
+            (num_tokens, [round(ms, 3) for ms in samples])
+            for (num_tokens, _), samples in zip(sweep_points, step_ms_samples)
         ],
     )
     logger.info(

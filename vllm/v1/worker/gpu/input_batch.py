@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
 import torch
@@ -104,6 +105,13 @@ class InputBatch:
     max_req_tokens: int | None = None
     valid_num_draft_tokens_per_req: np.ndarray | None = None
 
+    # When > 0, dummy batches carry seeded-random token ids instead of zeros.
+    # All-zero ids embed identically, so every dummy token routes to the SAME
+    # MoE experts — grouped expert reads collapse and the profiled cost of a
+    # multi-token verify step is wildly understated vs real (spread) routing.
+    # Seeded per num_tokens so all TP ranks generate identical ids.
+    dummy_input_ids_random_high: ClassVar[int] = 0
+
     @classmethod
     def make_dummy(
         cls,
@@ -160,7 +168,14 @@ class InputBatch:
         input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
         query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
 
-        input_ids = input_buffers.input_ids[:num_tokens].zero_()
+        random_high = cls.dummy_input_ids_random_high
+        if random_high > 0:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(0xB12C0 + num_tokens)
+            input_ids = input_buffers.input_ids[:num_tokens]
+            input_ids.random_(0, random_high, generator=gen)
+        else:
+            input_ids = input_buffers.input_ids[:num_tokens].zero_()
         positions = input_buffers.positions[:num_tokens].zero_()
 
         input_buffers.is_padding[:num_tokens].fill_(True)

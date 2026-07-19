@@ -254,6 +254,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Speculative decoding.
         self.speculator = None
+        # VLLM_DSPARK_SPS_DEBUG: the SPS profiler collects per-dummy-run
+        # (start, post-verify, post-draft) CUDA events here when set.
+        self._sps_debug_events: list[list[torch.cuda.Event]] | None = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
@@ -665,6 +668,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         *args,
         skip_attn: bool = False,
         uniform_decode: bool = False,
+        uniform_query_len: int | None = None,
         skip_eplb: bool = False,
         is_profile: bool = False,
         **kwargs,
@@ -680,13 +684,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Create a dummy scheduler output.
         num_reqs = min(num_tokens, self.max_num_reqs)
         if uniform_decode:
-            # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
-            # and for spec-decode with MTP we want to make sure the dummy runs use
-            # 1+num_speculative_tokens we use max here, this will likely be eventually
-            # changed in the worker: https://github.com/vllm-project/vllm/pull/35243
-            num_tokens = max(num_tokens, self.decode_query_len)
-            num_reqs = num_tokens // self.decode_query_len
-            assert num_tokens % self.decode_query_len == 0
+            if uniform_query_len is not None:
+                # Sub-depth uniform decode (SPS curve profiling): dispatch a
+                # capacity-pruned verify shape, e.g. one request at a query
+                # length below decode_query_len, via the varlen graph buckets.
+                assert 0 < uniform_query_len <= self.decode_query_len
+                assert num_tokens % uniform_query_len == 0
+                num_reqs = num_tokens // uniform_query_len
+            else:
+                # HACK(lucas): for now since the worker is shared between MRV1
+                # and MRV2, and for spec-decode with MTP we want to make sure
+                # the dummy runs use 1+num_speculative_tokens we use max here,
+                # this will likely be eventually changed in the worker:
+                # https://github.com/vllm-project/vllm/pull/35243
+                num_tokens = max(num_tokens, self.decode_query_len)
+                num_reqs = num_tokens // self.decode_query_len
+                assert num_tokens % self.decode_query_len == 0
         # Distribute the remainder evenly so no dummy request exceeds
         # ceil(num_tokens / num_reqs) <= max_model_len tokens.
         num_tokens_per_request = [
@@ -720,6 +733,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_active_loras=max_loras,
         ):
             # Execute the model.
+            sps_debug = getattr(self, "_sps_debug_events", None)
+            if sps_debug is not None:
+                ev = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+                ev[0].record()
             self.execute_model(
                 dummy_scheduler_output,
                 intermediate_tensors=intermediate_tensors,
@@ -727,6 +744,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_attn_for_dummy_run=skip_attn,
                 is_profile=is_profile,
             )
+            if sps_debug is not None:
+                ev[1].record()
         self.kv_connector.set_disabled(False)
 
         # Non-last PP ranks don't produce output for sampling.
@@ -784,6 +803,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
                 is_profile=is_profile,
             )
+            if sps_debug is not None:
+                ev[2].record()
+                sps_debug.append(ev)
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
