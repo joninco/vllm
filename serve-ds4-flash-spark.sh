@@ -316,6 +316,21 @@ unset VLLM_TORCH_PROFILER_WARMUP_ITERATIONS
 unset VLLM_TORCH_PROFILER_ACTIVE_ITERATIONS
 unset VLLM_TORCH_PROFILER_WAIT_ITERATIONS
 
+compilation_extra=
+if [[ "${enable_dspark}" == 1 ]]; then
+  # Dense verify-graph buckets: every depth 1..decode_query_len must be a
+  # distinctly captured (and profiled) batch size, else capacity choices pad
+  # up a coarse pow2 grid and mid-depth pruning is mispriced.
+  dense_sizes=$(python3 - "$((num_speculative_tokens + 1))" "${max_cudagraph_capture_size}" <<'PYEOF'
+import sys
+depth, cap = int(sys.argv[1]), int(sys.argv[2])
+sizes = sorted(set(list(range(1, min(depth, cap) + 1)) + list(range(depth, cap + 1, 4)) + [cap]))
+print(",".join(str(x) for x in sizes))
+PYEOF
+)
+  compilation_extra=$(printf ',"cudagraph_capture_sizes":[%s]' "${dense_sizes}")
+fi
+
 exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   "${model_path}" \
   --revision "${model_revision}" \
@@ -347,7 +362,7 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --enable-chunked-prefill \
   "${prefix_caching_args[@]}" \
   --compilation-config \
-    '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
+    "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]${compilation_extra}}" \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \
