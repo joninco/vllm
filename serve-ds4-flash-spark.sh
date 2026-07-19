@@ -116,6 +116,13 @@ load_format=${LOAD_FORMAT:-instanttensor}
 enable_flashinfer_autotune=${ENABLE_FLASHINFER_AUTOTUNE:-1}
 enable_prefix_caching=${ENABLE_PREFIX_CACHING:-1}
 dspark_draft_attention_backend=${DSPARK_DRAFT_ATTENTION_BACKEND:-B12X_MLA_SPARSE}
+# DSpark confidence verification gating (all inert when empty). SPS curve is
+# either the string "auto" or a raw JSON breakpoint list like [[8,900],[32,600]].
+dspark_sps_curve=${DSPARK_SPS_CURVE:-}
+dspark_confidence_threshold=${DSPARK_CONFIDENCE_THRESHOLD:-}
+dspark_budget_frac=${DSPARK_BUDGET_FRAC:-}
+dspark_confidence_temperature=${DSPARK_CONFIDENCE_TEMPERATURE:-}
+dspark_sps_overhead_ms=${DSPARK_SPS_OVERHEAD_MS:-}
 unset VLLM_ENABLE_MTP VLLM_ENABLE_DSPARK
 
 export VLLM_USE_B12X_DCP_A2A=${VLLM_USE_B12X_DCP_A2A:-0}
@@ -213,9 +220,29 @@ if [[ "${enable_dspark}" == 1 ]] && ((num_speculative_tokens > 0)); then
       ',"attention_backend":"%s"' \
       "${dspark_draft_attention_backend}")
   fi
+  gating_json=
+  if [[ -n "${dspark_sps_curve}" ]]; then
+    if [[ "${dspark_sps_curve}" == auto ]]; then
+      gating_json+=',"dspark_sps_curve":"auto"'
+    else
+      gating_json+=",\"dspark_sps_curve\":${dspark_sps_curve}"
+    fi
+  fi
+  if [[ -n "${dspark_confidence_threshold}" ]]; then
+    gating_json+=",\"dspark_confidence_threshold\":${dspark_confidence_threshold}"
+  fi
+  if [[ -n "${dspark_budget_frac}" ]]; then
+    gating_json+=",\"dspark_budget_frac\":${dspark_budget_frac}"
+  fi
+  if [[ -n "${dspark_confidence_temperature}" ]]; then
+    gating_json+=",\"dspark_confidence_temperature\":${dspark_confidence_temperature}"
+  fi
+  if [[ -n "${dspark_sps_overhead_ms}" ]]; then
+    gating_json+=",\"dspark_sps_overhead_ms\":${dspark_sps_overhead_ms}"
+  fi
   speculative_config=$(printf \
-    '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"probabilistic"%s}' \
-    "${num_speculative_tokens}" "${draft_attention_json}")
+    '{"method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"probabilistic"%s%s}' \
+    "${num_speculative_tokens}" "${draft_attention_json}" "${gating_json}")
   speculative_args+=(
     --speculative-config
     "${speculative_config}"
