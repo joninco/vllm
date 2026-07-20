@@ -44,7 +44,7 @@ def _import_b12x_block_fp8() -> Any | None:
     if _B12X_BLOCK_FP8_MISSING:
         return None
     try:
-        _B12X_BLOCK_FP8 = importlib.import_module("b12x.gemm.block_fp8_linear")
+        _B12X_BLOCK_FP8 = importlib.import_module("sparkinfer.gemm.block_fp8_linear")
     except ImportError:
         _B12X_BLOCK_FP8_MISSING = True
         return None
@@ -90,7 +90,7 @@ def _run_b12x_fp8_block_scaled_linear(
 ) -> torch.Tensor:
     block_fp8 = _import_b12x_block_fp8()
     if block_fp8 is None:
-        raise ImportError("b12x.gemm.block_fp8_linear is not importable")
+        raise ImportError("sparkinfer.gemm.block_fp8_linear is not importable")
 
     tokens = int(input_2d.shape[0])
     out_features = int(packed_weight.out_features)
@@ -100,7 +100,7 @@ def _run_b12x_fp8_block_scaled_linear(
     # so no caller-owned view is mutated by a custom op in the compile graph
     # (which inductor's decompose_auto_functionalized pass cannot remove). No
     # plan/scratch/binding needed.
-    return block_fp8.block_fp8_linear_mxfp8(
+    return block_fp8.run(
         source=input_2d,
         packed_weight=packed_weight,
         bias=bias,
@@ -180,7 +180,7 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         if not current_platform.is_device_capability_family(120):
             return False, "b12x FP8 kernels require a Blackwell 12x device"
         if _import_b12x_block_fp8() is None:
-            return False, "b12x.gemm.block_fp8_linear is not importable"
+            return False, "sparkinfer.gemm.block_fp8_linear is not importable"
         return True, None
 
     @classmethod
@@ -232,8 +232,8 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
         block_fp8 = _import_b12x_block_fp8()
         if block_fp8 is None:
-            raise ImportError("b12x.gemm.block_fp8_linear is not importable")
-        layer.b12x_packed_weight = block_fp8.pack_block_fp8_linear_weight_mxfp8(
+            raise ImportError("sparkinfer.gemm.block_fp8_linear is not importable")
+        layer.b12x_packed_weight = block_fp8.pack_weight(
             params.weight.detach(),
             weight_scale.detach(),
             block_size=tuple(layer.weight_block_size),

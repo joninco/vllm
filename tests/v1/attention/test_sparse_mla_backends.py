@@ -291,8 +291,8 @@ def test_b12x_sparse_glm_uses_8_head_alignment(
 ) -> None:
     if not current_platform.has_device_capability(120):
         pytest.skip("B12xMLASparseBackend requires SM 12.0")
-    if importlib.util.find_spec("b12x") is None:
-        pytest.skip("b12x package not available")
+    if importlib.util.find_spec("sparkinfer") is None:
+        pytest.skip("sparkinfer package not available")
 
     default_vllm_config.scheduler_config.max_num_batched_tokens = 2
     default_vllm_config.scheduler_config.max_num_seqs = 2
@@ -362,7 +362,7 @@ def test_b12x_sparse_glm_uses_8_head_alignment(
     assert lse is None
 
     if num_heads == 8:
-        import b12x.attention.mla.kernel as b12x_mla_kernel
+        import sparkinfer.attention._shared.mla.kernel as b12x_mla_kernel
 
         torch.accelerator.synchronize()
         assert torch.isfinite(output).all()
@@ -392,8 +392,8 @@ def test_b12x_sparse_nvfp4_uses_kernel_format_not_scratch_caps(
 ) -> None:
     if not current_platform.has_device_capability(120):
         pytest.skip("B12xMLASparseBackend requires SM 12.0")
-    if importlib.util.find_spec("b12x") is None:
-        pytest.skip("b12x package not available")
+    if importlib.util.find_spec("sparkinfer") is None:
+        pytest.skip("sparkinfer package not available")
 
     default_vllm_config.scheduler_config.max_num_batched_tokens = 2
     default_vllm_config.scheduler_config.max_num_seqs = 2
@@ -440,8 +440,8 @@ def test_b12x_sparse_glm_dcp_expands_heads_and_converts_topk(
 ) -> None:
     if not current_platform.has_device_capability(120):
         pytest.skip("B12xMLASparseBackend requires SM 12.0")
-    if importlib.util.find_spec("b12x") is None:
-        pytest.skip("b12x package not available")
+    if importlib.util.find_spec("sparkinfer") is None:
+        pytest.skip("sparkinfer package not available")
 
     from vllm.distributed import parallel_state
 
@@ -531,8 +531,8 @@ def test_b12x_sparse_glm_dcp_matches_unsharded_gpu(
 ) -> None:
     if not current_platform.has_device_capability(120):
         pytest.skip("B12xMLASparseBackend requires SM 12.0")
-    if importlib.util.find_spec("b12x") is None:
-        pytest.skip("b12x package not available")
+    if importlib.util.find_spec("sparkinfer") is None:
+        pytest.skip("sparkinfer package not available")
 
     from vllm.distributed import parallel_state
 
@@ -806,10 +806,10 @@ def test_sparse_backend_decode_correctness(
     elif backend_cls == B12xMLASparseBackend:
         if not current_platform.has_device_capability(120):
             pytest.skip("B12xMLASparseBackend requires SM 12.0 (consumer Blackwell)")
-        if importlib.util.find_spec("b12x") is None:
-            pytest.skip("b12x package not available")
+        if importlib.util.find_spec("sparkinfer") is None:
+            pytest.skip("sparkinfer package not available")
         if kv_cache_dtype != "fp8_ds_mla":
-            # b12x's GLM_NSA unified kernel consumes the fp8_ds_mla 656 B/token
+            # SparkInfer's GLM_NSA kernel consumes the fp8_ds_mla 656 B/token
             # record (raw e4m3 + inline FP32 scales). The other cache dtypes are
             # advertised for the serving alias path but not exercised here.
             pytest.skip("b12x sparse MLA is validated with the fp8_ds_mla cache")
@@ -954,7 +954,8 @@ def test_sparse_backend_decode_correctness(
 
         if use_fp8_ds_mla_quantization:
             # The SM100 FlashInfer/FlashMLA kernels read ue8m0 (power-of-2) block
-            # scales, so the reference truncates scales to match. b12x's GLM_NSA
+            # scales, so the reference truncates scales to match. SparkInfer's
+            # GLM_NSA
             # kernel instead keeps the raw e4m3 K with the inline arbitrary-FP32
             # group scale (it is incompatible with ue8m0 block-scaling), so for
             # B12x the reference must dequantize with the true FP32 scales.

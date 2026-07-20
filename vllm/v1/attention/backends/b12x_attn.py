@@ -671,10 +671,14 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
 
         _disable_cutlass_memory_debug_snapshot_if_off()
 
-        from b12x.attention.paged.api import paged_attention_forward
-        from b12x.integration.paged_attention_scratch import (
-            B12XPagedAttentionScratchCaps,
-            plan_paged_attention_scratch,
+        from sparkinfer.attention.paged import (
+            Caps as B12XPagedAttentionScratchCaps,
+        )
+        from sparkinfer.attention.paged import (
+            plan as plan_paged_attention_scratch,
+        )
+        from sparkinfer.attention.paged import (
+            run as paged_attention_forward,
         )
 
         self._paged_attention_forward = paged_attention_forward
@@ -813,10 +817,14 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             ) = current_workspace_manager().get_simultaneous(
                 *self._contig_workspace_specs(include_scratch=False)
             )
-            from b12x.attention.contiguous.api import (
-                b12x_varlen_attention_forward,
-                create_varlen_attention_plan,
-                plan_varlen_attention_scratch,
+            from sparkinfer.attention.varlen import (
+                create_plan as create_varlen_attention_plan,
+            )
+            from sparkinfer.attention.varlen import (
+                plan as plan_varlen_attention_scratch,
+            )
+            from sparkinfer.attention.varlen import (
+                run as b12x_varlen_attention_forward,
             )
 
             plan_sinks = (

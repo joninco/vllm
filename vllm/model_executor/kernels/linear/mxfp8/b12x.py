@@ -46,7 +46,7 @@ def _import_b12x_mxfp8() -> Any | None:
     if _B12X_MXFP8_MISSING:
         return None
     try:
-        _B12X_MXFP8 = importlib.import_module("b12x.gemm.mxfp8_linear")
+        _B12X_MXFP8 = importlib.import_module("sparkinfer.gemm.mxfp8_linear")
     except ImportError:
         _B12X_MXFP8_MISSING = True
         return None
@@ -82,9 +82,9 @@ def _b12x_mxfp8_warmup_token_counts(
 
 
 def _missing_b12x_mxfp8_api(mxfp8: Any) -> str | None:
-    for name in ("pack_mxfp8_linear_weight", "mxfp8_linear"):
+    for name in ("pack_weight", "mm"):
         if not callable(getattr(mxfp8, name, None)):
-            return f"b12x.gemm.mxfp8_linear missing callable {name}"
+            return f"sparkinfer.gemm.mxfp8_linear missing callable {name}"
     return None
 
 
@@ -130,8 +130,8 @@ def _apply_b12x_mxfp8_packed_linear(
 
     mxfp8 = _import_b12x_mxfp8()
     if mxfp8 is None:
-        raise ImportError("b12x.gemm.mxfp8_linear is not importable")
-    output = mxfp8.mxfp8_linear(
+        raise ImportError("sparkinfer.gemm.mxfp8_linear is not importable")
+    output = mxfp8.mm(
         input_2d,
         packed_weight,
         bias=bias,
@@ -166,7 +166,7 @@ def warmup_b12x_mxfp8_linear(
         output_dtype = torch.bfloat16
 
     mxfp8 = _import_b12x_mxfp8()
-    if mxfp8 is None or not callable(getattr(mxfp8, "mxfp8_linear", None)):
+    if mxfp8 is None or not callable(getattr(mxfp8, "mm", None)):
         return 0
 
     token_counts = _b12x_mxfp8_warmup_token_counts(
@@ -198,7 +198,7 @@ def warmup_b12x_mxfp8_linear(
                     dtype=output_dtype,
                     device=device,
                 )
-                mxfp8.mxfp8_linear(
+                mxfp8.mm(
                     source,
                     packed_weight,
                     expected_m=_b12x_mxfp8_expected_m(tokens),
@@ -258,15 +258,13 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
             return False, "b12x MXFP8 GEMM is not enabled"
         mxfp8 = _import_b12x_mxfp8()
         if mxfp8 is None:
-            return False, "b12x.gemm.mxfp8_linear is not importable"
+            return False, "sparkinfer.gemm.mxfp8_linear is not importable"
         missing_api = _missing_b12x_mxfp8_api(mxfp8)
         if missing_api is not None:
             return False, missing_api
-        support_probe = getattr(mxfp8, "is_mxfp8_linear_supported", None)
-        if support_probe is not None:
-            is_supported, reason = support_probe()
-            if not is_supported:
-                return False, reason
+        support_probe = getattr(mxfp8, "is_supported", None)
+        if callable(support_probe) and not support_probe():
+            return False, "sparkinfer.gemm.mxfp8_linear is not supported"
         return True, None
 
     @classmethod
@@ -306,9 +304,9 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
 
         mxfp8 = _import_b12x_mxfp8()
         if mxfp8 is None:
-            raise ImportError("b12x.gemm.mxfp8_linear is not importable")
+            raise ImportError("sparkinfer.gemm.mxfp8_linear is not importable")
         scale_k = in_features // MXFP8_BLOCK_SIZE
-        layer.b12x_mxfp8_packed_weight = mxfp8.pack_mxfp8_linear_weight(
+        layer.b12x_mxfp8_packed_weight = mxfp8.pack_weight(
             weight[:out_features, :in_features].detach(),
             weight_scale[:out_features, :scale_k].detach(),
         )

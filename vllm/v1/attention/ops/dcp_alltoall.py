@@ -29,6 +29,7 @@ import torch.distributed as dist
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.utils.multi_stream_utils import is_vllm_cudagraph_capture_active
 from vllm.v1.attention.ops.common import mask_dcp_empty_shards_
 
 if TYPE_CHECKING:
@@ -49,7 +50,7 @@ _DCP_A2A_GRAPH_BUFFERS: dict[
 @lru_cache(maxsize=1)
 def _load_b12x_dcp_a2a_pool() -> Any | None:
     try:
-        from b12x.distributed import PCIeDCPA2APool
+        from sparkinfer.comm.pcie import DcpAllToAllPool as PCIeDCPA2APool
     except Exception:
         return None
     return PCIeDCPA2APool
@@ -541,7 +542,9 @@ def _dcp_a2a_send_recv_buffers(
     # buffer address at capture, but a larger eager batch can grow that workspace
     # and free the captured address. Eager calls therefore use ordinary temporary
     # tensors, while captured calls retain fixed-size owners below.
-    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+    if device.type == "cuda" and (
+        is_vllm_cudagraph_capture_active() or torch.cuda.is_current_stream_capturing()
+    ):
         # FULL graphs share a global graph pool. Without a live Python owner,
         # a larger descriptor's staging allocation can be recycled while a
         # smaller descriptor is captured, leaving both NCCL graph nodes bound

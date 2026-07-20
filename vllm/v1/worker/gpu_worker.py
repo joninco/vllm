@@ -847,7 +847,10 @@ class Worker(WorkerBase):
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
 
+        # Keep vLLM's stable B12X diagnostics while notifying the renamed
+        # external package that post-start kernel compilation is unexpected.
         os.environ["B12X_VLLM_ENGINE_STARTED"] = "1"
+        os.environ["SPARKINFER_ENGINE_STARTED"] = "1"
 
         activate_jit_monitor(
             mode=self.observability_config.jit_monitor_mode,

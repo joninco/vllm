@@ -974,9 +974,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if schedule_seq_lens.dim() != 1:
             return None
 
-        from b12x.attention.indexer import (
-            build_paged_mqa_schedule_metadata,
-            uses_paged_mqa_schedule,
+        from sparkinfer.attention.nsa_indexer import (
+            plan_paged_schedule as build_paged_mqa_schedule_metadata,
+        )
+        from sparkinfer.attention.nsa_indexer import (
+            uses_paged_schedule as uses_paged_mqa_schedule,
         )
 
         if not uses_paged_mqa_schedule(

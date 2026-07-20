@@ -964,12 +964,18 @@ def _run_b12x_paged_topk(
     live K-row window (a metadata tensor, not an in-kernel reduction); when
     None, b12x falls back to the capacity cap.
     """
-    from b12x.attention.indexer import (
-        INDEXER_SOURCE_LAYOUT_PAGED,
+    from sparkinfer.attention.nsa_indexer import (
         PAGED_INDEX_PAGE_SIZE,
-        B12XIndexerScratchCaps,
         index_topk_fp8,
-        plan_indexer_scratch,
+    )
+    from sparkinfer.attention.nsa_indexer import (
+        SOURCE_LAYOUT_PAGED as INDEXER_SOURCE_LAYOUT_PAGED,
+    )
+    from sparkinfer.attention.nsa_indexer import (
+        Caps as B12XIndexerScratchCaps,
+    )
+    from sparkinfer.attention.nsa_indexer import (
+        plan as plan_indexer_scratch,
     )
 
     if int(PAGED_INDEX_PAGE_SIZE) != _B12X_PAGED_INDEX_PAGE_SIZE:
@@ -1037,7 +1043,7 @@ def _merge_b12x_dcp_topk(
             "cross-rank candidate merge."
         )
 
-    from b12x.attention.indexer.tiled_topk import run_row_topk
+    from sparkinfer.attention.nsa_indexer.tiled_topk import run_row_topk
 
     from vllm.distributed.parallel_state import get_dcp_group
     from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -1218,10 +1224,10 @@ def _prewarm_b12x_contiguous_prefill_variants(
         return
 
     try:
-        from b12x.attention.indexer.contiguous_kernel import (
+        from sparkinfer.attention.nsa_indexer.contiguous_kernel import (
             run_contiguous_logits_kernel,
         )
-        from b12x.attention.indexer.tiled_topk import run_tiled_topk
+        from sparkinfer.attention.nsa_indexer.tiled_topk import run_tiled_topk
     except (AttributeError, ImportError, ModuleNotFoundError):
         return
 
@@ -1318,11 +1324,17 @@ def _reserve_b12x_paged_indexer_scratch(
     device: torch.device,
     shared_page_table: bool = False,
 ) -> None:
-    from b12x.attention.indexer import (
-        INDEXER_SOURCE_LAYOUT_PAGED,
+    from sparkinfer.attention.nsa_indexer import (
         PAGED_INDEX_PAGE_SIZE,
-        B12XIndexerScratchCaps,
-        plan_indexer_scratch,
+    )
+    from sparkinfer.attention.nsa_indexer import (
+        SOURCE_LAYOUT_PAGED as INDEXER_SOURCE_LAYOUT_PAGED,
+    )
+    from sparkinfer.attention.nsa_indexer import (
+        Caps as B12XIndexerScratchCaps,
+    )
+    from sparkinfer.attention.nsa_indexer import (
+        plan as plan_indexer_scratch,
     )
 
     page_table_width = max(

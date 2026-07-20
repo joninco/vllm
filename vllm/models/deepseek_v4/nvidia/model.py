@@ -998,10 +998,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         if self._use_b12x_mhc:
-            from b12x.integration.residual import (
-                MHC_DEFAULT_BLOCK_K,
+            from sparkinfer.norm.mhc import (
+                DEFAULT_BLOCK_K as MHC_DEFAULT_BLOCK_K,
+            )
+            from sparkinfer.norm.mhc import (
+                MULT as MHC_MULT,
+            )
+            from sparkinfer.norm.mhc._impl import (
                 MHC_GRAM_BLOCK_H,
-                MHC_MULT,
                 MHC_SOURCE_TILE_H,
                 MHC_SUPPORTED_HIDDEN_SIZES,
             )
@@ -1069,7 +1073,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         comb: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
     ) -> object:
-        from b12x.integration.residual import B12XMHCScratchCaps, plan_mhc_scratch
+        from sparkinfer.norm.mhc import (
+            Caps as B12XMHCScratchCaps,
+        )
+        from sparkinfer.norm.mhc import (
+            plan as plan_mhc_scratch,
+        )
 
         tokens = int(x.shape[0])
         expected_m = int(expected_m)
@@ -1102,7 +1111,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm_weight: torch.Tensor,
         norm_eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        from b12x.integration.residual import b12x_mhc_pre
+        from sparkinfer.norm.mhc import run_pre as b12x_mhc_pre
 
         norm_weight = self._require_b12x_mhc_norm_weight(norm_weight)
         if torch.compiler.is_compiling():
@@ -1174,7 +1183,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm_eps: float,
         hc_fn_bf16: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        from b12x.integration.residual import b12x_mhc_post_pre
+        from sparkinfer.norm.mhc import run_post_pre as b12x_mhc_post_pre
 
         norm_weight = self._require_b12x_mhc_norm_weight(norm_weight)
         expected_m = int(residual.shape[0])
@@ -1672,7 +1681,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
                 if layer._should_run_b12x_mhc(int(hidden_states.shape[0])):
-                    from b12x.integration.residual import b12x_mhc_post
+                    from sparkinfer.norm.mhc import run_post as b12x_mhc_post
 
                     aux_recon = b12x_mhc_post(
                         hidden_states,
@@ -1694,7 +1703,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
             elif layer._should_run_b12x_mhc(int(hidden_states.shape[0])):
-                from b12x.integration.residual import b12x_mhc_post
+                from sparkinfer.norm.mhc import run_post as b12x_mhc_post
 
                 hidden_states = b12x_mhc_post(
                     hidden_states,

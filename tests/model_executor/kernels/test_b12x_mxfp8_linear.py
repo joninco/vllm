@@ -164,7 +164,7 @@ def test_warmup_b12x_mxfp8_linear_dedupes_weight_signatures(
     monkeypatch.setattr(
         b12x_mod,
         "_import_b12x_mxfp8",
-        lambda: types.SimpleNamespace(mxfp8_linear=mxfp8_linear),
+        lambda: types.SimpleNamespace(mm=mxfp8_linear),
     )
 
     def packed(in_features: int, padded_in_features: int, out_features: int):
@@ -242,13 +242,13 @@ def test_b12x_mxfp8_support_requires_runtime_api(monkeypatch) -> None:
     monkeypatch.setattr(
         b12x_mod,
         "_import_b12x_mxfp8",
-        lambda: types.SimpleNamespace(pack_mxfp8_linear_weight=object()),
+        lambda: types.SimpleNamespace(pack_weight=object()),
     )
 
     is_supported, reason = B12xMxfp8LinearKernel.is_supported()
 
     assert not is_supported
-    assert reason == "b12x.gemm.mxfp8_linear missing callable pack_mxfp8_linear_weight"
+    assert reason == "sparkinfer.gemm.mxfp8_linear missing callable pack_weight"
 
 
 def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
@@ -264,7 +264,7 @@ def test_b12x_mxfp8_process_weights_packs_modelopt_layout(monkeypatch) -> None:
     monkeypatch.setattr(
         b12x_mod,
         "_import_b12x_mxfp8",
-        lambda: types.SimpleNamespace(pack_mxfp8_linear_weight=pack),
+        lambda: types.SimpleNamespace(pack_weight=pack),
     )
 
     layer = torch.nn.Module()
@@ -310,7 +310,7 @@ def test_b12x_mxfp8_apply_uses_packed_weight(monkeypatch) -> None:
     monkeypatch.setattr(
         b12x_mod,
         "_import_b12x_mxfp8",
-        lambda: types.SimpleNamespace(mxfp8_linear=mxfp8_linear),
+        lambda: types.SimpleNamespace(mm=mxfp8_linear),
     )
 
     layer = torch.nn.Module()
@@ -390,7 +390,7 @@ def test_b12x_mxfp8_custom_op_body_uses_forward_context(monkeypatch) -> None:
     monkeypatch.setattr(
         b12x_mod,
         "_import_b12x_mxfp8",
-        lambda: types.SimpleNamespace(mxfp8_linear=mxfp8_linear),
+        lambda: types.SimpleNamespace(mm=mxfp8_linear),
     )
 
     layer = torch.nn.Module()

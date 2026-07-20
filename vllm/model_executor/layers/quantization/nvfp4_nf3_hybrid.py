@@ -593,7 +593,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         are known there, and the first forward is vLLM's eager profile run,
         so nothing compiles inside CUDA-graph capture).
         """
-        from b12x.moe.fused.w4a16.prepare import (
+        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
             PreparedNF3MoeWeights,
             W4A16PackedWeights,
             _make_workspace,
@@ -738,8 +738,12 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         routing and a fused top-k sum; if that compile is unavailable the
         packed launch also serves decode.
         """
-        from b12x.moe.fused.w4a16.host import max_packed_route_slots
-        from b12x.moe.fused.w4a16.kernel import compile_w4a16_fused_moe
+        from sparkinfer.moe._shared.kernels.w4a16.host import (
+            max_packed_route_slots,
+        )
+        from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+            compile_w4a16_fused_moe,
+        )
 
         runtime = self.quant_config.shared_runtime
         hidden = self.moe.hidden_dim
@@ -914,10 +918,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 getattr(props, "shared_memory_per_block_optin", 101_376)
             )
             if runtime.grid188_launch is None:
-                from b12x.moe.fused.w4a16.host import (
+                from sparkinfer.moe._shared.kernels.w4a16.host import (
                     packed_gemm_scratch_elements,
                 )
-                from b12x.moe.fused.w4a16.kernel import (
+                from sparkinfer.moe._shared.kernels.w4a16.kernel import (
                     compile_w4a16_fused_moe_hybrid,
                 )
 
@@ -948,7 +952,10 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                     or int(launch.local_memory_bytes) > 0
                 ):
                     raise RuntimeError("compiled hybrid launch failed admission")
-                if not hasattr(torch.ops.b12x, "w4a16_fused_moe_hybrid_launch"):
+                if not hasattr(
+                    torch.ops.sparkinfer,
+                    "w4a16_fused_moe_hybrid_launch",
+                ):
                     raise RuntimeError("hybrid one-grid custom op is unavailable")
                 runtime.grid188_scratch = self._borrow_grid188_scratch(
                     runtime.buffers,
@@ -1013,7 +1020,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         assert state.grid188_tier_map is not None
         assert state.grid188_output is not None
         m = int(x.shape[0])
-        torch.ops.b12x.w4a16_fused_moe_hybrid_launch(
+        torch.ops.sparkinfer.w4a16_fused_moe_hybrid_launch(
             x,
             *state.grid188_weight_views,
             topk_ids.view(-1),
@@ -1059,7 +1066,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         scratch/buffer set. The first apply is vLLM's eager profile run at
         max_num_batched_tokens, so max_m sizes itself to the serving
         ceiling and nothing compiles during CUDA-graph capture."""
-        from b12x.moe.fused.w4a16.host import (
+        from sparkinfer.moe._shared.kernels.w4a16.host import (
             make_w4a16_packed_buffers,
             max_packed_route_slots,
         )
@@ -1133,7 +1140,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         decode: bool,
     ) -> torch.Tensor:
         """Run one tier through its preplanned b12x launch."""
-        from b12x.moe.fused.w4a16.kernel import run_w4a16_moe
+        from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 
         runtime = self.quant_config.shared_runtime
         use_decode = decode and launch_pair[0] is not launch_pair[1]

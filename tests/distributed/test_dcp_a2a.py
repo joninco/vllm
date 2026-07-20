@@ -454,6 +454,37 @@ def test_packed_a2a_capture_buffers_stay_live_per_shape(
     dcp_alltoall._DCP_A2A_GRAPH_BUFFERS.clear()
 
 
+def test_packed_a2a_prewarm_buffers_are_retained_before_cuda_capture(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    created: list[object] = []
+
+    def fake_empty(*args, **kwargs):
+        value = object()
+        created.append(value)
+        return value
+
+    dcp_alltoall._DCP_A2A_GRAPH_BUFFERS.clear()
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(dcp_alltoall, "is_vllm_cudagraph_capture_active", lambda: True)
+    device = torch.device("cuda:0")
+
+    prewarm = dcp_alltoall._dcp_a2a_send_recv_buffers(
+        (3, 16, 11, 514), device, torch.bfloat16
+    )
+    capture = dcp_alltoall._dcp_a2a_send_recv_buffers(
+        (3, 16, 11, 514), device, torch.bfloat16
+    )
+
+    assert capture is prewarm
+    assert len(created) == 2
+    assert len(dcp_alltoall._DCP_A2A_GRAPH_BUFFERS) == 1
+    dcp_alltoall._DCP_A2A_GRAPH_BUFFERS.clear()
+
+
 def test_packed_a2a_eager_buffers_are_not_retained(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -469,6 +500,7 @@ def test_packed_a2a_eager_buffers_are_not_retained(
     dcp_alltoall._DCP_A2A_GRAPH_BUFFERS.clear()
     monkeypatch.setattr(torch, "empty", fake_empty)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(dcp_alltoall, "is_vllm_cudagraph_capture_active", lambda: False)
     device = torch.device("cuda:0")
 
     first = dcp_alltoall._dcp_a2a_send_recv_buffers(
@@ -1147,11 +1179,12 @@ def test_distributed_packed_a2a_with_workspace_matches_reference():
 
 
 @pytest.mark.skipif(
-    torch.accelerator.device_count() < 2 or importlib.util.find_spec("b12x") is None,
-    reason="Need two GPUs and b12x.",
+    torch.accelerator.device_count() < 2
+    or importlib.util.find_spec("sparkinfer") is None,
+    reason="Need two GPUs and sparkinfer.",
 )
 def test_distributed_b12x_a2a_eager_and_graph_matches_reference():
-    from b12x.distributed.pcie_dcp_a2a import _load_extension
+    from sparkinfer.comm.pcie.pcie_dcp_a2a import _load_extension
 
     _load_extension()
     _distributed_run(
