@@ -77,6 +77,9 @@ from vllm.model_executor.kernels.linear.mxfp4 import (
 from vllm.model_executor.kernels.linear.mxfp4.aiter import (
     AiterMxfp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp4.b12x import (
+    B12xMxFp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp4.emulation import (
     EmulationMxfp4LinearKernel,
 )
@@ -126,6 +129,9 @@ from vllm.model_executor.kernels.linear.mxfp8.xpu import (
 from vllm.model_executor.kernels.linear.nvfp4 import (
     NvFp4LinearKernel,
     NvFp4LinearLayerConfig,
+)
+from vllm.model_executor.kernels.linear.nvfp4.b12x import (
+    B12xNvFp4LinearKernel,
 )
 from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
     CutlassNvFp4LinearKernel,
@@ -229,12 +235,15 @@ def _get_linear_backend() -> str:
 
 # Mapping from linear_backend name to the set of kernel classes it covers.
 # When a user sets --linear-backend <name>, only kernels in the corresponding
-# set are considered candidates. If none can implement the layer config,
-# an error is raised to respect the user's explicit intent.
+# set are considered candidates. A backend with no kernel for the layer family
+# falls back to automatic selection. A matching backend kernel that cannot
+# implement the layer config remains an error.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "b12x": {
         B12xFp8BlockScaledMMKernel,
+        B12xMxFp4LinearKernel,
         B12xMxfp8LinearKernel,
+        B12xNvFp4LinearKernel,
     },
     "cutlass": {
         CutlassInt8ScaledMMLinearKernel,
@@ -508,6 +517,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
 
 _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xNvFp4LinearKernel,
         FlashInferCuteDslNvFp4LinearKernel,
         FlashInferCutlassNvFp4LinearKernel,
         FlashInferB12xNvFp4LinearKernel,
@@ -535,6 +545,7 @@ _POSSIBLE_MXFP6_KERNELS: dict[PlatformEnum, list[type[MxFp6LinearKernel]]] = {
 
 _POSSIBLE_MXFP4_KERNELS: dict[PlatformEnum, list[type[MxFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xMxFp4LinearKernel,
         FlashInferMxFp4LinearKernel,
         MarlinMxFp4LinearKernel,
         HummingMxFp4LinearKernel,
@@ -1213,6 +1224,8 @@ __all__ = [
     "Mxfp8LinearKernel",
     "Mxfp8LinearLayerConfig",
     "B12xMxfp8LinearKernel",
+    "B12xNvFp4LinearKernel",
+    "B12xMxFp4LinearKernel",
     "init_mxfp4_linear_kernel",
     "MxFp4LinearKernel",
     "MxFp4LinearLayerConfig",

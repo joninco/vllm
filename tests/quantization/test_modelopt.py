@@ -839,6 +839,85 @@ def test_modelopt_mixed_precision_dispatches_layer_quant_algo(
     )
 
 
+def test_modelopt_mixed_precision_prefers_explicit_w4a4_scheme() -> None:
+    """Static FP4 activation metadata overrides a coarse W4A16 layer label."""
+    from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
+    from vllm.model_executor.layers.quantization import modelopt as m
+
+    w4a4_targets = [
+        "model.layers.0.mlp.experts",
+        "model.layers.0.mlp.shared_expert.gate_proj",
+        "model.layers.0.mlp.shared_expert.up_proj",
+        "model.layers.0.mlp.shared_expert.down_proj",
+    ]
+    quantized_layers = {
+        target: {"quant_algo": "W4A16_NVFP4", "group_size": 16}
+        for target in [*w4a4_targets, "model.layers.1.fake_proj"]
+    }
+    hf_quant_config: dict[str, Any] = {
+        "quant_algo": "MIXED_PRECISION",
+        "quant_method": "modelopt",
+        "config_groups": {
+            "group_0": {
+                "input_activations": {
+                    "dynamic": False,
+                    "num_bits": 4,
+                    "type": "float",
+                    "group_size": 16,
+                },
+                "weights": {
+                    "dynamic": False,
+                    "num_bits": 4,
+                    "type": "float",
+                    "group_size": 16,
+                },
+                "targets": w4a4_targets,
+            }
+        },
+        "quantized_layers": quantized_layers,
+    }
+
+    config = m.ModelOptMixedPrecisionConfig.from_config(hf_quant_config)
+
+    assert config._resolve_quant_algo("model.layers.0.mlp.experts") == "NVFP4"
+    assert (
+        config._resolve_quant_algo("model.layers.0.mlp.shared_expert.gate_up_proj")
+        == "NVFP4"
+    )
+    assert (
+        config._resolve_quant_algo("model.layers.0.mlp.shared_expert.down_proj")
+        == "NVFP4"
+    )
+    assert config._resolve_quant_algo("model.layers.1.fake_proj") == "W4A16_NVFP4"
+
+    with patch(
+        "vllm.model_executor.layers.quantization.modelopt.init_nvfp4_linear_kernel",
+        return_value=MagicMock(),
+    ):
+        method = config.get_quant_method(
+            MagicMock(spec=LinearBase),
+            "model.layers.0.mlp.shared_expert.down_proj",
+        )
+    assert isinstance(method, m.ModelOptNvFp4LinearMethod)
+
+    fake_experts = MagicMock(spec=RoutedExperts)
+    fake_experts.moe_config = MagicMock()
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.select_nvfp4_moe_backend",
+            return_value=(MagicMock(), MagicMock()),
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "is_global_sf_supported_for_nvfp4_backend",
+            return_value=False,
+        ),
+    ):
+        moe_method = config.get_quant_method(fake_experts, "model.layers.0.mlp.experts")
+    assert isinstance(moe_method, m.ModelOptNvFp4FusedMoE)
+    assert not moe_method.use_a16
+
+
 def test_modelopt_mixed_precision_resolves_minimax_qkv_from_shards() -> None:
     config = _mixed_precision_config(
         {

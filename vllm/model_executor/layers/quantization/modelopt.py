@@ -2291,18 +2291,40 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         group_size: int | None,
         **kwargs: Any,
     ) -> "ModelOptMixedPrecisionConfig":
-        if "quantization" in original_config:
-            quantized_layers = original_config["quantization"].get(
+        quantization_config = original_config.get("quantization", original_config)
+
+        quantized_layers = {
+            name: dict(layer_info)
+            for name, layer_info in quantization_config.get(
                 "quantized_layers", {}
-            )
-        else:
-            quantized_layers = original_config.get("quantized_layers", {})
+            ).items()
+        }
 
         if not quantized_layers:
             raise ValueError(
                 "MIXED_PRECISION quant_algo requires a non-empty "
                 "'quantized_layers' mapping in the quantization config."
             )
+
+        config_groups = quantization_config.get("config_groups", {})
+        for group in config_groups.values():
+            input_config = group.get("input_activations", {})
+            weight_config = group.get("weights", {})
+            is_static_w4a4 = all(
+                config.get("type") == "float"
+                and config.get("num_bits") == 4
+                and config.get("dynamic") is False
+                for config in (input_config, weight_config)
+            )
+            if not is_static_w4a4:
+                continue
+            for target in group.get("targets", []):
+                layer_info = quantized_layers.get(target)
+                if (
+                    layer_info is not None
+                    and layer_info.get("quant_algo", "").upper() == "W4A16_NVFP4"
+                ):
+                    layer_info["quant_algo"] = "NVFP4"
 
         # Determine group_size from the first NVFP4-family entry if not
         # provided. Both NVFP4 (W4A4) and W4A16_NVFP4 share the same packing

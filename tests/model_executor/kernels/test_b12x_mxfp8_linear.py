@@ -13,6 +13,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.kernels.linear import (
     _LINEAR_BACKEND_KERNEL_MAP,
     _POSSIBLE_MXFP8_KERNELS,
+    init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8.b12x import (
@@ -29,6 +30,12 @@ from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
     B12xFp8BlockScaledMMKernel,
     _b12x_fp8_block_scaled_linear,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+    FlashInferFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8StaticTensorSym,
+)
 from vllm.platforms import PlatformEnum
 
 
@@ -40,6 +47,36 @@ class _Param:
 def test_b12x_backend_maps_mxfp8_kernel() -> None:
     assert B12xMxfp8LinearKernel in _LINEAR_BACKEND_KERNEL_MAP["b12x"]
     assert B12xMxfp8LinearKernel in _POSSIBLE_MXFP8_KERNELS[PlatformEnum.CUDA]
+
+
+def test_b12x_backend_falls_back_for_per_tensor_fp8(
+    monkeypatch,
+    default_vllm_config,
+) -> None:
+    import vllm.model_executor.kernels.linear as linear_mod
+
+    monkeypatch.setattr(linear_mod.current_platform, "_enum", PlatformEnum.CUDA)
+    monkeypatch.setattr(linear_mod, "_get_linear_backend", lambda: "b12x")
+    monkeypatch.setattr(
+        FlashInferFP8ScaledMMLinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (True, None)),
+    )
+    monkeypatch.setattr(
+        FlashInferFP8ScaledMMLinearKernel,
+        "can_implement",
+        classmethod(lambda cls, config: (True, None)),
+    )
+
+    kernel = init_fp8_linear_kernel(
+        activation_quant_key=kFp8StaticTensorSym,
+        weight_quant_key=kFp8StaticTensorSym,
+        input_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        weight_shape=(2048, 2048),
+    )
+
+    assert isinstance(kernel, FlashInferFP8ScaledMMLinearKernel)
 
 
 def test_b12x_mxfp8_explicit_backend_selects_kernel(monkeypatch) -> None:

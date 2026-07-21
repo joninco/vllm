@@ -220,7 +220,7 @@ class KernelConfig:
     """Backend for quantized linear layer GEMM kernels. Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
-    - "b12x": Use b12x kernels for Blackwell FP8 block-scaled linear layers
+    - "b12x": Use B12X kernels for Blackwell FP8, MXFP8, NVFP4, and MXFP4 linears
     - "cutlass": Use CUTLASS-based kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
     - "flashinfer_cutedsl": Use FlashInfer with CuTe-DSL kernels (NVFP4, MXFP8)
