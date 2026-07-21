@@ -14,6 +14,9 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.attention.b12x_mxfp8_bmm import (
+    warmup_b12x_mla_mxfp8_bmm,
+)
 from vllm.model_executor.kernels.linear.mxfp8.b12x import warmup_b12x_mxfp8_linear
 from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
 from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
@@ -342,6 +345,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     )
     if warmed_mxfp8:
         logger.info("Warmed up %d B12X MXFP8 linear GEMM signatures.", warmed_mxfp8)
+
+    warmed_mla_bmm = warmup_b12x_mla_mxfp8_bmm(worker.get_model())
+    if warmed_mla_bmm:
+        logger.info(
+            "Warmed up %d B12X MLA MXFP8 BMM variants.",
+            warmed_mla_bmm,
+        )
 
     warmed_indexer = warmup_b12x_sparse_indexer(worker)
     if warmed_indexer:

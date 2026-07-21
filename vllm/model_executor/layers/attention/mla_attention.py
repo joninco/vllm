@@ -234,6 +234,10 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.kernels.attention.b12x_mxfp8_bmm import (
+    can_implement_b12x_mxfp8_bmm,
+    run_b12x_mxfp8_bmm,
+)
 from vllm.model_executor.layers.attention.attention import (
     _init_kv_cache_quant,
     get_attention_context,
@@ -315,6 +319,12 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
+_B12X_ABSORB_BMM_MAX_M = 32
+
+
+@functools.cache
+def _b12x_absorb_bmm_enabled() -> bool:
+    return envs.VLLM_B12X_ABSORB_BMM
 
 
 def _can_use_b12x_dcp_prefill_workspace(
@@ -948,8 +958,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and self.impl.dcp_world_size > 1
             and self.impl.is_sparse
             and getattr(self.impl, "supports_dcp_project_before_merge", False)
-            and hasattr(self, "W_UV")
-            and self.W_UV.dtype == torch.bfloat16
+            and (
+                (hasattr(self, "W_UV") and self.W_UV.dtype == torch.bfloat16)
+                or getattr(self, "_use_b12x_absorb_bmm", False)
+            )
         )
         project_before_merge_min_tokens = getattr(
             self,
@@ -1041,9 +1053,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 # Pads the head_dim if necessary (for the underlying kernel)
                 N, B, P = mqa_q_nope.shape
-                W_UK_T = self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
-                assert W_UK_T is not None
-                _, _, L = W_UK_T.shape
+                use_b12x_absorb_bmm = getattr(self, "_use_b12x_absorb_bmm", False)
+                W_UK_T = None
+                if use_b12x_absorb_bmm:
+                    assert not qrep_decode, (
+                        "B12X absorbed BMM does not support DCP-replicated queries."
+                    )
+                    L = self.kv_lora_rank
+                else:
+                    W_UK_T = self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
+                    assert W_UK_T is not None
+                    _, _, L = W_UK_T.shape
 
                 if self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
@@ -1052,7 +1072,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
+                if use_b12x_absorb_bmm:
+                    if B <= _B12X_ABSORB_BMM_MAX_M:
+                        run_b12x_mxfp8_bmm(
+                            mqa_q_nope,
+                            self._b12x_absorb_uk_rhs,
+                            mqa_ql_nope,
+                            b_major="n",
+                        )
+                    else:
+                        torch.bmm(
+                            mqa_q_nope,
+                            self._dequant_b12x_absorbed_pair()[0],
+                            out=mqa_ql_nope,
+                        )
+                else:
+                    assert W_UK_T is not None
+                    torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
 
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
@@ -1236,7 +1272,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         raise RuntimeError(
                             "Projected DCP valid counts must be contiguous."
                         )
-                    local_w_uv = self.W_UV.contiguous()
+                    local_w_uv = (
+                        self._dequant_b12x_absorbed_pair()[1].contiguous()
+                        if getattr(self, "_use_b12x_absorb_bmm", False)
+                        else self.W_UV.contiguous()
+                    )
                     w_uv_dcp = get_dcp_group().all_gather(local_w_uv, dim=0)
                     expected_shape = (
                         self.num_heads * get_dcp_group().world_size,
@@ -1408,7 +1448,121 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             output_padded[num_actual_toks:].zero_()
         return output_padded
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
+    def _prepare_b12x_absorb_bmm(self, act_dtype: torch.dtype) -> bool:
+        for name in ("_b12x_absorb_uk_rhs", "_b12x_absorb_uv_rhs"):
+            if hasattr(self, name):
+                delattr(self, name)
+        if not _b12x_absorb_bmm_enabled():
+            return False
+        if (
+            act_dtype != torch.bfloat16
+            or self.is_aiter_triton_fp4_bmm_enabled
+            or self.is_aiter_triton_fp8_bmm_enabled
+        ):
+            logger.warning_once(
+                "VLLM_B12X_ABSORB_BMM=1 requires BF16 MLA projections; "
+                "falling back to the materialized absorbed weights."
+            )
+            return False
+        if getattr(self, "dcp_q_replicate", False):
+            logger.warning_once(
+                "VLLM_B12X_ABSORB_BMM=1 does not support DCP query "
+                "replication; falling back to the gathered BF16 weights."
+            )
+            return False
+
+        weight = getattr(self.kv_b_proj, "weight", None)
+        weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
+        head_stride = self.qk_nope_head_dim + self.v_head_dim
+        expected_weight_shape = (
+            self.num_heads * head_stride,
+            self.kv_lora_rank,
+        )
+        expected_scale_shape = (
+            self.num_heads * head_stride,
+            self.kv_lora_rank // 32,
+        )
+        if (
+            not isinstance(weight, torch.Tensor)
+            or not isinstance(weight_scale, torch.Tensor)
+            or weight.dtype != torch.float8_e4m3fn
+            or weight_scale.dtype not in (torch.uint8, torch.float8_e8m0fnu)
+            or tuple(weight.shape) != expected_weight_shape
+            or tuple(weight_scale.shape) != expected_scale_shape
+            or not weight.is_contiguous()
+            or not weight_scale.is_contiguous()
+        ):
+            logger.warning_once(
+                "VLLM_B12X_ABSORB_BMM=1 requires a contiguous ModelOpt MXFP8 "
+                "kv_b_proj pack; falling back to the materialized absorbed weights."
+            )
+            return False
+
+        values = weight.view(self.num_heads, head_stride, self.kv_lora_rank)
+        scales = weight_scale.view(
+            self.num_heads,
+            head_stride,
+            self.kv_lora_rank // 32,
+        )
+        uk_rhs = (
+            values[:, : self.qk_nope_head_dim, :],
+            scales[:, : self.qk_nope_head_dim, :],
+        )
+        uv_rhs = (
+            values[:, self.qk_nope_head_dim :, :],
+            scales[:, self.qk_nope_head_dim :, :],
+        )
+        uk_supported = can_implement_b12x_mxfp8_bmm(
+            batch=self.num_heads,
+            max_m=_B12X_ABSORB_BMM_MAX_M,
+            n=self.kv_lora_rank,
+            k=self.qk_nope_head_dim,
+            b_major="n",
+            device=weight.device,
+        )
+        uv_supported = can_implement_b12x_mxfp8_bmm(
+            batch=self.num_heads,
+            max_m=_B12X_ABSORB_BMM_MAX_M,
+            n=self.v_head_dim,
+            k=self.kv_lora_rank,
+            b_major="k",
+            device=weight.device,
+        )
+        if not (uk_supported and uv_supported):
+            logger.warning_once(
+                "VLLM_B12X_ABSORB_BMM=1 but the MLA geometry is outside the "
+                "sparkinfer.gemm.bmm envelope; falling back to the materialized "
+                "absorbed weights."
+            )
+            return False
+
+        self._b12x_absorb_uk_rhs = uk_rhs
+        self._b12x_absorb_uv_rhs = uv_rhs
+        for name in ("W_UK_T", "W_UV"):
+            if hasattr(self, name):
+                delattr(self, name)
+        logger.info_once(
+            "Serving MLA absorbed projections directly from the B12X MXFP8 pack."
+        )
+        return True
+
+    def _dequant_b12x_absorbed_pair(self) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = self.kv_b_proj.weight
+        weight_scale = self.kv_b_proj.weight_scale
+        if weight_scale.dtype != torch.float8_e8m0fnu:
+            weight_scale = weight_scale.view(torch.float8_e8m0fnu)
+        dequant = weight.to(torch.bfloat16) * weight_scale.to(
+            torch.bfloat16
+        ).repeat_interleave(32, dim=-1)
+        kv_b = dequant.T.view(
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+        w_uk, w_uv = kv_b.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        return w_uk.permute(1, 2, 0), w_uv.transpose(0, 1)
+
+    def _process_materialized_absorbed_weights(self, act_dtype: torch.dtype):
         # we currently do not have quantized bmm's which are needed for
         # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
         # the bmm's in 16-bit, the extra memory overhead of this is fairly low
@@ -1527,6 +1681,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if not should_load_quant_weights(quant_method):
             set_default_quant_scales(self, register_buffer=False)
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+        self._use_b12x_absorb_bmm = self._prepare_b12x_absorb_bmm(act_dtype)
+        if not self._use_b12x_absorb_bmm:
+            self._process_materialized_absorbed_weights(act_dtype)
+            return
+
+        quant_method = (
+            self.quant_config.get_quant_method(self, prefix=self.layer_name)
+            if self.quant_config
+            else None
+        )
+        if not should_load_quant_weights(quant_method):
+            set_default_quant_scales(self, register_buffer=False)
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
@@ -1598,6 +1766,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             x = rocm_aiter_ops.triton_fp8_bmm(
                 x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True, YQ=out
             )
+        elif getattr(self, "_use_b12x_absorb_bmm", False):
+            if x.shape[1] <= _B12X_ABSORB_BMM_MAX_M:
+                run_b12x_mxfp8_bmm(
+                    x,
+                    self._b12x_absorb_uv_rhs,
+                    out.transpose(0, 1),
+                    b_major="k",
+                )
+            else:
+                torch.bmm(
+                    x,
+                    self._dequant_b12x_absorbed_pair()[1],
+                    out=out.transpose(0, 1),
+                )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
             torch.bmm(x, self.W_UV, out=out.transpose(0, 1))

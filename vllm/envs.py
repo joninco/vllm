@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_SPARSE_INDEXER: bool = False
     VLLM_USE_B12X_MHC: bool = False
     VLLM_USE_B12X_FP8_GEMM: bool = False
+    VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
@@ -1111,6 +1112,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_B12X_FP8_GEMM": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_FP8_GEMM", "0"))
     ),
+    # Serve MLA absorbed projections directly from the B12X MXFP8 pack.
+    "VLLM_B12X_ABSORB_BMM": lambda: bool(int(os.getenv("VLLM_B12X_ABSORB_BMM", "0"))),
     # Compute DSpark draft-proposal logits with a rowwise-fp8 copy of the
     # shared target lm_head. Verification is unchanged, so accepted outputs
     # retain target-model semantics. Requires fp8 tensor cores (SM89+).

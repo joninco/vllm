@@ -22,6 +22,9 @@ from tests.v1.attention.utils import (
 )
 from vllm import _custom_ops as ops
 from vllm.config.vllm import set_current_vllm_config
+from vllm.model_executor.kernels.attention import (
+    b12x_mxfp8_bmm as b12x_mxfp8_bmm_module,
+)
 from vllm.model_executor.layers.attention import mla_attention as mla_attention_module
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
@@ -155,6 +158,185 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
     assert layer.W_UK_T.data_ptr() == w_uk_t_ptr
     torch.testing.assert_close(layer.W_UV, old_w_uv + 100)
     torch.testing.assert_close(layer.W_UK_T, old_w_uk_t + 100)
+
+
+def _make_b12x_absorb_bmm_layer() -> MLAAttention:
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kv_lora_rank = 512
+    layer.num_heads = 16
+    layer.qk_nope_head_dim = 192
+    layer.v_head_dim = 256
+    layer.kv_b_proj = torch.nn.Module()
+    layer.kv_b_proj.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.zeros((16 * 448, 512), dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        ),
+    )
+    layer.kv_b_proj.register_parameter(
+        "weight_scale",
+        torch.nn.Parameter(
+            torch.full((16 * 448, 16), 127, dtype=torch.uint8),
+            requires_grad=False,
+        ),
+    )
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.dcp_q_replicate = False
+    layer.quant_config = None
+    layer.layer_name = "test"
+    return layer
+
+
+@pytest.mark.cpu_test
+def test_b12x_absorb_bmm_uses_zero_copy_checkpoint_views(monkeypatch):
+    layer = _make_b12x_absorb_bmm_layer()
+    calls = []
+
+    def can_implement(**kwargs):
+        calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(mla_attention_module, "_b12x_absorb_bmm_enabled", lambda: True)
+    monkeypatch.setattr(
+        mla_attention_module,
+        "can_implement_b12x_mxfp8_bmm",
+        can_implement,
+    )
+    monkeypatch.setattr(
+        mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
+    )
+
+    layer.process_weights_after_loading(torch.bfloat16)
+
+    assert layer._use_b12x_absorb_bmm
+    assert not hasattr(layer, "W_UK_T")
+    assert not hasattr(layer, "W_UV")
+    uk_values, uk_scales = layer._b12x_absorb_uk_rhs
+    uv_values, uv_scales = layer._b12x_absorb_uv_rhs
+    assert uk_values.shape == (16, 192, 512)
+    assert uk_scales.shape == (16, 192, 16)
+    assert uv_values.shape == (16, 256, 512)
+    assert uv_scales.shape == (16, 256, 16)
+    assert uk_values.untyped_storage().data_ptr() == layer.kv_b_proj.weight.data_ptr()
+    assert uv_values.untyped_storage().data_ptr() == layer.kv_b_proj.weight.data_ptr()
+    assert uk_scales.untyped_storage().data_ptr() == (
+        layer.kv_b_proj.weight_scale.data_ptr()
+    )
+    assert uv_scales.untyped_storage().data_ptr() == (
+        layer.kv_b_proj.weight_scale.data_ptr()
+    )
+    assert [(call["b_major"], call["n"], call["k"]) for call in calls] == [
+        ("n", 512, 192),
+        ("k", 256, 512),
+    ]
+
+
+@pytest.mark.cpu_test
+def test_b12x_absorb_bmm_rejects_dcp_query_replication(monkeypatch):
+    layer = _make_b12x_absorb_bmm_layer()
+    layer.dcp_q_replicate = True
+
+    monkeypatch.setattr(mla_attention_module, "_b12x_absorb_bmm_enabled", lambda: True)
+    monkeypatch.setattr(
+        mla_attention_module,
+        "can_implement_b12x_mxfp8_bmm",
+        lambda **_: pytest.fail("DCP query replication must reject B12X BMM first"),
+    )
+
+    assert not layer._prepare_b12x_absorb_bmm(torch.bfloat16)
+
+
+@pytest.mark.cpu_test
+def test_b12x_absorb_bmm_unsupported_pack_uses_materialized_pair(monkeypatch):
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kv_lora_rank = 2
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = 3
+    layer.v_head_dim = 4
+    layer.kv_b_proj = torch.nn.Module()
+    layer.kv_b_proj.weight = torch.nn.Parameter(
+        torch.arange(28.0, dtype=torch.float16).reshape(14, 2)
+    )
+    layer.kv_b_proj.quant_method = None
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.dcp_q_replicate = False
+    layer.quant_config = None
+    layer.layer_name = "test"
+
+    monkeypatch.setattr(mla_attention_module, "_b12x_absorb_bmm_enabled", lambda: True)
+    monkeypatch.setattr(
+        mla_attention_module, "set_default_quant_scales", lambda *_, **__: None
+    )
+
+    layer.process_weights_after_loading(torch.bfloat16)
+
+    assert not layer._use_b12x_absorb_bmm
+    assert layer.W_UK_T.shape == (2, 3, 2)
+    assert layer.W_UV.shape == (2, 2, 4)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(("major", "major_code"), [("k", 0), ("n", 1)])
+def test_b12x_mxfp8_bmm_custom_op_uses_generic_api(monkeypatch, major, major_code):
+    calls = []
+    gemm = SimpleNamespace(bmm=lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_B12X_BMM", gemm)
+    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_B12X_BMM_MISSING", False)
+    lhs = torch.empty((2, 3, 4))
+    b_values = torch.empty((2, 5, 4))
+    b_scales = torch.empty((2, 5, 1), dtype=torch.uint8)
+    out = torch.empty((2, 3, 5))
+
+    b12x_mxfp8_bmm_module._b12x_mxfp8_bmm_impl(lhs, b_values, b_scales, out, major_code)
+
+    args, kwargs = calls[0]
+    assert args == (lhs, (b_values, b_scales), out)
+    assert kwargs["b_major"] == major
+    assert kwargs["sf_axis"] == major
+    assert kwargs["a_dtype"] == "bfloat16"
+    assert kwargs["b_dtype"] == "float8_e4m3fn"
+
+
+@pytest.mark.cpu_test
+def test_b12x_mla_mxfp8_bmm_warmup_deduplicates_signatures(monkeypatch):
+    calls = []
+
+    def prewarm(rhs, m_values, **kwargs):
+        calls.append((rhs, tuple(m_values), kwargs))
+        return len(tuple(m_values))
+
+    monkeypatch.setattr(
+        b12x_mxfp8_bmm_module,
+        "_B12X_BMM",
+        SimpleNamespace(prewarm_bmm=prewarm),
+    )
+    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_B12X_BMM_MISSING", False)
+    model = torch.nn.Sequential(torch.nn.Module(), torch.nn.Module())
+    for module in model:
+        module._b12x_absorb_uk_rhs = (
+            torch.empty((16, 192, 512), dtype=torch.float8_e4m3fn),
+            torch.empty((16, 192, 16), dtype=torch.uint8),
+        )
+        module._b12x_absorb_uv_rhs = (
+            torch.empty((16, 256, 512), dtype=torch.float8_e4m3fn),
+            torch.empty((16, 256, 16), dtype=torch.uint8),
+        )
+
+    warmed = b12x_mxfp8_bmm_module.warmup_b12x_mla_mxfp8_bmm(
+        model, m_values=(1, 2, 2, 3)
+    )
+
+    assert warmed == 6
+    assert len(calls) == 2
+    assert [(call[1], call[2]["b_major"]) for call in calls] == [
+        ((1, 2, 3), "n"),
+        ((1, 2, 3), "k"),
+    ]
 
 
 # Validate parameter combinations during collection, before GPU fixtures run.
