@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.attention.backends import b12x_attn
@@ -82,7 +83,9 @@ def test_b12x_hybrid_align_reserves_expanded_page_table() -> None:
 
 def test_b12x_lazily_prepares_missing_decode_capture_bucket(monkeypatch) -> None:
     impl = object.__new__(B12XPagedAttentionImpl)
-    plan = SimpleNamespace(layout=SimpleNamespace(nbytes=64))
+    # A lazy mid-batch plan may be larger than every materialized capture plan;
+    # initialization reserves Sparkinfer's all-batch envelope for this case.
+    plan = SimpleNamespace(layout=SimpleNamespace(nbytes=96))
     created: list[int] = []
 
     def create_plan(size: int) -> SimpleNamespace:
@@ -91,20 +94,48 @@ def test_b12x_lazily_prepares_missing_decode_capture_bucket(monkeypatch) -> None
 
     impl._decode_plans = {}
     impl._create_decode_plan = create_plan
+    impl._scratch_nbytes = 128
+    impl._extend_plan = object()
+    metadata = SimpleNamespace(max_query_len=1)
+    monkeypatch.setattr(b12x_attn, "_capture_alloc_forbidden", lambda: False)
+
+    selected = impl._select_plan(metadata, 7, 7)
+
+    assert selected is plan
+    assert impl._decode_plans == {7: plan}
+    assert created == [7]
+
+    assert impl._select_plan(metadata, 7, 7) is plan
+    assert created == [7]
+
+
+def test_b12x_partial_storage_limit_accepts_zero(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_B12X_PAGED_DECODE_MAX_PARTIAL_ROWS", "0")
+
+    assert (
+        b12x_attn._env_optional_storage_limit(
+            "VLLM_B12X_PAGED_DECODE_MAX_PARTIAL_ROWS",
+            allow_zero=True,
+        )
+        == 0
+    )
+
+
+def test_b12x_lazy_decode_bucket_exceeding_envelope_fails_closed(
+    monkeypatch,
+) -> None:
+    impl = object.__new__(B12XPagedAttentionImpl)
+    impl._decode_plans = {}
+    impl._create_decode_plan = lambda _size: SimpleNamespace(
+        layout=SimpleNamespace(nbytes=65)
+    )
     impl._scratch_nbytes = 64
     impl._extend_plan = object()
     metadata = SimpleNamespace(max_query_len=1)
     monkeypatch.setattr(b12x_attn, "_capture_alloc_forbidden", lambda: False)
 
-    selected, fixed_split_size = impl._select_plan(metadata, 7, 7)
-
-    assert selected is plan
-    assert fixed_split_size is None
-    assert impl._decode_plans == {7: plan}
-    assert created == [7]
-
-    assert impl._select_plan(metadata, 7, 7) == (plan, None)
-    assert created == [7]
+    with pytest.raises(RuntimeError, match="exceeds reserved scratch"):
+        impl._select_plan(metadata, 7, 7)
 
 
 def test_b12x_missing_decode_bucket_fails_closed_during_capture(monkeypatch) -> None:
@@ -120,3 +151,57 @@ def test_b12x_missing_decode_bucket_fails_closed_during_capture(monkeypatch) -> 
 
     with pytest.raises(RuntimeError, match="batch size 7"):
         impl._select_plan(metadata, 7, 7)
+
+
+def test_b12x_decode_forward_leaves_split_policy_to_plan(monkeypatch) -> None:
+    impl = object.__new__(B12XPagedAttentionImpl)
+    impl.output_head_size = 4
+    impl.dtype = torch.float32
+    impl.window_left = -1
+    impl.sinks = None
+    impl._scratch_nbytes = 32
+    impl._kv_cache_views = lambda kv_cache: (kv_cache, kv_cache)
+    impl._prepare_sinks = lambda sinks, device: None
+    impl._prepare_fp8_descales = lambda layer, num_reqs, device: (None, None)
+
+    bind_kwargs: dict[str, object] = {}
+
+    def bind(**kwargs):
+        bind_kwargs.update(kwargs)
+        return object()
+
+    plan = SimpleNamespace(bind=bind)
+    impl._select_plan = lambda metadata, total_q, num_reqs: plan
+    impl._paged_attention_forward = lambda *, binding: binding
+
+    workspace = SimpleNamespace(
+        get_simultaneous=lambda specs: (torch.empty(32, dtype=torch.uint8),)
+    )
+    monkeypatch.setattr(b12x_attn, "current_workspace_manager", lambda: workspace)
+
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        max_query_len=1,
+        causal=True,
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        query_start_loc=torch.arange(3, dtype=torch.int32),
+    )
+    query = torch.zeros((2, 1, 4))
+    output = torch.empty_like(query)
+    kv_cache = torch.ones(1)
+
+    result = impl.forward(
+        SimpleNamespace(),
+        query,
+        torch.empty(0),
+        torch.empty(0),
+        kv_cache,
+        metadata,
+        output,
+    )
+
+    assert result is output
+    assert "fixed_split_size" not in bind_kwargs
+    assert "disable_split_kv" not in bind_kwargs
+    assert bind_kwargs["active_total_q"] == 2

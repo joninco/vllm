@@ -218,6 +218,31 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
+def _env_optional_storage_limit(name: str, *, allow_zero: bool) -> int | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r; using Sparkinfer's planned capacity",
+            name,
+            value,
+        )
+        return None
+    minimum = 0 if allow_zero else 1
+    if parsed < minimum:
+        logger.warning(
+            "Ignoring %s=%r below the minimum %d; using Sparkinfer's planned capacity",
+            name,
+            value,
+            minimum,
+        )
+        return None
+    return parsed
+
+
 def _env_flag(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None or value == "":
@@ -643,31 +668,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             max_batched,
             cache_config.mamba_cache_mode,
         )
-        gqa_tiles = max(cdiv(self.num_queries_per_kv, _MIN_PAGED_TILE_Q), 1)
         extend_q_tiles = cdiv(max_batched * self.num_queries_per_kv, _MIN_PAGED_TILE_Q)
-
-        self._decode_max_chunks_per_req = _env_int(
-            "VLLM_B12X_PAGED_DECODE_MAX_CHUNKS_PER_REQ",
-            64,
-        )
-        sm_count = int(
-            torch.cuda.get_device_properties(self.device).multi_processor_count
-        )
-        graph_block_valid_capacity = max(
-            (sm_count * 2) // max(self.num_kv_heads, 1),
-            1,
-        )
-
-        def _decode_work_items(batch_size: int) -> int:
-            default = max(
-                batch_size * gqa_tiles * self._decode_max_chunks_per_req,
-                graph_block_valid_capacity,
-            )
-            return _env_int("VLLM_B12X_PAGED_DECODE_MAX_WORK_ITEMS", default)
-
-        def _decode_partial_rows(batch_size: int) -> int:
-            del batch_size
-            return _env_int("VLLM_B12X_PAGED_DECODE_MAX_PARTIAL_ROWS", 0)
 
         extend_work_items = _env_int(
             "VLLM_B12X_PAGED_EXTEND_MAX_WORK_ITEMS",
@@ -678,6 +679,12 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
 
         from sparkinfer.attention.paged import (
             Caps as B12XPagedAttentionScratchCaps,
+        )
+        from sparkinfer.attention.paged import (
+            decode_graph_capacity as plan_decode_graph_capacity,
+        )
+        from sparkinfer.attention.paged import (
+            decode_graph_scratch_envelope as plan_decode_graph_scratch_envelope,
         )
         from sparkinfer.attention.paged import (
             plan as plan_paged_attention_scratch,
@@ -727,20 +734,43 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             int(size) for size in capture_sizes if 0 < int(size) <= max_num_seqs
         }
         decode_plan_sizes.add(max_num_seqs)
-        decode_work_items_capacity = max(
-            _decode_work_items(batch_size) for batch_size in decode_plan_sizes
+        if os.getenv("VLLM_B12X_PAGED_DECODE_MAX_CHUNKS_PER_REQ"):
+            logger.warning_once(
+                "VLLM_B12X_PAGED_DECODE_MAX_CHUNKS_PER_REQ is ignored; "
+                "Sparkinfer owns decode graph chunk policy. Use the fixed "
+                "work/partial capacity controls only to constrain storage."
+            )
+        decode_work_items_limit = _env_optional_storage_limit(
+            "VLLM_B12X_PAGED_DECODE_MAX_WORK_ITEMS",
+            allow_zero=False,
         )
-        decode_partial_rows_capacity = max(
-            _decode_partial_rows(batch_size) for batch_size in decode_plan_sizes
+        decode_partial_rows_limit = _env_optional_storage_limit(
+            "VLLM_B12X_PAGED_DECODE_MAX_PARTIAL_ROWS",
+            allow_zero=True,
         )
 
         def _create_decode_plan(batch_size: int) -> Any:
+            capacity = plan_decode_graph_capacity(
+                device=self.device,
+                q_dtype=self.dtype,
+                kv_dtype=self.kv_torch_dtype,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_size,
+                head_dim_vo=self.output_head_size,
+                page_size=self.block_size,
+                batch=batch_size,
+                max_cache_page_count=max_page_table_width,
+                window_left=self.window_left,
+                max_work_items=decode_work_items_limit,
+                max_partial_rows=decode_partial_rows_limit,
+            )
             plan = _make_plan(
                 "decode",
                 batch_size,
                 batch_size,
-                decode_work_items_capacity,
-                decode_partial_rows_capacity,
+                capacity.max_work_items,
+                capacity.max_partial_rows,
                 True,
                 max_page_table_width,
                 True,
@@ -752,11 +782,26 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
                 max_cache_page_count=max_page_table_width,
                 window_left=self.window_left,
             )
-            if plan.plan.split_kv:
-                raise RuntimeError("B12X_ATTN decode plans must not use split-kv.")
             return plan
 
         self._create_decode_plan = _create_decode_plan
+        decode_scratch_envelope = plan_decode_graph_scratch_envelope(
+            device=self.device,
+            q_dtype=self.dtype,
+            kv_dtype=self.kv_torch_dtype,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_size,
+            head_dim_vo=self.output_head_size,
+            page_size=self.block_size,
+            max_batch=max_num_seqs,
+            max_page_table_width=max_page_table_width,
+            max_cache_page_count=max_page_table_width,
+            window_left=self.window_left,
+            max_work_items=decode_work_items_limit,
+            max_partial_rows=decode_partial_rows_limit,
+            copy_runtime_metadata=True,
+        )
         self._decode_plans: dict[int, Any] = {}
         for batch_size in sorted(decode_plan_sizes):
             self._decode_plans[batch_size] = self._create_decode_plan(batch_size)
@@ -771,7 +816,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             True,
         )
         self._scratch_nbytes = max(
-            max(int(plan.layout.nbytes) for plan in self._decode_plans.values()),
+            int(decode_scratch_envelope.nbytes),
             int(self._extend_plan.layout.nbytes),
         )
 
@@ -1036,7 +1081,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
         attn_metadata: B12XPagedMetadata,
         total_q: int,
         num_reqs: int,
-    ) -> tuple[Any, int | None]:
+    ) -> Any:
         if attn_metadata.max_query_len <= 1 and int(total_q) == int(num_reqs):
             batch_size = int(total_q)
             plan = self._decode_plans.get(batch_size)
@@ -1054,8 +1099,8 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
                         f"{self._scratch_nbytes} bytes."
                     )
                 self._decode_plans[batch_size] = plan
-            return plan, None
-        return self._extend_plan, None
+            return plan
+        return self._extend_plan
 
     def _forward_noncausal_contiguous(
         self,
@@ -1274,11 +1319,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             num_reqs,
             q.device,
         )
-        is_single_token_decode = attn_metadata.max_query_len <= 1 and int(
-            num_actual_tokens
-        ) == int(num_reqs)
-
-        plan, fixed_split_size = self._select_plan(
+        plan = self._select_plan(
             attn_metadata,
             num_actual_tokens,
             num_reqs,
@@ -1295,8 +1336,6 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
-            fixed_split_size=fixed_split_size,
-            disable_split_kv=is_single_token_decode,
             window_left=self.window_left,
             active_total_q=num_actual_tokens,
             attention_sink_bias=sinks,
