@@ -6,7 +6,7 @@ import inspect
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache, partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -2418,29 +2418,35 @@ def fast_plan_decode(
 
     assert self.is_cuda_graph_enabled, "Should be cudagraph only here"
 
-    fast_decode_plan(
-        self,
-        indptr=indptr_cpu,
-        indices=indices,
-        last_page_len=last_page_len_cpu,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-        pos_encoding_mode=pos_encoding_mode,
-        window_left=window_left,
-        logits_soft_cap=logits_soft_cap,
-        q_data_type=q_data_type,
-        kv_data_type=kv_data_type,
-        data_type=data_type,
-        sm_scale=sm_scale,
-        rope_scale=rope_scale,
-        rope_theta=rope_theta,
-        non_blocking=non_blocking,
-        fixed_split_size=fixed_split_size,
-        disable_split_kv=disable_split_kv,
-        q_len_per_req=q_len_per_req,
-    )
+    plan_kwargs: dict[str, Any] = {
+        "indptr": indptr_cpu,
+        "indices": indices,
+        "last_page_len": last_page_len_cpu,
+        "num_qo_heads": num_qo_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "page_size": page_size,
+        "pos_encoding_mode": pos_encoding_mode,
+        "window_left": window_left,
+        "logits_soft_cap": logits_soft_cap,
+        "q_data_type": q_data_type,
+        "kv_data_type": kv_data_type,
+        "data_type": data_type,
+        "sm_scale": sm_scale,
+        "rope_scale": rope_scale,
+        "rope_theta": rope_theta,
+        "non_blocking": non_blocking,
+        "fixed_split_size": fixed_split_size,
+        "disable_split_kv": disable_split_kv,
+    }
+    if flashinfer_supports_uniform_multi_token_decode():
+        plan_kwargs["q_len_per_req"] = q_len_per_req
+    elif q_len_per_req != 1:
+        raise RuntimeError(
+            "The installed FlashInfer fast_decode_plan does not support "
+            f"q_len_per_req={q_len_per_req}"
+        )
+    fast_decode_plan(self, **plan_kwargs)
 
 
 @triton.jit

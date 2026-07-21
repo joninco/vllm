@@ -29,16 +29,8 @@ from vllm.v1.worker.utils import AttentionGroup
 
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
-    is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
-
-    def get_extra_common_attn_kwargs(
-        self,
-        kv_cache_group_id: int,
-        num_reqs: int,
-    ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
 
     def get_extra_attn_kwargs(
         self,
@@ -262,7 +254,6 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
-            is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
@@ -284,6 +275,7 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            is_prefilling=is_prefilling,
         )
 
     def postprocess_state(
