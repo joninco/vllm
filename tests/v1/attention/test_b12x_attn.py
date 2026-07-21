@@ -42,6 +42,10 @@ def test_b12x_dense_backend_advertises_page128() -> None:
     assert B12XPagedAttentionBackend.get_preferred_block_size(64) == 64
 
 
+def test_b12x_dense_backend_advertises_sliding_window() -> None:
+    assert B12XPagedAttentionBackend.supports_sliding_window()
+
+
 def test_b12x_dense_kv_cache_shape_accepts_page128() -> None:
     assert B12XPagedAttentionBackend.get_kv_cache_shape(
         num_blocks=3,

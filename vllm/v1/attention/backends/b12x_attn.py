@@ -371,6 +371,10 @@ class B12XPagedAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_non_causal(cls) -> bool:
         return True
 
@@ -589,8 +593,9 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
 
         self.num_heads = int(num_heads)
         self.head_size = int(head_size)
-        self.head_size_v = int(
-            self.head_size if type(self).head_size_v is None else type(self).head_size_v
+        class_head_size_v = type(self).head_size_v
+        self.output_head_size = int(
+            self.head_size if class_head_size_v is None else class_head_size_v
         )
         self._uses_packed_kv_cache = type(self).head_size_v is not None
         self.scale = float(scale)
@@ -623,7 +628,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
                 f"{cache_config.block_size}."
             )
 
-        self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        self.device = torch.device("cuda", torch.accelerator.current_device_index())
         self.dtype = torch.get_default_dtype()
         if self.dtype not in (torch.float16, torch.bfloat16):
             self.dtype = model_config.dtype
@@ -702,7 +707,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
                     num_q_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
                     head_dim_qk=self.head_size,
-                    head_dim_vo=self.head_size_v,
+                    head_dim_vo=self.output_head_size,
                     page_size=self.block_size,
                     max_total_q=max_total_q,
                     max_batch=max_batch,
@@ -779,7 +784,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             spec_config is not None
             and getattr(spec_config, "method", None) == "dflash"
             and self.window_left != -1
-            and self.head_size_v == self.head_size
+            and self.output_head_size == self.head_size
         )
         self._contig_q_per_req = 1
         self._contig_max_batch = 1
@@ -861,7 +866,7 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             self.num_heads,
             self.num_kv_heads,
             self.head_size,
-            self.head_size_v,
+            self.output_head_size,
             self.window_left,
             self._scratch_nbytes,
         )
@@ -1213,9 +1218,9 @@ class B12XPagedAttentionImpl(AttentionImpl[B12XPagedMetadata]):
             )
         if attn_metadata is None:
             return output.fill_(0)
-        if output.shape[-1] != self.head_size_v:
+        if output.shape[-1] != self.output_head_size:
             raise ValueError(
-                f"B12X_ATTN expected output head dim {self.head_size_v}, got "
+                f"B12X_ATTN expected output head dim {self.output_head_size}, got "
                 f"{output.shape[-1]}."
             )
         if kv_cache.numel() == 0:
@@ -1356,7 +1361,7 @@ def get_b12x_paged_attention_backend(
             "B12X_ATTN head_size_v=%d is outside the advertised head sizes %s; "
             "b12x will validate the exact paged kernel traits at runtime.",
             head_size_v,
-            B12XPagedAttentionBackend.get_supported_head_sizes(),
+            tuple(B12XPagedAttentionBackend.get_supported_head_sizes()),
         )
 
     backend = _B12X_PAGED_BACKEND_BY_V_HEAD.get(head_size_v)
