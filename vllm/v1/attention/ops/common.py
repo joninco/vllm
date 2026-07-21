@@ -264,6 +264,7 @@ def cp_lse_ag_out_rs(
     is_lse_base_on_e=True,
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
+    head_major_output: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -278,7 +279,10 @@ def cp_lse_ag_out_rs(
         seq_lens=seq_lens,
         query_start_loc=query_start_loc,
     )
-    out = cp_group.reduce_scatter(out, dim=1)
+    if head_major_output:
+        out = cp_group.reduce_scatter_head_major(out, dim=1)
+    else:
+        out = cp_group.reduce_scatter(out, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size

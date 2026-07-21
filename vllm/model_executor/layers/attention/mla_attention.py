@@ -1325,6 +1325,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             is_lse_base_on_e=self.impl.lse_base_on_e,
                             seq_lens=seq_lens,
                             query_start_loc=query_start_loc,
+                            head_major_output=True,
                         )
                 else:
                     attn_out = self.dcp_manager.combine(
