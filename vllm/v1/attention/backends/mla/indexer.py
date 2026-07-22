@@ -777,6 +777,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         min_decode_len = int(decode_lens_cpu.min().item())
         if not use_native and (max_decode_len > 1 or force_flatten):
             assert self.decode_seq_lens_buffer.dim() == 1
+            if block_table.shape[1] != self.expanded_block_table_buffer.shape[1]:
+                raise ValueError(
+                    "MTP block-table row width does not match its expanded buffer: "
+                    f"{block_table.shape[1]} != "
+                    f"{self.expanded_block_table_buffer.shape[1]}"
+                )
             if (
                 min_decode_len == max_decode_len
                 and num_decodes * max_decode_len == num_decode_tokens
@@ -841,15 +847,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
 
                 # Give each of the flattened entries the same block table row as the
-                # original request. The model runner may right-pad block-table rows
-                # for backend alignment (for example, 1875 logical blocks becomes
-                # 1876 at block_size=64), while this indexer buffer is sized to the
-                # logical page count. Match the uniform Triton path above, which
-                # copies only expanded_bt_stride entries and drops that unused tail.
-                expanded_block_table_width = self.expanded_block_table_buffer.shape[1]
+                # original request. The expanded buffer uses the same backend-aligned
+                # row width as the model runner's source table.
                 self.expanded_block_table_buffer[:actual_expanded] = (
                     torch.repeat_interleave(
-                        block_table[:, :expanded_block_table_width],
+                        block_table,
                         decode_lens,
                         dim=0,
                         output_size=actual_expanded,
