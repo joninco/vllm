@@ -844,7 +844,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             unprojected_rows = min(last_ag_rs_row, project_threshold)
             if unprojected_rows >= first_ag_rs_row:
                 candidates.append((unprojected_rows, False))
-            if not workspace_eligible and last_ag_rs_row > project_threshold:
+            if last_ag_rs_row > project_threshold:
                 candidates.append((last_ag_rs_row, True))
 
         return max(

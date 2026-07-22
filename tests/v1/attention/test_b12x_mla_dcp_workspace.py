@@ -110,6 +110,37 @@ def test_sparse_profile_reserves_largest_non_workspace_ag_rs_batch(monkeypatch):
     assert attn._get_sparse_memory_profile_bytes() == expected
 
 
+def test_sparse_profile_accounts_for_projected_fallback_before_workspace(monkeypatch):
+    attn, workspace_enabled = _make_profile_attention(workspace_enabled=True)
+    attn.dcp_project_before_merge_min_prefill_tokens = 512
+    monkeypatch.setattr(envs, "VLLM_MEMORY_PROFILE_INCLUDE_ATTN", True)
+    monkeypatch.setattr(
+        envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", workspace_enabled
+    )
+
+    unprojected = _estimate_dcp_ag_rs_transient_bytes(
+        num_tokens=512,
+        local_heads=11,
+        dcp_world_size=6,
+        q_head_dim=576,
+        output_head_dim=512,
+        kv_lora_rank=512,
+        v_head_dim=256,
+        project_before_merge=False,
+    )
+    projected = _estimate_dcp_ag_rs_transient_bytes(
+        num_tokens=1024,
+        local_heads=11,
+        dcp_world_size=6,
+        q_head_dim=576,
+        output_head_dim=256,
+        kv_lora_rank=512,
+        v_head_dim=256,
+        project_before_merge=True,
+    )
+    assert attn._get_sparse_memory_profile_bytes() == max(unprojected, projected)
+
+
 def test_sparse_profile_accounts_for_projected_fallback_without_workspace(monkeypatch):
     attn, workspace_enabled = _make_profile_attention(workspace_enabled=False)
     monkeypatch.setattr(envs, "VLLM_MEMORY_PROFILE_INCLUDE_ATTN", True)

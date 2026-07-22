@@ -59,6 +59,7 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
     profile_pool = object()
     production_pool = object()
     events: list[str] = []
+    lazy_wrappers: list[FakeWrapper] = []
 
     class FakeManager:
         def __init__(self):
@@ -70,6 +71,9 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
         def capture(self, *args, **kwargs):
             assert self.pool is profile_pool
             assert wrapper.graph_pool is profile_pool
+            lazy_wrapper = FakeWrapper()
+            lazy_wrapper.graph_pool = self.pool
+            lazy_wrappers.append(lazy_wrapper)
             events.append("capture")
 
     class FakeWrapper:
@@ -109,6 +113,7 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
         events.append("cleanup")
         assert manager.pool is profile_pool
         assert wrapper.graph_pool is profile_pool
+        assert lazy_wrappers[0].graph_pool is profile_pool
 
     runner._cleanup_cudagraph_memory_profile = cleanup
 
@@ -128,7 +133,9 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
         model_runner_module.CUDAGraphWrapper, "_all_instances", [wrapper]
     )
     monkeypatch.setattr(
-        model_runner_module.BreakableCUDAGraphWrapper, "_all_instances", []
+        model_runner_module.BreakableCUDAGraphWrapper,
+        "_all_instances",
+        lazy_wrappers,
     )
     monkeypatch.setattr(model_runner_module.gc, "collect", lambda: None)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
@@ -160,6 +167,34 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
     assert workspace_module._workspace_lane.get() == 0
     assert manager.pool is production_pool
     assert wrapper.graph_pool is production_pool
+    assert lazy_wrappers[0].graph_pool is production_pool
+
+
+def test_breakable_runner_inherits_active_manager_pool(monkeypatch):
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    active_pool = object()
+
+    class FakeBreakableWrapper:
+        def __init__(self, model, vllm_config):
+            self.model = model
+            self.vllm_config = vllm_config
+            self.graph_pool = object()
+
+    monkeypatch.setattr(
+        cudagraph_utils, "BreakableCUDAGraphWrapper", FakeBreakableWrapper
+    )
+    manager = cudagraph_utils.CudaGraphManager.__new__(cudagraph_utils.CudaGraphManager)
+    manager.breakable_cg_runner = None
+    manager.vllm_config = object()
+    manager.pool = active_pool
+    model = object()
+
+    manager.init_breakable_cg_runner(model)
+
+    assert manager.breakable_cg_runner is not None
+    assert manager.breakable_cg_runner.model is model
+    assert manager.breakable_cg_runner.graph_pool is active_pool
 
 
 def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
