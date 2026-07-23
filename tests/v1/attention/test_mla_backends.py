@@ -528,7 +528,8 @@ def test_b12x_mla_mxfp8_bmm_warmup_skips_replaced_uk_signature(
 
 
 @pytest.mark.cpu_test
-def test_mxfp8_mla_query_custom_op_uses_sparkinfer_api(monkeypatch):
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_mxfp8_mla_query_custom_op_uses_sparkinfer_api(monkeypatch, output_dtype):
     calls = []
     mla_query = SimpleNamespace(
         run=lambda *args, **kwargs: calls.append((args, kwargs))
@@ -540,19 +541,21 @@ def test_mxfp8_mla_query_custom_op_uses_sparkinfer_api(monkeypatch):
     b_scales = torch.empty((8, 192, 16), dtype=torch.uint8)
     q_pe = torch.empty((2, 8, 64), dtype=torch.bfloat16)
     q_scale = torch.ones(1, dtype=torch.float32)
-    out = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    out = torch.empty((2, 8, 576), dtype=output_dtype)
 
     b12x_mxfp8_bmm_module._mxfp8_mla_query_impl(
         lhs, b_values, b_scales, q_pe, q_scale, out
     )
 
     args, kwargs = calls[0]
-    assert args == (lhs, (b_values, b_scales), q_pe, q_scale, out)
-    assert kwargs == {}
+    assert args == (lhs, (b_values, b_scales), q_pe, out)
+    expected_scale = q_scale if output_dtype == torch.float8_e4m3fn else None
+    assert kwargs == {"q_scale": expected_scale}
 
 
 @pytest.mark.cpu_test
-def test_bf16_mla_query_custom_op_uses_sparkinfer_api(monkeypatch):
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_bf16_mla_query_custom_op_uses_sparkinfer_api(monkeypatch, output_dtype):
     calls = []
     mla_query = SimpleNamespace(
         run=lambda *args, **kwargs: calls.append((args, kwargs))
@@ -563,13 +566,14 @@ def test_bf16_mla_query_custom_op_uses_sparkinfer_api(monkeypatch):
     weight = torch.empty((11, 192, 512), dtype=torch.bfloat16)
     q_pe = torch.empty((2, 11, 64), dtype=torch.bfloat16)
     q_scale = torch.ones(1, dtype=torch.float32)
-    out = torch.empty((2, 11, 576), dtype=torch.bfloat16)
+    out = torch.empty((2, 11, 576), dtype=output_dtype)
 
     b12x_mxfp8_bmm_module._bf16_mla_query_impl(lhs, weight, q_pe, q_scale, out)
 
     args, kwargs = calls[0]
-    assert args == (lhs, weight, q_pe, q_scale, out)
-    assert kwargs == {}
+    assert args == (lhs, weight, q_pe, out)
+    expected_scale = q_scale if output_dtype == torch.float8_e4m3fn else None
+    assert kwargs == {"q_scale": expected_scale}
 
 
 @pytest.mark.cpu_test

@@ -50,7 +50,7 @@ def _import_fused_mla_query() -> Any | None:
     if _FUSED_MLA_QUERY_MISSING:
         return None
     try:
-        mla_query = importlib.import_module("sparkinfer.attention.mla_query")
+        mla_query = importlib.import_module("sparkinfer.gemm.mla_query_projection")
     except ImportError:
         _FUSED_MLA_QUERY_MISSING = True
         return None
@@ -204,8 +204,14 @@ def _mxfp8_mla_query_impl(
 ) -> None:
     mla_query = _import_fused_mla_query()
     if mla_query is None:
-        raise ImportError("sparkinfer.attention.mla_query is not available")
-    mla_query.run(lhs, (b_values, b_scales), q_pe, q_scale, out)
+        raise ImportError("sparkinfer.gemm.mla_query_projection is not available")
+    mla_query.run(
+        lhs,
+        (b_values, b_scales),
+        q_pe,
+        out,
+        q_scale=q_scale if out.dtype == torch.float8_e4m3fn else None,
+    )
 
 
 def _mxfp8_mla_query_fake(
@@ -237,8 +243,14 @@ def _bf16_mla_query_impl(
 ) -> None:
     mla_query = _import_fused_mla_query()
     if mla_query is None:
-        raise ImportError("sparkinfer.attention.mla_query is not available")
-    mla_query.run(lhs, weight, q_pe, q_scale, out)
+        raise ImportError("sparkinfer.gemm.mla_query_projection is not available")
+    mla_query.run(
+        lhs,
+        weight,
+        q_pe,
+        out,
+        q_scale=q_scale if out.dtype == torch.float8_e4m3fn else None,
+    )
 
 
 def _bf16_mla_query_fake(
