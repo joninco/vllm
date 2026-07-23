@@ -1373,9 +1373,16 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
             lse = torch.zeros((q.shape[0], q.shape[1]), dtype=torch.float32)
             return out, lse
 
-    def fake_lse_reduce(attn_out, lse, group, is_lse_base_on_e=True):
+    def fake_lse_reduce(
+        attn_out,
+        lse,
+        group,
+        is_lse_base_on_e=True,
+        head_major_output=False,
+    ):
         assert group.world_size == 2
         assert lse is not None
+        assert head_major_output
         return attn_out[:, :2, :]
 
     monkeypatch.setattr(mla_attention, "get_dcp_group", lambda: FakeDCPGroup())
@@ -1402,6 +1409,16 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)
+    layer._try_fused_mla_query = lambda q_nope, q_pe: torch.cat(
+        (
+            torch.ones(
+                (q_pe.shape[0], q_pe.shape[1], layer.kv_lora_rank),
+                dtype=q_pe.dtype,
+            ),
+            q_pe,
+        ),
+        dim=-1,
+    )
 
     def fake_v_up_proj(x, out):
         out.copy_(x.reshape(out.shape))
@@ -1475,6 +1492,7 @@ def test_fp8_dcp_quantized_query_requires_backend_opt_in(monkeypatch):
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)
+    layer._try_fused_mla_query = lambda q_nope, q_pe: None
     layer._q_scale = torch.tensor(1.0, dtype=torch.float32)
     layer._decode_concat_quant_fp8_op = lambda q_nope, q_pe, scale: torch.empty(
         (q_nope.shape[0], q_nope.shape[1], q_nope.shape[2] + q_pe.shape[2]),

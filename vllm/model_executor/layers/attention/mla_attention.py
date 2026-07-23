@@ -1454,9 +1454,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             "does not return decode softmax LSE."
                         )
                     self.impl.need_to_return_lse_for_decode = True
+                # A fused BF16 query is also a single tensor. Only an actual
+                # FP8 query requires the backend's DCP quant-input contract.
                 if (
                     fp8_attention
                     and isinstance(mqa_q, torch.Tensor)
+                    and mqa_q.dtype == _FP8_DTYPE
                     and not getattr(self.impl, "supports_dcp_quant_query_input", False)
                 ):
                     raise NotImplementedError(
