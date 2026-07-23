@@ -1100,12 +1100,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             return None
 
         workspace_getter = getattr(self.impl, "get_mxfp8_mla_query_output", None)
-        output = (
-            workspace_getter(num_tokens, num_heads, output_dtype)
-            if callable(workspace_getter)
-            else None
-        )
-        if output is None:
+        if callable(workspace_getter):
+            output = workspace_getter(num_tokens, num_heads, output_dtype)
+            # A backend that exposes the workspace contract controls where it
+            # is safe to use the fused path. For example, B12X DCP and padded
+            # virtual-TP layouts require their existing gather/copy path.
+            if output is None:
+                return None
+        else:
             output = torch.empty(
                 (
                     num_tokens,

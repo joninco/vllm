@@ -223,6 +223,45 @@ def run_mxfp8_mla_query(
     return out
 
 
+def _module_uses_mxfp8_mla_query(module: torch.nn.Module) -> bool:
+    """Return whether fused query assembly replaces this module's UK BMM."""
+    mla_query = _import_mxfp8_mla_query()
+    rhs = getattr(module, "_b12x_absorb_uk_rhs", None)
+    output_dtype = getattr(module, "_mxfp8_mla_query_output_dtype", None)
+    if (
+        mla_query is None
+        or rhs is None
+        or output_dtype
+        not in (
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+        )
+    ):
+        return False
+
+    b_values, _ = rhs
+    backend_gate = getattr(
+        getattr(module, "impl", None),
+        "supports_mxfp8_mla_query_output",
+        None,
+    )
+    if callable(backend_gate) and not backend_gate(
+        int(b_values.shape[0]), output_dtype
+    ):
+        return False
+
+    return bool(
+        mla_query.can_implement(
+            num_heads=int(b_values.shape[0]),
+            max_m=1,
+            nope_dim=int(b_values.shape[1]),
+            latent_dim=int(b_values.shape[2]),
+            output_dtype=output_dtype,
+            device=b_values.device,
+        )
+    )
+
+
 def warmup_b12x_mla_mxfp8_bmm(
     model: torch.nn.Module,
     *,
@@ -240,6 +279,8 @@ def warmup_b12x_mla_mxfp8_bmm(
             ("_b12x_absorb_uk_rhs", "n"),
             ("_b12x_absorb_uv_rhs", "k"),
         ):
+            if attr == "_b12x_absorb_uk_rhs" and _module_uses_mxfp8_mla_query(module):
+                continue
             rhs = getattr(module, attr, None)
             if rhs is None:
                 continue
@@ -278,6 +319,8 @@ def warmup_mxfp8_mla_query(
     )
     warmed = 0
     for module in model.modules():
+        if not _module_uses_mxfp8_mla_query(module):
+            continue
         rhs = getattr(module, "_b12x_absorb_uk_rhs", None)
         output_dtype = getattr(module, "_mxfp8_mla_query_output_dtype", None)
         if rhs is None or output_dtype not in (

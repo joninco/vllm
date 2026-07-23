@@ -1420,6 +1420,20 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             raise RuntimeError("B12X DCP prefill borrowed an invalid raw scratch")
         return q_workspace, dense_out_workspace, scratch_storage
 
+    def supports_mxfp8_mla_query_output(
+        self,
+        num_heads: int,
+        output_dtype: torch.dtype,
+    ) -> bool:
+        """Whether fused query assembly can target the planned B12X layout."""
+        return bool(
+            self.dcp_world_size == 1
+            and output_dtype == torch.bfloat16
+            and num_heads == self._input_num_heads
+            and self._kernel_num_heads == self._input_num_heads
+            and self.q_head_dim == 576
+        )
+
     def get_mxfp8_mla_query_output(
         self,
         num_tokens: int,
@@ -1434,13 +1448,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         the query without a concat or workspace copy.
         """
         if (
-            self.dcp_world_size != 1
-            or output_dtype != torch.bfloat16
+            not B12xMLASparseImpl.supports_mxfp8_mla_query_output(
+                self, num_heads, output_dtype
+            )
             or num_tokens <= 0
             or num_tokens > self._max_batched
-            or num_heads != self._input_num_heads
-            or self._kernel_num_heads != self._input_num_heads
-            or self.q_head_dim != 576
         ):
             return None
         q_workspace, _, _ = self._borrow_workspace_parts()
