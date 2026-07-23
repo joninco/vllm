@@ -20,8 +20,8 @@ _BMM_SPEC = {
 }
 _B12X_BMM: Any | None = None
 _B12X_BMM_MISSING = False
-_MXFP8_MLA_QUERY: Any | None = None
-_MXFP8_MLA_QUERY_MISSING = False
+_FUSED_MLA_QUERY: Any | None = None
+_FUSED_MLA_QUERY_MISSING = False
 
 
 def _import_b12x_bmm() -> Any | None:
@@ -43,22 +43,22 @@ def _import_b12x_bmm() -> Any | None:
     return gemm
 
 
-def _import_mxfp8_mla_query() -> Any | None:
-    global _MXFP8_MLA_QUERY, _MXFP8_MLA_QUERY_MISSING
-    if _MXFP8_MLA_QUERY is not None:
-        return _MXFP8_MLA_QUERY
-    if _MXFP8_MLA_QUERY_MISSING:
+def _import_fused_mla_query() -> Any | None:
+    global _FUSED_MLA_QUERY, _FUSED_MLA_QUERY_MISSING
+    if _FUSED_MLA_QUERY is not None:
+        return _FUSED_MLA_QUERY
+    if _FUSED_MLA_QUERY_MISSING:
         return None
     try:
         mla_query = importlib.import_module("sparkinfer.attention.mla_query")
     except ImportError:
-        _MXFP8_MLA_QUERY_MISSING = True
+        _FUSED_MLA_QUERY_MISSING = True
         return None
     required = ("run", "can_implement", "prewarm")
     if not all(callable(getattr(mla_query, name, None)) for name in required):
-        _MXFP8_MLA_QUERY_MISSING = True
+        _FUSED_MLA_QUERY_MISSING = True
         return None
-    _MXFP8_MLA_QUERY = mla_query
+    _FUSED_MLA_QUERY = mla_query
     return mla_query
 
 
@@ -97,7 +97,48 @@ def can_implement_mxfp8_mla_query(
     output_dtype: torch.dtype,
     device: torch.device,
 ) -> bool:
-    mla_query = _import_mxfp8_mla_query()
+    return can_implement_fused_mla_query(
+        num_heads=num_heads,
+        max_m=max_m,
+        nope_dim=nope_dim,
+        latent_dim=latent_dim,
+        output_dtype=output_dtype,
+        weight_format="mxfp8",
+        device=device,
+    )
+
+
+def can_implement_bf16_mla_query(
+    *,
+    num_heads: int,
+    max_m: int,
+    nope_dim: int,
+    latent_dim: int,
+    output_dtype: torch.dtype,
+    device: torch.device,
+) -> bool:
+    return can_implement_fused_mla_query(
+        num_heads=num_heads,
+        max_m=max_m,
+        nope_dim=nope_dim,
+        latent_dim=latent_dim,
+        output_dtype=output_dtype,
+        weight_format="bf16",
+        device=device,
+    )
+
+
+def can_implement_fused_mla_query(
+    *,
+    num_heads: int,
+    max_m: int,
+    nope_dim: int,
+    latent_dim: int,
+    output_dtype: torch.dtype,
+    weight_format: Literal["bf16", "mxfp8"],
+    device: torch.device,
+) -> bool:
+    mla_query = _import_fused_mla_query()
     if mla_query is None:
         return False
     return bool(
@@ -107,6 +148,7 @@ def can_implement_mxfp8_mla_query(
             nope_dim=nope_dim,
             latent_dim=latent_dim,
             output_dtype=output_dtype,
+            weight_format=weight_format,
             device=device,
         )
     )
@@ -160,7 +202,7 @@ def _mxfp8_mla_query_impl(
     q_scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    mla_query = _import_mxfp8_mla_query()
+    mla_query = _import_fused_mla_query()
     if mla_query is None:
         raise ImportError("sparkinfer.attention.mla_query is not available")
     mla_query.run(lhs, (b_values, b_scales), q_pe, q_scale, out)
@@ -182,6 +224,38 @@ direct_register_custom_op(
     op_func=_mxfp8_mla_query_impl,
     mutates_args=["out"],
     fake_impl=_mxfp8_mla_query_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def _bf16_mla_query_impl(
+    lhs: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    mla_query = _import_fused_mla_query()
+    if mla_query is None:
+        raise ImportError("sparkinfer.attention.mla_query is not available")
+    mla_query.run(lhs, weight, q_pe, q_scale, out)
+
+
+def _bf16_mla_query_fake(
+    lhs: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    del lhs, weight, q_pe, q_scale, out
+
+
+direct_register_custom_op(
+    op_name="bf16_mla_query",
+    op_func=_bf16_mla_query_impl,
+    mutates_args=["out"],
+    fake_impl=_bf16_mla_query_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -223,43 +297,69 @@ def run_mxfp8_mla_query(
     return out
 
 
-def _module_uses_mxfp8_mla_query(module: torch.nn.Module) -> bool:
-    """Return whether fused query assembly replaces this module's UK BMM."""
-    mla_query = _import_mxfp8_mla_query()
+def run_bf16_mla_query(
+    lhs: torch.Tensor,
+    weight: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    torch.ops.vllm.bf16_mla_query(lhs, weight, q_pe, q_scale, out)
+    return out
+
+
+def _module_fused_mla_query_spec(
+    module: torch.nn.Module,
+) -> (
+    tuple[
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        Literal["bf16", "mxfp8"],
+        torch.dtype,
+    ]
+    | None
+):
+    """Return the module's qualified fused-query weight and output format."""
+    mla_query = _import_fused_mla_query()
+    output_dtype = getattr(module, "_fused_mla_query_output_dtype", None)
+    if mla_query is None or output_dtype not in (
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ):
+        return None
+
     rhs = getattr(module, "_b12x_absorb_uk_rhs", None)
-    output_dtype = getattr(module, "_mxfp8_mla_query_output_dtype", None)
-    if (
-        mla_query is None
-        or rhs is None
-        or output_dtype
-        not in (
-            torch.bfloat16,
-            torch.float8_e4m3fn,
-        )
-    ):
-        return False
+    if rhs is not None:
+        weight = rhs
+        weight_format: Literal["bf16", "mxfp8"] = "mxfp8"
+        b_values, _ = rhs
+        shape = tuple(b_values.shape)
+        device = b_values.device
+    else:
+        weight = getattr(module, "W_UK_T", None)
+        if not isinstance(weight, torch.Tensor) or weight.dtype != torch.bfloat16:
+            return None
+        weight_format = "bf16"
+        shape = tuple(weight.shape)
+        device = weight.device
 
-    b_values, _ = rhs
-    backend_gate = getattr(
-        getattr(module, "impl", None),
-        "supports_mxfp8_mla_query_output",
-        None,
-    )
-    if callable(backend_gate) and not backend_gate(
-        int(b_values.shape[0]), output_dtype
+    if len(shape) != 3:
+        return None
+    if not mla_query.can_implement(
+        num_heads=int(shape[0]),
+        max_m=1,
+        nope_dim=int(shape[1]),
+        latent_dim=int(shape[2]),
+        output_dtype=output_dtype,
+        weight_format=weight_format,
+        device=device,
     ):
-        return False
+        return None
+    return weight, weight_format, output_dtype
 
-    return bool(
-        mla_query.can_implement(
-            num_heads=int(b_values.shape[0]),
-            max_m=1,
-            nope_dim=int(b_values.shape[1]),
-            latent_dim=int(b_values.shape[2]),
-            output_dtype=output_dtype,
-            device=b_values.device,
-        )
-    )
+
+def _module_uses_mxfp8_mla_query(module: torch.nn.Module) -> bool:
+    spec = _module_fused_mla_query_spec(module)
+    return spec is not None and spec[1] == "mxfp8"
 
 
 def warmup_b12x_mla_mxfp8_bmm(
@@ -304,42 +404,44 @@ def warmup_b12x_mla_mxfp8_bmm(
     return warmed
 
 
-def warmup_mxfp8_mla_query(
+def warmup_fused_mla_query(
     model: torch.nn.Module,
     *,
     m_values: Iterable[int] = range(1, 33),
 ) -> int:
-    mla_query = _import_mxfp8_mla_query()
+    mla_query = _import_fused_mla_query()
     if mla_query is None:
         return 0
 
     values = tuple(dict.fromkeys(int(m) for m in m_values if int(m) > 0))
-    seen: set[tuple[tuple[int, ...], tuple[int, ...], torch.dtype, torch.device]] = (
-        set()
-    )
+    seen: set[tuple[object, ...]] = set()
     warmed = 0
     for module in model.modules():
-        if not _module_uses_mxfp8_mla_query(module):
+        spec = _module_fused_mla_query_spec(module)
+        if spec is None:
             continue
-        rhs = getattr(module, "_b12x_absorb_uk_rhs", None)
-        output_dtype = getattr(module, "_mxfp8_mla_query_output_dtype", None)
-        if rhs is None or output_dtype not in (
-            torch.bfloat16,
-            torch.float8_e4m3fn,
-        ):
-            continue
-        b_values, b_scales = rhs
-        signature = (
-            tuple(b_values.shape),
-            tuple(b_scales.shape),
-            output_dtype,
-            b_values.device,
-        )
+        weight, weight_format, output_dtype = spec
+        if isinstance(weight, torch.Tensor):
+            signature = (
+                weight_format,
+                tuple(weight.shape),
+                output_dtype,
+                weight.device,
+            )
+        else:
+            b_values, b_scales = weight
+            signature = (
+                weight_format,
+                tuple(b_values.shape),
+                tuple(b_scales.shape),
+                output_dtype,
+                b_values.device,
+            )
         if signature in seen:
             continue
         seen.add(signature)
         warmed += mla_query.prewarm(
-            rhs,
+            weight,
             values,
             output_dtype=output_dtype,
         )
@@ -348,9 +450,12 @@ def warmup_mxfp8_mla_query(
 
 __all__ = [
     "can_implement_b12x_mxfp8_bmm",
+    "can_implement_bf16_mla_query",
+    "can_implement_fused_mla_query",
     "can_implement_mxfp8_mla_query",
+    "run_bf16_mla_query",
     "run_b12x_mxfp8_bmm",
     "run_mxfp8_mla_query",
     "warmup_b12x_mla_mxfp8_bmm",
-    "warmup_mxfp8_mla_query",
+    "warmup_fused_mla_query",
 ]

@@ -1420,7 +1420,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             raise RuntimeError("B12X DCP prefill borrowed an invalid raw scratch")
         return q_workspace, dense_out_workspace, scratch_storage
 
-    def supports_mxfp8_mla_query_output(
+    def supports_fused_mla_query_output(
         self,
         num_heads: int,
         output_dtype: torch.dtype,
@@ -1434,7 +1434,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             and self.q_head_dim == 576
         )
 
-    def get_mxfp8_mla_query_output(
+    def get_fused_mla_query_output(
         self,
         num_tokens: int,
         num_heads: int,
@@ -1448,7 +1448,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         the query without a concat or workspace copy.
         """
         if (
-            not self.supports_mxfp8_mla_query_output(num_heads, output_dtype)
+            not self.supports_fused_mla_query_output(num_heads, output_dtype)
             or num_tokens <= 0
             or num_tokens > self._max_batched
         ):

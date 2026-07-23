@@ -504,10 +504,10 @@ def test_b12x_mla_mxfp8_bmm_warmup_skips_replaced_uk_signature(
     monkeypatch.setattr(b12x_mxfp8_bmm_module, "_B12X_BMM_MISSING", False)
     monkeypatch.setattr(
         b12x_mxfp8_bmm_module,
-        "_MXFP8_MLA_QUERY",
-        SimpleNamespace(can_implement=lambda **_: True),
+        "_FUSED_MLA_QUERY",
+        SimpleNamespace(can_implement=lambda **_: fused_query_supported),
     )
-    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_MXFP8_MLA_QUERY_MISSING", False)
+    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_FUSED_MLA_QUERY_MISSING", False)
     model = torch.nn.Sequential(torch.nn.Module())
     module = model[0]
     module._b12x_absorb_uk_rhs = (
@@ -518,10 +518,7 @@ def test_b12x_mla_mxfp8_bmm_warmup_skips_replaced_uk_signature(
         torch.empty((8, 256, 512), dtype=torch.float8_e4m3fn),
         torch.empty((8, 256, 16), dtype=torch.uint8),
     )
-    module._mxfp8_mla_query_output_dtype = torch.bfloat16
-    module.impl = SimpleNamespace(
-        supports_mxfp8_mla_query_output=lambda *args: fused_query_supported
-    )
+    module._fused_mla_query_output_dtype = torch.bfloat16
 
     warmed = b12x_mxfp8_bmm_module.warmup_b12x_mla_mxfp8_bmm(model, m_values=(1, 2, 3))
 
@@ -536,8 +533,8 @@ def test_mxfp8_mla_query_custom_op_uses_sparkinfer_api(monkeypatch):
     mla_query = SimpleNamespace(
         run=lambda *args, **kwargs: calls.append((args, kwargs))
     )
-    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_MXFP8_MLA_QUERY", mla_query)
-    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_MXFP8_MLA_QUERY_MISSING", False)
+    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_FUSED_MLA_QUERY", mla_query)
+    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_FUSED_MLA_QUERY_MISSING", False)
     lhs = torch.empty((8, 2, 192), dtype=torch.bfloat16)
     b_values = torch.empty((8, 192, 512), dtype=torch.float8_e4m3fn)
     b_scales = torch.empty((8, 192, 16), dtype=torch.uint8)
@@ -555,7 +552,28 @@ def test_mxfp8_mla_query_custom_op_uses_sparkinfer_api(monkeypatch):
 
 
 @pytest.mark.cpu_test
-def test_mxfp8_mla_query_warmup_deduplicates_dtype_signatures(monkeypatch):
+def test_bf16_mla_query_custom_op_uses_sparkinfer_api(monkeypatch):
+    calls = []
+    mla_query = SimpleNamespace(
+        run=lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_FUSED_MLA_QUERY", mla_query)
+    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_FUSED_MLA_QUERY_MISSING", False)
+    lhs = torch.empty((11, 2, 192), dtype=torch.bfloat16)
+    weight = torch.empty((11, 192, 512), dtype=torch.bfloat16)
+    q_pe = torch.empty((2, 11, 64), dtype=torch.bfloat16)
+    q_scale = torch.ones(1, dtype=torch.float32)
+    out = torch.empty((2, 11, 576), dtype=torch.bfloat16)
+
+    b12x_mxfp8_bmm_module._bf16_mla_query_impl(lhs, weight, q_pe, q_scale, out)
+
+    args, kwargs = calls[0]
+    assert args == (lhs, weight, q_pe, q_scale, out)
+    assert kwargs == {}
+
+
+@pytest.mark.cpu_test
+def test_fused_mla_query_warmup_deduplicates_weight_and_dtype_signatures(monkeypatch):
     calls = []
 
     def prewarm(rhs, m_values, **kwargs):
@@ -564,21 +582,21 @@ def test_mxfp8_mla_query_warmup_deduplicates_dtype_signatures(monkeypatch):
 
     monkeypatch.setattr(
         b12x_mxfp8_bmm_module,
-        "_MXFP8_MLA_QUERY",
+        "_FUSED_MLA_QUERY",
         SimpleNamespace(prewarm=prewarm, can_implement=lambda **_: True),
     )
-    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_MXFP8_MLA_QUERY_MISSING", False)
+    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_FUSED_MLA_QUERY_MISSING", False)
     model = torch.nn.Sequential(torch.nn.Module(), torch.nn.Module(), torch.nn.Module())
     for index, module in enumerate(model):
         module._b12x_absorb_uk_rhs = (
             torch.empty((8, 192, 512), dtype=torch.float8_e4m3fn),
             torch.empty((8, 192, 16), dtype=torch.uint8),
         )
-        module._mxfp8_mla_query_output_dtype = (
+        module._fused_mla_query_output_dtype = (
             torch.bfloat16 if index < 2 else torch.float8_e4m3fn
         )
 
-    warmed = b12x_mxfp8_bmm_module.warmup_mxfp8_mla_query(model, m_values=(1, 2, 2, 3))
+    warmed = b12x_mxfp8_bmm_module.warmup_fused_mla_query(model, m_values=(1, 2, 2, 3))
 
     assert warmed == 6
     assert len(calls) == 2
@@ -590,12 +608,41 @@ def test_mxfp8_mla_query_warmup_deduplicates_dtype_signatures(monkeypatch):
 
 
 @pytest.mark.cpu_test
-def test_mxfp8_mla_query_dispatch_uses_backend_workspace(monkeypatch):
+def test_fused_mla_query_warmup_includes_bf16_virtual_tp_signature(monkeypatch):
+    calls = []
+
+    def prewarm(weight, m_values, **kwargs):
+        calls.append((weight, tuple(m_values), kwargs))
+        return 2
+
+    monkeypatch.setattr(
+        b12x_mxfp8_bmm_module,
+        "_FUSED_MLA_QUERY",
+        SimpleNamespace(prewarm=prewarm, can_implement=lambda **_: True),
+    )
+    monkeypatch.setattr(b12x_mxfp8_bmm_module, "_FUSED_MLA_QUERY_MISSING", False)
+    model = torch.nn.Sequential(torch.nn.Module(), torch.nn.Module())
+    for module in model:
+        module.W_UK_T = torch.nn.Parameter(
+            torch.empty((11, 192, 512), dtype=torch.bfloat16)
+        )
+        module._fused_mla_query_output_dtype = torch.bfloat16
+
+    warmed = b12x_mxfp8_bmm_module.warmup_fused_mla_query(model, m_values=(1, 6, 32))
+
+    assert warmed == 2
+    assert len(calls) == 1
+    assert calls[0][0] is model[0].W_UK_T
+    assert calls[0][1] == (1, 6, 32)
+
+
+@pytest.mark.cpu_test
+def test_fused_mla_query_dispatch_uses_backend_workspace(monkeypatch):
     layer = MLAAttention.__new__(MLAAttention)
     layer._use_b12x_absorb_bmm = True
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
-    layer._mxfp8_mla_query_output_dtype = torch.bfloat16
+    layer._fused_mla_query_output_dtype = torch.bfloat16
     layer.kv_lora_rank = 512
     layer.qk_rope_head_dim = 64
     layer._q_scale = torch.ones(1, dtype=torch.float32)
@@ -606,7 +653,7 @@ def test_mxfp8_mla_query_dispatch_uses_backend_workspace(monkeypatch):
     workspace = torch.empty((2, 8, 576), dtype=torch.bfloat16)
     workspace_calls = []
     layer.impl = SimpleNamespace(
-        get_mxfp8_mla_query_output=lambda *args: (
+        get_fused_mla_query_output=lambda *args: (
             workspace_calls.append(args) or workspace
         )
     )
@@ -622,7 +669,7 @@ def test_mxfp8_mla_query_dispatch_uses_backend_workspace(monkeypatch):
     q_nope = torch.empty((8, 2, 192), dtype=torch.bfloat16)
     q_pe = torch.empty((2, 8, 64), dtype=torch.bfloat16)
 
-    result = layer._try_mxfp8_mla_query(q_nope, q_pe)
+    result = layer._try_fused_mla_query(q_nope, q_pe)
 
     assert result is workspace
     assert workspace_calls == [(2, 8, torch.bfloat16)]
@@ -632,30 +679,36 @@ def test_mxfp8_mla_query_dispatch_uses_backend_workspace(monkeypatch):
 
 
 @pytest.mark.cpu_test
-def test_mxfp8_mla_query_dispatch_preserves_unsupported_fallback(monkeypatch):
+def test_fused_mla_query_dispatch_preserves_unsupported_fallback(monkeypatch):
     layer = MLAAttention.__new__(MLAAttention)
     layer._use_b12x_absorb_bmm = True
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
-    layer._mxfp8_mla_query_output_dtype = torch.bfloat16
+    layer._fused_mla_query_output_dtype = torch.bfloat16
     layer.kv_lora_rank = 512
     layer.impl = SimpleNamespace()
+    layer._b12x_absorb_uk_rhs = (
+        torch.empty((11, 192, 512), dtype=torch.float8_e4m3fn),
+        torch.empty((11, 192, 16), dtype=torch.uint8),
+    )
     monkeypatch.setattr(
         mla_attention_module, "can_implement_mxfp8_mla_query", lambda **_: False
     )
     q_nope = torch.empty((11, 2, 192), dtype=torch.bfloat16)
     q_pe = torch.empty((2, 11, 64), dtype=torch.bfloat16)
 
-    assert layer._try_mxfp8_mla_query(q_nope, q_pe) is None
+    assert layer._try_fused_mla_query(q_nope, q_pe) is None
 
 
 @pytest.mark.cpu_test
-def test_mxfp8_mla_query_dispatch_honors_backend_workspace_rejection(monkeypatch):
+def test_fused_mla_query_dispatch_uses_temporary_when_backend_rejects_direct_output(
+    monkeypatch,
+):
     layer = MLAAttention.__new__(MLAAttention)
     layer._use_b12x_absorb_bmm = True
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
-    layer._mxfp8_mla_query_output_dtype = torch.bfloat16
+    layer._fused_mla_query_output_dtype = torch.bfloat16
     layer.kv_lora_rank = 512
     layer.qk_rope_head_dim = 64
     layer._q_scale = torch.ones(1, dtype=torch.float32)
@@ -665,7 +718,7 @@ def test_mxfp8_mla_query_dispatch_honors_backend_workspace_rejection(monkeypatch
     )
     workspace_calls = []
     layer.impl = SimpleNamespace(
-        get_mxfp8_mla_query_output=lambda *args: workspace_calls.append(args) or None
+        get_fused_mla_query_output=lambda *args: workspace_calls.append(args) or None
     )
     kernel_calls = []
     monkeypatch.setattr(
@@ -679,13 +732,52 @@ def test_mxfp8_mla_query_dispatch_honors_backend_workspace_rejection(monkeypatch
     q_nope = torch.empty((8, 2, 192), dtype=torch.bfloat16)
     q_pe = torch.empty((2, 8, 64), dtype=torch.bfloat16)
 
-    assert layer._try_mxfp8_mla_query(q_nope, q_pe) is None
+    result = layer._try_fused_mla_query(q_nope, q_pe)
+    assert result is not None
+    assert tuple(result.shape) == (2, 8, 576)
     assert workspace_calls == [(2, 8, torch.bfloat16)]
-    assert kernel_calls == []
+    assert kernel_calls == [
+        (q_nope, layer._b12x_absorb_uk_rhs, q_pe, layer._q_scale, result)
+    ]
 
 
 @pytest.mark.cpu_test
-def test_b12x_mxfp8_mla_query_workspace_is_zero_copy_and_dcp1_only():
+def test_bf16_fused_mla_query_dispatch_supports_tp6_dcp_temporary(monkeypatch):
+    layer = MLAAttention.__new__(MLAAttention)
+    layer._use_b12x_absorb_bmm = False
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer._fused_mla_query_output_dtype = torch.bfloat16
+    layer.kv_lora_rank = 512
+    layer.qk_rope_head_dim = 64
+    layer._q_scale = torch.ones(1, dtype=torch.float32)
+    layer.W_UK_T = torch.empty((11, 192, 512), dtype=torch.bfloat16)
+    workspace_calls = []
+    layer.impl = SimpleNamespace(
+        get_fused_mla_query_output=lambda *args: workspace_calls.append(args) or None
+    )
+    kernel_calls = []
+    monkeypatch.setattr(
+        mla_attention_module, "can_implement_bf16_mla_query", lambda **_: True
+    )
+    monkeypatch.setattr(
+        mla_attention_module,
+        "run_bf16_mla_query",
+        lambda *args: kernel_calls.append(args),
+    )
+    q_nope = torch.empty((11, 2, 192), dtype=torch.bfloat16)
+    q_pe = torch.empty((2, 11, 64), dtype=torch.bfloat16)
+
+    result = layer._try_fused_mla_query(q_nope, q_pe)
+
+    assert result is not None
+    assert tuple(result.shape) == (2, 11, 576)
+    assert workspace_calls == [(2, 11, torch.bfloat16)]
+    assert kernel_calls == [(q_nope, layer.W_UK_T, q_pe, layer._q_scale, result)]
+
+
+@pytest.mark.cpu_test
+def test_b12x_fused_mla_query_workspace_is_zero_copy_and_dcp1_only():
     from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
 
     workspace = torch.empty((4, 8, 576), dtype=torch.bfloat16)
@@ -697,22 +789,22 @@ def test_b12x_mxfp8_mla_query_workspace_is_zero_copy_and_dcp1_only():
         q_head_dim=576,
         _borrow_workspace_parts=lambda: (workspace, None, torch.empty(1)),
     )
-    impl.supports_mxfp8_mla_query_output = lambda num_heads, output_dtype: (
-        B12xMLASparseImpl.supports_mxfp8_mla_query_output(impl, num_heads, output_dtype)
+    impl.supports_fused_mla_query_output = lambda num_heads, output_dtype: (
+        B12xMLASparseImpl.supports_fused_mla_query_output(impl, num_heads, output_dtype)
     )
 
-    output = B12xMLASparseImpl.get_mxfp8_mla_query_output(impl, 2, 8, torch.bfloat16)
+    output = B12xMLASparseImpl.get_fused_mla_query_output(impl, 2, 8, torch.bfloat16)
 
-    assert B12xMLASparseImpl.supports_mxfp8_mla_query_output(impl, 8, torch.bfloat16)
+    assert B12xMLASparseImpl.supports_fused_mla_query_output(impl, 8, torch.bfloat16)
     assert output is not None
     assert tuple(output.shape) == (2, 8, 576)
     assert output.data_ptr() == workspace.data_ptr()
     impl.dcp_world_size = 2
-    assert not B12xMLASparseImpl.supports_mxfp8_mla_query_output(
+    assert not B12xMLASparseImpl.supports_fused_mla_query_output(
         impl, 8, torch.bfloat16
     )
     assert (
-        B12xMLASparseImpl.get_mxfp8_mla_query_output(impl, 2, 8, torch.bfloat16) is None
+        B12xMLASparseImpl.get_fused_mla_query_output(impl, 2, 8, torch.bfloat16) is None
     )
 
 

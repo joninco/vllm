@@ -235,6 +235,7 @@ def test_kernel_warmup_limits_fused_mla_query_to_graph_sizes(monkeypatch) -> Non
     worker = _flashinfer_autotune_worker(model)
     worker.vllm_config.compilation_config.cudagraph_capture_sizes = [2, 4, 32, 64]
     worker.vllm_config.kernel_config.enable_flashinfer_autotune = False
+    worker.vllm_config.kernel_config.enable_cutedsl_warmup = False
 
     monkeypatch.setattr(kernel_warmup, "deepseek_v4_mhc_warmup", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -257,7 +258,7 @@ def test_kernel_warmup_limits_fused_mla_query_to_graph_sizes(monkeypatch) -> Non
 
     monkeypatch.setattr(
         kernel_warmup,
-        "warmup_mxfp8_mla_query",
+        "warmup_fused_mla_query",
         fake_mla_query_warmup,
     )
 
