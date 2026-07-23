@@ -697,6 +697,9 @@ def test_b12x_mxfp8_mla_query_workspace_is_zero_copy_and_dcp1_only():
         q_head_dim=576,
         _borrow_workspace_parts=lambda: (workspace, None, torch.empty(1)),
     )
+    impl.supports_mxfp8_mla_query_output = lambda num_heads, output_dtype: (
+        B12xMLASparseImpl.supports_mxfp8_mla_query_output(impl, num_heads, output_dtype)
+    )
 
     output = B12xMLASparseImpl.get_mxfp8_mla_query_output(impl, 2, 8, torch.bfloat16)
 

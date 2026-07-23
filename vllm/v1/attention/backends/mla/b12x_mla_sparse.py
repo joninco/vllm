@@ -1448,9 +1448,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         the query without a concat or workspace copy.
         """
         if (
-            not B12xMLASparseImpl.supports_mxfp8_mla_query_output(
-                self, num_heads, output_dtype
-            )
+            not self.supports_mxfp8_mla_query_output(num_heads, output_dtype)
             or num_tokens <= 0
             or num_tokens > self._max_batched
         ):
