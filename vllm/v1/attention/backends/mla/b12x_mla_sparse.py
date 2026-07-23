@@ -997,6 +997,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.v_head_dim: int = mla_args.get("v_head_dim", 512)
         # GLM_NSA contract: q_head_dim = kv_lora_rank (512) + qk_rope (64) = 576.
         self.q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        # Query absorption sees a head-major, non-contiguous Q view. Some
+        # cuBLAS BF16 BMM kernels read past tight custom allocations, so route
+        # this BMM through the safe query op instead of materializing Q.
+        self.use_safe_mla_query_bmm = True
         # The indexer carries the shared buffer for normal layers and tests;
         # the explicitly-passed buffer covers backbone skip layers, whose
         # indexer is not constructed (see deepseek_v2.py).

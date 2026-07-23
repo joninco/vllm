@@ -322,6 +322,35 @@ _FP8_DTYPE = current_platform.fp8_dtype()
 _B12X_ABSORB_BMM_MAX_M = 32
 
 
+def _run_mla_query_bmm(
+    query: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    use_safe_op: bool,
+) -> None:
+    if (
+        use_safe_op
+        and query.is_cuda
+        and weight.is_cuda
+        and output.is_cuda
+        and query.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and output.dtype == torch.bfloat16
+    ):
+        try:
+            safe_bmm = torch.ops._C.safe_mla_query_bmm
+        except AttributeError:
+            safe_bmm = None
+        if safe_bmm is not None:
+            safe_bmm(query, weight, output)
+            return
+
+    # Fallback for CPU tests, non-BF16 paths, and builds without the CUDA op.
+    # The copy keeps tight DCP/custom-allocation query views out of torch.bmm.
+    torch.bmm(query.contiguous() if use_safe_op else query, weight, out=output)
+
+
 @functools.cache
 def _b12x_absorb_bmm_enabled() -> bool:
     return envs.VLLM_B12X_ABSORB_BMM
@@ -737,6 +766,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             **extra_impl_args,
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
+        self.use_safe_mla_query_bmm = getattr(
+            self.impl, "use_safe_mla_query_bmm", False
+        )
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
@@ -1292,14 +1324,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                             b_major="n",
                         )
                     else:
-                        torch.bmm(
+                        _run_mla_query_bmm(
                             mqa_q_nope,
                             self._dequant_b12x_absorbed_pair()[0],
-                            out=mqa_ql_nope,
+                            mqa_ql_nope,
+                            use_safe_op=self.use_safe_mla_query_bmm,
                         )
                 else:
                     assert W_UK_T is not None
-                    torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
+                    _run_mla_query_bmm(
+                        mqa_q_nope,
+                        W_UK_T,
+                        mqa_ql_nope,
+                        use_safe_op=self.use_safe_mla_query_bmm,
+                    )
 
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)

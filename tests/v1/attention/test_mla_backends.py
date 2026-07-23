@@ -173,6 +173,75 @@ def test_mla_kv_cache_spec_uses_layer_cache_dtype(
         assert spec.page_size_bytes == 64 * 656
 
 
+@pytest.mark.cpu_test
+def test_mla_init_propagates_safe_query_bmm_contract(monkeypatch):
+    class FakeImpl:
+        is_sparse = True
+        supports_mha_prefill = False
+
+        def __init__(self, **kwargs):
+            self.use_safe_mla_query_bmm = True
+
+    class FakeBackend:
+        @staticmethod
+        def is_mla():
+            return True
+
+        @staticmethod
+        def get_name():
+            return "TEST_MLA"
+
+        @staticmethod
+        def get_impl_cls():
+            return FakeImpl
+
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={}, cudagraph_capture_sizes=[]
+        ),
+        attention_config=SimpleNamespace(mla_prefill_backend=None),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            dcp_comm_backend="a2a",
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+    )
+    monkeypatch.setattr(mla_attention_module, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(
+        mla_attention_module, "get_current_vllm_config_or_none", lambda: config
+    )
+    monkeypatch.setattr(mla_attention_module, "_init_kv_cache_quant", lambda *a: None)
+    monkeypatch.setattr(
+        mla_attention_module,
+        "get_mla_prefill_backend",
+        lambda _: (_ for _ in ()).throw(ValueError),
+    )
+    monkeypatch.setattr(mla_attention_module, "_DecodeConcatQuantFP8", lambda **_: None)
+    monkeypatch.setattr(mla_attention_module, "QuantFP8", lambda **_: None)
+    monkeypatch.setattr(
+        mla_attention_module.rocm_aiter_ops, "is_fp8bmm_enabled", lambda: False
+    )
+    monkeypatch.setattr(
+        mla_attention_module.rocm_aiter_ops, "is_fp4bmm_enabled", lambda: False
+    )
+
+    layer = MLAAttention(
+        num_heads=8,
+        scale=1.0,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=3,
+        q_lora_rank=None,
+        kv_lora_rank=4,
+        kv_b_proj=SimpleNamespace(),
+        prefix="test",
+        attn_backend=FakeBackend,
+        use_sparse=True,
+    )
+
+    assert layer.use_safe_mla_query_bmm
+
+
 # Remove sm100 backends from the list if not using sm100
 if not torch.cuda.is_available() or torch.cuda.get_device_properties(0).major < 10:
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.CUTLASS_MLA)
@@ -863,6 +932,80 @@ def test_sparse_mla_profile_skips_dense_prefill_workspace(monkeypatch):
     assert torch.equal(output, torch.zeros_like(output))
 
 
+@pytest.mark.cpu_test
+def test_mla_query_absorb_safe_bmm_fallback_materializes_input(monkeypatch):
+    class FakeSparseImpl(SparseMLACommonImpl):
+        supports_quant_query_input = False
+
+        def __init__(self):
+            self.dcp_world_size = 1
+
+        def forward_mqa(self, q, kv_cache, attn_metadata, layer):
+            assert isinstance(q, tuple)
+            return torch.ones(
+                (q[0].shape[0], q[0].shape[1], layer.kv_lora_rank),
+                dtype=q[0].dtype,
+            ), None
+
+    layer = object.__new__(MLAAttention)
+    layer.impl = FakeSparseImpl()
+    layer.kv_cache_dtype = "auto"
+    layer.num_heads = 2
+    layer.qk_nope_head_dim = 4
+    layer.qk_rope_head_dim = 2
+    layer.kv_lora_rank = 3
+    layer.v_head_dim = 3
+    layer.q_pad_num_heads = None
+    layer.use_safe_mla_query_bmm = True
+    layer.is_aiter_triton_fp4_bmm_enabled = False
+    layer.is_aiter_triton_fp8_bmm_enabled = False
+    layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)
+
+    def fake_v_up_proj(x, out):
+        out.copy_(x.reshape(out.shape))
+
+    layer._v_up_proj = fake_v_up_proj
+
+    real_bmm = torch.bmm
+    seen_input_layouts = []
+
+    def checked_bmm(input_tensor, mat2, *, out=None):
+        if mat2 is layer.W_UK_T:
+            seen_input_layouts.append(input_tensor.is_contiguous())
+        return real_bmm(input_tensor, mat2, out=out)
+
+    monkeypatch.setattr(torch, "bmm", checked_bmm)
+
+    num_tokens = 3
+    q = torch.ones((num_tokens, 2, 6), dtype=torch.bfloat16)
+    q_nope, _ = q.split((4, 2), dim=-1)
+    assert not q_nope.transpose(0, 1).is_contiguous()
+    kv_c = torch.empty((num_tokens, 3), dtype=torch.bfloat16)
+    k_pe = torch.empty((num_tokens, 1, 2), dtype=torch.bfloat16)
+    kv_cache = torch.empty((0,), dtype=torch.uint8)
+    output = torch.empty((num_tokens, 6), dtype=torch.bfloat16)
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        num_decodes=num_tokens,
+        num_prefills=0,
+        num_decode_tokens=num_tokens,
+        max_query_len=1,
+    )
+
+    result = MLAAttention.forward_impl(
+        layer,
+        q,
+        kv_c,
+        k_pe,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert seen_input_layouts == [True]
+
+
 def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     from vllm.model_executor.layers.attention import mla_attention
 
@@ -922,6 +1065,7 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
     layer.force_contiguous_mla_bmm_input = False
+    layer.use_safe_mla_query_bmm = False
     layer.force_contiguous_mla_bmm_output = False
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
@@ -995,6 +1139,7 @@ def test_fp8_dcp_quantized_query_requires_backend_opt_in(monkeypatch):
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
     layer.force_contiguous_mla_bmm_input = False
+    layer.use_safe_mla_query_bmm = False
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)
