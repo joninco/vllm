@@ -1420,6 +1420,35 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             raise RuntimeError("B12X DCP prefill borrowed an invalid raw scratch")
         return q_workspace, dense_out_workspace, scratch_storage
 
+    def get_mxfp8_mla_query_output(
+        self,
+        num_tokens: int,
+        num_heads: int,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Return the final B12X query view for fused DCP1 assembly.
+
+        DCP query gathering needs a different local-head layout, so those
+        configurations retain the ordinary temporary query path. For DCP1,
+        writing the fused epilogue directly here lets ``forward_mqa`` consume
+        the query without a concat or workspace copy.
+        """
+        if (
+            self.dcp_world_size != 1
+            or output_dtype != torch.bfloat16
+            or num_tokens <= 0
+            or num_tokens > self._max_batched
+            or num_heads != self._input_num_heads
+            or self._kernel_num_heads != self._input_num_heads
+            or self.q_head_dim != 576
+        ):
+            return None
+        q_workspace, _, _ = self._borrow_workspace_parts()
+        output = q_workspace[:num_tokens, :num_heads]
+        if not output.is_contiguous():
+            raise RuntimeError("B12X fused MLA query output must be contiguous")
+        return output
+
     def _validate_dcp_prefill_workspace_contract(self, num_tokens: int) -> None:
         supported_topologies = {
             (4, 4),

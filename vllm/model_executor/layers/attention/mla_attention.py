@@ -236,7 +236,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.kernels.attention.b12x_mxfp8_bmm import (
     can_implement_b12x_mxfp8_bmm,
+    can_implement_mxfp8_mla_query,
     run_b12x_mxfp8_bmm,
+    run_mxfp8_mla_query,
 )
 from vllm.model_executor.layers.attention.attention import (
     _init_kv_cache_quant,
@@ -1072,6 +1074,56 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             return output
 
+    def _try_mxfp8_mla_query(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Fuse the small-M absorbed-query BMM with query assembly."""
+        if (
+            not getattr(self, "_use_b12x_absorb_bmm", False)
+            or self.is_aiter_triton_fp4_bmm_enabled
+            or self.is_aiter_triton_fp8_bmm_enabled
+        ):
+            return None
+
+        num_heads, num_tokens, nope_dim = q_nope.shape
+        output_dtype = self._mxfp8_mla_query_output_dtype
+        if not can_implement_mxfp8_mla_query(
+            num_heads=num_heads,
+            max_m=num_tokens,
+            nope_dim=nope_dim,
+            latent_dim=self.kv_lora_rank,
+            output_dtype=output_dtype,
+            device=q_nope.device,
+        ):
+            return None
+
+        workspace_getter = getattr(self.impl, "get_mxfp8_mla_query_output", None)
+        output = (
+            workspace_getter(num_tokens, num_heads, output_dtype)
+            if callable(workspace_getter)
+            else None
+        )
+        if output is None:
+            output = torch.empty(
+                (
+                    num_tokens,
+                    num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=output_dtype,
+                device=q_nope.device,
+            )
+        run_mxfp8_mla_query(
+            q_nope,
+            self._b12x_absorb_uk_rhs,
+            q_pe,
+            self._q_scale,
+            output,
+        )
+        return output
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -1274,7 +1326,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_pe_padded.copy_(mqa_q_pe)
                 mqa_q_pe = mqa_pe_padded
 
-            if self.is_aiter_triton_fp4_bmm_enabled:
+            fused_mqa_q = self._try_mxfp8_mla_query(mqa_q_nope, mqa_q_pe)
+
+            if fused_mqa_q is not None:
+                mqa_q = fused_mqa_q
+            elif self.is_aiter_triton_fp4_bmm_enabled:
                 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
                 mqa_ql_nope = batched_gemm_a16wfp4(
@@ -1343,14 +1399,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
-                assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
-                assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-                mqa_q = self._decode_concat_quant_fp8_op(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
-                )
-            else:
-                mqa_q = (mqa_ql_nope, mqa_q_pe)
+            if fused_mqa_q is None:
+                if fp8_attention and self.impl.supports_quant_query_input:
+                    assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
+                    assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
+                    mqa_q = self._decode_concat_quant_fp8_op(
+                        mqa_ql_nope, mqa_q_pe, self._q_scale
+                    )
+                else:
+                    mqa_q = (mqa_ql_nope, mqa_q_pe)
             dcp_use_b12x = False
             use_ag_rs_fallback = False
             project_before_merge = False
@@ -1951,6 +2008,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if not self._use_b12x_absorb_bmm:
             self._process_materialized_absorbed_weights(act_dtype)
             return
+
+        self._mxfp8_mla_query_output_dtype = (
+            current_platform.fp8_dtype()
+            if is_quantized_kv_cache(self.kv_cache_dtype)
+            and self.impl.supports_quant_query_input
+            else torch.bfloat16
+        )
 
         quant_method = (
             self.quant_config.get_quant_method(self, prefix=self.layer_name)
