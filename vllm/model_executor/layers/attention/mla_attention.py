@@ -331,6 +331,7 @@ def _run_mla_query_bmm(
 ) -> None:
     if (
         use_safe_op
+        and current_platform.is_cuda()
         and query.is_cuda
         and weight.is_cuda
         and output.is_cuda

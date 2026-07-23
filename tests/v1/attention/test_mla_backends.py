@@ -884,6 +884,7 @@ def test_sparse_mla_profile_skips_dense_prefill_workspace(monkeypatch):
         def __init__(self) -> None:
             self.dcp_world_size = 1
             self.supports_quant_query_input = False
+            self.use_safe_mla_query_bmm = False
 
         def forward_mqa(self, *args, **kwargs):
             raise AssertionError("profile run should return before forward_mqa")
@@ -896,6 +897,7 @@ def test_sparse_mla_profile_skips_dense_prefill_workspace(monkeypatch):
 
     layer = object.__new__(MLAAttention)
     layer.impl = ProfileSparseImpl()
+    layer.attn_backend = SimpleNamespace(get_name=lambda: "B12X_MLA_SPARSE")
     layer.num_heads = num_heads
     layer.qk_nope_head_dim = qk_nope_head_dim
     layer.v_head_dim = v_head_dim
@@ -957,6 +959,7 @@ def test_mla_query_absorb_safe_bmm_fallback_materializes_input(monkeypatch):
     layer.v_head_dim = 3
     layer.q_pad_num_heads = None
     layer.use_safe_mla_query_bmm = True
+    layer._fused_mla_query_output_dtype = torch.bfloat16
     layer.is_aiter_triton_fp4_bmm_enabled = False
     layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.W_UK_T = torch.ones((2, 4, 3), dtype=torch.bfloat16)
