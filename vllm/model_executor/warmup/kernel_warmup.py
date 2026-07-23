@@ -354,7 +354,20 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             warmed_mla_bmm,
         )
 
-    warmed_mla_query = warmup_mxfp8_mla_query(worker.get_model())
+    # Graph replay cannot JIT a missing specialization. Prewarm only the
+    # graph-visible token counts covered by the small-M kernel instead of
+    # retaining all 32 possible variants in every worker. M=1 also covers
+    # eager-only configurations and the ordinary single-request decode path.
+    mla_query_warmup_sizes = sorted(
+        {
+            1,
+            *(size for size in cudagraph_capture_sizes if 1 <= size <= 32),
+        }
+    )
+    warmed_mla_query = warmup_mxfp8_mla_query(
+        worker.get_model(),
+        m_values=mla_query_warmup_sizes,
+    )
     if warmed_mla_query:
         logger.info(
             "Warmed up %d fused MLA MXFP8 query variants.",

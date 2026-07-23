@@ -229,6 +229,43 @@ def test_kernel_warmup_runs_b12x_mxfp8_linear_warmup(monkeypatch) -> None:
     }
 
 
+def test_kernel_warmup_limits_fused_mla_query_to_graph_sizes(monkeypatch) -> None:
+    calls = []
+    model = torch.nn.Linear(2, 2)
+    worker = _flashinfer_autotune_worker(model)
+    worker.vllm_config.compilation_config.cudagraph_capture_sizes = [2, 4, 32, 64]
+    worker.vllm_config.kernel_config.enable_flashinfer_autotune = False
+
+    monkeypatch.setattr(kernel_warmup, "deepseek_v4_mhc_warmup", lambda *a, **k: None)
+    monkeypatch.setattr(
+        kernel_warmup,
+        "flashinfer_sparse_mla_decode_autotune_warmup",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup,
+        "deepseek_v4_sparse_mla_attention_warmup",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(kernel_warmup, "minimax_m3_msa_warmup", lambda *a, **k: None)
+    monkeypatch.setattr(kernel_warmup, "warmup_b12x_mxfp8_linear", lambda *a, **k: 0)
+    monkeypatch.setattr(kernel_warmup, "warmup_b12x_moe_dynamic", lambda *a, **k: 0)
+
+    def fake_mla_query_warmup(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 4
+
+    monkeypatch.setattr(
+        kernel_warmup,
+        "warmup_mxfp8_mla_query",
+        fake_mla_query_warmup,
+    )
+
+    kernel_warmup.kernel_warmup(worker)
+
+    assert calls == [((model,), {"m_values": [1, 2, 4, 32]})]
+
+
 def test_kernel_warmup_runs_b12x_moe_warmup(monkeypatch) -> None:
     calls = []
     model = torch.nn.Linear(2, 2)
