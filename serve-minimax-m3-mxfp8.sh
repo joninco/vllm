@@ -3,10 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
-MODEL_PATH="/models/MiniMax-M3-MXFP8-NVFP4"
-SERVED_MODEL_NAME="MiniMax-M3-MXFP8-NVFP4"
+MODEL_PATH="${MODEL_PATH:-/data/models/MiniMax-M3-NVFP4}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-MiniMax-M3}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
+TP_SIZE="${TP_SIZE:-4}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.97}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+LOAD_FORMAT="${LOAD_FORMAT:-fastsafetensors}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Python interpreter not found or not executable: ${PYTHON_BIN}" >&2
@@ -64,8 +69,11 @@ print(
 PY
 
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
-export SAFETENSORS_FAST_GPU=1
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
 export CUTE_DSL_ARCH="${CUTE_DSL_ARCH:-sm_120a}"
+export B12X_MOE_FORCE_A8="${B12X_MOE_FORCE_A8:-0}"
+export B12X_MOE_FORCE_A16="${B12X_MOE_FORCE_A16:-0}"
 export VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE="${VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE:-1}"
 export VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
 export VLLM_USE_AOT_COMPILE="${VLLM_USE_AOT_COMPILE:-1}"
@@ -158,7 +166,7 @@ while (($#)); do
   esac
 done
 
-M3_PROFILE="${M3_PROFILE:-torch}"
+M3_PROFILE="${M3_PROFILE:-off}"
 PROFILER_ARGS=()
 case "${M3_PROFILE,,}" in
   0|false|no|off|"")
@@ -203,11 +211,11 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}" \
   --trust-remote-code \
   --host "${HOST}" \
   --port "${PORT}" \
-  --tensor-parallel-size 4 \
+  --tensor-parallel-size "${TP_SIZE}" \
   --mm-encoder-tp-mode data \
-  --gpu-memory-utilization 0.98 \
-  --max-num-batched-tokens 2048 \
-  --max-num-seqs 4 \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
+  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
+  --max-num-seqs "${MAX_NUM_SEQS}" \
   --quantization modelopt_mixed \
   --kv-cache-dtype fp8_e4m3 \
   --attention-backend B12X_ATTN \
@@ -216,7 +224,7 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}" \
   -cc.mode=VLLM_COMPILE \
   -cc.cudagraph_mode=FULL_AND_PIECEWISE \
   --block-size 128 \
-  --load-format fastsafetensors \
+  --load-format "${LOAD_FORMAT}" \
   --enable-chunked-prefill \
   --enable-prefix-caching \
   --skip-mm-profiling \

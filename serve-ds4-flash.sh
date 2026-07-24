@@ -192,10 +192,7 @@ case "${backend}" in
     export VLLM_USE_B12X_MHC=${VLLM_USE_B12X_MHC:-1}
     export VLLM_USE_B12X_MOE=${VLLM_USE_B12X_MOE:-1}
     export VLLM_USE_B12X_SPARSE_INDEXER=${VLLM_USE_B12X_SPARSE_INDEXER:-1}
-    export B12X_MLA_SM120_UNIFIED=${B12X_MLA_SM120_UNIFIED:-1}
     export B12X_MHC_MAX_TOKENS=${B12X_MHC_MAX_TOKENS:-16384}
-    export B12X_DENSE_SPLITK_TURBO=${B12X_DENSE_SPLITK_TURBO:-1}
-    export B12X_W4A16_TC_DECODE=${B12X_W4A16_TC_DECODE:-1}
     backend_args=(--attention-backend B12X_MLA_SPARSE --moe-backend b12x)
     if [[ "${backend}" != "b12x-a8-dglin" ]]; then
       backend_args+=(--linear-backend b12x)
