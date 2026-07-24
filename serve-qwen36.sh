@@ -38,6 +38,8 @@ export VLLM_USE_B12X_MOE="${VLLM_USE_B12X_MOE:-1}"
 export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
 export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE="${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE:-64KB}"
+export B12X_MOE_FORCE_A8="${B12X_MOE_FORCE_A8:-0}"
+export B12X_MOE_FORCE_A16="${B12X_MOE_FORCE_A16:-0}"
 
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
@@ -55,6 +57,9 @@ max_num_seqs=${MAX_NUM_SEQS:-4}
 max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
 max_cudagraph_capture_size=${MAX_CUDAGRAPH_CAPTURE_SIZE:-16}
 load_format=${LOAD_FORMAT:-fastsafetensors}
+moe_backend=${MOE_BACKEND:-b12x}
+linear_backend=${LINEAR_BACKEND:-b12x}
+attention_backend=${ATTENTION_BACKEND:-B12X_ATTN}
 
 enable_mtp=0
 case "${VLLM_ENABLE_MTP:-1}" in
@@ -130,6 +135,8 @@ case "${VLLM_PROFILE:-0}" in
     ;;
 esac
 
+unset VLLM_ENABLE_MTP VLLM_ENABLE_DFLASH VLLM_PROFILE
+
 exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   "${model_path}" \
   --revision "${model_revision}" \
@@ -142,9 +149,9 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --block-size 128 \
   --load-format "${load_format}" \
   --quantization modelopt_fp4 \
-  --moe-backend b12x \
-  --linear-backend b12x \
-  --attention-backend flashinfer \
+  --moe-backend "${moe_backend}" \
+  --linear-backend "${linear_backend}" \
+  --attention-backend "${attention_backend}" \
   --gpu-memory-utilization "${gpu_memory_utilization}" \
   --max-model-len "${max_model_len}" \
   --max-num-seqs "${max_num_seqs}" \
@@ -154,7 +161,9 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --no-scheduler-reserve-full-isl \
   --enable-chunked-prefill \
   --enable-prefix-caching \
+  --skip-mm-profiling \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
+  --generation-config vllm \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_xml \
   --enable-auto-tool-choice \
