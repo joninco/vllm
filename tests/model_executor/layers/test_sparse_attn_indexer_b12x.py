@@ -782,8 +782,8 @@ def test_b12x_dcp_owner_merge_exact_query_split_rows(monkeypatch):
         get_indexer_dcp_group,
         raising=False,
     )
-    monkeypatch.setattr(indexer_mod, "get_dcp_group", lambda: ConfiguredDCPGroup())
-    monkeypatch.setattr(indexer_mod, "get_tp_group", lambda: FakeTPGroup())
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: ConfiguredDCPGroup())
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: FakeTPGroup())
     monkeypatch.setattr(indexer_mod, "_use_triton_dcp_remap", lambda _: False)
     workspace_manager = _FakeWorkspaceManager()
     monkeypatch.setattr(
@@ -867,12 +867,14 @@ def test_b12x_dcp_owner_merge_supports_tp_equal_dcp(monkeypatch):
         output_indices.copy_(positions.to(torch.int32))
 
     _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, world_size=dcp_size)
+    from vllm.distributed import parallel_state
+
     monkeypatch.setattr(
         indexer_mod,
         "_get_owner_merge_dcp_group",
         lambda expected_world_size: FakeDCPGroup(),
     )
-    monkeypatch.setattr(indexer_mod, "get_tp_group", lambda: FakeTPGroup())
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: FakeTPGroup())
     monkeypatch.setattr(indexer_mod, "_use_triton_dcp_remap", lambda _: False)
     monkeypatch.setattr(
         indexer_mod,
@@ -897,8 +899,10 @@ def test_b12x_dcp_owner_merge_supports_tp_equal_dcp(monkeypatch):
 
 
 def test_b12x_dcp_owner_merge_falls_back_for_tail(monkeypatch):
+    from vllm.distributed import parallel_state
+
     monkeypatch.setattr(
-        indexer_mod,
+        parallel_state,
         "get_tp_group",
         lambda: pytest.fail("tail fallback must not initialize a TP collective"),
     )
