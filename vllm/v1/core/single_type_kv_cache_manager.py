@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
+    get_kv_cache_cp_shard_count,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -75,14 +76,16 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        # Under (D)CP a request's cache is sharded across ranks, so one local
-        # block of `block_size` slots covers `block_size * dcp` tokens of the
-        # global sequence -- scale the scheduler-visible block size to match.
+        # Under (D)CP a request's cache may be sharded across ranks, so one
+        # local block covers `block_size * unique_cp_shards` global tokens.
+        # Scale the scheduler-visible block size to match.
         # dcp_replicated groups (e.g. the DFlash draft) instead keep the full
         # cache on every rank, so one block covers exactly `block_size` global
         # tokens and must not be scaled.
-        if dcp_world_size > 1 and not getattr(kv_cache_spec, "dcp_replicated", False):
-            self.block_size *= dcp_world_size
+        if dcp_world_size * pcp_world_size > 1:
+            self.block_size *= get_kv_cache_cp_shard_count(
+                kv_cache_spec, dcp_world_size, pcp_world_size
+            )
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
         self.enable_caching = enable_caching
@@ -704,11 +707,13 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "and chunked local attention groups"
         )
         block_size = kv_cache_spec.block_size
-        if dcp_world_size > 1 and not getattr(kv_cache_spec, "dcp_replicated", False):
-            # DCP shards each block's KV across ranks; hashes must be viewed at
-            # the sharded block size. Replicated groups keep the model block
-            # size on every rank.
-            block_size *= dcp_world_size
+        if dcp_world_size * pcp_world_size > 1:
+            # Hashes must use the effective block size after accounting for
+            # the number of unique CP shards. Replicated groups keep the model
+            # block size on every rank.
+            block_size *= get_kv_cache_cp_shard_count(
+                kv_cache_spec, dcp_world_size, pcp_world_size
+            )
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,

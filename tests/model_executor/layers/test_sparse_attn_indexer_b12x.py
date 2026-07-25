@@ -50,11 +50,12 @@ def test_replicated_constructor_uses_single_rank_without_dcp_group(monkeypatch):
         lambda: types.SimpleNamespace(
             parallel_config=types.SimpleNamespace(
                 decode_context_parallel_size=4,
+                prefill_context_parallel_size=1,
                 cp_kv_cache_interleave_size=1,
             )
         ),
     )
-    monkeypatch.setattr(indexer_mod, "get_dcp_group", fail_dcp_group)
+    monkeypatch.setattr(indexer_mod, "get_indexer_dcp_group", fail_dcp_group)
     monkeypatch.setattr(indexer_mod, "use_b12x_sparse_indexer", lambda: True)
 
     indexer = indexer_mod.SparseAttnIndexer(

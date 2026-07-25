@@ -8,7 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_indexer_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup import (
     VllmJitKernel,
@@ -38,7 +38,11 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MLAAttentionSpec,
+    get_kv_cache_cp_shard_count,
+)
 
 logger = init_logger(__name__)
 
@@ -331,23 +335,39 @@ class BuildPrefillChunkMetadataKernel(
         max_tokens = max(1, min(vllm_config.scheduler_config.max_num_batched_tokens, 8))
         hf_config = vllm_config.model_config.hf_config
         parallel_config = vllm_config.parallel_config
-        dcp_world = parallel_config.decode_context_parallel_size
         dcp_interleave = parallel_config.cp_kv_cache_interleave_size
-        dcp_rank = get_dcp_group().rank_in_group if dcp_world > 1 else 0
         compress_ratios = tuple(
             max(1, int(ratio))
             for ratio in (getattr(hf_config, "compress_ratios", None) or (1,))
         )
-        return self._trace_dispatch(self.dispatch)(
-            query_slice_start=WarmupIntRange(0, 2),
-            query_slice_stop=(1, 2 * max_tokens - 1, 2 * max_tokens),
-            DCP_RANK=dcp_rank,
-            DCP_WORLD=dcp_world,
-            DCP_INTERLEAVE=dcp_interleave,
-            BLOCK_SIZE=self.BLOCK_SIZE,
-            COMPRESS_RATIO=list(compress_ratios),
-            input_variant=_BUILD_PREFILL_CHUNK_METADATA_INPUT_VARIANTS,
-        )
+        configured_dcp_world = int(parallel_config.decode_context_parallel_size)
+        requested_shards = int(envs.VLLM_DCP_INDEXER_SHARDS)
+        if envs.VLLM_DCP_REPLICATE_INDEXER_CACHE:
+            requested_shards = 1
+        dcp_world_sizes = {configured_dcp_world}
+        if 0 < requested_shards < configured_dcp_world:
+            dcp_world_sizes.add(requested_shards)
+
+        keys: list[BuildPrefillChunkMetadataKernel.CompileKey] = []
+        for dcp_world in sorted(dcp_world_sizes):
+            if dcp_world > 1:
+                indexer_group = get_indexer_dcp_group(dcp_world)
+                dcp_rank = int(indexer_group.rank_in_group)
+            else:
+                dcp_rank = 0
+            keys.extend(
+                self._trace_dispatch(self.dispatch)(
+                    query_slice_start=WarmupIntRange(0, 2),
+                    query_slice_stop=(1, 2 * max_tokens - 1, 2 * max_tokens),
+                    DCP_RANK=dcp_rank,
+                    DCP_WORLD=dcp_world,
+                    DCP_INTERLEAVE=dcp_interleave,
+                    BLOCK_SIZE=self.BLOCK_SIZE,
+                    COMPRESS_RATIO=list(compress_ratios),
+                    input_variant=_BUILD_PREFILL_CHUNK_METADATA_INPUT_VARIANTS,
+                )
+            )
+        return keys
 
     def compile(self, compile_key: CompileKey) -> None:
         warmup = getattr(self.kernel, "warmup", None)
@@ -493,9 +513,12 @@ def get_indexer_max_num_blocks_per_req(
     block_size: int,
     configured_cp_world_size: int,
     dcp_replicated: bool,
+    dcp_kv_shard_count: int | None = None,
 ) -> int:
     """Size indexer metadata for the cache group's effective DCP layout."""
-    effective_cp_world_size = 1 if dcp_replicated else configured_cp_world_size
+    effective_cp_world_size = (
+        1 if dcp_replicated else int(dcp_kv_shard_count or configured_cp_world_size)
+    )
     return cdiv(max_model_len, block_size * effective_cp_world_size)
 
 
@@ -575,12 +598,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         scheduler_config = self.vllm_config.scheduler_config
         parallel_config = self.vllm_config.parallel_config
-        self.dcp_replicated = bool(getattr(self.kv_cache_spec, "dcp_replicated", False))
-        configured_dcp_world_size = parallel_config.decode_context_parallel_size
-        self.dcp_world_size = 1 if self.dcp_replicated else configured_dcp_world_size
-        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
+        self.dcp_replicated = bool(getattr(self.kv_cache_spec, "dcp_replicated", False))
+        configured_dcp_world_size = parallel_config.decode_context_parallel_size
+        # PCP slot mappings are gathered independently below. This group tracks
+        # only the unique sparse-indexer shards within DCP.
+        self.dcp_world_size = get_kv_cache_cp_shard_count(
+            self.kv_cache_spec,
+            configured_dcp_world_size,
+            1,
+        )
+        if self.dcp_world_size > 1:
+            indexer_group = get_indexer_dcp_group(self.dcp_world_size)
+            if int(indexer_group.world_size) != self.dcp_world_size:
+                raise RuntimeError(
+                    "Indexer metadata DCP group does not match its KV shard count: "
+                    f"group={indexer_group.world_size}, shards={self.dcp_world_size}"
+                )
+            self.dcp_rank = int(indexer_group.rank_in_group)
+        else:
+            self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         # The DCP sparse-indexer code is parameterized by interleave size, but
         # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),

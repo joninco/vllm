@@ -33,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_cp_shard_count,
+    has_nondefault_kv_cp_layout,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -611,10 +613,10 @@ def resolve_kv_cache_block_sizes(
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size`` scaled by DCP unless the group is replicated.
+      ``cache_config.block_size`` scaled by its unique CP shard count.
       Multiple groups: LCM of every group's effective block size. Attention
-      groups are scaled by DCP; Mamba and replicated attention groups keep
-      their full per-rank state and are not scaled.
+      groups are scaled by their unique CP shard count; Mamba and fully
+      replicated attention groups keep their full per-rank state.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.prefix_match_unit`` override if set, else the GCD of
@@ -625,19 +627,25 @@ def resolve_kv_cache_block_sizes(
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
+    pcp = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
     groups = kv_cache_config.kv_cache_groups
 
-    if len(groups) <= 1:
-        dcp_replicated = len(groups) == 1 and getattr(
-            groups[0].kv_cache_spec, "dcp_replicated", False
+    if not groups:
+        bs = cache_config.block_size * dcp * pcp
+        return bs, bs
+    if len(groups) == 1:
+        spec = groups[0].kv_cache_spec
+        bs = (
+            spec.block_size * get_kv_cache_cp_shard_count(spec, dcp, pcp)
+            if isinstance(spec, AttentionSpec)
+            else spec.block_size
         )
-        bs = cache_config.block_size * (1 if dcp_replicated else dcp)
         return bs, bs
 
     group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp
+        g.kv_cache_spec.block_size
+        * get_kv_cache_cp_shard_count(g.kv_cache_spec, dcp, pcp)
         if isinstance(g.kv_cache_spec, AttentionSpec)
-        and not getattr(g.kv_cache_spec, "dcp_replicated", False)
         else g.kv_cache_spec.block_size
         for g in groups
     ]
@@ -1348,14 +1356,16 @@ def _is_lockstep_mla_spec_layout(
     if not all(isinstance(spec, MLAAttentionSpec) for spec in specs):
         return False
 
-    replication_modes = {bool(getattr(spec, "dcp_replicated", False)) for spec in specs}
-    global_block_sizes = {
-        spec.block_size
-        if getattr(spec, "dcp_replicated", False)
-        else spec.block_size * cp_world_size
+    shard_counts = {
+        get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
         for spec in specs
     }
-    return replication_modes == {False, True} and len(global_block_sizes) == 1
+    global_block_sizes = {
+        spec.block_size
+        * get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
+        for spec in specs
+    }
+    return len(shard_counts) > 1 and len(global_block_sizes) == 1
 
 
 def _use_lockstep_mla_allocation(
@@ -1375,10 +1385,11 @@ def _use_lockstep_mla_allocation(
             if isinstance(group_spec, UniformTypeKVCacheSpecs)
             else [group_spec]
         )
-        group_modes = {
-            bool(getattr(spec, "dcp_replicated", False)) for spec in group_layer_specs
+        group_layouts = {
+            get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
+            for spec in group_layer_specs
         }
-        if len(group_modes) != 1:
+        if len(group_layouts) != 1:
             return False
         layer_specs.extend(group_layer_specs)
 
@@ -1734,14 +1745,14 @@ def group_and_unify_kv_cache_specs(
     lockstep_mla_layout = _is_lockstep_mla_spec_layout(
         kv_cache_spec.values(), dcp_world_size, pcp_world_size
     )
-    # Replicated layers need a group separate from sharded layers because they
-    # have different token ownership and block-table semantics.
-    has_repl = any(
-        getattr(spec, "dcp_replicated", False)
+    # Any non-default CP layout needs a group separate from normally sharded
+    # layers because token ownership and block-table semantics differ.
+    has_custom_cp = any(
+        has_nondefault_kv_cp_layout(spec, dcp_world_size, pcp_world_size)
         and (not isinstance(spec, MLAAttentionSpec) or lockstep_mla_layout)
         for spec in kv_cache_spec.values()
     )
-    if not (has_swa or has_repl):
+    if not (has_swa or has_custom_cp):
         return None
 
     # Other uniform page layouts do not need tuple packing.
@@ -1753,8 +1764,8 @@ def group_and_unify_kv_cache_specs(
     grouped_swa_mla_specs: dict[tuple[int, int, bool, bool], dict[str, KVCacheSpec]] = (
         defaultdict(dict)
     )
-    # Keep incompatible replicated types and page layouts separate. This
-    # includes DFlash drafts and replicated MLA indexer caches.
+    # Keep incompatible custom-CP types and page layouts separate. This
+    # includes DFlash drafts and partially/fully replicated MLA indexer caches.
     grouped_repl_specs: dict[tuple[Any, ...], dict[str, KVCacheSpec]] = defaultdict(
         dict
     )
@@ -1771,18 +1782,33 @@ def group_and_unify_kv_cache_specs(
                     spec.dcp_sharded,
                 )
             ][name] = spec
-        elif getattr(spec, "dcp_replicated", False) and (
+        elif has_nondefault_kv_cp_layout(spec, dcp_world_size, pcp_world_size) and (
             not isinstance(spec, MLAAttentionSpec) or lockstep_mla_layout
         ):
+            cp_layout = (
+                getattr(spec, "dcp_replicated", False),
+                getattr(spec, "dcp_kv_shard_count", None),
+                get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size),
+            )
             if isinstance(spec, MLAAttentionSpec):
-                key = (type(spec).__name__, spec.block_size, spec.page_size_bytes)
+                key = (
+                    type(spec).__name__,
+                    spec.block_size,
+                    spec.page_size_bytes,
+                    *cp_layout,
+                )
             else:
                 uniform_type = KVCacheSpecRegistry.get_uniform_type_base_spec(spec)
                 assert uniform_type is not None
                 sliding_window = (
                     spec.sliding_window if isinstance(spec, SlidingWindowSpec) else None
                 )
-                key = (uniform_type, spec.block_size, sliding_window)
+                key = (
+                    uniform_type,
+                    spec.block_size,
+                    sliding_window,
+                    *cp_layout,
+                )
             grouped_repl_specs[key][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec

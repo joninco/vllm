@@ -1941,6 +1941,39 @@ def test_replicated_mla_uses_lockstep_pool_capacity_and_contiguous_tensors():
     ) == pytest.approx(2.0)
 
 
+def test_partial_replicated_mla_uses_lockstep_dcp8_layout():
+    target = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+    )
+    indexer = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_kv_shard_count=4,
+    )
+    groups = [
+        KVCacheGroupSpec(["target"], target),
+        KVCacheGroupSpec(["indexer"], indexer),
+    ]
+
+    assert kv_cache_utils._use_lockstep_mla_allocation(groups, 8, 1)
+    assert target.block_size * 8 == indexer.block_size * 4 == 512
+
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(
+        {"target": target, "indexer": indexer}, 8, 1
+    )
+    assert grouped_specs is not None
+    grouped = kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+    assert len(grouped) == 2
+    assert kv_cache_utils._use_lockstep_mla_allocation(grouped, 8, 1)
+    assert grouped[1].kv_cache_spec.page_size_bytes == indexer.page_size_bytes
+
+
 def test_lockstep_mla_predicate_rejects_nonmatching_layouts():
     sharded = MLAAttentionSpec(
         block_size=64,
@@ -2666,7 +2699,8 @@ def test_group_and_unify_separates_replicated_full_and_sliding_drafts():
             "target.mla": new_mla_spec(),
             "draft.full": draft_full,
             "draft.swa": draft_swa,
-        }
+        },
+        dcp_world_size=2,
     )
 
     assert grouped is not None
@@ -2692,6 +2726,10 @@ def new_indexer_mla_spec(block_size=16):
 def _grouping_config():
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
         speculative_config=None,
     )
 
