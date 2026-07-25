@@ -1798,13 +1798,11 @@ def group_and_unify_kv_cache_specs(
                     *cp_layout,
                 )
             else:
-                uniform_type = KVCacheSpecRegistry.get_uniform_type_base_spec(spec)
-                assert uniform_type is not None
                 sliding_window = (
                     spec.sliding_window if isinstance(spec, SlidingWindowSpec) else None
                 )
                 key = (
-                    uniform_type,
+                    type(spec).__name__,
                     spec.block_size,
                     sliding_window,
                     *cp_layout,
