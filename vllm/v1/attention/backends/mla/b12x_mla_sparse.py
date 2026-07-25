@@ -280,7 +280,8 @@ def _ckv_prefetch_target_indices(
 @dataclass(frozen=True)
 class _CKVWorkspaceIdentity:
     device: torch.device
-    storage_generation: int
+    storage_data_ptr: int
+    storage_nbytes: int
     data_ptr: int
     storage_offset: int
     shape: tuple[int, ...]
@@ -292,9 +293,11 @@ def _ckv_workspace_identity(workspace: torch.Tensor) -> _CKVWorkspaceIdentity:
     storage = workspace.untyped_storage()
     return _CKVWorkspaceIdentity(
         device=workspace.device,
-        # WorkspaceManager does not expose its allocation generation. PyTorch's
-        # storage handle changes when MRV2 replaces the backing allocation.
-        storage_generation=int(storage._cdata),
+        # WorkspaceManager exposes transient tensor views, so tensor identity is
+        # not stable across borrows. The storage base and size are public,
+        # stable allocation metadata; liveness is tracked separately below.
+        storage_data_ptr=storage.data_ptr(),
+        storage_nbytes=storage.nbytes(),
         data_ptr=workspace.data_ptr(),
         storage_offset=workspace.storage_offset(),
         shape=tuple(workspace.shape),
@@ -324,12 +327,16 @@ class _CKVPrefetchState:
         self.last_layer_idx: int | None = None
 
     def begin_step(self) -> None:
+        self.wait_for_pending_writes()
+        self.pending_layers.clear()
+        self.last_layer_idx = None
+
+    def wait_for_pending_writes(self) -> None:
+        """Order current-stream fallback work after side-stream gathers."""
         for event, _ in self.pending_layers.values():
             # Preserve ring ordering without blocking the host indefinitely.
             # The next main-stream gather is enqueued after these dependencies.
             event.wait()
-        self.pending_layers.clear()
-        self.last_layer_idx = None
 
     def enter_layer(self, layer_idx: int) -> None:
         if self.last_layer_idx is not None and layer_idx <= self.last_layer_idx:
@@ -362,11 +369,20 @@ class _CKVPrefetchState:
         return self.ckv_workspace
 
     def close(self) -> None:
-        self.begin_step()
+        # ``Event.wait`` only orders work on the current stream. A released pool
+        # slot can be acquired by another execution lane and written from a
+        # different stream, so retirement must complete outstanding writers.
+        for event, _ in self.pending_layers.values():
+            event.synchronize()
+        self.pending_layers.clear()
+        self.last_layer_idx = None
         if self.ckv_workspace_slot is not None:
             self.workspace_pool.release(self.ckv_workspace_slot)
             self.ckv_workspace_slot = None
             self.ckv_workspace = None
+
+
+_CKV_PREFETCH_STATE_REGISTRIES: weakref.WeakSet = weakref.WeakSet()
 
 
 class _CKVPrefetchStateRegistry:
@@ -375,6 +391,7 @@ class _CKVPrefetchStateRegistry:
     def __init__(self, workspace_pool: _CKVPrefetchWorkspacePool | None = None) -> None:
         self.states: dict[_CKVWorkspaceIdentity, _CKVPrefetchState] = {}
         self.workspace_pool = workspace_pool
+        _CKV_PREFETCH_STATE_REGISTRIES.add(self)
 
     def _bind_workspace_pool(self, pool: _CKVPrefetchWorkspacePool) -> None:
         if self.workspace_pool is None:
@@ -399,6 +416,9 @@ class _CKVPrefetchStateRegistry:
         self._prune_released_workspaces()
         for state in self.states.values():
             state.begin_step()
+
+    def clear(self) -> None:
+        self._retire(list(self.states))
 
     def for_workspace(
         self,
@@ -1649,6 +1669,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         cls._all_layer_kv_caches = []
         cls._shared_gather_event = None
         cls._shared_gather_buf_idx = 0
+        for registry in tuple(_CKV_PREFETCH_STATE_REGISTRIES):
+            registry.clear()
 
     def do_kv_cache_update(
         self,
@@ -2607,6 +2629,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     kv_cache, attn_metadata, layer, num_actual_toks
                 )
             else:
+                # The ring shares one local staging region across gathered
+                # slots. An irregular fallback can occur while a future layer
+                # is pending, so order this main-stream write after all current
+                # side-stream users without increasing the persistent pool.
+                prefetch_state.wait_for_pending_writes()
                 current_buf_idx = (
                     layer_idx % self._ckv_workspace_slots
                     if layer_idx is not None

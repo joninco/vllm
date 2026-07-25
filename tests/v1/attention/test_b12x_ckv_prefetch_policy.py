@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -127,9 +128,13 @@ def test_ckv_workspace_rejects_ring_slot_outside_depth():
 class _FakeEvent:
     def __init__(self):
         self.wait_calls = 0
+        self.synchronize_calls = 0
 
     def wait(self):
         self.wait_calls += 1
+
+    def synchronize(self):
+        self.synchronize_calls += 1
 
 
 def test_ckv_prefetch_incomplete_step_recovers_with_stream_wait():
@@ -144,9 +149,42 @@ def test_ckv_prefetch_incomplete_step_recovers_with_stream_wait():
     state.enter_layer(0)
 
     assert event.wait_calls == 1
+    assert event.synchronize_calls == 0
     assert state.pending_layers == {}
     assert state.layer_caches[3] is cache
     assert state.last_layer_idx == 0
+
+
+def test_ckv_prefetch_sync_fallback_orders_after_pending_side_stream_writes():
+    registry = _make_registry()
+    workspace_buffer = torch.empty(16, dtype=torch.uint8)
+    state = registry.for_workspace(workspace_buffer)
+    event = _FakeEvent()
+    state.pending_layers[3] = (event, 1)
+
+    state.wait_for_pending_writes()
+
+    assert event.wait_calls == 1
+    assert event.synchronize_calls == 0
+    assert state.pending_layers == {3: (event, 1)}
+
+
+def test_ckv_prefetch_close_completes_side_stream_before_releasing_slot():
+    registry = _make_registry(max_slots=1)
+    workspace_buffer = torch.empty(16, dtype=torch.uint8)
+    state = registry.for_workspace(workspace_buffer)
+    ring_ptr = state.get_ckv_workspace(64).data_ptr()
+    event = _FakeEvent()
+    state.pending_layers[1] = (event, 0)
+
+    state.close()
+
+    assert event.wait_calls == 0
+    assert event.synchronize_calls == 1
+    assert state.pending_layers == {}
+    assert state.ckv_workspace is None
+    replacement = registry.for_workspace(torch.empty(32, dtype=torch.uint8))
+    assert replacement.get_ckv_workspace(64).data_ptr() == ring_ptr
 
 
 def test_ckv_prefetch_first_request_discovers_caches_without_lookahead():
@@ -233,6 +271,25 @@ def test_ckv_prefetch_lazily_owns_one_stream_per_workspace_lane(monkeypatch):
     assert len(created_streams) == 2
 
 
+def test_ckv_prefetch_liveness_follows_backing_storage_not_borrowed_view(
+    monkeypatch,
+):
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
+    (borrowed_view,) = manager.get_simultaneous(((16,), torch.uint8))
+    borrowed_view_ref = weakref.ref(borrowed_view)
+    registry = _make_registry()
+    state = registry.for_workspace(borrowed_view)
+
+    del borrowed_view
+    gc.collect()
+    (reborrowed_view,) = manager.get_simultaneous(((16,), torch.uint8))
+
+    assert borrowed_view_ref() is None
+    assert registry.for_workspace(reborrowed_view) is state
+
+
 def test_ckv_prefetch_ring_survives_intervening_workspace_borrow(monkeypatch):
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
@@ -289,7 +346,8 @@ def test_ckv_prefetch_workspace_identity_invalidates_changed_geometry():
     resized_state = registry.for_workspace(changed_geometry)
 
     assert resized_state is not old_state
-    assert event.wait_calls == 1
+    assert event.wait_calls == 0
+    assert event.synchronize_calls == 1
     assert len(registry.states) == 1
 
 
@@ -313,13 +371,13 @@ def test_ckv_prefetch_workspace_identity_tracks_manager_resize(monkeypatch):
     (resized_workspace,) = manager.get_simultaneous(((257,), torch.uint8))
     resized_state = registry.for_workspace(resized_workspace, 0, cache)
 
-    assert (
-        _ckv_workspace_identity(first_workspace).storage_generation
-        != _ckv_workspace_identity(resized_workspace).storage_generation
+    assert _ckv_workspace_identity(first_workspace) != _ckv_workspace_identity(
+        resized_workspace
     )
     assert resized_state is not first_state
     assert resized_state.layer_caches == []
-    assert event.wait_calls == 1
+    assert event.wait_calls == 0
+    assert event.synchronize_calls == 1
     assert registry.for_workspace(draft_workspace) is draft_state
     assert len(registry.states) == 2
 
@@ -336,11 +394,30 @@ def test_ckv_prefetch_registry_retires_released_profile_workspace():
     gc.collect()
     registry.begin_step()
 
-    assert event.wait_calls == 1
+    assert event.wait_calls == 0
+    assert event.synchronize_calls == 1
     assert registry.states == {}
 
     replacement = registry.for_workspace(torch.empty(16, dtype=torch.uint8))
     assert replacement.get_ckv_workspace(64).data_ptr() == first_ring_ptr
+
+
+def test_reset_kv_cache_binding_state_clears_builder_owned_registries():
+    registry = _make_registry(max_slots=1)
+    workspace_buffer = torch.empty(16, dtype=torch.uint8)
+    state = registry.for_workspace(workspace_buffer)
+    ring_ptr = state.get_ckv_workspace(64).data_ptr()
+    cache = torch.empty(0)
+    event = _FakeEvent()
+    state.register_cache(0, cache)
+    state.pending_layers[1] = (event, 0)
+
+    B12xMLASparseImpl.reset_kv_cache_binding_state()
+
+    assert registry.states == {}
+    assert event.synchronize_calls == 1
+    replacement = registry.for_workspace(torch.empty(32, dtype=torch.uint8))
+    assert replacement.get_ckv_workspace(64).data_ptr() == ring_ptr
 
 
 def test_ckv_prefetch_workspace_pool_fails_before_unprofiled_allocation():
