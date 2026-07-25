@@ -10,7 +10,7 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, get_current_vllm_config
-from vllm.distributed import get_dcp_group, get_query_split_group, get_tp_group
+from vllm.distributed import get_dcp_group, get_query_split_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -344,34 +344,6 @@ def _dcp_finalize_topk_remap(
     topk_indices.copy_(final.to(topk_indices.dtype))
 
 
-def _dcp_all_gather_first_dim_into(
-    group,
-    input_tensor: torch.Tensor,
-    output_tensor: torch.Tensor,
-) -> None:
-    """All-gather into caller-owned output, concatenating along dim 0."""
-    assert input_tensor.is_contiguous()
-    assert output_tensor.is_contiguous()
-    assert output_tensor.shape[0] == input_tensor.shape[0] * group.world_size
-    assert output_tensor.shape[1:] == input_tensor.shape[1:]
-
-    communicator = getattr(group, "device_communicator", None)
-    pynccl_comm = getattr(communicator, "pynccl_comm", None)
-    if pynccl_comm is not None and not getattr(pynccl_comm, "disabled", False):
-        pynccl_comm.all_gather(output_tensor, input_tensor)
-        return
-
-    device_group = getattr(communicator, "device_group", None)
-    if device_group is not None:
-        import torch.distributed as dist
-
-        dist.all_gather_into_tensor(output_tensor, input_tensor, group=device_group)
-        return
-
-    gathered = group.all_gather(input_tensor, dim=0)
-    output_tensor.copy_(gathered)
-
-
 def _dcp_all_to_all_first_dim_into(
     group,
     input_tensor: torch.Tensor,
@@ -406,6 +378,34 @@ def _dcp_all_to_all_first_dim_into(
         input_tensor.view(-1),
         group=device_group,
     )
+
+
+def _dcp_all_gather_first_dim_into(
+    group,
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+) -> None:
+    """All-gather into caller-owned output, concatenating along dim 0."""
+    assert input_tensor.is_contiguous()
+    assert output_tensor.is_contiguous()
+    assert output_tensor.shape[0] == input_tensor.shape[0] * group.world_size
+    assert output_tensor.shape[1:] == input_tensor.shape[1:]
+
+    communicator = getattr(group, "device_communicator", None)
+    pynccl_comm = getattr(communicator, "pynccl_comm", None)
+    if pynccl_comm is not None and not getattr(pynccl_comm, "disabled", False):
+        pynccl_comm.all_gather(output_tensor, input_tensor)
+        return
+
+    device_group = getattr(communicator, "device_group", None)
+    if device_group is not None:
+        import torch.distributed as dist
+
+        dist.all_gather_into_tensor(output_tensor, input_tensor, group=device_group)
+        return
+
+    gathered = group.all_gather(input_tensor, dim=0)
+    output_tensor.copy_(gathered)
 
 
 def _unpack_b12x_dcp_gathered_candidates(
@@ -1160,7 +1160,11 @@ def _get_owner_merge_dcp_group(expected_world_size: int):
     from vllm.distributed import parallel_state
 
     selector = getattr(parallel_state, "get_indexer_dcp_group", None)
-    group = selector(expected_world_size) if selector is not None else get_dcp_group()
+    group = (
+        selector(expected_world_size)
+        if selector is not None
+        else parallel_state.get_dcp_group()
+    )
     if int(group.world_size) != int(expected_world_size):
         raise RuntimeError(
             "DCP owner top-k group does not match the indexer KV shard count: "
@@ -1200,7 +1204,9 @@ def _merge_b12x_dcp_topk_by_owner(
     if rows % int(dcp_world_size) != 0:
         return False
 
-    tp_group = get_tp_group()
+    from vllm.distributed import parallel_state
+
+    tp_group = parallel_state.get_tp_group()
     tp_world_size = int(tp_group.world_size)
     tp_rank = int(tp_group.rank_in_group)
     if tp_world_size % int(dcp_world_size) != 0:
@@ -1960,7 +1966,9 @@ def sparse_attn_indexer(
                         dcp_rank=dcp_rank,
                         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                     )
-                if qs_active and not used_owner_merge:
+                if used_owner_merge:
+                    continue
+                if qs_active:
                     gathered_indices = qs_group.all_gather(
                         topk_indices.contiguous(), dim=0
                     )
