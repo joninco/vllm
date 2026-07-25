@@ -450,10 +450,10 @@ def _unpack_b12x_dcp_gathered_candidates(
 
 
 def _get_dcp_warmup_params(
-    expected_world_size: int | None = None,
+    expected_dcp_world_size: int | None = None,
 ) -> tuple[int, int, int]:
-    dcp_world_size = int(expected_world_size or 1)
-    group_world_size = expected_world_size
+    dcp_world_size = int(expected_dcp_world_size or 1)
+    group_world_size = expected_dcp_world_size
     dcp_rank = 0
     cp_kv_cache_interleave_size = 1
     try:
@@ -462,7 +462,7 @@ def _get_dcp_warmup_params(
         vllm_config = get_current_vllm_config_or_none()
         if vllm_config is not None:
             parallel_config = vllm_config.parallel_config
-            if expected_world_size is None:
+            if expected_dcp_world_size is None:
                 dcp_world_size = int(parallel_config.decode_context_parallel_size)
                 group_world_size = dcp_world_size
             cp_kv_cache_interleave_size = int(
@@ -484,7 +484,7 @@ def _get_dcp_warmup_params(
     return dcp_world_size, dcp_rank, cp_kv_cache_interleave_size
 
 
-def _sync_dcp_warmup(expected_world_size: int) -> None:
+def _sync_dcp_warmup(dcp_world_size: int) -> None:
     """Finish one-time DCP warmup on every rank before graph warmup proceeds."""
     if current_platform.is_cuda():
         torch.accelerator.synchronize()
@@ -492,7 +492,7 @@ def _sync_dcp_warmup(expected_world_size: int) -> None:
     try:
         from vllm.distributed.parallel_state import get_indexer_dcp_group
 
-        dcp_group = get_indexer_dcp_group(expected_world_size)
+        dcp_group = get_indexer_dcp_group(dcp_world_size)
         if int(dcp_group.world_size) <= 1:
             return
         dcp_group.barrier()

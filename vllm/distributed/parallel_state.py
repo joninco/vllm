@@ -1472,18 +1472,24 @@ _INDEXER_DCP: GroupCoordinator | None = None
 def get_indexer_dcp_group(
     expected_world_size: int | None = None,
 ) -> GroupCoordinator:
-    """Return the process group matching an indexer's KV shard count."""
+    """Return the group matching an indexer's actual KV shard count.
+
+    A partially replicated target indexer and a fully sharded speculative
+    indexer can coexist in the same model. Callers that know their shard count
+    must provide it so the speculative indexer does not inherit the target's
+    smaller process group.
+    """
     if expected_world_size is None:
         return _INDEXER_DCP if _INDEXER_DCP is not None else get_dcp_group()
 
-    if _INDEXER_DCP is not None and _INDEXER_DCP.world_size == expected_world_size:
+    if _INDEXER_DCP is not None and int(_INDEXER_DCP.world_size) == expected_world_size:
         return _INDEXER_DCP
 
     dcp_group = get_dcp_group()
-    if dcp_group.world_size == expected_world_size:
+    if int(dcp_group.world_size) == expected_world_size:
         return dcp_group
 
-    partial_size = _INDEXER_DCP.world_size if _INDEXER_DCP is not None else None
+    partial_size = int(_INDEXER_DCP.world_size) if _INDEXER_DCP is not None else None
     raise RuntimeError(
         "No sparse-indexer DCP group matches the requested KV shard count: "
         f"requested={expected_world_size}, partial={partial_size}, "
@@ -1503,16 +1509,19 @@ def get_indexer_query_split_group(
             return _INDEXER_QUERY_SPLIT
         return get_query_split_group()
 
-    if _INDEXER_DCP is not None and _INDEXER_DCP.world_size == indexer_dcp_world_size:
+    if (
+        _INDEXER_DCP is not None
+        and int(_INDEXER_DCP.world_size) == indexer_dcp_world_size
+    ):
         if _INDEXER_QUERY_SPLIT is None:
             raise RuntimeError("Partial indexer DCP group has no query-split group")
         return _INDEXER_QUERY_SPLIT
 
     dcp_group = get_dcp_group()
-    if dcp_group.world_size == indexer_dcp_world_size:
+    if int(dcp_group.world_size) == indexer_dcp_world_size:
         return get_query_split_group()
 
-    partial_size = _INDEXER_DCP.world_size if _INDEXER_DCP is not None else None
+    partial_size = int(_INDEXER_DCP.world_size) if _INDEXER_DCP is not None else None
     raise RuntimeError(
         "No indexer query-split group matches the requested KV shard count: "
         f"requested={indexer_dcp_world_size}, partial={partial_size}, "

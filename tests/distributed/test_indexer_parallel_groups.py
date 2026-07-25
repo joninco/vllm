@@ -62,6 +62,12 @@ def test_indexer_group_selector_supports_partial_target_and_sharded_draft(
     assert parallel_state.get_indexer_dcp_group(8) is configured_dcp
     assert parallel_state.get_indexer_query_split_group(4) is partial_query_split
     assert parallel_state.get_indexer_query_split_group(8) is configured_query_split
+
+
+def test_indexer_group_selector_rejects_unknown_shard_count(monkeypatch):
+    monkeypatch.setattr(parallel_state, "_INDEXER_DCP", SimpleNamespace(world_size=4))
+    monkeypatch.setattr(parallel_state, "_DCP", SimpleNamespace(world_size=8))
+
     with pytest.raises(RuntimeError, match="requested=2"):
         parallel_state.get_indexer_dcp_group(2)
     with pytest.raises(RuntimeError, match="requested=2"):

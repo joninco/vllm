@@ -40,7 +40,7 @@ def test_replicated_constructor_uses_single_rank_without_dcp_group(monkeypatch):
     def init_module(self):
         torch.nn.Module.__init__(self)
 
-    def fail_dcp_group():
+    def fail_dcp_group(*_args):
         pytest.fail("replicated indexer construction must not query the DCP group")
 
     monkeypatch.setattr(indexer_mod.CustomOp, "__init__", init_module)
@@ -73,6 +73,49 @@ def test_replicated_constructor_uses_single_rank_without_dcp_group(monkeypatch):
     assert indexer.dcp_replicated is True
     assert indexer.dcp_world_size == 1
     assert indexer.dcp_rank == 0
+
+
+@pytest.mark.parametrize("kv_shards", [2, 4])
+def test_sharded_constructor_requests_group_matching_kv_shards(monkeypatch, kv_shards):
+    def init_module(self):
+        torch.nn.Module.__init__(self)
+
+    requested_sizes: list[int] = []
+
+    def get_group(expected_world_size):
+        requested_sizes.append(expected_world_size)
+        return types.SimpleNamespace(world_size=expected_world_size, rank_in_group=1)
+
+    monkeypatch.setattr(indexer_mod.CustomOp, "__init__", init_module)
+    monkeypatch.setattr(
+        indexer_mod,
+        "get_current_vllm_config",
+        lambda: types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(
+                decode_context_parallel_size=4,
+                prefill_context_parallel_size=1,
+                cp_kv_cache_interleave_size=1,
+            )
+        ),
+    )
+    monkeypatch.setattr(indexer_mod, "get_indexer_dcp_group", get_group)
+    monkeypatch.setattr(indexer_mod, "use_b12x_sparse_indexer", lambda: True)
+
+    indexer = indexer_mod.SparseAttnIndexer(
+        k_cache=torch.nn.Identity(),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=4,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=4096,
+        topk_indices_buffer=torch.empty((2, 4), dtype=torch.int32),
+        dcp_kv_shard_count=kv_shards,
+    )
+
+    assert requested_sizes == [kv_shards]
+    assert indexer.dcp_world_size == kv_shards
+    assert indexer.dcp_rank == 1
 
 
 def _install_fake_b12x_indexer(
@@ -515,7 +558,10 @@ def test_replicated_decode_skips_dcp_merge_and_keeps_global_topk_ids(
     monkeypatch.setattr(
         indexer_mod,
         "get_forward_context",
-        lambda: types.SimpleNamespace(attn_metadata={metadata_key: metadata}),
+        lambda: types.SimpleNamespace(
+            attn_metadata={metadata_key: metadata},
+            cudagraph_runtime_mode=indexer_mod.CUDAGraphMode.NONE,
+        ),
     )
 
     hidden_states = torch.empty((q_rows, 128), dtype=torch.bfloat16)
@@ -545,6 +591,8 @@ def test_replicated_decode_skips_dcp_merge_and_keeps_global_topk_ids(
         total_seq_lens=1024,
         topk_indices_buffer=topk_indices_buffer,
         skip_k_cache_insert=True,
+        use_pcp=False,
+        dense_mha_metadata_layer_name="",
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
     )
@@ -654,7 +702,10 @@ def test_b12x_dcp_decode_requests_score_output(monkeypatch):
     monkeypatch.setattr(
         indexer_mod,
         "get_forward_context",
-        lambda: types.SimpleNamespace(attn_metadata={metadata_key: metadata}),
+        lambda: types.SimpleNamespace(
+            attn_metadata={metadata_key: metadata},
+            cudagraph_runtime_mode=indexer_mod.CUDAGraphMode.NONE,
+        ),
     )
 
     hidden_states = torch.empty((q_rows, 128), dtype=torch.bfloat16)
@@ -681,6 +732,8 @@ def test_b12x_dcp_decode_requests_score_output(monkeypatch):
         total_seq_lens=1024,
         topk_indices_buffer=topk_indices_buffer,
         skip_k_cache_insert=True,
+        use_pcp=False,
+        dense_mha_metadata_layer_name="",
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
         topk_scores_buffer=topk_scores_buffer,
@@ -1131,6 +1184,8 @@ def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
         total_seq_lens=total_seq_lens,
         topk_indices_buffer=topk_indices_buffer,
         skip_k_cache_insert=False,
+        use_pcp=False,
+        dense_mha_metadata_layer_name="",
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
     )
@@ -1237,6 +1292,8 @@ def test_b12x_profile_work_skips_piecewise_capture(monkeypatch):
         total_seq_lens=128,
         topk_indices_buffer=topk_indices_buffer,
         skip_k_cache_insert=False,
+        use_pcp=False,
+        dense_mha_metadata_layer_name="",
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
     )
@@ -1268,7 +1325,7 @@ def test_b12x_dcp_profile_uses_planner_page_table_width(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
-    monkeypatch.setattr(indexer_mod, "_get_dcp_warmup_params", lambda: (2, 0, 1))
+    monkeypatch.setattr(indexer_mod, "_get_dcp_warmup_params", lambda *_: (2, 0, 1))
     monkeypatch.setattr(indexer_mod, "_prewarm_b12x_dcp_topk_merge", lambda **_: None)
 
     q_rows = 8192
@@ -1301,6 +1358,8 @@ def test_b12x_dcp_profile_uses_planner_page_table_width(monkeypatch):
         total_seq_lens=total_seq_lens,
         topk_indices_buffer=topk_indices_buffer,
         skip_k_cache_insert=False,
+        use_pcp=False,
+        dense_mha_metadata_layer_name="",
         use_fp4_cache=False,
         use_b12x_sparse_indexer=True,
     )
