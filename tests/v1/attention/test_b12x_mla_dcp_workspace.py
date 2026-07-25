@@ -77,7 +77,11 @@ def test_dcp_workspace_gate_accepts_valid_rows(num_tokens, max_num_tokens):
     )
 
 
-def _make_profile_attention(*, workspace_enabled: bool, pure_a2a: bool = False):
+def _make_profile_attention(
+    *,
+    workspace_enabled: bool,
+    pure_a2a: bool = False,
+):
     class Backend:
         @staticmethod
         def get_name():
