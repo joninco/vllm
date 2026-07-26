@@ -57,9 +57,7 @@ def test_memory_profile_cleanup_resets_backend_cache_bindings(monkeypatch):
     runner.kv_block_zeroer = object()
     runner.verification_capacity_manager = object()
     runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
-    runner.compilation_config = SimpleNamespace(
-        static_forward_context={"layer": layer}
-    )
+    runner.compilation_config = SimpleNamespace(static_forward_context={"layer": layer})
 
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
@@ -94,13 +92,14 @@ def test_cudagraph_manager_clear_releases_capture_state():
     assert manager.intermediate_tensors is None
 
 
-def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
+def test_memory_profile_reuses_production_pool_and_destroys_graphs(monkeypatch):
     from vllm.v1.worker import workspace as workspace_module
     from vllm.v1.worker.gpu import model_runner as model_runner_module
 
-    profile_pool = object()
-    production_pool = object()
     events: list[str] = []
+    production_pool = object()
+    anchor_graph = SimpleNamespace(reset=lambda: events.append("anchor_reset"))
+    anchor_token = object()
     lazy_wrappers: list[FakeWrapper] = []
 
     class FakeManager:
@@ -111,8 +110,8 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
             return True
 
         def capture(self, *args, **kwargs):
-            assert self.pool is profile_pool
-            assert wrapper.graph_pool is profile_pool
+            assert self.pool is production_pool
+            assert wrapper.graph_pool is production_pool
             lazy_wrapper = FakeWrapper()
             lazy_wrapper.graph_pool = self.pool
             lazy_wrappers.append(lazy_wrapper)
@@ -136,6 +135,7 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
         model_runner_module.GPUModelRunner
     )
     runner.vllm_config = object()
+    runner.device = torch.device("cuda")
     runner.cudagraph_manager = manager
     runner.speculator = FakeSpeculator()
     runner.lora_config = None
@@ -150,12 +150,13 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
     runner._init_minimal_kv_cache_for_profiling = lambda: None
     runner.maybe_setup_dummy_loras = lambda _: nullcontext()
     runner._zero_cudagraph_capture_kv_blocks = lambda: None
+    runner._cudagraph_pool_anchor = None
 
     def cleanup():
         events.append("cleanup")
-        assert manager.pool is profile_pool
-        assert wrapper.graph_pool is profile_pool
-        assert lazy_wrappers[0].graph_pool is profile_pool
+        assert manager.pool is production_pool
+        assert wrapper.graph_pool is production_pool
+        assert lazy_wrappers[0].graph_pool is production_pool
 
     runner._cleanup_cudagraph_memory_profile = cleanup
 
@@ -167,12 +168,24 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
         model_runner_module,
         "current_platform",
         SimpleNamespace(
-            graph_pool_handle=lambda: profile_pool,
+            graph_pool_handle=lambda: pytest.fail(
+                "memory profiling must not allocate a disposable graph pool"
+            ),
             get_global_graph_pool=lambda: production_pool,
         ),
     )
     monkeypatch.setattr(
         model_runner_module.CUDAGraphWrapper, "_all_instances", [wrapper]
+    )
+
+    def create_anchor(pool, device):
+        events.append("anchor_create")
+        return anchor_graph, anchor_token
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "_create_cudagraph_pool_anchor",
+        create_anchor,
     )
     monkeypatch.setattr(
         model_runner_module.BreakableCUDAGraphWrapper,
@@ -183,10 +196,15 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda: next(memory_info))
+
+    def checkpoint_graph_channels():
+        events.append("checkpoint")
+        return ("channel-checkpoint",)
+
     monkeypatch.setattr(
         model_runner_module,
         "checkpoint_b12x_graph_channels",
-        lambda: events.append("checkpoint") or ("channel-checkpoint",),
+        checkpoint_graph_channels,
     )
     monkeypatch.setattr(
         model_runner_module,
@@ -198,11 +216,12 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
         ),
     )
 
-    assert runner.profile_cudagraph_memory() == 50
+    assert runner.profile_cudagraph_memory() == 100
     assert events == [
         "checkpoint",
         "capture",
         "spec_capture",
+        "anchor_create",
         "cleanup",
         "rollback",
     ]
@@ -210,6 +229,101 @@ def test_memory_profile_destroys_graphs_before_restoring_pools(monkeypatch):
     assert manager.pool is production_pool
     assert wrapper.graph_pool is production_pool
     assert lazy_wrappers[0].graph_pool is production_pool
+    assert runner._cudagraph_pool_anchor == (anchor_graph, anchor_token)
+
+    runner._release_cudagraph_pool_anchor()
+    assert runner._cudagraph_pool_anchor is None
+    assert events[-1] == "anchor_reset"
+
+
+def test_production_capture_releases_pool_anchor_on_failure(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    events: list[str] = []
+
+    class FakeManager:
+        @staticmethod
+        def needs_capture():
+            return True
+
+        @staticmethod
+        def capture(*args, **kwargs):
+            events.append("capture")
+            raise RuntimeError("capture failed")
+
+    runner = model_runner_module.GPUModelRunner.__new__(
+        model_runner_module.GPUModelRunner
+    )
+    runner.cudagraph_manager = FakeManager()
+    runner._cudagraph_pool_anchor = (
+        SimpleNamespace(reset=lambda: events.append("anchor_reset")),
+        object(),
+    )
+    runner.lora_config = None
+    runner.model = object()
+    runner.model_state = object()
+    runner.input_buffers = object()
+    runner.intermediate_tensors = object()
+    runner.block_tables = object()
+    runner.attn_groups = object()
+    runner.kv_cache_config = object()
+    runner.use_aux_hidden_state_outputs = False
+    runner.speculator = None
+    runner.maybe_setup_dummy_loras = lambda _: nullcontext()
+
+    monkeypatch.setattr(model_runner_module.gc, "collect", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda: (1000, 0))
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        runner.capture_model()
+
+    assert runner._cudagraph_pool_anchor is None
+    assert events == ["capture", "anchor_reset"]
+
+
+def test_skipped_production_capture_releases_pool_anchor():
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    events: list[str] = []
+    runner = model_runner_module.GPUModelRunner.__new__(
+        model_runner_module.GPUModelRunner
+    )
+    runner.cudagraph_manager = SimpleNamespace(needs_capture=lambda: False)
+    runner._cudagraph_pool_anchor = (
+        SimpleNamespace(reset=lambda: events.append("anchor_reset")),
+        object(),
+    )
+
+    assert runner.capture_model() == 0
+    assert runner._cudagraph_pool_anchor is None
+    assert events == ["anchor_reset"]
+
+
+def test_shutdown_releases_pool_anchor(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+
+    events: list[str] = []
+    runner = model_runner_module.GPUModelRunner.__new__(
+        model_runner_module.GPUModelRunner
+    )
+    runner.vllm_config = object()
+    runner._cudagraph_pool_anchor = (
+        SimpleNamespace(reset=lambda: events.append("anchor_reset")),
+        object(),
+    )
+
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda: events.append("synchronize")
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(model_runner_module.gc, "collect", lambda: None)
+    monkeypatch.setattr(model_runner_module, "free_before_shutdown", lambda _: None)
+
+    runner.shutdown()
+
+    assert runner._cudagraph_pool_anchor is None
+    assert events == ["synchronize", "anchor_reset"]
 
 
 def test_breakable_runner_inherits_active_manager_pool(monkeypatch):
