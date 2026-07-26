@@ -179,11 +179,12 @@ def test_b12x_dma_min_bytes_is_configurable(
     monkeypatch.delenv("VLLM_PCIE_DMA_MIN_BYTES", raising=False)
     assert _b12x_pcie_dma_min_bytes() == 6 * 1024 * 1024
 
-    monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", "24MB")
+    monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", " 24mB ")
     assert _b12x_pcie_dma_min_bytes() == 24 * 1024 * 1024
 
-    monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", "off")
-    assert _b12x_pcie_dma_min_bytes() is None
+    for disabled in ("off", " DISABLED ", "NoNe"):
+        monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", disabled)
+        assert _b12x_pcie_dma_min_bytes() is None
 
     monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", "-1")
     with pytest.raises(ValueError, match="must be non-negative"):

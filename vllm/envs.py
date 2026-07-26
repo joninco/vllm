@@ -1849,7 +1849,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
         "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
     ),
-    # Minimum input size for uncompressed SparkInfer DMA allreduce dispatch.
+    # Minimum input size for uncompressed SparkInfer DMA allreduce dispatch;
+    # defaults to 6 MiB. Accepts raw bytes or a case-insensitive KB/MB suffix.
+    # Whitespace is ignored. "off", "disabled", and "none" disable DMA.
     # A deployment preflight may override this with a measured crossover.
     "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
     # Allow the b12x PCIe oneshot allreduce on cross-NUMA PCIe topologies.
