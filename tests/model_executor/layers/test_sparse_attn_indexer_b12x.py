@@ -10,6 +10,19 @@ import torch
 from vllm.model_executor.layers import sparse_attn_indexer as indexer_mod
 
 
+def test_query_split_context_crossover_env(monkeypatch):
+    monkeypatch.delenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", raising=False)
+    assert indexer_mod._dcp_query_split_context_eligible(1)
+
+    monkeypatch.setenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", "65536")
+    assert not indexer_mod._dcp_query_split_context_eligible(8192)
+    assert indexer_mod._dcp_query_split_context_eligible(65536)
+
+    monkeypatch.setenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", "-1")
+    with pytest.raises(ValueError, match="must be non-negative"):
+        indexer_mod._dcp_query_split_context_eligible(65536)
+
+
 def _profile_forward_context():
     return types.SimpleNamespace(
         attn_metadata=None,
