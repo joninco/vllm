@@ -27,6 +27,7 @@ from vllm.config import (
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.device_communicators.custom_all_reduce import (
     CustomAllreduce,
+    _b12x_pcie_dma_min_bytes,
     _b12x_pcie_oneshot_limits,
     get_b12x_pcie_allreduce,
 )
@@ -170,6 +171,23 @@ def test_b12x_oneshot_buffer_tracks_dispatch_limits(
         84 * 1024,
         84 * 1024,
     )
+
+
+def test_b12x_dma_min_bytes_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_PCIE_DMA_MIN_BYTES", raising=False)
+    assert _b12x_pcie_dma_min_bytes() == 6 * 1024 * 1024
+
+    monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", "24MB")
+    assert _b12x_pcie_dma_min_bytes() == 24 * 1024 * 1024
+
+    monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", "off")
+    assert _b12x_pcie_dma_min_bytes() is None
+
+    monkeypatch.setenv("VLLM_PCIE_DMA_MIN_BYTES", "-1")
+    with pytest.raises(ValueError, match="must be non-negative"):
+        _b12x_pcie_dma_min_bytes()
 
 
 def test_b12x_fused_custom_op_dispatch(monkeypatch) -> None:

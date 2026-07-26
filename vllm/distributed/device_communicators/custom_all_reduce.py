@@ -31,11 +31,6 @@ except Exception:
 
 logger = init_logger(__name__)
 
-# Fixed DMA crossover for the 8x PCIe GLM serving path: 512 BF16 rows at
-# hidden size 6144. The oneshot crossovers come from the
-# VLLM_PCIE_ONESHOT_*_MAX_SIZE envs (default 84KB, seven such rows).
-_B12X_PCIE_DMA_MIN_BYTES = 6 * 1024 * 1024
-
 
 def _get_pcie_allreduce_backend() -> str:
     backend = envs.VLLM_PCIE_ALLREDUCE_BACKEND.lower()
@@ -92,6 +87,16 @@ def _b12x_pcie_oneshot_limits() -> tuple[int, int, int]:
     # MiB once target and draft graphs use independent channels.
     buffer_size = max(allreduce_max_size, fused_max_size, 16)
     return allreduce_max_size, fused_max_size, buffer_size
+
+
+def _b12x_pcie_dma_min_bytes() -> int | None:
+    configured = envs.VLLM_PCIE_DMA_MIN_BYTES.strip().lower()
+    if configured in {"off", "disabled", "none"}:
+        return None
+    min_bytes = _parse_byte_size(configured)
+    if min_bytes < 0:
+        raise ValueError("b12x PCIe DMA minimum size must be non-negative")
+    return min_bytes
 
 
 @lru_cache(maxsize=1)
@@ -510,10 +515,17 @@ class CustomAllreduce:
                 return
             assert pcie_runtime is not None
             self._pcie_runtime = pcie_runtime
-            # Prefill-size DMA allreduce alongside the oneshot. Its fixed
-            # lower bound is applied after every rank initializes cleanly.
-            dma_cls = _load_b12x_pcie_dma()
-            if dma_cls is None:
+            # Prefill-size DMA allreduce alongside the oneshot. A deployment
+            # preflight can tune its crossover or disable it when lossless DMA
+            # never beats NCCL on the selected PCIe topology.
+            dma_min_bytes = _b12x_pcie_dma_min_bytes()
+            dma_cls = None if dma_min_bytes is None else _load_b12x_pcie_dma()
+            if dma_min_bytes is None:
+                logger.info(
+                    "b12x PCIe DMA allreduce disabled by "
+                    "VLLM_PCIE_DMA_MIN_BYTES=off; large allreduces stay on PyNCCL."
+                )
+            elif dma_cls is None:
                 logger.warning(
                     "b12x PCIe DMA allreduce unavailable "
                     "(sparkinfer.comm.pcie.DmaAllReduce not importable); "
@@ -556,17 +568,17 @@ class CustomAllreduce:
                     )
                 else:
                     assert dma is not None
-                    dma.min_bytes = _B12X_PCIE_DMA_MIN_BYTES
+                    dma.min_bytes = dma_min_bytes
                     self._pcie_dma = dma
                     logger.debug("b12x PCIe DMA allreduce wire mode: %s", dma.wire_mode)
 
             if rank == 0:
                 logger.info(
                     "Configured b12x PCIe crossovers: "
-                    "oneshot max=%d, fused max=%d, DMA min=%d.",
+                    "oneshot max=%d, fused max=%d, DMA min=%s.",
                     self._pcie_allreduce_max_size,
                     self._pcie_fused_add_rms_norm_max_size,
-                    _B12X_PCIE_DMA_MIN_BYTES,
+                    dma_min_bytes if dma_min_bytes is not None else "off",
                 )
             self.disabled = False
             logger.debug(
