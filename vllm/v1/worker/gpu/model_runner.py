@@ -21,6 +21,7 @@ import functools
 import gc
 import sys
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -146,6 +147,30 @@ def _maybe_save_b12x_moe_activation_amax() -> None:
 
 def _profile_cg_mode(cg_mode: CUDAGraphMode) -> str:
     return cg_mode.name.lower()
+
+
+def _create_cudagraph_pool_anchor(
+    pool: Any, device: torch.device
+) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
+    """Keep a graph-private pool live between profiling and real capture.
+
+    PyTorch cannot reopen a pool whose last graph was reset while allocations
+    remain. This tiny graph holds the pool reference until production capture.
+
+    Args:
+        pool: CUDA graph pool to retain.
+        device: CUDA device on which to create the anchor.
+
+    Returns:
+        The anchor graph and its retained token tensor.
+    """
+    token = torch.zeros(1, device=device)
+    token.add_(0)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=pool):
+        token.add_(0)
+    return graph, token
 
 
 def _profile_batch_phase(input_batch: InputBatch, dummy_run: bool = False) -> str:
@@ -296,6 +321,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
+        self._cudagraph_pool_anchor: (
+            tuple[torch.cuda.CUDAGraph, torch.Tensor] | None
+        ) = None
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
@@ -859,9 +887,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # production cache. Keep the hook optional so backends without
             # cache-generation state pay no cost.
             impl = getattr(layer, "impl", None)
-            reset_binding_state = getattr(
-                impl, "reset_kv_cache_binding_state", None
-            )
+            reset_binding_state = getattr(impl, "reset_kv_cache_binding_state", None)
             if reset_binding_state is not None:
                 reset_binding_state()
             if hasattr(layer, "kv_cache"):
@@ -874,6 +900,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.empty_cache()
         torch.accelerator.synchronize()
 
+    def _release_cudagraph_pool_anchor(self) -> None:
+        anchor = getattr(self, "_cudagraph_pool_anchor", None)
+        if anchor is None:
+            return
+        self._cudagraph_pool_anchor = None
+        graph, token = anchor
+        graph.reset()
+        del token
+
     def profile_cudagraph_memory(self) -> int:
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
@@ -884,7 +919,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return 0
 
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
-        profiling_pool = current_platform.graph_pool_handle()
+        # Profile into the same pool used by the production capture. Destroying
+        # graphs can leave physical pages retained by their pool; a different
+        # disposable pool strands those pages. Reusing the global pool lets the
+        # production capture consume its retained capacity.
+        profiling_pool = current_platform.get_global_graph_pool()
         managers = [self.cudagraph_manager]
         if self.speculator is not None:
             managers.extend(self.speculator.get_cudagraph_managers())
@@ -905,9 +944,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.empty_cache()
         torch.accelerator.synchronize()
         start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
-        graph_channel_checkpoints = ()
+        graph_channel_checkpoints: tuple[tuple[Callable[[Any], None], Any], ...] = ()
         try:
-            # Snapshot graph-owned SparkInfer channels before this disposable
+            # Snapshot graph-owned SparkInfer channels before this profiling
             # capture so profiling cannot leave stale channels behind.
             graph_channel_checkpoints = checkpoint_b12x_graph_channels()
             with self.maybe_setup_dummy_loras(self.lora_config):
@@ -930,10 +969,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._zero_cudagraph_capture_kv_blocks()
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
             gross_cuda_graph_size = max(start_free_gpu_memory - end_free_gpu_memory, 0)
+            assert getattr(self, "_cudagraph_pool_anchor", None) is None
+            self._cudagraph_pool_anchor = _create_cudagraph_pool_anchor(
+                profiling_pool, self.device
+            )
         finally:
             try:
-                # Destroy disposable graphs while every manager and wrapper still
-                # points at the private pool that owns their allocations.
+                # Destroy profiling graphs while every manager and wrapper still
+                # points at the pool that owns their allocations.
                 try:
                     self._cleanup_cudagraph_memory_profile()
                 finally:
@@ -957,15 +1000,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         free_after_cleanup = torch.accelerator.get_memory_info()[0]
         retained_pool_size = max(start_free_gpu_memory - free_after_cleanup, 0)
-        # A CUDA graph private pool can retain physical pages after its graph
-        # objects are destroyed. memory_profiling observes those pages as
-        # non-torch memory, so only return the remaining capture cost here.
-        cuda_graph_size = max(gross_cuda_graph_size - retained_pool_size, 0)
+        # Retained private-pool pages are PyTorch-reserved. The outer profiler
+        # deliberately restores the pre-graph torch peak, so they are not
+        # accounted elsewhere. Reserve the complete graph high-water mark;
+        # production reuses the retained portion and allocates only the rest.
+        cuda_graph_size = gross_cuda_graph_size
         logger.info(
-            "Estimated MRV2 CUDA graph memory: %.2f GiB additional "
-            "(%.2f GiB captured, %.2f GiB retained and counted as non-torch)",
+            "Estimated MRV2 CUDA graph memory: %.2f GiB total "
+            "(%.2f GiB retained in the reusable pool)",
             cuda_graph_size / (1 << 30),
-            gross_cuda_graph_size / (1 << 30),
             retained_pool_size / (1 << 30),
         )
         return int(cuda_graph_size)
@@ -974,6 +1017,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def capture_model(self) -> int:
         assert self.cudagraph_manager is not None
         if not self.cudagraph_manager.needs_capture():
+            self._release_cudagraph_pool_anchor()
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
@@ -987,23 +1031,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.empty_cache()
         start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
-        with self.maybe_setup_dummy_loras(self.lora_config):
-            self.cudagraph_manager.capture(
-                self.model,
-                self.model_state,
-                self.input_buffers,
-                self.intermediate_tensors,
-                self.block_tables,
-                self.attn_groups,
-                self.kv_cache_config,
-                has_lora=self.lora_config is not None,
-                use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-                lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
-            )
-            if self.speculator is not None:
-                with use_workspace_lane(1):
-                    self.speculator.capture()
-            self._zero_cudagraph_capture_kv_blocks()
+        try:
+            with self.maybe_setup_dummy_loras(self.lora_config):
+                self.cudagraph_manager.capture(
+                    self.model,
+                    self.model_state,
+                    self.input_buffers,
+                    self.intermediate_tensors,
+                    self.block_tables,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                    has_lora=self.lora_config is not None,
+                    use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                    lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                )
+                if self.speculator is not None:
+                    with use_workspace_lane(1):
+                        self.speculator.capture()
+                self._zero_cudagraph_capture_kv_blocks()
+        finally:
+            self._release_cudagraph_pool_anchor()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -2102,6 +2149,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        self._release_cudagraph_pool_anchor()
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):
