@@ -242,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
     VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA: bool = True
     VLLM_PCIE_ONESHOT_SINGLE_CHANNEL: bool = False
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1895,6 +1896,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
         "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
     ),
+    # Minimum input size for uncompressed SparkInfer DMA allreduce dispatch.
+    # A deployment preflight may override this with a measured crossover.
+    "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
     # Allow the b12x PCIe oneshot allreduce on cross-NUMA PCIe topologies.
     "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA": lambda: (
         os.getenv("VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA", "1") != "0"
