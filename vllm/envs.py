@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     VLLM_DCP_INDEXER_SHARDS: int = 0
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_DCP_QUERY_SPLIT: bool = False
+    VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS: int = 0
     VLLM_DCP_TOPK_OWNER_MERGE: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
@@ -1200,6 +1201,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DCP_QUERY_SPLIT": lambda: (
         os.getenv("VLLM_DCP_QUERY_SPLIT", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    # Keep query-split process groups initialized while selecting the faster
+    # full-query path below a deployment-calibrated context crossover.
+    "VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", "0")
     ),
     # Send each query row's exact FP32 top-k candidates to one DCP owner, merge
     # once there, then gather only the final indices over TP. This is an
