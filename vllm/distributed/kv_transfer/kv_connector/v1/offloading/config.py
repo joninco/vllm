@@ -20,7 +20,7 @@ from vllm.v1.kv_offload.config import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, KVCacheTensor
 
 
 def is_kv_cache_tensor_packed(kv_cache_tensor: "KVCacheTensor") -> bool:
@@ -40,16 +40,17 @@ def build_offloading_config(
     engine_id = kv_transfer_config.engine_id
 
     parallel_config = vllm_config.parallel_config
+
+    def _tokens_per_block(kv_cache_spec: "KVCacheSpec") -> int:
+        if not isinstance(kv_cache_spec, AttentionSpec) or getattr(
+            kv_cache_spec, "dcp_replicated", False
+        ):
+            return kv_cache_spec.block_size
+        return kv_cache_spec.block_size * parallel_config.decode_context_parallel_size
+
     groups = tuple(
         OffloadingGroupConfig(
-            tokens_per_block=(
-                group.kv_cache_spec.block_size
-                * (
-                    parallel_config.decode_context_parallel_size
-                    if isinstance(group.kv_cache_spec, AttentionSpec)
-                    else 1
-                )
-            ),
+            tokens_per_block=_tokens_per_block(group.kv_cache_spec),
             layer_names=tuple(group.layer_names),
         )
         for group in kv_cache_config.kv_cache_groups
