@@ -326,6 +326,45 @@ def test_dcp_scales_attention_but_not_mamba_group_blocks():
     ] == [1, 3]
 
 
+def test_dcp_does_not_scale_replicated_group_blocks():
+    config = _make_vllm_config(
+        tensor_parallel_size=4,
+        decode_context_parallel_size=4,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                MLAAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=432,
+                    dtype=torch.uint8,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["indexer"],
+                MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=132,
+                    dtype=torch.uint8,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    assert tuple(group.tokens_per_block for group in offloading_config.groups) == (
+        64,
+        64,
+    )
+
+
 def test_preserves_data_parallel_index():
     config = _make_vllm_config()
     config.parallel_config.data_parallel_index = 2
