@@ -35,6 +35,8 @@ class FileMapper:
         dcp_size: int,
         rank: int,
         dtype: str,
+        kv_cache_abi: str = "vllm-default-v1",
+        worker_kv_bytes_per_block: int = 0,
         kv_cache_groups: list[dict] | None = None,
         inference_engine: str = "vllm",
         parallel_agnostic: bool = False,
@@ -74,6 +76,9 @@ class FileMapper:
         # identity participates in the storage namespace.
         if canonical_format is not None:
             self.fields["canonical_format"] = canonical_format
+        if kv_cache_abi != "vllm-default-v1":
+            self.fields["kv_cache_abi"] = str(kv_cache_abi)
+            self.fields["worker_kv_bytes_per_block"] = int(worker_kv_bytes_per_block)
         self.base_path: str = self._compute_base_path(root_dir, self.fields)
 
     @classmethod
@@ -106,6 +111,8 @@ class FileMapper:
             dcp_size=parallel.dcp_size,
             rank=parallel.rank,
             dtype=config.model.dtype,
+            kv_cache_abi=config.model.kv_cache_abi,
+            worker_kv_bytes_per_block=config.worker_kv_bytes_per_block,
             kv_cache_groups=kv_cache_groups,
             parallel_agnostic=(
                 parallel_agnostic

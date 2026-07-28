@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import math
-import os
 import re
 from dataclasses import dataclass
 from functools import cache
@@ -12,16 +11,20 @@ import torch
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.mla_cache_format import (
+    NVFP4_MLA_CACHE_FORMAT,
+    NVFP4_MLA_SCALES_ENV,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.platforms import current_platform
 
-_NVFP4_MLA_SCALES_ENV = "VLLM_NVFP4_MLA_SCALES_FILE"
+_NVFP4_MLA_SCALES_ENV = NVFP4_MLA_SCALES_ENV
 _NVFP4_MLA_SCALES_FORMAT = "nvfp4_ds_mla_outer_scale_v1"
 _NVFP4_MLA_NUM_LAYERS = 78
 _NVFP4_MLA_LATENT_DIM = 512
 _NVFP4_MLA_SCALE_DENOMINATOR = 6.0 * 448.0
 _NVFP4_MLA_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
-_KV_FP8_ROPE_ENABLED = os.getenv("KV_FP8_ROPE", "0") == "1"
+_KV_FP8_ROPE_ENABLED = NVFP4_MLA_CACHE_FORMAT.fp8_rope
 
 
 _IS_GLM_MOE_DSA_CACHE: bool | None = None
@@ -253,13 +256,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # per-token second-level scale stored in the record, so the host-side
         # divide stays identity and a scales file must not also be supplied.
         self._nvfp4_mla_outer_scale = 1.0
-        scale_file = os.getenv(_NVFP4_MLA_SCALES_ENV, "").strip()
-        if scale_file and os.getenv("VLLM_NVFP4_MLA_DYNAMIC_SCALE", "0") == "1":
-            raise ValueError(
-                f"{_NVFP4_MLA_SCALES_ENV} and VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 "
-                "are mutually exclusive: the dynamic mode derives per-token "
-                "scales in the writer and ignores static calibration"
-            )
+        NVFP4_MLA_CACHE_FORMAT.validate()
+        scale_file = NVFP4_MLA_CACHE_FORMAT.scales_file
         if scale_file and (
             self.mla_attn.kv_cache_dtype == "nvfp4_ds_mla"
             and self.mla_attn.attn_backend.get_name() == "B12X_MLA_SPARSE"
