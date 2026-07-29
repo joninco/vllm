@@ -90,6 +90,30 @@ def test_finished_recving_for_running_request_keeps_blocks():
     assert_scheduler_empty(scheduler)
 
 
+def test_finished_sending_for_running_request_keeps_blocks():
+    vllm_config = create_vllm_config()
+    scheduler = create_scheduler(vllm_config)
+    request = create_request(max_tokens=4)
+    scheduler.add_request(request)
+
+    scheduler_output = scheduler.schedule()
+    model_runner_output = create_model_runner_output(
+        reqs=[request], finished_sending={request.request_id}
+    )
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert request.status == RequestStatus.RUNNING
+
+    # The request still owns its blocks and can finish normally.
+    scheduler_output = scheduler.schedule()
+    model_runner_output = create_model_runner_output(reqs=[request], use_eos=True)
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+    assert request.is_finished()
+
+    scheduler.schedule()
+    assert_scheduler_empty(scheduler)
+
+
 def test_duplicate_finished_sending_after_free_ignored():
     """A second finished_sending for a request whose blocks were already
     freed by the first completion is ignored."""
