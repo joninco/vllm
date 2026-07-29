@@ -55,7 +55,6 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.deepseek_v4_compressor_warmup import (
     deepseek_v4_compressor_triton_warmup,
 )
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -89,6 +88,16 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+def kernel_warmup(worker: "Worker") -> None:
+    """Run kernel warmup without importing its CUDA dependencies on preload."""
+    from vllm.model_executor.warmup.kernel_warmup import (
+        kernel_warmup as run_kernel_warmup,
+    )
+
+    run_kernel_warmup(worker)
+
 
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
