@@ -2849,7 +2849,18 @@ class Scheduler(SchedulerInterface):
                     req_id,
                 )
                 continue
-            self._free_blocks(req)
+            if RequestStatus.is_finished(req.status):
+                self._free_blocks(req)
+            else:
+                # A stale completion must never release blocks still owned by
+                # a live request.
+                logger.warning(
+                    "Finished sending KV transfer for request %s in "
+                    "unexpected status %s; ignoring late/duplicate "
+                    "completion.",
+                    req_id,
+                    req.status,
+                )
 
     def _update_requests_with_invalid_blocks(
         self,
