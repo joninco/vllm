@@ -7,10 +7,12 @@ from types import SimpleNamespace
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 
 class _TestSpeculator(AutoRegressiveSpeculator):
@@ -80,3 +82,87 @@ def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
 
     assert actual_logits_hidden is hidden
     assert actual_feedback_hidden is hidden
+
+
+def test_probabilistic_draft_sampler_owns_disjoint_philox_offset(monkeypatch):
+    captured = {}
+
+    def fake_gumbel_sample(
+        logits,
+        idx_mapping,
+        temperature,
+        seeds,
+        positions,
+        **kwargs,
+    ):
+        captured["positions"] = positions
+        captured.update(kwargs)
+        return torch.zeros(logits.shape[0], dtype=torch.int64)
+
+    monkeypatch.setattr(base_spec_module, "gumbel_sample", fake_gumbel_sample)
+    positions = torch.tensor([12, 99], dtype=torch.int64)
+    active_rows = torch.tensor(2, dtype=torch.int32)
+    speculator = object.__new__(_TestSpeculator)
+    speculator.use_fp64_gumbel = False
+
+    speculator._sample_probabilistic_draft(
+        logits=torch.zeros(2, 5),
+        positions=positions,
+        idx_mapping=torch.arange(2),
+        temperature=torch.ones(2),
+        seeds=torch.tensor([7, 11], dtype=torch.int64),
+        draft_step=torch.tensor(0, dtype=torch.int64),
+        draft_logits=torch.empty(2, 5),
+        active_rows=active_rows,
+    )
+
+    torch.testing.assert_close(
+        captured["positions"], positions + 1 + (1 << 30), rtol=0, atol=0
+    )
+    assert captured["apply_temperature"] is True
+    assert captured["output_processed_logits_active_rows"] is active_rows
+
+
+def test_ar_probabilistic_draft_uses_shared_sampler(monkeypatch):
+    captured = {}
+
+    def fake_sample_probabilistic_draft(
+        self,
+        logits,
+        positions,
+        idx_mapping,
+        temperature,
+        seeds,
+        draft_step,
+        draft_logits,
+        active_rows=None,
+    ):
+        captured["positions"] = positions
+        captured["active_rows"] = active_rows
+        return torch.zeros(logits.shape[0], dtype=torch.int64)
+
+    monkeypatch.setattr(
+        DraftModelSpeculator,
+        "_sample_probabilistic_draft",
+        fake_sample_probabilistic_draft,
+    )
+    speculator = object.__new__(_TestSpeculator)
+    speculator.model = SimpleNamespace(
+        compute_logits=lambda hidden_states: torch.zeros(hidden_states.shape[0], 5)
+    )
+    speculator.active_num_reqs = torch.tensor(2, dtype=torch.int32)
+    speculator.use_fp64_gumbel = False
+    positions = torch.tensor([12, 99], dtype=torch.int64)
+
+    speculator.sample_draft(
+        hidden_states=torch.zeros(2, 3),
+        positions=positions,
+        idx_mapping=torch.arange(2),
+        temperature=torch.ones(2),
+        seeds=torch.tensor([7, 11], dtype=torch.int64),
+        draft_step=torch.tensor(0, dtype=torch.int64),
+        draft_logits=torch.empty(2, 5),
+    )
+
+    assert captured["positions"] is positions
+    assert captured["active_rows"] is speculator.active_num_reqs

@@ -353,6 +353,31 @@ class DraftModelSpeculator(BaseSpeculator):
         logits = self.model.compute_logits(hidden_states)
         return logits.argmax(dim=-1)
 
+    def _sample_probabilistic_draft(
+        self,
+        logits: torch.Tensor,
+        positions: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_step: torch.Tensor,
+        draft_logits: torch.Tensor,
+        active_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Sample a draft from a stream disjoint from verifier recovery."""
+        return gumbel_sample(
+            logits,
+            idx_mapping,
+            temperature,
+            seeds,
+            draft_gumbel_pos(positions),
+            apply_temperature=True,
+            output_processed_logits=draft_logits,
+            output_processed_logits_col=draft_step,
+            output_processed_logits_active_rows=active_rows,
+            use_fp64=self.use_fp64_gumbel,
+        )
+
     def sample_draft(
         self,
         hidden_states: torch.Tensor,
@@ -365,16 +390,14 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
-            return gumbel_sample(
-                logits,
-                idx_mapping,
-                temperature,
-                seeds,
-                draft_gumbel_pos(positions),
-                apply_temperature=True,
-                output_processed_logits=draft_logits,
-                output_processed_logits_col=draft_step,
-                use_fp64=self.use_fp64_gumbel,
+            return self._sample_probabilistic_draft(
+                logits=logits,
+                positions=positions,
+                idx_mapping=idx_mapping,
+                temperature=temperature,
+                seeds=seeds,
+                draft_step=draft_step,
+                draft_logits=draft_logits,
             )
         return self._greedy_sample_draft(hidden_states)
 
