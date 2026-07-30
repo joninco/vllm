@@ -151,6 +151,9 @@ class _Harness:
         exl3_module._RANK_SLICED_RUNTIMES.clear()
         return False
 
+    def planned_caps(self):
+        return self.api.planned
+
 
 def _apply(method, layer, m):
     x = torch.zeros((m, HIDDEN), dtype=torch.bfloat16)
@@ -282,5 +285,5 @@ if __name__ == "__main__":
     test_dual_plan_construction_and_dispatch()
     test_prefill_trellis_disabled_restores_parity()
     test_prefill_block_m_env_override()
-    test_parity_path_guarded_against_capture()
+    test_explicit_parity_path_guarded_against_capture()
     print("EXL3_PREFILL_PLAN_TESTS_OK")
