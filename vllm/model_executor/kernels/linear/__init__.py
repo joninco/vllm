@@ -160,6 +160,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
 from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
     B12xFp8BlockScaledMMKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
+    B12xTensorFP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
     CPUFp8BlockScaledMMKernel,
     CPUInt8ScaledMMLinearKernel,
@@ -227,6 +230,7 @@ def _get_linear_backend() -> str:
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "b12x": {
         B12xFp8BlockScaledMMKernel,
+        B12xTensorFP8ScaledMMLinearKernel,
         B12xMxFp4LinearKernel,
         B12xMxfp8LinearKernel,
         B12xNvFp4LinearKernel,
@@ -341,6 +345,7 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
 # in priority/performance order (when available)
 _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xTensorFP8ScaledMMLinearKernel,
         MarlinFP8ScaledMMLinearKernel,
         FlashInferFP8ScaledMMLinearKernel,
         CutlassFP8ScaledMMLinearKernel,
@@ -575,21 +580,20 @@ def choose_scaled_mm_linear_kernel(
 
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()
-    b12x_fp8_gemm_required = (
-        envs.VLLM_USE_B12X_FP8_GEMM and B12xFp8BlockScaledMMKernel in platform_kernels
-    )
+    b12x_candidates = _filter_kernels_by_backend("b12x", platform_kernels)
+    b12x_fp8_gemm_required = envs.VLLM_USE_B12X_FP8_GEMM and bool(b12x_candidates)
     if b12x_fp8_gemm_required:
-        if force_kernel is not None and force_kernel is not B12xFp8BlockScaledMMKernel:
+        if force_kernel is not None and force_kernel not in b12x_candidates:
             raise ValueError(
-                "VLLM_USE_B12X_FP8_GEMM requires B12xFp8BlockScaledMMKernel "
-                f"for block-FP8 linear layers, got {force_kernel.__name__}."
+                "VLLM_USE_B12X_FP8_GEMM requires a B12X kernel for this "
+                f"linear layer, got {force_kernel.__name__}."
             )
         if linear_backend not in ("auto", "b12x"):
             raise ValueError(
                 "VLLM_USE_B12X_FP8_GEMM requires --linear-backend=auto or b12x "
-                f"for block-FP8 linear layers, got {linear_backend}."
+                f"for FP8 linear layers, got {linear_backend}."
             )
-        platform_kernels = [cast(type[_KernelT], B12xFp8BlockScaledMMKernel)]
+        platform_kernels = [cast(type[_KernelT], kernel) for kernel in b12x_candidates]
     elif linear_backend != "auto":
         filtered = _filter_kernels_by_backend(linear_backend, platform_kernels)
         if not filtered:
@@ -1149,4 +1153,5 @@ __all__ = [
     "DeepGemmFp8BlockScaledMMKernel",
     "FlashInferFp8DeepGEMMDynamicBlockScaledKernel",
     "B12xFp8BlockScaledMMKernel",
+    "B12xTensorFP8ScaledMMLinearKernel",
 ]

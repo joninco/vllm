@@ -19,6 +19,9 @@ from vllm.model_executor.kernels.attention.b12x_mxfp8_bmm import (
     warmup_fused_mla_query,
 )
 from vllm.model_executor.kernels.linear.mxfp8.b12x import warmup_b12x_mxfp8_linear
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
+    warmup_b12x_tensor_fp8_linear,
+)
 from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
 from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
     warmup_b12x_sparse_indexer,
@@ -303,6 +306,22 @@ def kernel_warmup(worker: "Worker"):
     )
     if warmed_mxfp8:
         logger.info("Warmed up %d B12X MXFP8 linear GEMM signatures.", warmed_mxfp8)
+
+    warmed_tensor_fp8 = warmup_b12x_tensor_fp8_linear(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=cudagraph_capture_sizes,
+        output_dtype=getattr(
+            getattr(worker, "model_config", None),
+            "dtype",
+            torch.bfloat16,
+        ),
+    )
+    if warmed_tensor_fp8:
+        logger.info(
+            "Warmed up %d B12X tensor FP8 linear GEMM signatures.",
+            warmed_tensor_fp8,
+        )
 
     warmed_mla_bmm = warmup_b12x_mla_mxfp8_bmm(worker.get_model())
     if warmed_mla_bmm:
