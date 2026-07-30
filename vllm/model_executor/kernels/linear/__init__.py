@@ -173,6 +173,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
 from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
     B12xFp8BlockScaledMMKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
+    B12xTensorFP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
     CPUFp8BlockScaledMMKernel,
     CPUInt8ScaledMMLinearKernel,
@@ -241,6 +244,7 @@ def _get_linear_backend() -> str:
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "b12x": {
         B12xFp8BlockScaledMMKernel,
+        B12xTensorFP8ScaledMMLinearKernel,
         B12xMxFp4LinearKernel,
         B12xMxfp8LinearKernel,
         B12xNvFp4LinearKernel,
@@ -391,6 +395,7 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
 # in priority/performance order (when available)
 _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xTensorFP8ScaledMMLinearKernel,
         MarlinFP8ScaledMMLinearKernel,
         FlashInferFP8ScaledMMLinearKernel,
         CutlassFP8ScaledMMLinearKernel,
@@ -1255,4 +1260,5 @@ __all__ = [
     "DeepGemmFp8BlockScaledMMKernel",
     "FlashInferFp8DeepGEMMDynamicBlockScaledKernel",
     "B12xFp8BlockScaledMMKernel",
+    "B12xTensorFP8ScaledMMLinearKernel",
 ]

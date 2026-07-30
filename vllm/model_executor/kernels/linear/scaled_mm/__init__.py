@@ -7,6 +7,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
 from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
     B12xFp8BlockScaledMMKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
+    B12xTensorFP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
     Fp8BlockScaledMMLinearKernel,
 )
@@ -72,4 +75,5 @@ __all__ = [
     "CPUFp8BlockScaledMMKernel",
     "XPUFp8BlockScaledMMKernel",
     "B12xFp8BlockScaledMMKernel",
+    "B12xTensorFP8ScaledMMLinearKernel",
 ]

@@ -12,6 +12,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.kernels.linear import (
     _LINEAR_BACKEND_KERNEL_MAP,
+    _POSSIBLE_FP8_KERNELS,
     _POSSIBLE_MXFP8_KERNELS,
     init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
@@ -30,8 +31,13 @@ from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
     B12xFp8BlockScaledMMKernel,
     _b12x_fp8_block_scaled_linear,
 )
-from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
-    FlashInferFP8ScaledMMLinearKernel,
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
+    B12xTensorFP8ScaledMMLinearKernel,
+    _b12x_tensor_fp8_linear,
+    warmup_b12x_tensor_fp8_linear,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    FP8ScaledMMLinearLayerConfig,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
@@ -49,7 +55,12 @@ def test_b12x_backend_maps_mxfp8_kernel() -> None:
     assert B12xMxfp8LinearKernel in _POSSIBLE_MXFP8_KERNELS[PlatformEnum.CUDA]
 
 
-def test_b12x_backend_falls_back_for_per_tensor_fp8(
+def test_b12x_backend_maps_tensor_fp8_kernel() -> None:
+    assert B12xTensorFP8ScaledMMLinearKernel in _LINEAR_BACKEND_KERNEL_MAP["b12x"]
+    assert B12xTensorFP8ScaledMMLinearKernel in _POSSIBLE_FP8_KERNELS[PlatformEnum.CUDA]
+
+
+def test_b12x_backend_selects_per_tensor_fp8(
     monkeypatch,
     default_vllm_config,
 ) -> None:
@@ -58,12 +69,12 @@ def test_b12x_backend_falls_back_for_per_tensor_fp8(
     monkeypatch.setattr(linear_mod.current_platform, "_enum", PlatformEnum.CUDA)
     monkeypatch.setattr(linear_mod, "_get_linear_backend", lambda: "b12x")
     monkeypatch.setattr(
-        FlashInferFP8ScaledMMLinearKernel,
+        B12xTensorFP8ScaledMMLinearKernel,
         "is_supported",
         classmethod(lambda cls, compute_capability=None: (True, None)),
     )
     monkeypatch.setattr(
-        FlashInferFP8ScaledMMLinearKernel,
+        B12xTensorFP8ScaledMMLinearKernel,
         "can_implement",
         classmethod(lambda cls, config: (True, None)),
     )
@@ -76,7 +87,297 @@ def test_b12x_backend_falls_back_for_per_tensor_fp8(
         weight_shape=(2048, 2048),
     )
 
-    assert isinstance(kernel, FlashInferFP8ScaledMMLinearKernel)
+    assert isinstance(kernel, B12xTensorFP8ScaledMMLinearKernel)
+
+
+def test_b12x_tensor_fp8_env_selects_kernel_with_auto_backend(
+    monkeypatch,
+    default_vllm_config,
+) -> None:
+    import vllm.model_executor.kernels.linear as linear_mod
+
+    monkeypatch.setattr(linear_mod.current_platform, "_enum", PlatformEnum.CUDA)
+    monkeypatch.setattr(linear_mod, "_get_linear_backend", lambda: "auto")
+    monkeypatch.setattr(linear_mod.envs, "VLLM_USE_B12X_FP8_GEMM", True)
+    monkeypatch.setattr(
+        B12xTensorFP8ScaledMMLinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (True, None)),
+    )
+    monkeypatch.setattr(
+        B12xTensorFP8ScaledMMLinearKernel,
+        "can_implement",
+        classmethod(lambda cls, config: (True, None)),
+    )
+
+    kernel = init_fp8_linear_kernel(
+        activation_quant_key=kFp8StaticTensorSym,
+        weight_quant_key=kFp8StaticTensorSym,
+        input_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        weight_shape=(2048, 2048),
+    )
+
+    assert isinstance(kernel, B12xTensorFP8ScaledMMLinearKernel)
+
+
+def test_b12x_tensor_fp8_can_implement_static_tensor_only(monkeypatch) -> None:
+    import vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor as b12x_mod
+
+    monkeypatch.setattr(b12x_mod, "_current_linear_backend", lambda: "b12x")
+    config = FP8ScaledMMLinearLayerConfig(
+        activation_quant_key=kFp8StaticTensorSym,
+        weight_quant_key=kFp8StaticTensorSym,
+        weight_shape=(64, 128),
+        input_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+    )
+
+    can_implement, reason = B12xTensorFP8ScaledMMLinearKernel.can_implement(config)
+
+    assert can_implement
+    assert reason is None
+
+
+def test_b12x_tensor_fp8_process_weights_packs_modelopt_layout(
+    monkeypatch,
+) -> None:
+    import vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor as b12x_mod
+
+    calls = []
+    packed = types.SimpleNamespace(out_features=64)
+
+    def pack(weight: torch.Tensor, output_scale: torch.Tensor):
+        calls.append((weight, output_scale))
+        return packed
+
+    monkeypatch.setattr(
+        b12x_mod,
+        "_import_b12x_tensor_fp8",
+        lambda: types.SimpleNamespace(pack_weight=pack),
+    )
+    vllm_config = VllmConfig()
+    monkeypatch.setattr(
+        b12x_mod, "get_current_vllm_config_or_none", lambda: vllm_config
+    )
+
+    layer = torch.nn.Module()
+    layer.prefix = "model.layers.0.self_attn.qkv_proj"
+    original_weight = (
+        torch.randn((128, 64), dtype=torch.float32).clamp(-4, 4).to(torch.float8_e4m3fn)
+    )
+    layer.weight = torch.nn.Parameter(original_weight, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(torch.tensor(0.25), requires_grad=False)
+    layer.input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+    kernel = object.__new__(B12xTensorFP8ScaledMMLinearKernel)
+    kernel.config = types.SimpleNamespace(weight_shape=(64, 128))
+    kernel.layer_param_names = (
+        "weight",
+        "weight_scale",
+        "input_scale",
+        "input_scale_ub",
+    )
+
+    kernel.process_weights_after_loading(layer)
+
+    assert layer.b12x_tensor_fp8_packed_weight is packed
+    assert vllm_config.compilation_config.static_forward_context[layer.prefix] is layer
+    assert len(calls) == 1
+    weight, output_scale = calls[0]
+    torch.testing.assert_close(weight, original_weight.T.contiguous())
+    torch.testing.assert_close(output_scale, torch.tensor([0.125]))
+
+
+def test_b12x_tensor_fp8_apply_quantizes_and_uses_packed_weight(
+    monkeypatch,
+) -> None:
+    import vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor as b12x_mod
+
+    calls = []
+
+    def mm(
+        source: torch.Tensor,
+        packed_weight,
+        *,
+        bias: torch.Tensor | None = None,
+        out_dtype: torch.dtype,
+        expected_m: int,
+        stream: object,
+    ) -> torch.Tensor:
+        del stream
+        calls.append((source, packed_weight, bias, out_dtype, expected_m))
+        return torch.full(
+            (source.shape[0], packed_weight.out_features),
+            3.0,
+            dtype=out_dtype,
+        )
+
+    monkeypatch.setattr(
+        b12x_mod,
+        "_import_b12x_tensor_fp8",
+        lambda: types.SimpleNamespace(mm=mm),
+    )
+    monkeypatch.setattr(
+        b12x_mod,
+        "current_stream",
+        lambda: types.SimpleNamespace(cuda_stream=object()),
+    )
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+
+    layer = torch.nn.Module()
+    packed = types.SimpleNamespace(out_features=48)
+    layer.b12x_tensor_fp8_packed_weight = packed
+    layer.weight = torch.nn.Parameter(
+        torch.empty((128, 48), dtype=torch.float8_e4m3fn),
+        requires_grad=False,
+    )
+    layer.weight_scale = torch.nn.Parameter(torch.tensor(0.25), requires_grad=False)
+    layer.input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+    x = torch.empty((2, 3, 128), dtype=torch.bfloat16)
+    x_q = torch.empty((6, 128), dtype=torch.float8_e4m3fn)
+    bias = torch.empty((48,), dtype=torch.bfloat16)
+    kernel = object.__new__(B12xTensorFP8ScaledMMLinearKernel)
+    kernel.config = types.SimpleNamespace(out_dtype=torch.bfloat16)
+    kernel.layer_param_names = (
+        "weight",
+        "weight_scale",
+        "input_scale",
+        "input_scale_ub",
+    )
+    kernel.quant_fp8 = lambda source, scale, scale_ub: (x_q, scale)
+
+    output = kernel.apply_weights(layer, x, bias)
+
+    assert output.shape == (2, 3, 48)
+    assert output.dtype == torch.bfloat16
+    assert len(calls) == 1
+    source, called_packed, called_bias, out_dtype, expected_m = calls[0]
+    assert source.data_ptr() == x_q.data_ptr()
+    assert called_packed is packed
+    assert called_bias is bias
+    assert out_dtype == torch.bfloat16
+    assert expected_m == 6
+
+
+def test_b12x_tensor_fp8_custom_op_body_uses_forward_context(monkeypatch) -> None:
+    import vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor as b12x_mod
+
+    calls = []
+
+    def mm(
+        source: torch.Tensor,
+        packed_weight,
+        *,
+        bias: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        expected_m: int,
+        stream: object,
+    ) -> torch.Tensor:
+        del stream
+        calls.append((source, packed_weight, bias, out_dtype, expected_m))
+        return torch.full(
+            (source.shape[0], packed_weight.out_features),
+            5.0,
+            dtype=out_dtype,
+        )
+
+    monkeypatch.setattr(
+        b12x_mod,
+        "_import_b12x_tensor_fp8",
+        lambda: types.SimpleNamespace(mm=mm),
+    )
+    monkeypatch.setattr(
+        b12x_mod,
+        "current_stream",
+        lambda: types.SimpleNamespace(cuda_stream=object()),
+    )
+
+    layer = torch.nn.Module()
+    layer.prefix = "model.layers.2.self_attn.qkv_proj"
+    packed = types.SimpleNamespace(out_features=32)
+    layer.b12x_tensor_fp8_packed_weight = packed
+    x_q = torch.empty((2, 3, 128), dtype=torch.float8_e4m3fn)
+    bias = torch.empty((32,), dtype=torch.bfloat16)
+    vllm_config = VllmConfig()
+    vllm_config.compilation_config.static_forward_context[layer.prefix] = layer
+
+    with set_forward_context({}, vllm_config):
+        output = _b12x_tensor_fp8_linear(
+            x_q,
+            bias,
+            layer.prefix,
+            32,
+            torch.bfloat16,
+        )
+
+    assert output.shape == (2, 3, 32)
+    assert len(calls) == 1
+    source, called_packed, called_bias, out_dtype, expected_m = calls[0]
+    assert source.shape == (6, 128)
+    assert called_packed is packed
+    assert called_bias is bias
+    assert out_dtype == torch.bfloat16
+    assert expected_m == 6
+    torch.testing.assert_close(output, torch.full_like(output, 5.0))
+
+
+def test_warmup_b12x_tensor_fp8_dedupes_weight_signatures(monkeypatch) -> None:
+    import vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor as b12x_mod
+
+    calls = []
+
+    def prewarm(packed_weight, token_counts, *, out_dtype, stream):
+        del stream
+        calls.append((packed_weight, tuple(token_counts), out_dtype))
+        return len(tuple(token_counts))
+
+    platform = types.SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability_family=lambda family: family == 120,
+    )
+    monkeypatch.setattr(b12x_mod, "current_platform", platform)
+    monkeypatch.setattr(b12x_mod, "_b12x_tensor_fp8_enabled", lambda: True)
+    monkeypatch.setattr(
+        b12x_mod,
+        "_import_b12x_tensor_fp8",
+        lambda: types.SimpleNamespace(prewarm=prewarm),
+    )
+    monkeypatch.setattr(
+        b12x_mod,
+        "current_stream",
+        lambda: types.SimpleNamespace(cuda_stream=object()),
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
+
+    def packed(in_features: int, padded_in_features: int, out_features: int):
+        return types.SimpleNamespace(
+            in_features=in_features,
+            padded_in_features=padded_in_features,
+            out_features=out_features,
+            values=torch.empty(1),
+        )
+
+    packed_a = packed(128, 128, 256)
+    packed_b = packed(160, 256, 512)
+    modules = [
+        types.SimpleNamespace(b12x_tensor_fp8_packed_weight=packed_a),
+        types.SimpleNamespace(b12x_tensor_fp8_packed_weight=packed_a),
+        types.SimpleNamespace(b12x_tensor_fp8_packed_weight=packed_b),
+        types.SimpleNamespace(),
+    ]
+    model = types.SimpleNamespace(modules=lambda: iter(modules))
+
+    warmed = warmup_b12x_tensor_fp8_linear(
+        model,
+        max_tokens=2048,
+        cudagraph_capture_sizes=[1, 2],
+    )
+
+    assert warmed == 6
+    assert calls == [
+        (packed_a, (1, 2, 2048), torch.bfloat16),
+        (packed_b, (1, 2, 2048), torch.bfloat16),
+    ]
 
 
 def test_b12x_mxfp8_explicit_backend_selects_kernel(monkeypatch) -> None:
