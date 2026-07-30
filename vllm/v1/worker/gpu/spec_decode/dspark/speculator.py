@@ -32,7 +32,6 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import triton
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.capacity import (
     build_sps_table,
@@ -40,7 +39,6 @@ from vllm.v1.worker.gpu.spec_decode.dspark.capacity import (
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
-from vllm.v1.worker.gpu.spec_decode.utils import draft_gumbel_pos
 
 
 class DSparkSpeculator(DFlashSpeculator):
@@ -214,19 +212,16 @@ class DSparkSpeculator(DFlashSpeculator):
             buf.index_copy_(1, self._d2t_scatter_index, logits.to(buf.dtype))
             logits = buf
 
-        # sample_pos is the predicted token's position Q. Key the salted draft
-        # stream at Q-1, disjoint from the verifier's acceptance and recovery
-        # streams.
-        return gumbel_sample(
-            logits,
-            idx_map,
-            self.temperature,
-            self.seeds,
-            draft_gumbel_pos(sample_pos - 2),
-            apply_temperature=True,
-            logits_cache=self.draft_logits,
-            logits_cache_col=self._step_cols[step],
-            use_fp64=self.use_fp64_gumbel,
+        # sample_pos is the predicted token's position Q. The shared sampler
+        # adds one before salting, so Q-2 keys the draft stream at Q-1.
+        return self._sample_probabilistic_draft(
+            logits=logits,
+            positions=sample_pos - 2,
+            idx_mapping=idx_map,
+            temperature=self.temperature,
+            seeds=self.seeds,
+            draft_step=self._step_cols[step],
+            draft_logits=self.draft_logits,
         )
 
     def _sample_sequential(

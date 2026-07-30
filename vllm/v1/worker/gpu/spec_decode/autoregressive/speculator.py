@@ -18,7 +18,6 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
@@ -313,7 +312,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             # The target model's attention metadata and slot mappings
             # can directly be used for draft prefill when the KV cache
             # layout matches.
-            prefill_attn_metadata = attn_metadata
+            prefill_attn_metadata: dict[str, Any] | None = attn_metadata
             prefill_slot_mappings = slot_mappings
             if rebuild_prefill_attn_metadata:
                 prefill_attn_metadata, prefill_slot_mappings = (
@@ -391,19 +390,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     ) -> torch.Tensor:
         logits = self.model.compute_logits(hidden_states)
         if draft_logits is not None:
-            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
-            # used for draft and target sampling.
-            return gumbel_sample(
-                logits,
-                idx_mapping,
-                temperature,
-                seeds,
-                positions + 1,
-                apply_temperature=True,
-                logits_cache=draft_logits,
-                logits_cache_col=draft_step,
-                logits_cache_active_rows=self.active_num_reqs,
-                use_fp64=self.use_fp64_gumbel,
+            return self._sample_probabilistic_draft(
+                logits=logits,
+                positions=positions,
+                idx_mapping=idx_mapping,
+                temperature=temperature,
+                seeds=seeds,
+                draft_step=draft_step,
+                draft_logits=draft_logits,
+                active_rows=self.active_num_reqs,
             )
         else:
             return logits.argmax(dim=-1)
