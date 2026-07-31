@@ -15,6 +15,7 @@ from vllm.v1.attention.backends.b12x_attn import (
     _kv_page_size,
     _max_page_table_width,
     _uses_b12x_dflash_attention,
+    get_b12x_paged_attention_backend,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.utils import select_common_block_size
@@ -64,6 +65,14 @@ def test_b12x_dense_backend_advertises_page128() -> None:
     assert not B12XPagedAttentionBackend.supports_block_size(32)
     assert B12XPagedAttentionBackend.get_preferred_block_size(16) == 128
     assert B12XPagedAttentionBackend.get_preferred_block_size(64) == 64
+
+
+def test_b12x_value_head_size_is_encoded_in_backend_subclass() -> None:
+    backend = get_b12x_paged_attention_backend(64)
+
+    assert backend.get_name() == "B12X_ATTN"
+    assert backend.head_size_v == 64
+    assert backend.get_impl_cls().head_size_v == 64
 
 
 def test_b12x_dense_backend_advertises_sliding_window() -> None:
