@@ -472,10 +472,11 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None
+            decode_topk = topk[:, :nd, :]
             minimax_m3_sparse_attn_decode(
                 q[:nd],
                 kv_cache,
-                topk[:, :nd, :],
+                decode_topk,
                 d.block_table,
                 d.seq_lens,
                 self.num_kv_heads,
@@ -498,10 +499,11 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         if main_md.num_prefills > 0:
             p = main_md.prefill
             assert p is not None
+            prefill_topk = topk[:, nd:num_tokens, :]
             minimax_m3_sparse_attn(
                 q[nd:],
                 kv_cache,
-                topk[:, nd:num_tokens, :],
+                prefill_topk,
                 p.block_table,
                 p.cu_seqlens_q,
                 p.seq_lens,

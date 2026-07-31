@@ -10,6 +10,7 @@ from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 
 import vllm.model_executor.layers.fused_allreduce_gemma_rms_norm as fused_ar_norm
 import vllm.model_executor.parameter as parameter_module
+import vllm.models.minimax_m3.common.sparse_attention as sparse_attention
 import vllm.models.minimax_m3.nvidia.model as minimax_model
 from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
@@ -22,6 +23,12 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.models.minimax_m3.common.indexer import _get_minimax_m3_indexer_num_heads
+from vllm.models.minimax_m3.common.sparse_attention import (
+    MiniMaxM3SparseDecodeMetadata,
+    MiniMaxM3SparseMetadata,
+    MiniMaxM3SparsePrefillMetadata,
+    MiniMaxM3SparseTritonImpl,
+)
 from vllm.models.minimax_m3.nvidia import sparse_attention_b12x
 from vllm.models.minimax_m3.nvidia.model import (
     MiniMAXGemmaRMSNorm,
@@ -602,6 +609,75 @@ def test_minimax_m3_sparse_attention_custom_op_uses_forward_context() -> None:
     assert seen_output is output
     assert seen_query_fp8 is query_fp8
     torch.testing.assert_close(output, query)
+
+
+def test_minimax_m3_triton_sparse_attention_reuses_topk_slices(monkeypatch) -> None:
+    topk = torch.arange(6, dtype=torch.int32).view(1, 3, 2)
+    decode = MiniMaxM3SparseDecodeMetadata(
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        decode_query_len=1,
+    )
+    prefill = MiniMaxM3SparsePrefillMetadata(
+        cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        context_lens=torch.tensor([0], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        max_query_len=2,
+        max_seq_len=2,
+        total_kv_blocks=1,
+    )
+    metadata = MiniMaxM3SparseMetadata(
+        seq_lens=torch.tensor([1, 2], dtype=torch.int32),
+        max_seq_len=2,
+        slot_mapping=torch.arange(3, dtype=torch.int64),
+        num_actual_tokens=3,
+        num_decodes=1,
+        num_decode_tokens=1,
+        num_prefills=1,
+        num_prefill_tokens=2,
+        decode=decode,
+        prefill=prefill,
+    )
+    monkeypatch.setattr(
+        sparse_attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layer": metadata}),
+    )
+
+    kernel_topk: list[torch.Tensor] = []
+    reports: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        sparse_attention,
+        "minimax_m3_sparse_attn_decode",
+        lambda _q, _cache, selected, *_args, **_kwargs: kernel_topk.append(selected),
+    )
+    monkeypatch.setattr(
+        sparse_attention,
+        "minimax_m3_sparse_attn",
+        lambda _q, _cache, selected, *_args, **_kwargs: kernel_topk.append(selected),
+    )
+
+    impl = object.__new__(MiniMaxM3SparseTritonImpl)
+    impl.head_size = 2
+    impl.num_heads = 1
+    impl.num_kv_heads = 1
+    impl.scale = 1.0
+    impl.use_fp8_kv = False
+    impl._maybe_log_sparse_stats = lambda **kwargs: reports.append(kwargs["topk"])
+    layer = SimpleNamespace(layer_name="layer", topk_indices_buffer=topk)
+
+    output = torch.empty((3, 2))
+    result = impl.forward(layer, torch.empty((3, 2)), torch.empty(0), output)
+
+    assert result is output
+    assert len(kernel_topk) == 2
+    torch.testing.assert_close(kernel_topk[0], topk[:, :1, :])
+    torch.testing.assert_close(kernel_topk[1], topk[:, 1:, :])
+    assert reports[0] is kernel_topk[0]
+    assert reports[1] is kernel_topk[1]
 
 
 def test_b12x_msa_triton_compare_budget_is_process_global(monkeypatch) -> None:
