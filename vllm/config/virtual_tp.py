@@ -717,7 +717,15 @@ def _is_supported_b12x_virtual_tp_config(model_config: ModelConfig) -> bool:
         or _is_deepseek_v4_config(model_config)
         or _is_sparse_mla_config(model_config)
         or _is_minimax_m3_config(model_config)
+        or _is_kimi_k3_config(model_config)
     )
+
+
+def _is_kimi_k3_config(model_config: ModelConfig) -> bool:
+    for config in _iter_virtual_tp_configs(model_config):
+        if getattr(config, "model_type", None) in {"kimi_k3", "kimi_linear"}:
+            return True
+    return False
 
 
 def _uses_native_b12x_moe(vllm_config: VllmConfig) -> bool:

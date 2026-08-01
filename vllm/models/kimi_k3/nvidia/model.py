@@ -6,6 +6,7 @@ import math
 from collections.abc import Iterable
 from typing import Any, cast
 
+import regex as re
 import torch
 from torch import nn
 
@@ -1291,6 +1292,19 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             )
         else:
             expert_params_mapping = []
+        expert_dispatch: dict[tuple[int, str], tuple[str, str, int, str]] = {}
+        for mapping_entry in expert_params_mapping:
+            expert_param_name, expert_weight_name, expert_id, expert_shard_id = (
+                mapping_entry
+            )
+            match = re.fullmatch(r"experts\.(\d+)\.(w[123])\.", expert_weight_name)
+            if match is not None:
+                expert_dispatch[(int(match.group(1)), match.group(2))] = (
+                    expert_param_name,
+                    expert_weight_name,
+                    expert_id,
+                    expert_shard_id,
+                )
         params_dict = dict(self.named_parameters())
 
         # Under the MXFP4 quant interface the routed experts register unpacked
@@ -1308,6 +1322,37 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 continue
             if experts_unpacked and name.endswith(".weight_packed"):
                 name = name.replace(".weight_packed", ".weight")
+
+            expert_match = re.match(
+                r"^.*\.experts\.(\d+)\.(w[123])\..+$",
+                name,
+            )
+            if expert_match is not None:
+                dispatched = expert_dispatch.get(
+                    (int(expert_match.group(1)), expert_match.group(2))
+                )
+                if dispatched is not None:
+                    (
+                        expert_param_name,
+                        expert_weight_name,
+                        expert_id,
+                        expert_shard_id,
+                    ) = dispatched
+                    name = name.replace(expert_weight_name, expert_param_name, 1)
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    param = params_dict.get(name)
+                    if param is None:
+                        continue
+                    param.weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        expert_id=expert_id,
+                        shard_id=expert_shard_id,
+                    )
+                    loaded_params.add(name)
+                    continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
