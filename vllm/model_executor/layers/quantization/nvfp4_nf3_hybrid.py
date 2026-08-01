@@ -41,10 +41,18 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
     FusedMoEQuantConfig,
+    RoutedExperts,
 )
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    is_layer_skipped,
+)
 from vllm.model_executor.utils import set_weight_attrs
 
 if TYPE_CHECKING:
@@ -74,6 +82,34 @@ _GRID188_HIDDEN = 6144
 _GRID188_INTERMEDIATE = 512
 _GRID188_NUM_KEPT = 64
 _GRID188_NUM_NF3 = 192
+
+
+def _is_dense_layer_ignored(
+    prefix: str,
+    ignored_layers: list[str],
+    fused_mapping: dict[str, list[str]],
+) -> bool:
+    """Match dense exclusions as full paths or exact path components."""
+    expanded = list(ignored_layers)
+    candidates = [prefix]
+    base, separator, projection = prefix.rpartition(".")
+    if projection in fused_mapping:
+        candidates.extend(
+            f"{base}{separator}{shard}" for shard in fused_mapping[projection]
+        )
+
+    for ignored in ignored_layers:
+        if not ignored or "." in ignored:
+            continue
+        expanded.extend(
+            candidate for candidate in candidates if ignored in candidate.split(".")
+        )
+
+    return is_layer_skipped(
+        prefix=prefix,
+        ignored_layers=expanded,
+        fused_mapping=fused_mapping,
+    )
 
 
 def _combined_tier_local_descriptors(
@@ -266,10 +302,36 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         )
         self.hybrid_bit_map: dict[str, list[int]] = hybrid_bit_map or {}
         self.kept_format = kept_format
+        self.dense_format: str | None = None
+        self.dense_ignored_layers: list[str] = []
         self.shared_runtime = _HybridSharedRuntime()
 
     def get_name(self) -> QuantizationMethods:
         return "nvfp4_nf3_hybrid"
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if isinstance(layer, RoutedExperts):
+            return self.FusedMoEMethodCls(
+                quant_config=self, moe_config=layer.moe_config
+            )
+        if isinstance(layer, LinearBase):
+            if self.dense_format == "mxfp8":
+                from vllm.model_executor.layers.quantization.fp8 import (
+                    Mxfp8SerializedLinearMethod,
+                )
+
+                if not _is_dense_layer_ignored(
+                    prefix,
+                    self.dense_ignored_layers,
+                    self.packed_modules_mapping,
+                ):
+                    return Mxfp8SerializedLinearMethod()
+                return UnquantizedLinearMethod()
+            online_method = self._get_shared_expert_online_method(
+                layer, prefix
+            ) or self._get_dense_linear_online_method(layer, prefix)
+            return online_method or UnquantizedLinearMethod()
+        return None
 
     @classmethod
     def override_quantization_method(
@@ -311,6 +373,23 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         assert isinstance(config, NvFp4Nf3HybridConfig)
         config.hybrid_bit_map = hybrid_bit_map
         config.kept_format = kept_format
+        quantization = original_config.get("quantization")
+        dense_format = original_config.get("dense_format")
+        dense_ignored_layers = original_config.get("ignored_layers")
+        if isinstance(quantization, dict):
+            dense_format = dense_format or quantization.get("dense_format")
+            dense_ignored_layers = dense_ignored_layers or quantization.get(
+                "ignored_layers"
+            )
+        if dense_format is not None:
+            if dense_format != "mxfp8":
+                raise ValueError(f"unsupported dense_format {dense_format!r}")
+            if dense_ignored_layers is not None and not isinstance(
+                dense_ignored_layers, list
+            ):
+                raise ValueError("ignored_layers must be a list")
+            config.dense_format = dense_format
+            config.dense_ignored_layers = list(dense_ignored_layers or [])
         return config
 
 
@@ -421,7 +500,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             name = name_mapped or weight_name or ""
             if "input_scale" in name:  # W4A16: activation scales are unused
                 return True
-            assert expert_id is not None
+            if expert_id is None:
+                raise ValueError(f"missing expert ID while loading {name}")
             tier, local_id = state.remap[int(expert_id)]
             family = "w13" if "w13_" in name else "w2"
             if "weight_scale_2" in name:  # NVFP4 per-tensor global (kept only)
@@ -1076,7 +1156,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             int(launch.fc2_tile_k),
             int(launch.fc2_tile_n),
             bool(launch.schedule_whole_tiles),
-            int(torch.cuda.current_stream(x.device).cuda_stream),
+            int(torch.accelerator.current_stream(x.device).cuda_stream),
         )
         return state.grid188_output[:m]
 
@@ -1180,6 +1260,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             # the -1 entries of the other tier.
             launch_expert_map = expert_map
         buffers = runtime.buffers
+        assert buffers is not None
         return run_w4a16_moe(
             x,
             prepared,
