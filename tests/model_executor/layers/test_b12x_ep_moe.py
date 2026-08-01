@@ -131,14 +131,20 @@ def test_b12x_ep_runner_uses_b12x_op_and_late_allreduce(
     )
     runner.moe_config = SimpleNamespace(
         is_sequence_parallel=False,
+        skip_final_all_reduce=False,
         tp_size=1,
         ep_size=2,
     )
     reductions = []
+
+    def all_reduce(states):
+        reductions.append(states)
+        return states.add(1)
+
     monkeypatch.setattr(
         moe_runner,
         "tensor_model_parallel_all_reduce",
-        lambda states: reductions.append(states) or states.add(1),
+        all_reduce,
     )
 
     forward_entry = runner._select_forward()
@@ -167,10 +173,15 @@ def test_b12x_ep_apply_passes_validated_map_to_separate_api(
     fake_plan = object()
     scratch = torch.empty(64, dtype=torch.uint8)
     calls = []
+
+    def plan_scratch(**kwargs):
+        calls.append(("plan", kwargs))
+        return fake_plan
+
     monkeypatch.setattr(
         b12x_ep_moe,
         "_plan_b12x_ep_moe_fp4_scratch",
-        lambda **kwargs: calls.append(("plan", kwargs)) or fake_plan,
+        plan_scratch,
     )
     monkeypatch.setattr(
         b12x_ep_moe,
@@ -236,10 +247,15 @@ def test_b12x_ep_workspace_plan_uses_global_and_local_expert_counts(
             SimpleNamespace(dtype=torch.uint8, shape=(101,)),
         ]
     )
+
+    def plan_scratch(**kwargs):
+        calls.append(kwargs)
+        return fake_plan
+
     monkeypatch.setattr(
         b12x_ep_moe,
         "_plan_b12x_ep_moe_fp4_scratch",
-        lambda **kwargs: calls.append(kwargs) or fake_plan,
+        plan_scratch,
     )
 
     shapes = experts.workspace_shapes(
@@ -349,10 +365,15 @@ def test_b12x_ep_warmup_uses_mapped_path_for_each_serving_shape(
     )
     plan_calls = []
     run_calls = []
+
+    def plan_scratch(**kwargs):
+        plan_calls.append(kwargs)
+        return fake_plan
+
     monkeypatch.setattr(
         b12x_ep_moe,
         "_plan_b12x_ep_moe_fp4_scratch",
-        lambda **kwargs: plan_calls.append(kwargs) or fake_plan,
+        plan_scratch,
     )
     monkeypatch.setattr(
         b12x_ep_moe,

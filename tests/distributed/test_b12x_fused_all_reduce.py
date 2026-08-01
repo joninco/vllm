@@ -66,12 +66,14 @@ def make_b12x_custom_allreduce(
     *,
     allreduce_max_size: int,
     fused_max_size: int,
+    world_size: int = 2,
 ) -> tuple[CustomAllreduce, MagicMock]:
     runtime = MagicMock()
     runtime.for_stream.return_value.should_allreduce.return_value = True
 
     custom_allreduce = object.__new__(CustomAllreduce)
     custom_allreduce.disabled = False
+    custom_allreduce.world_size = world_size
     custom_allreduce._pcie_runtime = runtime
     custom_allreduce._pcie_dma = None
     custom_allreduce._pcie_capture_stream = None
@@ -169,6 +171,18 @@ def test_b12x_eager_owner_fails_closed_on_second_stream_bind() -> None:
     assert [
         call.kwargs["channel_id"] for call in runtime.for_stream.call_args_list
     ] == ["vllm:eager:allreduce", "vllm:eager:allreduce"]
+
+
+def test_b12x_hierarchical_allreduce_dispatches_above_world_size_eight() -> None:
+    custom_allreduce, runtime = make_b12x_custom_allreduce(
+        allreduce_max_size=64,
+        fused_max_size=0,
+        world_size=12,
+    )
+    inp = torch.randn(2, 4)
+
+    assert custom_allreduce.should_custom_ar(inp)
+    runtime.for_stream.return_value.should_allreduce.assert_called_once_with(inp)
 
 
 def test_b12x_fused_allreduce_falls_back_above_its_cutoff() -> None:
