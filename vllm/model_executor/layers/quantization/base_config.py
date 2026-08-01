@@ -27,6 +27,9 @@ class QuantizeMethodBase(ABC):
     in process_weights_after_loading, reducing peak memory during loading.
     """
 
+    process_weights_after_loading_priority: int = 0
+    """Higher-priority methods are processed after lower-priority methods."""
+
     @abstractmethod
     def create_weights(
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs

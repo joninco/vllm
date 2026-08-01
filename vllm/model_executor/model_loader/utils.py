@@ -96,7 +96,15 @@ def initialize_model(
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
-    for _, module in model.named_modules():
+    modules = sorted(
+        model.named_modules(),
+        key=lambda named_module: getattr(
+            getattr(named_module[1], "quant_method", None),
+            "process_weights_after_loading_priority",
+            0,
+        ),
+    )
+    for _, module in modules:
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             # When quant methods need to process weights after loading

@@ -25,6 +25,8 @@ logger = init_logger(__name__)
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
+    process_weights_after_loading_priority = 100
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
         self.moe: FusedMoEConfig = moe
