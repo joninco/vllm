@@ -1001,11 +1001,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # sources with the SM10x/11x block below; set_gencode_flags_for_srcs appends
   # per-source flags, so shared files accumulate both SM12x and SM10x/11x
   # gencodes when both families are requested.
-  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-    cuda_archs_loose_intersection(FP4_SM120_ARCHS "12.0f" "${CUDA_ARCHS}")
-  else()
-    cuda_archs_loose_intersection(FP4_SM120_ARCHS "12.0a;12.1a" "${CUDA_ARCHS}")
-  endif()
+  cuda_archs_loose_intersection(FP4_SM120_ARCHS
+    "12.0a;12.1a" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND FP4_SM120_ARCHS)
     set(FP4_SM120_SRCS
       "csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu"
