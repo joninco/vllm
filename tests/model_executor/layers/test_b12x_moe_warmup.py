@@ -8,6 +8,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.b12x_moe as b12x_moe
 import vllm.model_executor.layers.fused_moe.runner.moe_runner as moe_runner
+import vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 as ct_mxfp4  # noqa: E501
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -254,6 +255,60 @@ def test_b12x_source_release_leaves_prepared_owner_as_storage_owner() -> None:
         )
         == owner_ptrs
     )
+
+
+def test_compressed_tensors_mxfp4_releases_only_superseded_scales() -> None:
+    layer = torch.nn.Module()
+    aliased_scale = torch.nn.Parameter(
+        torch.empty(8, 32, 2, dtype=torch.uint8),
+        requires_grad=False,
+    )
+    released_scale = torch.nn.Parameter(
+        torch.empty(8, 64, 1, dtype=torch.uint8),
+        requires_grad=False,
+    )
+    layer.register_parameter("w13_weight_scale", aliased_scale)
+    layer.register_parameter("w2_weight_scale", released_scale)
+    representation = SimpleNamespace(w13_scale=aliased_scale)
+    prepared = SimpleNamespace(
+        representation_for=lambda quant_mode: representation,
+    )
+    fused_experts = SimpleNamespace(
+        _lookup_prepared_experts=lambda: prepared,
+    )
+    method = object.__new__(ct_mxfp4.CompressedTensorsW4A4Mxfp4MoEMethod)
+    method.moe_kernel = SimpleNamespace(fused_experts=fused_experts)
+
+    method._release_superseded_scale_storage(layer)
+
+    assert layer.w13_weight_scale is aliased_scale
+    assert layer.w13_weight_scale.numel() > 0
+    assert layer.w2_weight_scale is released_scale
+    assert layer.w2_weight_scale.numel() == 0
+
+
+def test_compressed_tensors_situ_mxfp4_selects_b12x(monkeypatch) -> None:
+    class FakeB12xExperts:
+        pass
+
+    monkeypatch.setattr(
+        ct_mxfp4.CutlassExpertsMxfp4,
+        "_supports_current_device",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        ct_mxfp4,
+        "select_mxfp4_moe_backend",
+        lambda moe: (ct_mxfp4.Mxfp4MoeBackend.B12X, FakeB12xExperts),
+    )
+
+    method = ct_mxfp4.CompressedTensorsW4A4Mxfp4MoEMethod(
+        SimpleNamespace(activation=MoEActivation.SITU)
+    )
+
+    assert method.mxfp4_backend == ct_mxfp4.Mxfp4MoeBackend.B12X
+    assert method.experts_cls is FakeB12xExperts
+    assert not method.use_cutlass_mxfp4
 
 
 def test_b12x_moe_warmup_uses_minimax_swiglu_params(monkeypatch) -> None:

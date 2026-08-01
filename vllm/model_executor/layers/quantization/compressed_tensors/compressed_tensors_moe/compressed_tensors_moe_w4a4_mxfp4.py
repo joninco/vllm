@@ -8,6 +8,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
+    MoEActivation,
     RoutedExperts,
     SharedExperts,
 )
@@ -28,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
+    select_mxfp4_moe_backend,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
     CompressedTensorsMoEMethod,
@@ -49,7 +51,12 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
         # use cutlass if supported, otherwise fallback to marlin for weight-only FP4
         self.use_cutlass_mxfp4 = CutlassExpertsMxfp4._supports_current_device()
         self.experts_cls: type[mk.FusedMoEExperts]
-        if self.use_cutlass_mxfp4:
+        if moe.activation is MoEActivation.SITU:
+            self.mxfp4_backend, experts_cls = select_mxfp4_moe_backend(moe)
+            assert experts_cls is not None
+            self.experts_cls = experts_cls
+            self.use_cutlass_mxfp4 = False
+        elif self.use_cutlass_mxfp4:
             logger.info_once("Using CutlassExpertsMxfp4 for MXFP4 MoE")
             self.experts_cls = CutlassExpertsMxfp4
         elif current_platform.is_xpu():
@@ -188,7 +195,7 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_scale = torch.nn.Parameter(
                 torch.stack(swizzled_w2), requires_grad=False
             )
-        elif current_platform.is_xpu():
+        elif self.mxfp4_backend == Mxfp4MoeBackend.B12X or current_platform.is_xpu():
             pass
         else:
             logger.warning_once(
@@ -207,6 +214,49 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
                 experts_cls=self.experts_cls,
                 mxfp4_backend=self.mxfp4_backend,
                 routing_tables=layer._expert_routing_tables(),
+            )
+            if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
+                self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+                self._release_superseded_scale_storage(layer)
+
+    def _release_superseded_scale_storage(self, layer: RoutedExperts) -> None:
+        assert self.moe_kernel is not None
+        fused_experts = self.moe_kernel.fused_experts
+        lookup_prepared = getattr(fused_experts, "_lookup_prepared_experts", None)
+        if lookup_prepared is None or (prepared := lookup_prepared()) is None:
+            return
+        try:
+            representation = prepared.representation_for("w4a16")
+        except (AttributeError, KeyError, ValueError):
+            return
+
+        prepared_storage = {
+            value.untyped_storage().data_ptr()
+            for field in (
+                "w13",
+                "w2",
+                "w13_scale",
+                "w2_scale",
+                "micro_w13_scale",
+                "micro_w2_scale",
+            )
+            if isinstance((value := getattr(representation, field, None)), torch.Tensor)
+        }
+        released = 0
+        for name in ("w13_weight_scale", "w2_weight_scale"):
+            scale = getattr(layer, name, None)
+            if (
+                isinstance(scale, torch.nn.Parameter)
+                and scale.numel() > 0
+                and scale.untyped_storage().data_ptr() not in prepared_storage
+            ):
+                released += scale.numel() * scale.element_size()
+                scale.data = scale.data.new_empty((0,))
+        if released:
+            logger.info_once(
+                "compressed-tensors b12x MXFP4 released %.1f MiB/layer of "
+                "superseded checkpoint scale storage",
+                released / 2**20,
             )
 
     def apply(
