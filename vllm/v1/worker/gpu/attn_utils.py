@@ -229,6 +229,7 @@ def _reshape_attention_kv_cache(
     kv_cache_shape: tuple[int, ...],
     kv_cache_stride_order: tuple[int, ...],
     num_blocks: int,
+    num_blocks_per_kv_block: int,
     packing: tuple[int, int] | None,
 ) -> torch.Tensor:
     permuted_kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
@@ -261,7 +262,10 @@ def _reshape_attention_kv_cache(
             "kv-first layouts are not supported."
         )
         dtype_size = get_dtype_size(kv_cache_spec.dtype)
-        page_stride = kv_cache_spec.page_size_bytes // dtype_size
+        assert kv_cache_spec.page_size_bytes % num_blocks_per_kv_block == 0
+        page_stride = (
+            kv_cache_spec.page_size_bytes // num_blocks_per_kv_block // dtype_size
+        )
 
         num_blocks_dim = inv_order[0]
         strides = list(torch.empty(permuted_kv_cache_shape, device="meta").stride())
@@ -366,6 +370,7 @@ def _reshape_kv_cache(
                     kv_cache_shape,
                     kv_cache_stride_order,
                     kernel_num_blocks,
+                    num_blocks_per_kv_block,
                     packing,
                 )
 
@@ -568,6 +573,7 @@ def build_attn_metadata(
         ),
     )
     exact_cached_attn_metadata: dict[tuple[Any, ...], Any] = {}
+    shared_num_computed_tokens: torch.Tensor | None = None
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -611,22 +617,34 @@ def build_attn_metadata(
             max_req_tokens=max_req_tokens,
             **common_attn_metadata_extra_kwargs,
         )
+        if (
+            shared_num_computed_tokens is not None
+            and common_attn_metadata._num_computed_tokens_cache is None
+        ):
+            common_attn_metadata._num_computed_tokens_cache = shared_num_computed_tokens
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
-            exact_cache_key = exact_attention_metadata_cache_key(
-                attn_group.kv_cache_spec,
-                type(attn_metadata_builder),
-                0,
-                common_attn_metadata,
+            can_reuse_exact_metadata = (
+                not for_cudagraph_capture
+                and attn_metadata_builder.supports_exact_metadata_reuse
+            )
+            exact_cache_key = (
+                exact_attention_metadata_cache_key(
+                    attn_group.kv_cache_spec,
+                    type(attn_metadata_builder),
+                    0,
+                    common_attn_metadata,
+                )
+                if can_reuse_exact_metadata
+                else None
             )
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
-            elif (
-                attn_metadata_builder.supports_exact_metadata_reuse
-                and exact_cache_key in exact_cached_attn_metadata
+            elif can_reuse_exact_metadata and (
+                exact_cache_key in exact_cached_attn_metadata
             ):
                 metadata = exact_cached_attn_metadata[exact_cache_key]
             else:
@@ -643,10 +661,13 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
-                if attn_metadata_builder.supports_exact_metadata_reuse:
+                if can_reuse_exact_metadata:
+                    assert exact_cache_key is not None
                     exact_cached_attn_metadata[exact_cache_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+        if shared_num_computed_tokens is None:
+            shared_num_computed_tokens = common_attn_metadata._num_computed_tokens_cache
     return attn_metadata
 
 

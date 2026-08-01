@@ -164,6 +164,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        self.block_table_tensor: torch.Tensor = torch.empty(
+            (
+                self.vllm_config.scheduler_config.max_num_seqs,
+                1 + self.kv_cache_spec.num_speculative_blocks,
+            ),
+            dtype=torch.int32,
+            device=device,
+        )
 
     def build(  # type: ignore[override]
         self,
@@ -184,6 +192,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             m.seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
+            output=self.block_table_tensor,
         )
 
         spec_sequence_masks_cpu: torch.Tensor | None = None

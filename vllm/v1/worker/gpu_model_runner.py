@@ -2558,11 +2558,18 @@ class GPUModelRunner(
                 if cascade_attn_prefix_lens
                 else 0
             )
-            exact_cache_key = exact_attention_metadata_cache_key(
-                kv_cache_spec,
-                type(builder),
-                cascade_attn_prefix_len,
-                common_attn_metadata,
+            can_reuse_exact_metadata = (
+                not for_cudagraph_capture and builder.supports_exact_metadata_reuse
+            )
+            exact_cache_key = (
+                exact_attention_metadata_cache_key(
+                    kv_cache_spec,
+                    type(builder),
+                    cascade_attn_prefix_len,
+                    common_attn_metadata,
+                )
+                if can_reuse_exact_metadata
+                else None
             )
 
             extra_attn_metadata_args = {}
@@ -2595,9 +2602,8 @@ class GPUModelRunner(
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
-            elif (
-                builder.supports_exact_metadata_reuse
-                and exact_cache_key in exact_cached_attn_metadata
+            elif can_reuse_exact_metadata and (
+                exact_cache_key in exact_cached_attn_metadata
             ):
                 attn_metadata_i = exact_cached_attn_metadata[exact_cache_key]
             elif (
@@ -2617,7 +2623,8 @@ class GPUModelRunner(
                 )
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
-                if builder.supports_exact_metadata_reuse:
+                if can_reuse_exact_metadata:
+                    assert exact_cache_key is not None
                     exact_cached_attn_metadata[exact_cache_key] = attn_metadata_i
 
             if ubid is None:
@@ -7897,6 +7904,7 @@ class GPUModelRunner(
                         kv_cache_shape,
                         kv_cache_stride_order,
                         kernel_num_blocks,
+                        num_blocks_per_kv_block,
                         packing,
                     )
 
