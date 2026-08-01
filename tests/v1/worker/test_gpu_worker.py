@@ -50,6 +50,38 @@ def test_kernel_warmup_runs_once(monkeypatch: pytest.MonkeyPatch):
     assert worker._kernel_warmup_complete is True
 
 
+def test_runtime_kernel_warmup_waits_for_kv_cache(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    worker = object.__new__(Worker)
+    worker.model_runner = SimpleNamespace()
+    calls: list[tuple[str, object]] = []
+
+    def persistent_warmup(warmed_worker: object) -> bool:
+        calls.append(("persistent", warmed_worker))
+        return False
+
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "kernel_warmup",
+        persistent_warmup,
+    )
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "runtime_kernel_warmup",
+        lambda warmed_worker: calls.append(("runtime", warmed_worker)),
+    )
+
+    worker._warmup_kernels_once()
+    worker.model_runner.block_tables = object()
+    worker._warmup_kernels_once()
+    worker._warmup_kernels_once()
+
+    assert calls == [("persistent", worker), ("runtime", worker)]
+    assert worker._kernel_warmup_complete is True
+    assert worker._runtime_kernel_warmup_complete is True
+
+
 def test_failed_kernel_warmup_is_retryable(monkeypatch: pytest.MonkeyPatch):
     worker = object.__new__(Worker)
     calls = 0
@@ -74,7 +106,7 @@ def test_memory_profile_replays_model_after_kernel_warmup(
     monkeypatch: pytest.MonkeyPatch,
 ):
     worker = object.__new__(Worker)
-    calls = []
+    calls: list[object] = []
     worker.device = "cuda:0"
     worker.model_runner = SimpleNamespace(
         profile_run=lambda: calls.append("profile"),

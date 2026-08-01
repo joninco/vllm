@@ -394,6 +394,7 @@ def test_b12x_sparse_glm_uses_8_head_alignment(
     q_rope = torch.zeros((1, num_heads, 64), dtype=torch.bfloat16, device=DEVICE_TYPE)
     kv_cache = torch.zeros((1, 64, 656), dtype=torch.uint8, device=DEVICE_TYPE)
     metadata = SimpleNamespace(
+        is_spec_decode=False,
         block_table=torch.zeros((1, 1), dtype=torch.int32, device=DEVICE_TYPE),
         block_size=64,
         cache_seq_lens_per_token=torch.full(
@@ -543,6 +544,7 @@ def test_b12x_sparse_glm_dcp_expands_heads_and_converts_topk(
     q = torch.zeros((1, gathered_heads, 576), dtype=torch.bfloat16, device=DEVICE_TYPE)
     kv_cache = torch.zeros((1, 64, 656), dtype=torch.uint8, device=DEVICE_TYPE)
     metadata = SimpleNamespace(
+        is_spec_decode=False,
         req_id_per_token=torch.zeros((1,), dtype=torch.int32, device=DEVICE_TYPE),
         page_table_1=torch.empty((1, topk), dtype=torch.int32, device=DEVICE_TYPE),
         nsa_cache_seqlens=torch.empty((1,), dtype=torch.int32, device=DEVICE_TYPE),
@@ -640,6 +642,7 @@ def test_b12x_sparse_glm_dcp_matches_unsharded_gpu(
 
     def make_metadata(local_seq_len: int, block_table: torch.Tensor):
         return SimpleNamespace(
+            is_spec_decode=False,
             req_id_per_token=torch.zeros((1,), dtype=torch.int32, device=DEVICE_TYPE),
             page_table_1=torch.empty((1, topk), dtype=torch.int32, device=DEVICE_TYPE),
             nsa_cache_seqlens=torch.empty((1,), dtype=torch.int32, device=DEVICE_TYPE),

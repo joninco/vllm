@@ -90,20 +90,29 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
-def kernel_warmup(worker: "Worker") -> None:
+def kernel_warmup(worker: "Worker") -> bool:
     """Run kernel warmup without importing its CUDA dependencies on preload.
 
     Args:
         worker: Worker whose kernels should be warmed up.
 
     Returns:
-        None.
+        Whether runtime-dependent kernel warmup also completed.
     """
     from vllm.model_executor.warmup.kernel_warmup import (
         kernel_warmup as run_kernel_warmup,
     )
 
-    run_kernel_warmup(worker)
+    return run_kernel_warmup(worker)
+
+
+def runtime_kernel_warmup(worker: "Worker") -> None:
+    """Run warmups that require the initialized KV-cache runtime state."""
+    from vllm.model_executor.warmup.kernel_warmup import (
+        runtime_kernel_warmup as run_runtime_kernel_warmup,
+    )
+
+    run_runtime_kernel_warmup(worker)
 
 
 if TYPE_CHECKING:
@@ -485,10 +494,20 @@ class Worker(WorkerBase):
 
     def _warmup_kernels_once(self) -> None:
         """Materialize persistent kernel resources before KV cache sizing."""
-        if getattr(self, "_kernel_warmup_complete", False):
-            return
-        kernel_warmup(self)
-        self._kernel_warmup_complete = True
+        if not getattr(self, "_kernel_warmup_complete", False):
+            runtime_complete = kernel_warmup(self)
+            self._kernel_warmup_complete = True
+            if runtime_complete:
+                self._runtime_kernel_warmup_complete = True
+
+        model_runner = getattr(self, "model_runner", None)
+        if (
+            model_runner is not None
+            and hasattr(model_runner, "block_tables")
+            and not getattr(self, "_runtime_kernel_warmup_complete", False)
+        ):
+            runtime_kernel_warmup(self)
+            self._runtime_kernel_warmup_complete = True
 
     def _profile_model_with_kernel_warmup(self) -> None:
         """Profile activations on top of persistent kernel allocations."""

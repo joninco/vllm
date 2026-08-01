@@ -678,6 +678,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.split_indexer_projection = _should_split_mxfp8_indexer_projection(
             quant_config, prefix
         )
+        self.indexer_qk_proj: MinimaxM3IndexerQKParallelLinear | None
         if self.split_indexer_projection:
             qkv_linear_cls = (
                 MinimaxM3QKVParallelLinear
@@ -1523,6 +1524,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
+        if intermediate_tensors is not None:
+            input_ids = None
+            inputs_embeds = None
+        elif inputs_embeds is None:
+            assert input_ids is not None
+            inputs_embeds = self.embed_input_ids(input_ids)
+            input_ids = None
+        else:
+            input_ids = None
+
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

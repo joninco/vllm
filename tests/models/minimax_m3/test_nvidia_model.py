@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 
 import vllm.model_executor.layers.fused_allreduce_gemma_rms_norm as fused_ar_norm
 import vllm.model_executor.parameter as parameter_module
@@ -14,6 +13,7 @@ import vllm.models.minimax_m3.common.sparse_attention as sparse_attention
 import vllm.models.minimax_m3.nvidia.model as minimax_model
 from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
+from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
@@ -674,8 +674,9 @@ def test_minimax_m3_triton_sparse_attention_reuses_topk_slices(monkeypatch) -> N
 
     assert result is output
     assert len(kernel_topk) == 2
-    torch.testing.assert_close(kernel_topk[0], topk[:, :1, :])
-    torch.testing.assert_close(kernel_topk[1], topk[:, 1:, :])
+    expected_topk = topk.transpose(0, 1)
+    torch.testing.assert_close(kernel_topk[0], expected_topk[:, :1, :])
+    torch.testing.assert_close(kernel_topk[1], expected_topk[:, 1:, :])
     assert reports[0] is kernel_topk[0]
     assert reports[1] is kernel_topk[1]
 

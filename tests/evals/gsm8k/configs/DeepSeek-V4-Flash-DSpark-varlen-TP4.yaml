@@ -11,7 +11,7 @@ server_args: >-
   --tensor-parallel-size 4
   --enable-expert-parallel
   --block-size 256
-  --gpu-memory-utilization 0.5
+  --gpu-memory-utilization 0.6
   --kv-cache-dtype fp8
   --max-num-batched-tokens 16384
   --max-num-seqs 32

@@ -114,6 +114,10 @@ def test_dflash_draft_kv_groups_keep_hybrid_tensor_sharing():
     vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(method="dflash"),
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
         kv_transfer_config=None,
     )
     kv_cache_groups = [

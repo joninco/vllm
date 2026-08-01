@@ -77,6 +77,7 @@ def test_resolve_flashinfer_autotune_file_uses_override_dir(
 def _flashinfer_autotune_worker(model, *, attn_groups=None):
     runner = SimpleNamespace(
         attn_groups=attn_groups or [],
+        block_tables=object(),
         is_pooling_model=True,
     )
     return SimpleNamespace(
@@ -464,3 +465,27 @@ def test_kernel_warmup_runs_flashinfer_autotune_for_model_kernel(
     kernel_warmup.kernel_warmup(worker)
 
     assert calls == [worker.model_runner]
+
+
+def test_kernel_warmup_defers_flashinfer_autotune_until_kv_cache(
+    monkeypatch,
+) -> None:
+    calls = _patch_flashinfer_autotune_deps(monkeypatch)
+    flashinfer_kernel_cls = type(
+        "FlashInferKernel",
+        (),
+        {"__module__": "vllm.model_executor.kernels.linear.scaled_mm.flashinfer"},
+    )
+
+    class ModuleWithKernel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quant_method = SimpleNamespace(
+                scheme=SimpleNamespace(fp8_linear=flashinfer_kernel_cls())
+            )
+
+    worker = _flashinfer_autotune_worker(ModuleWithKernel())
+    del worker.model_runner.block_tables
+
+    assert kernel_warmup.kernel_warmup(worker) is False
+    assert calls == []

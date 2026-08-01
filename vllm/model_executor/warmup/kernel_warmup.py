@@ -262,7 +262,7 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
     return len(warmed_signatures)
 
 
-def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool:
     if not worker.use_v2_model_runner:
         # Pooling models do not use the generation slot-mapping path.
         if not worker.model_runner.is_pooling_model:
@@ -315,7 +315,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         cutedsl_warmup()
 
     if process_local_only:
-        return
+        return False
 
     warmed_dcp_a2a = _warmup_b12x_dcp_a2a(worker)
     if warmed_dcp_a2a:
@@ -412,6 +412,19 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     )
 
     minimax_m3_msa_warmup(worker)
+
+    if not hasattr(worker.model_runner, "block_tables"):
+        logger.info_once(
+            "Deferring runtime-dependent kernel warmup until KV cache initialization."
+        )
+        return False
+
+    runtime_kernel_warmup(worker)
+    return True
+
+
+def runtime_kernel_warmup(worker: "Worker") -> None:
+    """Warm kernels whose dummy runs require initialized KV-cache state."""
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune

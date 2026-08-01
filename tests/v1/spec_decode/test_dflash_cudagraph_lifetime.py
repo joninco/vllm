@@ -200,3 +200,46 @@ def test_dflash_context_precompute_keeps_eager_fallback():
     assert args[1].data_ptr() == context_positions.data_ptr()
     assert args[1].shape == (3,)
     assert args[2] is context_slots
+
+
+def test_dflash_input_warmup_copies_sampling_state(monkeypatch):
+    temperature = torch.ones(2)
+    seeds = torch.zeros(2, dtype=torch.int64)
+    speculator = SimpleNamespace(
+        draft_kv_cache_group_id=0,
+        draft_kv_cache_group_ids=[0],
+        num_query_per_req=2,
+        dynamic_physical_depth=False,
+        max_num_reqs=2,
+        max_num_tokens=2048,
+        max_model_len=4096,
+        device=torch.device("cpu"),
+        input_buffers=object(),
+        block_tables=SimpleNamespace(
+            slot_mappings=[object()],
+            input_block_tables=[object()],
+            kernel_block_sizes=[16],
+        ),
+        context_positions=object(),
+        _context_slot_mappings=[object()],
+        sample_indices=object(),
+        sample_pos=object(),
+        sample_idx_mapping=object(),
+        temperature=temperature,
+        seeds=seeds,
+        num_cached_tokens=object(),
+        parallel_drafting_token_id=1,
+        sample_from_anchor=False,
+        _speculative_steps_for_query_len=lambda query_len: query_len - 1,
+    )
+    prepare_inputs = Mock()
+    monkeypatch.setattr(spec_module, "prepare_dflash_inputs", prepare_inputs)
+
+    DFlashSpeculator._warmup_prepare_inputs_kernel(speculator)
+
+    assert prepare_inputs.call_count == 5
+    for call in prepare_inputs.call_args_list:
+        assert call.args[7] is temperature
+        assert call.args[8] is seeds
+        assert call.args[14] is temperature
+        assert call.args[15] is seeds

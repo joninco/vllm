@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import torch
 
-import vllm.model_executor.layers.logits_processor as logits_processor_module
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
@@ -13,7 +12,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 
 
 class _StaticLogitsMethod:
-
     def __init__(self, logits: torch.Tensor):
         self.logits = logits
 
@@ -21,15 +19,7 @@ class _StaticLogitsMethod:
         return self.logits.clone()
 
 
-def test_get_top_tokens_masks_padding_and_maps_added_vocab(
-    monkeypatch, default_vllm_config
-):
-    monkeypatch.setattr(
-        logits_processor_module,
-        "get_tensor_model_parallel_world_size",
-        lambda: 1,
-    )
-
+def test_get_top_tokens_masks_padding_and_maps_added_vocab(default_vllm_config):
     # Local layout:
     #   [0:10]  original vocab tokens 0..9
     #   [10:12] original vocab padding
@@ -55,6 +45,7 @@ def test_get_top_tokens_masks_padding_and_maps_added_vocab(
     lm_head = SimpleNamespace(
         quant_method=_StaticLogitsMethod(logits),
         shard_indices=shard_indices,
+        tp_size=1,
     )
     hidden_states = torch.empty((3, 1))
 

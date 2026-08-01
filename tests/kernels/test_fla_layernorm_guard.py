@@ -4,7 +4,6 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from vllm.model_executor.layers.fla.ops.utils import input_guard
 
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
@@ -12,6 +11,7 @@ from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
     layernorm_fn,
     rms_norm_ref,
 )
+from vllm.third_party.flash_linear_attention.ops.utils import input_guard
 from vllm.utils.torch_utils import set_random_seed
 
 DEVICE = "xpu" if current_platform.is_xpu() else "cuda"
