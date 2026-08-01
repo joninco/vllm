@@ -26,6 +26,7 @@ launch with an expert map.
 """
 
 import dataclasses
+import os
 from typing import TYPE_CHECKING, Any
 
 import regex as re
@@ -72,9 +73,9 @@ _B12X_TILES = (64, 256, 64, 256)
 _B12X_DECODE_M = 8
 # Global scale the NF3 prepare path expects (scales are stored pre-divided).
 _NF3_GLOBAL_SCALE = 2.0**116
-# Expert-chunk size for NF3 unpack/repack (bounds transient VRAM: the int32
-# code planes are ~400 MB per 16 w13 experts at GLM-5.2 shapes).
-_NF3_PACK_CHUNK = 16
+# Expert-chunk size for NF3 unpack/repack. Kimi K3 can have less than 4 GiB of
+# headroom during preparation, so keep the transient int32 decode plane small.
+_NF3_PACK_CHUNK = 4
 # Exact one-grid decode specialization published for the TP4 hybrid checkpoint.
 _GRID188_M = 4
 _GRID188_TOPK = 8
@@ -82,6 +83,8 @@ _GRID188_HIDDEN = 6144
 _GRID188_INTERMEDIATE = 512
 _GRID188_NUM_KEPT = 64
 _GRID188_NUM_NF3 = 192
+_K3_HYBRID_HIDDEN = 3584
+_K3_HYBRID_INTERMEDIATE = 192
 
 
 def _is_dense_layer_ignored(
@@ -205,6 +208,58 @@ def _unpack_nf3_codes(packed: torch.Tensor, size_k: int) -> torch.Tensor:
     return codes.reshape(num_experts, rows, size_k)
 
 
+def _apply_nf3_codebook_override(levels: list[float]) -> None:
+    """Install the checkpoint NF3 codebook for preparation and execution."""
+    from sparkinfer.moe._shared.kernels.w4a16 import kernel as kernel_module
+    from sparkinfer.moe._shared.kernels.w4a16 import prepare as prepare_module
+
+    codebook = tuple(float(value) for value in levels)
+    if tuple(kernel_module._NF3_CODEBOOK) != codebook:
+        logger.info_once(
+            "Overriding b12x NF3 codebook with checkpoint levels: %s",
+            codebook,
+        )
+        kernel_module._NF3_CODEBOOK = codebook
+        prepare_module._NF3_CODEBOOK = codebook
+    os.environ["SPARKINFER_NF3_CODEBOOK"] = ",".join(
+        f"{value:.10g}" for value in codebook
+    )
+
+
+def _b12x_tiles_for_geometry(
+    hidden_size: int,
+    intermediate_size: int,
+) -> tuple[int, int, int, int]:
+    """Choose fixed W4A16 tiles that divide both expert GEMMs."""
+    if (
+        hidden_size == _K3_HYBRID_HIDDEN
+        and intermediate_size == _K3_HYBRID_INTERMEDIATE
+    ):
+        return (128, 64, 64, 128)
+    for tiles in (_B12X_TILES, (64, 128, 64, 128)):
+        fc1_k, fc1_n, fc2_k, fc2_n = tiles
+        if (
+            hidden_size % fc1_k == 0
+            and (2 * intermediate_size) % fc1_n == 0
+            and intermediate_size % fc2_k == 0
+            and hidden_size % fc2_n == 0
+        ):
+            return tiles
+    raise ValueError(
+        "nvfp4_nf3_hybrid has no fixed b12x tile configuration for "
+        f"hidden={hidden_size}, intermediate={intermediate_size}"
+    )
+
+
+def _decode_kquant_nf3_scale(raw: torch.Tensor) -> torch.Tensor:
+    """Interpret kquant's uint8 scale payload as biased E4M3 values."""
+    if raw.dtype == torch.uint8:
+        return raw.contiguous().view(torch.float8_e4m3fn)
+    if raw.dtype == torch.float8_e4m3fn:
+        return raw
+    raise TypeError(f"NF3 scale must be uint8/E4M3, got {raw.dtype}")
+
+
 class _HybridSharedRuntime:
     """Process-wide b12x W4A16 runtime shared by every hybrid MoE layer.
 
@@ -249,6 +304,7 @@ class _HybridLayerState:
         self.kept_mx = kept_mx
         self.num_kept = sum(1 for tier, _ in remap.values() if tier == 0)
         self.num_nf3 = sum(1 for tier, _ in remap.values() if tier == 1)
+        self.tiles = _b12x_tiles_for_geometry(hidden_size, intermediate_size)
         # b12x prepared weights (W4A16PackedWeights / PreparedNF3MoeWeights).
         self.prep_kept: Any = None
         self.prep_nf3: Any = None
@@ -271,6 +327,7 @@ class _HybridLayerState:
         # Keeps kernel-format tensors alive: b12x prepared weights VIEW the
         # converted tensors, so dropping them would dangle the views.
         self.keepalive: Any = None
+        self.prep_kept_hybrid: Any = None
         self.runtime_ready = False
 
 
@@ -302,6 +359,7 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         )
         self.hybrid_bit_map: dict[str, list[int]] = hybrid_bit_map or {}
         self.kept_format = kept_format
+        self.nf3_levels: list[float] | None = None
         self.dense_format: str | None = None
         self.dense_ignored_layers: list[str] = []
         self.shared_runtime = _HybridSharedRuntime()
@@ -374,6 +432,13 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         config.hybrid_bit_map = hybrid_bit_map
         config.kept_format = kept_format
         quantization = original_config.get("quantization")
+        nf3_levels = original_config.get("nf3_levels")
+        if nf3_levels is None and isinstance(quantization, dict):
+            nf3_levels = quantization.get("nf3_levels")
+        if nf3_levels is not None:
+            if not isinstance(nf3_levels, list) or len(nf3_levels) != 8:
+                raise ValueError("nf3_levels must contain exactly 8 dequant levels")
+            config.nf3_levels = [float(value) for value in nf3_levels]
         dense_format = original_config.get("dense_format")
         dense_ignored_layers = original_config.get("ignored_layers")
         if isinstance(quantization, dict):
@@ -444,11 +509,13 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         assert self.quant_config.is_checkpoint_nvfp4_serialized
-        if layer.activation is not MoEActivation.SILU:
+        if layer.activation not in (MoEActivation.SILU, MoEActivation.SITU):
             raise NotImplementedError(
-                "nvfp4_nf3_hybrid only supports SiLU-gated MoE layers, got "
+                "nvfp4_nf3_hybrid only supports SiLU/SiTU-gated MoE layers, got "
                 f"{layer.activation}."
             )
+        if self.quant_config.nf3_levels is not None:
+            _apply_nf3_codebook_override(self.quant_config.nf3_levels)
         bits = self._layer_bits(layer)
         kept_mx = bits is not None and self.quant_config.kept_format == "mxfp4_e8m0k32"
         if bits is None:
@@ -532,7 +599,18 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 # gate -> top half, up -> bottom half of the fused rows.
                 half = dst.shape[0] // 2
                 dst = dst[:half] if shard_id == "w1" else dst[half:]
-            dst.copy_(loaded_weight.reshape(dst.shape).to(dst.dtype))
+            if loaded_weight.numel() != dst.numel():
+                raise RuntimeError(
+                    "hybrid expert tensor shape mismatch: "
+                    f"layer={layer.layer_name}, expert={expert_id}, tier={tier}, "
+                    f"shard={shard_id}, mapped_name={name}, "
+                    f"checkpoint_shape={tuple(loaded_weight.shape)}, "
+                    f"destination_shape={tuple(dst.shape)}"
+                )
+            loaded_weight = loaded_weight.reshape(dst.shape)
+            if tier == 1 and "weight_scale" in name:
+                loaded_weight = _decode_kquant_nf3_scale(loaded_weight)
+            dst.copy_(loaded_weight.to(dst.dtype))
             return True
 
         def register(name: str, shape: tuple[int, ...], dtype=torch.uint8) -> None:
@@ -567,23 +645,43 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         # group (uint8) instead of e4m3 per group_size.
         nv_group = 32 if kept_mx else group_size
         nv_dtype = torch.uint8 if kept_mx else torch.float8_e4m3fn
-        for name, shape, dtype in (
-            ("w13_nv_scale", (num_kept, 2 * inter, hidden // nv_group), nv_dtype),
-            ("w13_nf3_scale", (num_nf3, 2 * inter, hidden // 32), torch.float8_e4m3fn),
-            ("w2_nv_scale", (num_kept, hidden, inter // nv_group), nv_dtype),
-            ("w2_nf3_scale", (num_nf3, hidden, inter // 32), torch.float8_e4m3fn),
+        for name, shape, dtype, device in (
+            (
+                "w13_nv_scale",
+                (num_kept, 2 * inter, hidden // nv_group),
+                nv_dtype,
+                None,
+            ),
+            (
+                "w13_nf3_scale",
+                (num_nf3, 2 * inter, hidden // 32),
+                torch.float8_e4m3fn,
+                "cpu",
+            ),
+            (
+                "w2_nv_scale",
+                (num_kept, hidden, inter // nv_group),
+                nv_dtype,
+                None,
+            ),
+            (
+                "w2_nf3_scale",
+                (num_nf3, hidden, inter // 32),
+                torch.float8_e4m3fn,
+                "cpu",
+            ),
         ):
-            layer.register_parameter(
-                name,
-                torch.nn.Parameter(
-                    torch.zeros(
-                        shape,
-                        dtype=dtype,
-                        device=torch.accelerator.current_device_index(),
-                    ),
-                    requires_grad=False,
+            scale = torch.nn.Parameter(
+                torch.zeros(
+                    shape,
+                    dtype=dtype,
+                    device=device or torch.accelerator.current_device_index(),
                 ),
+                requires_grad=False,
             )
+            if device == "cpu":
+                set_weight_attrs(scale, {"_vllm_keep_on_cpu": True})
+            layer.register_parameter(name, scale)
 
     def _build_kept_mxfp4(self, layer: "RoutedExperts") -> None:
         """Build the MXFP4 kept tier as a modular kernel over the kept
@@ -654,12 +752,22 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             routing_tables=None,
         )
         kernel.fused_experts.process_weights_after_loading(kept_module)
+        lookup_prepared = getattr(
+            kernel.fused_experts,
+            "_lookup_prepared_experts",
+            None,
+        )
+        if lookup_prepared is not None and (prepared := lookup_prepared()) is not None:
+            try:
+                state.prep_kept_hybrid = prepared.representation_for("w4a16")
+            except (AttributeError, KeyError, ValueError):
+                state.prep_kept_hybrid = None
         # Owning a modular kernel makes supports_internal_mk True, so vLLM's
         # post-load maybe_init_modular_kernel() returns early instead of
         # rebuilding a kernel from the (freed) standard weight attrs.
         self.moe_kernel = kernel
         kept_remap = torch.full(
-            (state.num_experts,), num_kept, dtype=torch.int32, device=device
+            (state.num_experts,), -1, dtype=torch.int32, device=device
         )
         for global_id, (tier, local_id) in state.remap.items():
             if tier == 0:
@@ -672,6 +780,40 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         # copies) so resident VRAM stays flat.
         for name in ("w13_weight", "w2_weight", "w13_nv_scale", "w2_nv_scale"):
             delattr(layer, name)
+        if state.prep_kept_hybrid is not None:
+            prepared_storage = {
+                value.untyped_storage().data_ptr()
+                for field in (
+                    "w13",
+                    "w2",
+                    "w13_scale",
+                    "w2_scale",
+                    "micro_w13_scale",
+                    "micro_w2_scale",
+                    "w13_global_scale",
+                    "w2_global_scale",
+                    "micro_w13_global_scale",
+                    "micro_w2_global_scale",
+                )
+                if isinstance(
+                    (value := getattr(state.prep_kept_hybrid, field, None)),
+                    torch.Tensor,
+                )
+            }
+            released = 0
+            for scale in (w13_scale, w2_scale):
+                if (
+                    scale.numel() > 0
+                    and scale.untyped_storage().data_ptr() not in prepared_storage
+                ):
+                    released += scale.numel() * scale.element_size()
+                    scale.data = scale.data.new_empty((0,))
+            if released:
+                logger.info_once(
+                    "nvfp4_nf3_hybrid: released %.1f MiB/layer of superseded "
+                    "MXFP4 scale storage",
+                    released / 2**20,
+                )
 
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
         """Repack both tiers into b12x W4A16 kernel formats.
@@ -709,40 +851,90 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         for global_id, (tier, local_id) in state.remap.items():
             (emap_kept if tier == 0 else emap_nf3)[global_id] = local_id
         state.emap_kept, state.emap_nf3 = emap_kept, emap_nf3
-        fc1_tile_n, fc2_tile_n = _B12X_TILES[1], _B12X_TILES[3]
+        fc1_tile_n, fc2_tile_n = state.tiles[1], state.tiles[3]
 
         if num_nf3 > 0:
-            w13_planes, w2_planes = [], []
-            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
-                codes = _unpack_nf3_codes(
-                    layer.w13_weight_packed[start : start + _NF3_PACK_CHUNK], hidden
-                )
-                w13_planes.append(
-                    _nf3_pack_code_experts(
-                        codes, size_k=hidden, size_n=2 * inter, tile_n=fc1_tile_n
-                    )
-                )
-                del codes
-            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
-                codes = _unpack_nf3_codes(
-                    layer.w2_weight_packed[start : start + _NF3_PACK_CHUNK], inter
-                )
-                w2_planes.append(
-                    _nf3_pack_code_experts(
-                        codes, size_k=inter, size_n=hidden, tile_n=fc2_tile_n
-                    )
-                )
-                del codes
-            w13_nf3 = torch.cat(w13_planes, 0).contiguous()
-            del w13_planes
-            w2_nf3 = torch.cat(w2_planes, 0).contiguous()
-            del w2_planes
-            w13_nf3_scale = _nf3_pack_scale_experts(
-                layer.w13_nf3_scale.float(), size_k=hidden, size_n=2 * inter
+
+            def drop_parameter_data(name: str) -> None:
+                parameter = getattr(layer, name)
+                parameter.data = parameter.data.new_empty((0,))
+
+            w13_words = 3 * (2 * inter) * hidden // 32
+            w13_nf3 = torch.empty(
+                (num_nf3, w13_words),
+                dtype=torch.int32,
+                device=device,
             )
-            w2_nf3_scale = _nf3_pack_scale_experts(
-                layer.w2_nf3_scale.float(), size_k=inter, size_n=hidden
+            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
+                end = min(start + _NF3_PACK_CHUNK, num_nf3)
+                codes = _unpack_nf3_codes(
+                    layer.w13_weight_packed[start:end],
+                    hidden,
+                )
+                packed = _nf3_pack_code_experts(
+                    codes,
+                    size_k=hidden,
+                    size_n=2 * inter,
+                    tile_n=fc1_tile_n,
+                )
+                w13_nf3[start:end].copy_(packed)
+                del codes, packed
+            drop_parameter_data("w13_weight_packed")
+
+            w2_words = 3 * hidden * inter // 32
+            w2_nf3 = torch.empty(
+                (num_nf3, w2_words),
+                dtype=torch.int32,
+                device=device,
             )
+            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
+                end = min(start + _NF3_PACK_CHUNK, num_nf3)
+                codes = _unpack_nf3_codes(
+                    layer.w2_weight_packed[start:end],
+                    inter,
+                )
+                packed = _nf3_pack_code_experts(
+                    codes,
+                    size_k=inter,
+                    size_n=hidden,
+                    tile_n=fc2_tile_n,
+                )
+                w2_nf3[start:end].copy_(packed)
+                del codes, packed
+            drop_parameter_data("w2_weight_packed")
+
+            w13_nf3_scale = torch.empty(
+                (num_nf3, hidden // 32, 2 * inter),
+                dtype=torch.uint8,
+                device=device,
+            )
+            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
+                end = min(start + _NF3_PACK_CHUNK, num_nf3)
+                packed = _nf3_pack_scale_experts(
+                    layer.w13_nf3_scale[start:end].to(device).float() * (2.0**-4),
+                    size_k=hidden,
+                    size_n=2 * inter,
+                )
+                w13_nf3_scale[start:end].copy_(packed)
+                del packed
+            drop_parameter_data("w13_nf3_scale")
+
+            w2_nf3_scale = torch.empty(
+                (num_nf3, inter // 32, hidden),
+                dtype=torch.uint8,
+                device=device,
+            )
+            for start in range(0, num_nf3, _NF3_PACK_CHUNK):
+                end = min(start + _NF3_PACK_CHUNK, num_nf3)
+                packed = _nf3_pack_scale_experts(
+                    layer.w2_nf3_scale[start:end].to(device).float() * (2.0**-4),
+                    size_k=inter,
+                    size_n=hidden,
+                )
+                w2_nf3_scale[start:end].copy_(packed)
+                del packed
+            drop_parameter_data("w2_nf3_scale")
+
             nf3_global = torch.full(
                 (num_nf3,), _NF3_GLOBAL_SCALE, dtype=torch.float32, device=device
             )
@@ -812,7 +1004,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             for name in ("w13_weight", "w2_weight", "w13_nv_scale", "w2_nv_scale"):
                 param = getattr(layer, name)
                 param.data = param.data.new_empty((0,))
-        # Free the NF3 originals (both tiers now live in kernel format).
+        # Free any placeholder NF3 originals (both tiers now live in kernel format).
         for name in (
             "w13_weight_packed",
             "w2_weight_packed",
@@ -822,7 +1014,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             param = getattr(layer, name)
             param.data = param.data.new_empty((0,))
 
-    def _get_launch_pair(self, prepared: Any) -> tuple[Any, Any]:
+    def _get_launch_pair(
+        self,
+        prepared: Any,
+        state: _HybridLayerState,
+    ) -> tuple[Any, Any]:
         """Compile (or fetch cached) preplanned launches for one tier.
 
         The prefill launch covers ALL m in [1, max_m]: packed block-64
@@ -843,6 +1039,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         assert runtime.topk is not None
         hidden = self.moe.hidden_dim
         inter = self.moe.intermediate_size_per_partition
+        activation = self.moe.activation.value
         key = (
             prepared.num_experts,
             prepared.weight_layout,
@@ -851,6 +1048,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             runtime.max_m,
             hidden,
             inter,
+            activation,
+            state.tiles,
         )
         cached = runtime.launches.get(key)
         if cached is not None:
@@ -863,7 +1062,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             intermediate_size=inter,
             num_experts=prepared.num_experts,
             top_k=runtime.topk,
-            activation="silu",
+            activation=activation,
             apply_router_weight_on_input=False,
             element_dtype="bf16",
             fast_math=True,
@@ -873,7 +1072,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             ),
             weight_layout=prepared.weight_layout,
             scale_format=prepared.scale_format,
-            force_tile_config=_B12X_TILES,
+            force_tile_config=state.tiles,
         )
         cap_slots = max_packed_route_slots(
             runtime.max_m * runtime.topk, 64, self.moe.num_experts
@@ -888,8 +1087,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             **common,
         )
         assert (int(prefill.fc1_tile_n), int(prefill.fc2_tile_n)) == (
-            _B12X_TILES[1],
-            _B12X_TILES[3],
+            state.tiles[1],
+            state.tiles[3],
         ), "b12x tile pin failed"
         decode = prefill
         try:
@@ -903,8 +1102,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 **common,
             )
             assert (int(candidate.fc1_tile_n), int(candidate.fc2_tile_n)) == (
-                _B12X_TILES[1],
-                _B12X_TILES[3],
+                state.tiles[1],
+                state.tiles[3],
             ), "b12x TC-decode tile pin failed"
             decode = candidate
         except Exception as exc:
@@ -1182,9 +1381,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 f"nvfp4_nf3_hybrid: topk changed {runtime.topk} -> {topk}"
             )
         if state.prep_kept is not None:
-            state.launch_kept = self._get_launch_pair(state.prep_kept)
+            state.launch_kept = self._get_launch_pair(state.prep_kept, state)
         if state.prep_nf3 is not None:
-            state.launch_nf3 = self._get_launch_pair(state.prep_nf3)
+            state.launch_nf3 = self._get_launch_pair(state.prep_nf3, state)
         if runtime.buffers is None:
             prep_any = state.prep_kept or state.prep_nf3
             if prep_any is None:
@@ -1266,7 +1465,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             prepared,
             topk_weights,
             ids,
-            activation="silu",
+            activation=self.moe.activation.value,
             intermediate_cache13=buffers.intermediate_cache13,
             intermediate_cache2=buffers.intermediate_cache2,
             output=output,

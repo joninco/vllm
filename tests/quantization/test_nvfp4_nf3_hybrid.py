@@ -15,7 +15,9 @@ from vllm.model_executor.layers.quantization.fp8 import (
 )
 from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
     NvFp4Nf3HybridConfig,
+    _b12x_tiles_for_geometry,
     _combined_tier_local_descriptors,
+    _decode_kquant_nf3_scale,
     _is_dense_layer_ignored,
     _read_hybrid_keys,
     _unpack_nf3_codes,
@@ -80,6 +82,32 @@ def test_config_parses_serialized_dense_mxfp8():
 
     assert config.dense_format == "mxfp8"
     assert config.dense_ignored_layers == ["g_proj", "vision_tower"]
+
+
+def test_config_parses_checkpoint_nf3_codebook():
+    levels = [-1.0, -0.6, -0.35, -0.1, 0.1, 0.35, 0.6, 1.0]
+    config = NvFp4Nf3HybridConfig.from_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "hybrid_bit_map": {"0": [4, 3]},
+            "nf3_levels": levels,
+        }
+    )
+
+    assert config.nf3_levels == levels
+
+
+def test_config_rejects_invalid_nf3_codebook():
+    with pytest.raises(ValueError, match="exactly 8"):
+        NvFp4Nf3HybridConfig.from_config(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "hybrid_bit_map": {"0": [4, 3]},
+                "nf3_levels": [0.0],
+            }
+        )
 
 
 def test_serialized_dense_mxfp8_selects_loader_after_exact_exclusions():
@@ -182,6 +210,18 @@ def test_unpack_nf3_codes():
     )
 
     torch.testing.assert_close(_unpack_nf3_codes(packed, size_k=8), expected)
+
+
+def test_kimi_tp16_uses_tuned_fc1_tile():
+    assert _b12x_tiles_for_geometry(3584, 3072 // 16) == (128, 64, 64, 128)
+
+
+def test_kquant_nf3_scale_reinterprets_raw_fp8_bits():
+    biased = torch.tensor([0.5, 2.0, 8.0], dtype=torch.float8_e4m3fn)
+    decoded = _decode_kquant_nf3_scale(biased.view(torch.uint8))
+
+    assert decoded.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(decoded.float() * (2.0**-4), biased.float() / 16)
 
 
 def test_grid188_tier_descriptors_encode_exact_partition():

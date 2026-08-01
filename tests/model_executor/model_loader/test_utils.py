@@ -6,7 +6,10 @@ from types import SimpleNamespace
 import torch
 
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.model_loader.utils import process_weights_after_loading
+from vllm.model_executor.model_loader.utils import (
+    device_loading_context,
+    process_weights_after_loading,
+)
 
 
 class _RecordingQuantMethod(QuantizeMethodBase):
@@ -39,3 +42,17 @@ def test_process_weights_after_loading_honors_method_priority():
     process_weights_after_loading(model, model_config, torch.device("cpu"))
 
     assert order == ["early", "default", "high"]
+
+
+def test_device_loading_context_preserves_cpu_staged_parameters():
+    module = torch.nn.Module()
+    module.register_parameter(
+        "staged",
+        torch.nn.Parameter(torch.ones(2), requires_grad=False),
+    )
+    module.staged._vllm_keep_on_cpu = True
+
+    with device_loading_context(module, torch.device("meta")):
+        assert module.staged.device.type == "cpu"
+
+    assert module.staged.device.type == "cpu"
