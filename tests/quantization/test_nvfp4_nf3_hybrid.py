@@ -17,9 +17,12 @@ from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
     NvFp4Nf3HybridConfig,
     _b12x_tiles_for_geometry,
     _combined_tier_local_descriptors,
+    _compose_exl3_intermediate_rotations,
     _decode_kquant_nf3_scale,
+    _exl3_parameter_specs,
     _is_dense_layer_ignored,
     _read_hybrid_keys,
+    _shard_exl3_weight,
     _unpack_nf3_codes,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
@@ -106,6 +109,41 @@ def test_config_rejects_invalid_nf3_codebook():
                 "quant_algo": "NVFP4",
                 "hybrid_bit_map": {"0": [4, 3]},
                 "nf3_levels": [0.0],
+            }
+        )
+
+
+def test_config_parses_native_exl3_trellis_tier():
+    config = NvFp4Nf3HybridConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "kv_cache_quant_algo": None,
+                "exclude_modules": [],
+                "hybrid_bit_map": {"0": [4, 3]},
+                "demoted_format": "exl3_3",
+                "trellis": {
+                    "mcg_mult": 0xCBAC1FED,
+                    "shared_su": True,
+                },
+            },
+        }
+    )
+
+    assert config.demoted_format == "exl3_3"
+    assert config.trellis_mcg == 0xCBAC1FED - 2**32
+    assert config.trellis_shared_su is True
+
+
+def test_config_rejects_exl3_without_trellis_marker():
+    with pytest.raises(ValueError, match="trellis.mcg_mult"):
+        NvFp4Nf3HybridConfig.from_config(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "hybrid_bit_map": {"0": [4, 3]},
+                "demoted_format": "exl3_3",
             }
         )
 
@@ -222,6 +260,60 @@ def test_kquant_nf3_scale_reinterprets_raw_fp8_bits():
 
     assert decoded.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(decoded.float() * (2.0**-4), biased.float() / 16)
+
+
+def test_exl3_parameter_geometry_broadcasts_h_side_rotations():
+    specs = {
+        name: (shape, dtype)
+        for name, shape, dtype in _exl3_parameter_specs(3, 128, 64, True)
+    }
+
+    assert specs["w13_exl3_trellis"] == ((3, 2, 8, 4, 48), torch.int16)
+    assert specs["w13_exl3_suh"] == ((1, 2, 128), torch.float16)
+    assert specs["w13_exl3_svh"] == ((3, 2, 64), torch.float16)
+    assert specs["w2_exl3_trellis"] == ((3, 4, 8, 48), torch.int16)
+    assert specs["w2_exl3_suh"] == ((3, 64), torch.float16)
+    assert specs["w2_exl3_svh"] == ((1, 128), torch.float16)
+
+
+@pytest.mark.parametrize(
+    ("family", "part", "shape", "shard_axis"),
+    [
+        ("w13", "trellis", (4, 6, 2), 1),
+        ("w13", "svh", (6,), 0),
+        ("w2", "trellis", (6, 4, 2), 0),
+        ("w2", "suh", (6,), 0),
+    ],
+)
+def test_exl3_tp_shards_only_intermediate_axes(family, part, shape, shard_axis):
+    weight = torch.arange(torch.Size(shape).numel()).reshape(shape)
+
+    sharded = _shard_exl3_weight(weight, family, part, tp_size=2, tp_rank=1)
+
+    torch.testing.assert_close(sharded, weight.chunk(2, shard_axis)[1])
+
+
+def test_exl3_tp_replicates_hidden_side_rotations():
+    weight = torch.arange(8)
+
+    assert _shard_exl3_weight(weight, "w13", "suh", 2, 1) is weight
+    assert _shard_exl3_weight(weight, "w2", "svh", 2, 1) is weight
+
+
+def test_exl3_intermediate_rotation_order_matches_fused_runtime():
+    w13_svh = torch.stack(
+        (
+            torch.full((2, 4), 1.0),
+            torch.full((2, 4), 2.0),
+        ),
+        dim=1,
+    )
+    w2_suh = torch.full((2, 4), 3.0)
+
+    rotations = _compose_exl3_intermediate_rotations(w13_svh, w2_suh)
+
+    expected = torch.tensor([[1.0] * 4 + [2.0] * 4 + [3.0] * 4] * 2)
+    torch.testing.assert_close(rotations, expected)
 
 
 def test_grid188_tier_descriptors_encode_exact_partition():

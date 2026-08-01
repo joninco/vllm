@@ -189,6 +189,7 @@ wht = "wht"
 WHT = "WHT"
 # EXL3 scaled Hadamard vector field.
 suh = "suh"
+SUH = "SUH"
 # Huawei Compute Architecture for Neural Networks
 CANN = "CANN"
 

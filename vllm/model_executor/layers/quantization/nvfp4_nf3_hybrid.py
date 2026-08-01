@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Mixed NVFP4/MXFP4 + NF3 (3-bit) MoE quantization ("nvfp4_nf3_hybrid").
+"""Mixed 4-bit + NF3/EXL3 MoE quantization ("nvfp4_nf3_hybrid").
 
 Serves checkpoints whose routed experts are per-layer mixed precision: a
 high-saliency "kept" tier stored as NVFP4 (e2m1 values + e4m3 group scales)
 or MXFP4 (e2m1 + ue8m0 scales per 32 group, checkpoint key
 ``kept_format = "mxfp4_e8m0k32"``), and a low-saliency tier stored as NF3
-(3-bit codebook packed 8 codes per 3 bytes, e4m3 scales per 32 group).
+(3-bit codebook packed 8 codes per 3 bytes) or native EXL3 Trellis tensors.
 
 The tier assignment is carried by the ``hybrid_bit_map`` key of the
 checkpoint quantization config: a dict mapping decoder-layer index (as a
@@ -210,8 +210,8 @@ def _unpack_nf3_codes(packed: torch.Tensor, size_k: int) -> torch.Tensor:
 
 def _apply_nf3_codebook_override(levels: list[float]) -> None:
     """Install the checkpoint NF3 codebook for preparation and execution."""
-    from sparkinfer.moe._shared.kernels.w4a16 import kernel as kernel_module
-    from sparkinfer.moe._shared.kernels.w4a16 import prepare as prepare_module
+    from b12x.moe._shared.kernels.w4a16 import kernel as kernel_module
+    from b12x.moe._shared.kernels.w4a16 import prepare as prepare_module
 
     codebook = tuple(float(value) for value in levels)
     if tuple(kernel_module._NF3_CODEBOOK) != codebook:
@@ -260,6 +260,90 @@ def _decode_kquant_nf3_scale(raw: torch.Tensor) -> torch.Tensor:
     raise TypeError(f"NF3 scale must be uint8/E4M3, got {raw.dtype}")
 
 
+def _signed_trellis_mcg(value: Any) -> int:
+    """Interpret a JSON uint32 Trellis marker as its int32 payload."""
+    marker = int(value)
+    if marker < 0 or marker > 0xFFFFFFFF:
+        raise ValueError(f"trellis.mcg_mult must be a uint32, got {value!r}")
+    return marker if marker < 0x80000000 else marker - 0x100000000
+
+
+def _exl3_parameter_specs(
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    shared_su: bool,
+) -> tuple[tuple[str, tuple[int, ...], torch.dtype], ...]:
+    """Return native rank-sliced EXL3 tensor geometry."""
+    trellis_width = 16 * 3
+    h_rows = 1 if shared_su else num_experts
+    return (
+        (
+            "w13_exl3_trellis",
+            (
+                num_experts,
+                2,
+                hidden_size // 16,
+                intermediate_size // 16,
+                trellis_width,
+            ),
+            torch.int16,
+        ),
+        ("w13_exl3_suh", (h_rows, 2, hidden_size), torch.float16),
+        (
+            "w13_exl3_svh",
+            (num_experts, 2, intermediate_size),
+            torch.float16,
+        ),
+        (
+            "w2_exl3_trellis",
+            (
+                num_experts,
+                intermediate_size // 16,
+                hidden_size // 16,
+                trellis_width,
+            ),
+            torch.int16,
+        ),
+        ("w2_exl3_suh", (num_experts, intermediate_size), torch.float16),
+        ("w2_exl3_svh", (h_rows, hidden_size), torch.float16),
+    )
+
+
+def _shard_exl3_weight(
+    loaded_weight: torch.Tensor,
+    family: str,
+    part: str,
+    tp_size: int,
+    tp_rank: int,
+) -> torch.Tensor:
+    """Shard only the EXL3 tensor axes that contain local intermediate rows."""
+    if tp_size == 1:
+        return loaded_weight
+    if family == "w13":
+        if part == "trellis":
+            return loaded_weight.chunk(tp_size, 1)[tp_rank]
+        if part == "svh":
+            return loaded_weight.chunk(tp_size, 0)[tp_rank]
+    elif family == "w2":
+        if part == "trellis":
+            return loaded_weight.chunk(tp_size, 0)[tp_rank]
+        if part == "suh":
+            return loaded_weight.chunk(tp_size, 0)[tp_rank]
+    return loaded_weight
+
+
+def _compose_exl3_intermediate_rotations(
+    w13_svh: torch.Tensor,
+    w2_suh: torch.Tensor,
+) -> torch.Tensor:
+    """Lay out gate-SVH, up-SVH, and down-SUH for the fused activation."""
+    return torch.cat(
+        (w13_svh[:, 0], w13_svh[:, 1], w2_suh),
+        dim=1,
+    ).contiguous()
+
+
 class _HybridSharedRuntime:
     """Process-wide b12x W4A16 runtime shared by every hybrid MoE layer.
 
@@ -273,10 +357,12 @@ class _HybridSharedRuntime:
         self.topk: int | None = None
         # (num_experts, weight_layout, scale_format, topk, max_m, H, I)
         #   -> (decode_launch, prefill_launch)
-        self.launches: dict[tuple, tuple[Any, Any]] = {}
+        self.launches: dict[tuple, Any] = {}
         self.buffers: Any = None
         self.out_kept: torch.Tensor | None = None
         self.out_nf3: torch.Tensor | None = None
+        self.trellis_scratch: torch.Tensor | None = None
+        self.trellis_output: torch.Tensor | None = None
         self.grid188_launch: Any = None
         self.grid188_scratch: dict[str, torch.Tensor] | None = None
         self.grid188_sms: int | None = None
@@ -296,7 +382,7 @@ class _HybridLayerState:
         num_experts: int,
         kept_mx: bool,
     ) -> None:
-        # global expert id -> (tier, local index); tier 0 = kept, 1 = NF3.
+        # global expert id -> (tier, local index); tier 0 = kept, 1 = demoted.
         self.remap = remap
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -328,11 +414,13 @@ class _HybridLayerState:
         # converted tensors, so dropping them would dangle the views.
         self.keepalive: Any = None
         self.prep_kept_hybrid: Any = None
+        self.trellis_weights: Any = None
+        self.trellis_plan: Any = None
         self.runtime_ready = False
 
 
 class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
-    """Config for mixed NVFP4/MXFP4 + NF3 checkpoints.
+    """Config for mixed NVFP4/MXFP4 + NF3/EXL3 checkpoints.
 
     Extends :class:`ModelOptNvFp4Config` with the two hybrid checkpoint
     keys: ``hybrid_bit_map`` (required; per-layer, per-expert bit widths)
@@ -360,6 +448,9 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
         self.hybrid_bit_map: dict[str, list[int]] = hybrid_bit_map or {}
         self.kept_format = kept_format
         self.nf3_levels: list[float] | None = None
+        self.demoted_format = "nf3_2p1"
+        self.trellis_mcg = 0
+        self.trellis_shared_su = False
         self.dense_format: str | None = None
         self.dense_ignored_layers: list[str] = []
         self.shared_runtime = _HybridSharedRuntime()
@@ -439,6 +530,27 @@ class NvFp4Nf3HybridConfig(ModelOptNvFp4Config):
             if not isinstance(nf3_levels, list) or len(nf3_levels) != 8:
                 raise ValueError("nf3_levels must contain exactly 8 dequant levels")
             config.nf3_levels = [float(value) for value in nf3_levels]
+        demoted_format = original_config.get("demoted_format")
+        if demoted_format is None and isinstance(quantization, dict):
+            demoted_format = quantization.get("demoted_format")
+        if demoted_format is not None:
+            if demoted_format not in ("nf3_2p1", "exl3_3"):
+                raise ValueError(f"unsupported demoted_format {demoted_format!r}")
+            config.demoted_format = demoted_format
+        trellis = original_config.get("trellis")
+        if trellis is None and isinstance(quantization, dict):
+            trellis = quantization.get("trellis")
+        if trellis is not None and not isinstance(trellis, dict):
+            raise ValueError("trellis must be a dict")
+        if isinstance(trellis, dict):
+            if "mcg_mult" in trellis:
+                config.trellis_mcg = _signed_trellis_mcg(trellis["mcg_mult"])
+            shared_su = trellis.get("shared_su", False)
+            if not isinstance(shared_su, bool):
+                raise ValueError("trellis.shared_su must be a bool")
+            config.trellis_shared_su = shared_su
+        if config.demoted_format == "exl3_3" and config.trellis_mcg == 0:
+            raise ValueError("exl3_3 requires trellis.mcg_mult")
         dense_format = original_config.get("dense_format")
         dense_ignored_layers = original_config.get("ignored_layers")
         if isinstance(quantization, dict):
@@ -570,6 +682,47 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             if expert_id is None:
                 raise ValueError(f"missing expert ID while loading {name}")
             tier, local_id = state.remap[int(expert_id)]
+            if "exl3_" in name:
+                if tier != 1:
+                    raise ValueError(f"EXL3 tensor belongs to kept expert: {name}")
+                if "w13_" in name:
+                    family = "w13"
+                elif "w2_" in name:
+                    family = "w2"
+                else:
+                    raise ValueError(f"unsupported EXL3 tensor {name}")
+                part = name.rsplit("exl3_", 1)[1]
+                if part not in ("trellis", "suh", "svh"):
+                    raise ValueError(f"unsupported EXL3 tensor {name}")
+                target = getattr(layer, f"{family}_exl3_{part}")
+                loaded_weight = _shard_exl3_weight(
+                    loaded_weight,
+                    family,
+                    part,
+                    tp_size,
+                    tp_rank,
+                )
+                if target.shape[0] == 1:
+                    local_id = 0
+                if family == "w13":
+                    if shard_id not in ("w1", "w3"):
+                        raise ValueError(
+                            f"missing projection shard for EXL3 tensor {name}"
+                        )
+                    projection = 0 if shard_id == "w1" else 1
+                    dst = target.data[local_id, projection]
+                else:
+                    dst = target.data[local_id]
+                if loaded_weight.numel() != dst.numel():
+                    raise RuntimeError(
+                        "hybrid EXL3 tensor shape mismatch: "
+                        f"layer={layer.layer_name}, expert={expert_id}, "
+                        f"shard={shard_id}, mapped_name={name}, "
+                        f"checkpoint_shape={tuple(loaded_weight.shape)}, "
+                        f"destination_shape={tuple(dst.shape)}"
+                    )
+                dst.copy_(loaded_weight.reshape(dst.shape).to(dst.dtype))
+                return True
             family = "w13" if "w13_" in name else "w2"
             if "weight_scale_2" in name:  # NVFP4 per-tensor global (kept only)
                 target = getattr(layer, f"{family}_weight_scale_2")
@@ -630,13 +783,28 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         # Names the stock prefix-based expert mapping produces; the scalar
         # *_weight_scale / *_input_scale entries are dispatchers whose loads
         # are routed (or dropped) by hybrid_weight_loader above.
+        exl3 = self.quant_config.demoted_format == "exl3_3"
+        if exl3 and state.num_nf3 > 0:
+            for name, shape, dtype in _exl3_parameter_specs(
+                state.num_nf3,
+                hidden,
+                inter,
+                self.quant_config.trellis_shared_su,
+            ):
+                register(name, shape, dtype)
         register("w13_weight", (num_kept, 2 * inter, hidden // 2))
-        register("w13_weight_packed", (num_nf3, 2 * inter, hidden // 8 * 3))
+        register(
+            "w13_weight_packed",
+            (1 if exl3 else num_nf3, 2 * inter, hidden // 8 * 3),
+        )
         register("w13_weight_scale", (1,))
         register("w13_weight_scale_2", (num_kept, 2), torch.float32)
         register("w13_input_scale", (1,), torch.float32)
         register("w2_weight", (num_kept, hidden, inter // 2))
-        register("w2_weight_packed", (num_nf3, hidden, inter // 8 * 3))
+        register(
+            "w2_weight_packed",
+            (1 if exl3 else num_nf3, hidden, inter // 8 * 3),
+        )
         register("w2_weight_scale", (1,))
         register("w2_weight_scale_2", (num_kept,), torch.float32)
         register("w2_input_scale", (1,), torch.float32)
@@ -853,12 +1021,53 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         state.emap_kept, state.emap_nf3 = emap_kept, emap_nf3
         fc1_tile_n, fc2_tile_n = state.tiles[1], state.tiles[3]
 
-        if num_nf3 > 0:
+        def drop_parameter_data(name: str) -> None:
+            parameter = getattr(layer, name)
+            parameter.data = parameter.data.new_empty((0,))
 
-            def drop_parameter_data(name: str) -> None:
-                parameter = getattr(layer, name)
-                parameter.data = parameter.data.new_empty((0,))
+        if num_nf3 > 0 and self.quant_config.demoted_format == "exl3_3":
+            from b12x.moe import fused_moe
 
+            w13_trellis = layer.w13_exl3_trellis.data.permute(
+                1, 0, 2, 3, 4
+            ).contiguous()
+            w2_trellis = layer.w2_exl3_trellis.data.contiguous()
+            intermediate_rotations = _compose_exl3_intermediate_rotations(
+                layer.w13_exl3_svh.data,
+                layer.w2_exl3_suh.data,
+            )
+            weight_plan = fused_moe.plan_weights(
+                quant_modes="w4a16",
+                source_format="exl3_trellis_mcg",
+                activation=self.moe.activation.value,
+                params_dtype=self.moe.in_dtype,
+                num_experts=num_nf3,
+                hidden_size=hidden,
+                intermediate_size=inter,
+                w13_layout="w13",
+                trellis_bits=3,
+                trellis_tile_config=state.tiles,
+            )
+            state.trellis_weights = fused_moe.prepare_weights(
+                plan=weight_plan,
+                params_dtype=self.moe.in_dtype,
+                w1_fp4=w13_trellis,
+                w2_fp4=w2_trellis,
+                gate_suh=layer.w13_exl3_suh.data[:, 0].contiguous(),
+                up_suh=layer.w13_exl3_suh.data[:, 1].contiguous(),
+                intermediate_rotations=intermediate_rotations,
+                down_svh=layer.w2_exl3_svh.data.contiguous(),
+                trellis_mcg=self.quant_config.trellis_mcg,
+            )
+            for name, _, _ in _exl3_parameter_specs(
+                num_nf3,
+                hidden,
+                inter,
+                self.quant_config.trellis_shared_su,
+            ):
+                drop_parameter_data(name)
+            torch.accelerator.empty_cache()
+        elif num_nf3 > 0:
             w13_words = 3 * (2 * inter) * hidden // 32
             w13_nf3 = torch.empty(
                 (num_nf3, w13_words),
@@ -1382,6 +1591,55 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             )
         if state.prep_kept is not None:
             state.launch_kept = self._get_launch_pair(state.prep_kept, state)
+        if state.trellis_weights is not None:
+            from b12x.moe import fused_moe
+
+            key = (
+                "trellis",
+                state.num_nf3,
+                state.hidden_size,
+                state.intermediate_size,
+                self.moe.num_experts,
+                self.moe.activation.value,
+                state.tiles,
+                runtime.topk,
+                runtime.max_m,
+            )
+            plan = runtime.launches.get(key)
+            if plan is None:
+                caps = fused_moe.Caps(
+                    max_tokens=runtime.max_m,
+                    num_topk=runtime.topk,
+                    device=torch.accelerator.current_device_index(),
+                    weight_plan=state.trellis_weights.plan,
+                    quant_mode="w4a16",
+                    route_num_experts=self.moe.num_experts,
+                )
+                plan = fused_moe.plan(caps)
+                runtime.launches[key] = plan
+            state.trellis_plan = plan
+            scratch_spec = plan.scratch_specs()[0]
+            scratch_elements = int(torch.Size(scratch_spec.shape).numel())
+            if runtime.trellis_scratch is None or (
+                runtime.trellis_scratch.numel() < scratch_elements
+                or runtime.trellis_scratch.dtype != scratch_spec.dtype
+            ):
+                runtime.trellis_scratch = torch.empty(
+                    scratch_spec.shape,
+                    dtype=scratch_spec.dtype,
+                    device=scratch_spec.device,
+                )
+            output_shape = (runtime.max_m, state.hidden_size)
+            if (
+                runtime.trellis_output is None
+                or tuple(runtime.trellis_output.shape) != output_shape
+                or runtime.trellis_output.device != scratch_spec.device
+            ):
+                runtime.trellis_output = torch.empty(
+                    output_shape,
+                    dtype=torch.float32,
+                    device=scratch_spec.device,
+                )
         if state.prep_nf3 is not None:
             state.launch_nf3 = self._get_launch_pair(state.prep_nf3, state)
         if runtime.buffers is None:
@@ -1578,6 +1836,41 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         if state.num_nf3 == 0:
             # Uniform kept-tier layer (for example an MTP head).
             return self._run_kept(layer, x, weights, topk_ids, decode)
+        if state.trellis_weights is not None:
+            from b12x.moe import fused_moe
+
+            trellis_ids = (
+                topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+            )
+            if not trellis_ids.is_contiguous():
+                trellis_ids = trellis_ids.contiguous()
+            assert state.trellis_plan is not None
+            assert runtime.trellis_scratch is not None
+            assert runtime.trellis_output is not None
+            assert state.emap_nf3 is not None
+            binding = fused_moe.bind(
+                state.trellis_plan,
+                scratch=runtime.trellis_scratch,
+                a=x if x.is_contiguous() else x.contiguous(),
+                experts=state.trellis_weights,
+                topk_weights=weights,
+                topk_ids=trellis_ids,
+                route_expert_map=state.emap_nf3,
+                output=runtime.trellis_output[:m],
+            )
+            out_trellis = fused_moe.run(binding=binding)[:m].to(x.dtype)
+            if state.num_kept == 0:
+                return out_trellis
+            return (
+                self._run_kept(
+                    layer,
+                    x,
+                    weights,
+                    topk_ids,
+                    decode,
+                )[:m]
+                + out_trellis
+            )
         out_kept = self._run_kept(layer, x, weights, topk_ids, decode)
         assert state.prep_nf3 is not None
         assert state.launch_nf3 is not None
