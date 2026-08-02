@@ -16,8 +16,6 @@ DSV4 compressed-MLA contract (== upstream/DeepGEMM): q_head_dim = 448 NoPE +
 """
 
 import os
-from collections.abc import Callable
-from functools import cache
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import torch
@@ -32,7 +30,12 @@ from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4FlashMLABackend,
 )
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
-from vllm.v1.attention.backends.mla.compressor_utils import get_c128a_topk_width
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_c128a_topk_width,
+    get_compressed_mla_max_q_chunks,
+    get_compressed_mla_split_cap,
+    get_dspark_swa_index_width,
+)
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import (
     dcp_a2a_lse_reduce,
@@ -48,38 +51,11 @@ _DSV4_HEAD_DIM = 512
 _DSV4_V_HEAD_DIM = 512
 _DSV4_CACHE_BYTES_PER_TOKEN = 584
 _DSV4_CACHE_PAD_ALIGNMENT_BYTES = 576
-_DECODE_SPLIT_TILE = 64
 _VALIDATE_DCP_INDICES_ENV = "VLLM_DSV4_DCP_VALIDATE_INDICES"
 
 
 def _cdiv(x: int, y: int) -> int:
     return (int(x) + int(y) - 1) // int(y)
-
-
-def _compressed_mla_split_cap(width: int) -> int:
-    return max(1, _cdiv(max(int(width), 1), _DECODE_SPLIT_TILE))
-
-
-@cache
-def _max_compressed_mla_q_chunks(
-    max_rows: int,
-    width: int,
-    max_chunks: int,
-    split_chunks_for_contract: Callable[..., int],
-) -> int:
-    """Return the cached q-chunk cap over every reachable row count."""
-    max_rows = max(int(max_rows), 1)
-    width = max(int(width), 1)
-    max_chunks = max(int(max_chunks), 1)
-    return max(
-        rows
-        * split_chunks_for_contract(
-            rows=rows,
-            width=width,
-            max_chunks=max_chunks,
-        )
-        for rows in range(1, max_rows + 1)
-    )
 
 
 def _dsv4_b12x_page_nbytes(page_size: int) -> int:
@@ -315,7 +291,7 @@ def _run_compressed_mla(
     width = int(swa_indices.shape[-1])
     if indexed_indices is not None:
         width += int(indexed_indices.shape[-1])
-    decode_split_cap = _compressed_mla_split_cap(width)
+    decode_split_cap = get_compressed_mla_split_cap(width)
     # Keep the legacy 64-wide split cap for decode, but let the b12x contract
     # select the smaller batched-prefill split count when rows > decode max.
     num_splits_cap = compressed_mla_split_chunks_for_contract(
@@ -526,15 +502,26 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 self.compress_ratio,
             )
 
-        width = max(int(self.window_size) + indexed_width, 1)
+        swa_width = int(self.window_size)
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.use_dspark():
+            swa_width = max(
+                swa_width,
+                get_dspark_swa_index_width(
+                    swa_width,
+                    speculative_config.num_speculative_tokens or 0,
+                ),
+            )
+
+        width = max(swa_width + indexed_width, 1)
         rows = max(int(self.max_num_batched_tokens), 1)
-        decode_split_cap = _compressed_mla_split_cap(width)
+        decode_split_cap = get_compressed_mla_split_cap(width)
         num_splits_cap = compressed_mla_split_chunks_for_contract(
             rows=rows,
             width=width,
             max_chunks=decode_split_cap,
         )
-        max_q_chunks = _max_compressed_mla_q_chunks(
+        max_q_chunks = get_compressed_mla_max_q_chunks(
             rows,
             width,
             decode_split_cap,
