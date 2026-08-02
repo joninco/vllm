@@ -3,6 +3,15 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
+
+_C128A_TOPK_ALIGNMENT = 128
+
+
+def get_c128a_topk_width(max_model_len: int, compress_ratio: int) -> int:
+    """Return C128 indexed width padded for FlashMLA B_TOPK divisibility."""
+    compressed_width = cdiv(max_model_len, compress_ratio)
+    return cdiv(compressed_width, _C128A_TOPK_ALIGNMENT) * _C128A_TOPK_ALIGNMENT
 
 
 @triton.jit
@@ -48,15 +57,12 @@ def _compressed_slot_mapping_kernel(
         else:
             virtual_block_size = block_size * DCP_WORLD_SIZE
             block_ids = pos_after_compress // virtual_block_size
-            virtual_block_offsets = (
-                pos_after_compress - block_ids * virtual_block_size
-            )
+            virtual_block_offsets = pos_after_compress - block_ids * virtual_block_size
             is_local = (
                 virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
             ) % DCP_WORLD_SIZE == DCP_RANK
             block_offsets = (
-                virtual_block_offsets
-                // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+                virtual_block_offsets // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
             ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
                 virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
             )
