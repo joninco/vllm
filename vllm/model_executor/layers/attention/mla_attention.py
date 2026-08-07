@@ -1092,6 +1092,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         num_heads, num_tokens, nope_dim = q_nope.shape
         output_dtype = self._fused_mla_query_output_dtype
+        weight: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+        runner: Callable[..., torch.Tensor]
         if getattr(self, "_use_b12x_absorb_bmm", False):
             weight = self._b12x_absorb_uk_rhs
             if not can_implement_mxfp8_mla_query(
@@ -1873,7 +1875,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if not (uk_supported and uv_supported):
             logger.warning_once(
                 "VLLM_B12X_ABSORB_BMM=1 but the MLA geometry is outside the "
-                "sparkinfer.gemm.bmm envelope; falling back to the materialized "
+                "b12x.gemm.bmm envelope; falling back to the materialized "
                 "absorbed weights."
             )
             return False

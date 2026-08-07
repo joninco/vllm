@@ -441,7 +441,10 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return output  # profiling run; caches unbound
-        main_md = attn_metadata[layer.layer_name]  # type: ignore[attr-defined]
+        layer_name = getattr(layer, "layer_name", None)
+        if not isinstance(layer_name, str):
+            raise RuntimeError("MiniMax M3 sparse attention requires a named layer")
+        main_md = attn_metadata[layer_name]
         assert isinstance(main_md, MiniMaxM3SparseMetadata)
 
         nd = main_md.num_decode_tokens
@@ -483,11 +486,11 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 v_scale=v_scale,
             )
             self._maybe_log_sparse_stats(
-                layer_name=layer.layer_name,
+                layer_name=layer_name,
                 mode="decode" if d.decode_query_len == 1 else "extend",
                 q=q[:nd],
                 out=out[:nd],
-                topk=decode_topk,
+                topk=topk[:, :nd, :],
                 seq_lens=d.seq_lens,
             )
 
@@ -511,11 +514,11 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 v_scale=v_scale,
             )
             self._maybe_log_sparse_stats(
-                layer_name=layer.layer_name,
+                layer_name=layer_name,
                 mode="extend",
                 q=q[nd:],
                 out=out[nd:],
-                topk=prefill_topk,
+                topk=topk[:, nd:num_tokens, :],
                 seq_lens=p.seq_lens,
             )
         return output

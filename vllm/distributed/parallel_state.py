@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
+    channel_id: str | None = None
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -641,7 +642,10 @@ class GroupCoordinator:
             )
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
-                maybe_ca_context = ca_comm.capture(stream=stream)  # type: ignore
+                maybe_ca_context = ca_comm.capture(  # type: ignore
+                    stream=stream,
+                    channel_id=graph_capture_context.channel_id,
+                )
 
             from vllm._aiter_ops import rocm_aiter_ops
 
@@ -1580,7 +1584,7 @@ def get_pp_group() -> GroupCoordinator:
 
 
 def checkpoint_b12x_graph_channels() -> tuple[tuple[Callable[[Any], None], Any], ...]:
-    """Snapshot SparkInfer channels used by disposable graph captures."""
+    """Snapshot B12X channels used by disposable graph captures."""
     checkpoints: list[tuple[Callable[[Any], None], Any]] = []
     seen_communicators: set[int] = set()
     for group in (_TP, _DCP, _PP):
@@ -1615,7 +1619,7 @@ def checkpoint_b12x_graph_channels() -> tuple[tuple[Callable[[Any], None], Any],
 def rollback_b12x_graph_channels(
     checkpoints: tuple[tuple[Callable[[Any], None], Any], ...],
 ) -> None:
-    """Roll back SparkInfer channels after disposable graphs are destroyed."""
+    """Roll back B12X channels after disposable graphs are destroyed."""
     for rollback, checkpoint in reversed(checkpoints):
         rollback(checkpoint)
 
@@ -1664,6 +1668,8 @@ def get_pcp_group() -> GroupCoordinator:
 def graph_capture(
     device: torch.device,
     graph_capture_context: GraphCaptureContext | None = None,
+    *,
+    channel_id: str | None = None,
 ):
     """
     `graph_capture` is a context manager which should surround the code that
@@ -1680,22 +1686,42 @@ def graph_capture(
 
     A caller may pass an explicit ``graph_capture_context`` to control the
     stream used (e.g. to capture on the default stream).
+
+    ``channel_id`` identifies the graph semantically to distributed transports.
+    It must be stable and identical across ranks; CUDA stream handles are local
+    process state and are not valid distributed identities.
     """
-    context = graph_capture_context or GraphCaptureContext(
-        torch.cuda.Stream(device=device)
-    )
+    if graph_capture_context is None:
+        context = GraphCaptureContext(
+            torch.cuda.Stream(device=device),
+            channel_id=channel_id,
+        )
+    else:
+        context = graph_capture_context
+        if channel_id is not None:
+            if context.channel_id is not None and context.channel_id != channel_id:
+                raise ValueError(
+                    "graph capture context and argument specify different "
+                    "semantic channel IDs"
+                )
+            context.channel_id = channel_id
     maybe_dcp_capture = (
         get_dcp_group().graph_capture(context)
         if _DCP is not None and get_dcp_group().world_size > 1
         else nullcontext()
     )
+    maybe_b12x_dcp_capture: contextlib.AbstractContextManager[Any]
     if _DCP is not None and get_dcp_group().world_size > 1:
         # Import locally to avoid making distributed initialization depend on
         # attention modules. The helper is a no-op until DCP warmup creates a
-        # SparkInfer pool for this process group.
+        # B12X pool for this process group.
         from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
 
-        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(get_dcp_group(), context.stream)
+        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(
+            get_dcp_group(),
+            context.stream,
+            channel_id=context.channel_id,
+        )
     else:
         maybe_b12x_dcp_capture = nullcontext()
     with (
@@ -2108,7 +2134,7 @@ def initialize_model_parallel(
     assert _QUERY_SPLIT is None, "query split group is already initialized"
     if envs.VLLM_DCP_QUERY_SPLIT:
         _, query_split_ranks = _build_indexer_replica_group_ranks(
-            tp_group_ranks, decode_context_model_parallel_size
+            tp_group_ranks, dcp_size
         )
         _QUERY_SPLIT = init_model_parallel_group(
             query_split_ranks,
@@ -2126,8 +2152,8 @@ def initialize_model_parallel(
         "indexer query split group is already initialized"
     )
     indexer_shards = int(envs.VLLM_DCP_INDEXER_SHARDS)
-    _validate_indexer_shard_count(indexer_shards, decode_context_model_parallel_size)
-    if 1 < indexer_shards < decode_context_model_parallel_size:
+    _validate_indexer_shard_count(indexer_shards, dcp_size)
+    if 1 < indexer_shards < dcp_size:
         indexer_dcp_ranks, indexer_query_split_ranks = (
             _build_indexer_replica_group_ranks(tp_group_ranks, indexer_shards)
         )
@@ -2152,7 +2178,7 @@ def initialize_model_parallel(
     # communicator from two streams is unsupported. Same ranks as ``_DCP``.
     global _DCP_CKV_PREFETCH
     assert _DCP_CKV_PREFETCH is None, "DCP ckv prefetch group is already initialized"
-    if decode_context_model_parallel_size > 1 and envs.VLLM_B12X_MLA_CKV_GATHER:
+    if dcp_size > 1 and envs.VLLM_B12X_MLA_CKV_GATHER:
         _DCP_CKV_PREFETCH = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,

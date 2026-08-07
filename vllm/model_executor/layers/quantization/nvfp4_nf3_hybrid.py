@@ -26,9 +26,9 @@ launch with an expert map.
 """
 
 import dataclasses
-import re
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 
 from vllm import envs
@@ -81,7 +81,7 @@ def _combined_tier_local_descriptors(
 ) -> list[int]:
     """Encode an exact E64/E192 partition for the mapped Grid188 kernel."""
     descriptors = [-1] * (_GRID188_NUM_KEPT + _GRID188_NUM_NF3)
-    seen_local = (set(), set())
+    seen_local: tuple[set[int], set[int]] = (set(), set())
     for global_id, tier_local in remap.items():
         try:
             global_id_i = int(global_id)
@@ -421,6 +421,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             name = name_mapped or weight_name or ""
             if "input_scale" in name:  # W4A16: activation scales are unused
                 return True
+            assert expert_id is not None
             tier, local_id = state.remap[int(expert_id)]
             family = "w13" if "w13_" in name else "w2"
             if "weight_scale_2" in name:  # NVFP4 per-tensor global (kept only)
@@ -456,7 +457,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
 
         def register(name: str, shape: tuple[int, ...], dtype=torch.uint8) -> None:
             param = torch.nn.Parameter(
-                torch.zeros(shape, dtype=dtype, device=torch.cuda.current_device()),
+                torch.zeros(
+                    shape,
+                    dtype=dtype,
+                    device=torch.accelerator.current_device_index(),
+                ),
                 requires_grad=False,
             )
             set_weight_attrs(param, {"weight_loader": hybrid_weight_loader})
@@ -491,7 +496,11 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             layer.register_parameter(
                 name,
                 torch.nn.Parameter(
-                    torch.zeros(shape, dtype=dtype, device=torch.cuda.current_device()),
+                    torch.zeros(
+                        shape,
+                        dtype=dtype,
+                        device=torch.accelerator.current_device_index(),
+                    ),
                     requires_grad=False,
                 ),
             )
@@ -529,6 +538,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
         )
         backend, experts_cls = select_mxfp4_moe_backend(kept_moe, activation_key=None)
+        if experts_cls is None:
+            raise RuntimeError("MXFP4 kept tier has no compatible MoE expert backend")
         kept_module = torch.nn.Module()
         kept_module.activation = layer.activation
         kept_module.moe_config = kept_moe
@@ -553,6 +564,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         quant_config = make_mxfp4_moe_quant_config(
             backend, w13_scale, w2_scale, layer=kept_module
         )
+        if quant_config is None:
+            raise RuntimeError("MXFP4 kept tier has no compatible quantization config")
         kernel = make_mxfp4_moe_kernel(
             quant_config,
             kept_moe,
@@ -593,7 +606,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         are known there, and the first forward is vLLM's eager profile run,
         so nothing compiles inside CUDA-graph capture).
         """
-        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+        from b12x.moe._shared.kernels.w4a16.prepare import (
             PreparedNF3MoeWeights,
             W4A16PackedWeights,
             _make_workspace,
@@ -738,14 +751,16 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         routing and a fused top-k sum; if that compile is unavailable the
         packed launch also serves decode.
         """
-        from sparkinfer.moe._shared.kernels.w4a16.host import (
+        from b12x.moe._shared.kernels.w4a16.host import (
             max_packed_route_slots,
         )
-        from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+        from b12x.moe._shared.kernels.w4a16.kernel import (
             compile_w4a16_fused_moe,
         )
 
         runtime = self.quant_config.shared_runtime
+        assert runtime.max_m is not None
+        assert runtime.topk is not None
         hidden = self.moe.hidden_dim
         inter = self.moe.intermediate_size_per_partition
         key = (
@@ -760,7 +775,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         cached = runtime.launches.get(key)
         if cached is not None:
             return cached
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        props = torch.cuda.get_device_properties(
+            torch.accelerator.current_device_index()
+        )
         common = dict(
             hidden_size=hidden,
             intermediate_size=inter,
@@ -912,16 +929,18 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
             if not prepared_contract:
                 raise RuntimeError("prepared tier layouts do not match Grid188 ABI")
 
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            props = torch.cuda.get_device_properties(
+                torch.accelerator.current_device_index()
+            )
             sms = int(props.multi_processor_count)
             max_shared_mem = int(
                 getattr(props, "shared_memory_per_block_optin", 101_376)
             )
             if runtime.grid188_launch is None:
-                from sparkinfer.moe._shared.kernels.w4a16.host import (
+                from b12x.moe._shared.kernels.w4a16.host import (
                     packed_gemm_scratch_elements,
                 )
-                from sparkinfer.moe._shared.kernels.w4a16.kernel import (
+                from b12x.moe._shared.kernels.w4a16.kernel import (
                     compile_w4a16_fused_moe_hybrid,
                 )
 
@@ -953,7 +972,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 ):
                     raise RuntimeError("compiled hybrid launch failed admission")
                 if not hasattr(
-                    torch.ops.sparkinfer,
+                    torch.ops.b12x,
                     "w4a16_fused_moe_hybrid_launch",
                 ):
                     raise RuntimeError("hybrid one-grid custom op is unavailable")
@@ -1020,7 +1039,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         assert state.grid188_tier_map is not None
         assert state.grid188_output is not None
         m = int(x.shape[0])
-        torch.ops.sparkinfer.w4a16_fused_moe_hybrid_launch(
+        torch.ops.b12x.w4a16_fused_moe_hybrid_launch(
             x,
             *state.grid188_weight_views,
             topk_ids.view(-1),
@@ -1066,7 +1085,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         scratch/buffer set. The first apply is vLLM's eager profile run at
         max_num_batched_tokens, so max_m sizes itself to the serving
         ceiling and nothing compiles during CUDA-graph capture."""
-        from sparkinfer.moe._shared.kernels.w4a16.host import (
+        from b12x.moe._shared.kernels.w4a16.host import (
             make_w4a16_packed_buffers,
             max_packed_route_slots,
         )
@@ -1076,6 +1095,8 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         if runtime.max_m is None:
             runtime.max_m = max(int(self.moe.max_num_tokens), int(m))
             runtime.topk = int(topk)
+        assert runtime.max_m is not None
+        assert runtime.topk is not None
         if int(topk) != runtime.topk:
             raise RuntimeError(
                 f"nvfp4_nf3_hybrid: topk changed {runtime.topk} -> {topk}"
@@ -1140,7 +1161,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         decode: bool,
     ) -> torch.Tensor:
         """Run one tier through its preplanned b12x launch."""
-        from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+        from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 
         runtime = self.quant_config.shared_runtime
         use_decode = decode and launch_pair[0] is not launch_pair[1]
@@ -1191,6 +1212,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         state: _HybridLayerState = layer.hybrid_state
         runtime = self.quant_config.shared_runtime
         if state.prep_kept is not None:
+            assert state.launch_kept is not None
+            assert state.emap_kept is not None
+            assert runtime.out_kept is not None
             m = x.shape[0]
             return self._run_tier(
                 x,
@@ -1203,6 +1227,9 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 decode,
             )
         kept_module = state.kept_module
+        assert kept_module is not None
+        assert state.kept_remap is not None
+        assert state.kept_kernel is not None
         kept_ids = state.kept_remap[topk_ids.long()]
         return state.kept_kernel.apply(
             x,
@@ -1234,6 +1261,7 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
         m = int(x.shape[0])
         if not state.runtime_ready:
             self._ensure_runtime(layer, m, int(topk_ids.shape[1]))
+        assert runtime.max_m is not None
         if m > runtime.max_m:
             raise RuntimeError(
                 f"nvfp4_nf3_hybrid: m={m} exceeds the planned launch "
@@ -1268,19 +1296,13 @@ class NvFp4Nf3HybridMoEMethod(FusedMoEMethodBase):
                 logger.info_once("nvfp4_nf3_hybrid: executing hybrid one-grid decode")
                 return self._run_grid188(layer, x, weights, grid_ids)
         if state.num_nf3 == 0:
-            # Uniform-NVFP4 layer (e.g. MTP head): single-tier launch.
-            output = torch.empty((m, state.hidden_size), dtype=x.dtype, device=x.device)
-            return self._run_tier(
-                x,
-                weights,
-                topk_ids,
-                state.prep_kept,
-                state.launch_kept,
-                state.emap_kept,
-                output,
-                decode,
-            )
+            # Uniform kept-tier layer (for example an MTP head).
+            return self._run_kept(layer, x, weights, topk_ids, decode)
         out_kept = self._run_kept(layer, x, weights, topk_ids, decode)
+        assert state.prep_nf3 is not None
+        assert state.launch_nf3 is not None
+        assert state.emap_nf3 is not None
+        assert runtime.out_nf3 is not None
         out_nf3 = self._run_tier(
             x,
             weights,

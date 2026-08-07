@@ -230,7 +230,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 f"fp8_e4m3 KV caches, got {self.kv_torch_dtype}."
             )
 
-        self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        self.device = torch.device("cuda", torch.accelerator.current_device_index())
         self._unit_fp8_descale = torch.ones((), dtype=torch.float32, device=self.device)
 
         from vllm.v1.attention.backends.b12x_attn import (
@@ -239,13 +239,13 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
 
         _disable_cutlass_memory_debug_snapshot_if_off()
 
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             Caps as B12XPagedAttentionScratchCaps,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             plan as plan_paged_attention_scratch,
         )
-        from sparkinfer.attention.paged import (
+        from b12x.attention.paged import (
             run as paged_attention_forward,
         )
 
@@ -604,7 +604,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 prefix_lens=prefix_lens,
                 max_query_len=max_query_len,
             )
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             triton_f32_cpu = triton_output.float().cpu()
         if (
             os.getenv("VLLM_DEBUG_B12X_MINIMAX_M3_MSA", "0") == "1"
@@ -672,7 +672,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
             output.zero_()
         returned_output, returned_lse = self._paged_attention_forward(binding=binding)
         if os.getenv(_B12X_MSA_SYNC_AFTER, "0") == "1":
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
         if not capturing:
             scratch_plan._q2k_indices_data_ptr = None
         if compare_triton:
@@ -1059,7 +1059,7 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
         rank_label = _debug_rank_label()
         device_index = q.device.index
         if device_index is None:
-            device_index = torch.cuda.current_device()
+            device_index = torch.accelerator.current_device_index()
         path = os.path.join(
             dump_dir,
             "b12x_minimax_m3_msa_"
@@ -1107,18 +1107,30 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
         layer: AttentionLayer,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
-        topk_idx: tuple[torch.Tensor | None, torch.Tensor | None],
         output: torch.Tensor,
+        *,
+        query_fp8: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del query_fp8
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return output
-        main_md = attn_metadata[layer.layer_name]  # type: ignore[attr-defined]
+        layer_name = getattr(layer, "layer_name", None)
+        if not isinstance(layer_name, str):
+            raise RuntimeError("B12X MiniMax M3 MSA requires a named attention layer")
+        main_md = attn_metadata[layer_name]
         assert isinstance(main_md, MiniMaxM3SparseMetadata)
-        decode_topk, prefill_topk = topk_idx
 
         nd = main_md.num_decode_tokens
         num_tokens = main_md.num_actual_tokens
+        topk_buffer = getattr(layer, "topk_indices_buffer", None)
+        if not isinstance(topk_buffer, torch.Tensor):
+            raise RuntimeError(
+                "B12X MiniMax M3 MSA requires the persistent top-k buffer"
+            )
+        topk = topk_buffer[:num_tokens].transpose(0, 1)
+        decode_topk = topk[:, :nd, :]
+        prefill_topk = topk[:, nd:num_tokens, :]
         hd = self.head_size
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
@@ -1141,10 +1153,10 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 cu_seqlens_q=d.cu_seqlens_q,
                 q2k_indices=decode_topk,
                 mode=decode_mode,
-                layer_name=layer.layer_name,
+                layer_name=layer_name,
             )
             self._maybe_log_sparse_stats(
-                layer_name=layer.layer_name,
+                layer_name=layer_name,
                 mode=decode_mode,
                 q=q[:nd],
                 out=out[:nd],
@@ -1168,10 +1180,10 @@ class MiniMaxM3SparseB12XImpl(MiniMaxM3SparseImpl):
                 mode="extend",
                 prefix_lens=p.context_lens,
                 max_query_len=p.max_query_len,
-                layer_name=layer.layer_name,
+                layer_name=layer_name,
             )
             self._maybe_log_sparse_stats(
-                layer_name=layer.layer_name,
+                layer_name=layer_name,
                 mode="extend",
                 q=q[nd:],
                 out=out[nd:],

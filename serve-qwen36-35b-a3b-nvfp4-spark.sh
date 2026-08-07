@@ -59,11 +59,11 @@ import importlib
 import sys
 
 try:
-    blockscaled = importlib.import_module("sparkinfer.gemm.blockscaled")
-    tensor_fp8 = importlib.import_module("sparkinfer.gemm.tensor_fp8_linear")
-    importlib.import_module("sparkinfer._lib.intrinsics")
-    importlib.import_module("sparkinfer.moe.fused_moe")
-    importlib.import_module("sparkinfer.attention.paged")
+    blockscaled = importlib.import_module("b12x.gemm.blockscaled")
+    tensor_fp8 = importlib.import_module("b12x.gemm.tensor_fp8_linear")
+    importlib.import_module("b12x._lib.intrinsics")
+    importlib.import_module("b12x.moe.fused_moe")
+    importlib.import_module("b12x.attention.paged")
 except ImportError as exc:
     print(f"B12X preflight failed: {exc}", file=sys.stderr)
     raise SystemExit(1) from exc

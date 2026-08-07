@@ -46,6 +46,7 @@ _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
+_B12X_DCP_A2A_EAGER_CHANNEL_ID = "eager:vllm-dcp-a2a"
 
 
 def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
@@ -64,7 +65,7 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
 @lru_cache(maxsize=1)
 def _load_b12x_dcp_a2a_pool() -> Any | None:
     try:
-        from sparkinfer.comm.pcie import DcpAllToAllPool as PCIeDCPA2APool
+        from b12x.comm.pcie import DcpAllToAllPool as PCIeDCPA2APool
     except Exception:
         return None
     return PCIeDCPA2APool
@@ -130,7 +131,8 @@ def _get_b12x_dcp_a2a_pool(
             query_head_dim=query_head_dim,
             single_channel=False,
         )
-        pool.for_stream()
+        pool.prepare_channels((_B12X_DCP_A2A_EAGER_CHANNEL_ID,))
+        pool.for_stream(channel_id=_B12X_DCP_A2A_EAGER_CHANNEL_ID)
     except Exception as exc:
         init_error = exc
 
@@ -170,8 +172,10 @@ def _get_b12x_dcp_a2a_pool(
 def capture_b12x_dcp_a2a(
     cp_group: GroupCoordinator,
     stream: torch.cuda.Stream | None = None,
+    *,
+    channel_id: str | None = None,
 ):
-    """Bind registered SparkInfer DCP pools to the graph's owning stream.
+    """Bind registered B12X DCP pools to the graph's owning stream.
 
     Each graph capture receives independent channels; reusing channels across
     target and draft graphs would make one graph depend on another's lifetime.
@@ -179,6 +183,7 @@ def capture_b12x_dcp_a2a(
     Args:
         cp_group: DCP group whose registered pools should enter capture.
         stream: CUDA stream owned by the enclosing graph capture.
+        channel_id: Rank-stable semantic identity for the captured graph.
     """
     group_id = id(cp_group.device_group)
     matching_pools = sorted(
@@ -191,14 +196,14 @@ def capture_b12x_dcp_a2a(
     )
     with ExitStack() as stack:
         for _, pool in matching_pools:
-            stack.enter_context(pool.capture(stream=stream))
+            stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
         yield
 
 
 def checkpoint_b12x_dcp_a2a_channels(
     cp_group: GroupCoordinator,
 ) -> tuple[int, dict[Any, tuple[Any, Any]]]:
-    """Snapshot SparkInfer DCP pools before a disposable graph capture."""
+    """Snapshot B12X DCP pools before a disposable graph capture."""
     group_id = id(cp_group.device_group)
     checkpoints = {
         key: (pool, pool.checkpoint_channels())
@@ -312,6 +317,7 @@ def _try_b12x_dcp_lse_reduce(
         cp_attn_lse,
         out=reduced,
         is_lse_base_on_e=is_lse_base_on_e,
+        channel_id=_B12X_DCP_A2A_EAGER_CHANNEL_ID,
     )
 
 
@@ -362,7 +368,10 @@ def _try_b12x_dcp_all_gather_heads(
     )
     if pool is None:
         return None
-    return pool.all_gather_heads(local_input)
+    return pool.all_gather_heads(
+        local_input,
+        channel_id=_B12X_DCP_A2A_EAGER_CHANNEL_ID,
+    )
 
 
 def dcp_b12x_all_gather_heads(

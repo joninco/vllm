@@ -73,6 +73,7 @@ def make_b12x_custom_allreduce(
     custom_allreduce._pcie_runtime = runtime
     custom_allreduce._pcie_dma = None
     custom_allreduce._pcie_capture_stream = None
+    custom_allreduce._pcie_capture_channel_id = None
     custom_allreduce._pcie_allreduce_max_size = allreduce_max_size
     custom_allreduce._pcie_fused_add_rms_norm_max_size = fused_max_size
     custom_allreduce._pcie_logged_first_allreduce = False
@@ -106,6 +107,7 @@ def test_b12x_fused_allreduce_uses_independent_cutoff() -> None:
         out=inp,
         residual_out=residual,
         stream=None,
+        channel_id="eager:vllm-tp-allreduce",
     )
 
 
@@ -357,7 +359,10 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
     )
     inp.copy_(original_inp)
     residual.copy_(original_residual)
-    with graph_capture(device=device) as capture_context:
+    with graph_capture(
+        device=device,
+        channel_id="graph:test-b12x-fused-allreduce",
+    ) as capture_context:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=capture_context.stream):
             torch.ops.vllm.b12x_fused_allreduce_add_rms_norm.default(
@@ -380,7 +385,7 @@ def _run_b12x_fused_allreduce_gpu(rank: int, port: int) -> None:
     reason="B12X fused PCIe all-reduce test requires SM120",
 )
 def test_b12x_fused_allreduce_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("sparkinfer.comm.pcie")
+    pytest.importorskip("b12x.comm.pcie")
     monkeypatch.setenv("VLLM_ENABLE_PCIE_ALLREDUCE", "1")
     monkeypatch.setenv("VLLM_PCIE_ALLREDUCE_BACKEND", "b12x")
     monkeypatch.setenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "16KB")

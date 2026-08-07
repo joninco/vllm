@@ -6882,7 +6882,10 @@ class GPUModelRunner(
         # stream (cuda_stream=0), which cannot be used for cudagraph capture.
         # cap_ctx=None keeps the side-stream path on CUDA.
         cap_ctx = (
-            GraphCaptureContext(current_stream())
+            GraphCaptureContext(
+                current_stream(),
+                channel_id="graph:vllm-model",
+            )
             if current_platform.is_rocm()
             else None
         )
@@ -6893,7 +6896,11 @@ class GPUModelRunner(
             set_cudagraph_capturing_enabled(True)
             with (
                 self._freeze_gc(),
-                graph_capture(device=self.device, graph_capture_context=cap_ctx),
+                graph_capture(
+                    device=self.device,
+                    graph_capture_context=cap_ctx,
+                    channel_id="graph:vllm-model",
+                ),
             ):
                 torch.accelerator.synchronize()
                 torch.accelerator.empty_cache()
@@ -7005,7 +7012,6 @@ class GPUModelRunner(
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         set_cudagraph_capturing_enabled(True)
-
         # Setup torch profiler for graph capture traces (conditional)
         from vllm.distributed.parallel_state import get_world_group
 
@@ -7043,7 +7049,13 @@ class GPUModelRunner(
                 "Rank %d: Torch profiler disabled for CUDA graph capture", local_rank
             )
 
-        with self._freeze_gc(), graph_capture(device=self.device):
+        with (
+            self._freeze_gc(),
+            graph_capture(
+                device=self.device,
+                channel_id="graph:vllm-model",
+            ),
+        ):
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]

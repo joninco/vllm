@@ -191,6 +191,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
+            channel_id="graph:vllm-dflash-query",
         )
 
     def capture(self) -> None:
@@ -496,6 +497,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         step: int,
         num_query_per_req: int | None = None,
         causal: bool | Mapping[int, bool] = False,
+        max_seq_len_upper_bound: int | None = None,
         query_start_loc_np: np.ndarray | None = None,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
@@ -510,6 +512,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             step=step,
             num_query_per_req=num_query_per_req,
             causal=causal,
+            max_seq_len_upper_bound=max_seq_len_upper_bound,
             query_start_loc_np=query_start_loc_np,
         )
 

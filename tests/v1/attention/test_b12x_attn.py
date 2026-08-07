@@ -126,7 +126,7 @@ def test_b12x_runtime_page_size_comes_from_static_cache_shape() -> None:
 def test_b12x_lazily_prepares_missing_decode_capture_bucket(monkeypatch) -> None:
     impl = object.__new__(B12XPagedAttentionImpl)
     # A lazy mid-batch plan may be larger than every materialized capture plan;
-    # initialization reserves Sparkinfer's all-batch envelope for this case.
+    # initialization reserves B12X's all-batch envelope for this case.
     plan = SimpleNamespace(layout=SimpleNamespace(nbytes=96))
     created: list[tuple[int, int]] = []
 

@@ -529,7 +529,7 @@ def test_b12x_mla_mxfp8_bmm_warmup_skips_replaced_uk_signature(
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_mxfp8_mla_query_custom_op_uses_sparkinfer_api(monkeypatch, output_dtype):
+def test_mxfp8_mla_query_custom_op_uses_b12x_api(monkeypatch, output_dtype):
     calls = []
     mla_query = SimpleNamespace(
         run=lambda *args, **kwargs: calls.append((args, kwargs))
@@ -555,7 +555,7 @@ def test_mxfp8_mla_query_custom_op_uses_sparkinfer_api(monkeypatch, output_dtype
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_bf16_mla_query_custom_op_uses_sparkinfer_api(monkeypatch, output_dtype):
+def test_bf16_mla_query_custom_op_uses_b12x_api(monkeypatch, output_dtype):
     calls = []
     mla_query = SimpleNamespace(
         run=lambda *args, **kwargs: calls.append((args, kwargs))
@@ -656,11 +656,12 @@ def test_fused_mla_query_dispatch_uses_backend_workspace(monkeypatch):
     )
     workspace = torch.empty((2, 8, 576), dtype=torch.bfloat16)
     workspace_calls = []
-    layer.impl = SimpleNamespace(
-        get_fused_mla_query_output=lambda *args: (
-            workspace_calls.append(args) or workspace
-        )
-    )
+
+    def get_workspace(*args):
+        workspace_calls.append(args)
+        return workspace
+
+    layer.impl = SimpleNamespace(get_fused_mla_query_output=get_workspace)
     kernel_calls = []
     monkeypatch.setattr(
         mla_attention_module, "can_implement_mxfp8_mla_query", lambda **_: True
@@ -721,9 +722,12 @@ def test_fused_mla_query_dispatch_uses_temporary_when_backend_rejects_direct_out
         torch.empty((8, 192, 16), dtype=torch.uint8),
     )
     workspace_calls = []
-    layer.impl = SimpleNamespace(
-        get_fused_mla_query_output=lambda *args: workspace_calls.append(args) or None
-    )
+
+    def reject_direct_output(*args):
+        workspace_calls.append(args)
+        return None
+
+    layer.impl = SimpleNamespace(get_fused_mla_query_output=reject_direct_output)
     kernel_calls = []
     monkeypatch.setattr(
         mla_attention_module, "can_implement_mxfp8_mla_query", lambda **_: True
@@ -757,9 +761,12 @@ def test_bf16_fused_mla_query_dispatch_supports_tp6_dcp_temporary(monkeypatch):
     layer._q_scale = torch.ones(1, dtype=torch.float32)
     layer.W_UK_T = torch.empty((11, 192, 512), dtype=torch.bfloat16)
     workspace_calls = []
-    layer.impl = SimpleNamespace(
-        get_fused_mla_query_output=lambda *args: workspace_calls.append(args) or None
-    )
+
+    def reject_direct_output(*args):
+        workspace_calls.append(args)
+        return None
+
+    layer.impl = SimpleNamespace(get_fused_mla_query_output=reject_direct_output)
     kernel_calls = []
     monkeypatch.setattr(
         mla_attention_module, "can_implement_bf16_mla_query", lambda **_: True
