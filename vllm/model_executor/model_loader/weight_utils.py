@@ -1218,15 +1218,19 @@ def instanttensor_weights_iterator(
         process_group = world_group.device_group if world_group.world_size > 1 else None
 
     device = current_platform.current_device()
+    copy_setting = os.getenv("INSTANTTENSOR_COPY", "1")
+    if copy_setting not in {"0", "1"}:
+        raise ValueError(f"INSTANTTENSOR_COPY must be 0 or 1, got {copy_setting!r}")
+    copy_tensors = copy_setting == "1"
 
-    # copy=True yields tensors that own their memory, staying valid after the
-    # context exits or InstantTensor reuses its buffer.
+    # copy=True is the safe default. copy=False exposes views into
+    # InstantTensor's reusable buffer for synchronous consumers.
     with instanttensor.safe_open(
         hf_weights_files,
         framework="pt",
         device=device,
         process_group=process_group,
-        copy=True,
+        copy=copy_tensors,
     ) as f:
         # Track bytes so the bar reports load throughput (GB/s).
         pbar = tqdm(
@@ -1247,6 +1251,11 @@ def instanttensor_weights_iterator(
                     name, weight_name_prefixes
                 ):
                     continue
+                if not copy_tensors:
+                    # Parameter loaders consume borrowed tensors synchronously.
+                    # Loaders retaining a tensor past this yield must materialize
+                    # owned storage before InstantTensor advances its ring buffer.
+                    tensor._vllm_instanttensor_borrowed = True
                 yield name, tensor
         finally:
             pbar.close()
