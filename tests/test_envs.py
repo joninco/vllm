@@ -49,6 +49,53 @@ def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch)
     assert envs.VLLM_P2P_SIDE_CHANNEL_PORT == 5799
 
 
+def _clear_unknown_vllm_envs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove inherited VLLM variables not known by this source tree."""
+    for name in list(os.environ):
+        if name.startswith("VLLM_") and name not in environment_variables:
+            monkeypatch.delenv(name)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "expected"),
+    [
+        ("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", "12", 12),
+        ("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "1", "1"),
+        ("VLLM_PCIE_DMA_FP8", "ring", "ring"),
+        ("VLLM_CPP_AR_1STAGE_NCCL_CUTOFF", "56KB", "56KB"),
+        ("VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS", "4", 4),
+        ("VLLM_USE_B12X_PCIE_DMA", "1", True),
+        ("VLLM_CACHE_DIR", "/cache/vllm", "/cache/vllm"),
+    ],
+)
+def test_gilded_gnosis_runtime_envs_are_registered(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+    expected: str | int,
+) -> None:
+    """Accept every GG runtime variable consumed outside the env registry."""
+    _clear_unknown_vllm_envs(monkeypatch)
+    monkeypatch.setenv(name, value)
+
+    envs.validate_environ(hard_fail=True)
+    assert environment_variables[name]() == expected
+
+
+def test_gilded_gnosis_env_registration_keeps_unknown_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Continue rejecting misspelled VLLM variables after registration."""
+    _clear_unknown_vllm_envs(monkeypatch)
+    monkeypatch.setenv("VLLM_GILDED_GNOSIS_TYPO", "1")
+
+    with pytest.raises(
+        ValueError,
+        match="Unknown vLLM environment variable detected: VLLM_GILDED_GNOSIS_TYPO",
+    ):
+        envs.validate_environ(hard_fail=True)
+
+
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
     monkeypatch.setenv("VLLM_PORT", "1234")
