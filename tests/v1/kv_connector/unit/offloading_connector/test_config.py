@@ -319,7 +319,6 @@ def test_dcp_scales_attention_but_not_mamba_group_blocks():
         for chunk_idx in range(4)
         if is_store_reachable_swa_chunk(
             chunk_idx,
-            4,
             mamba_group.alignment_chunk_count,
             mamba_group.sliding_window_size_in_chunks,
             mamba_group.is_eagle_group,

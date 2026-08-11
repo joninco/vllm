@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import Any, NamedTuple
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -94,10 +95,15 @@ class GroupOffloadConfig(NamedTuple):
     # Partial-tail data for this group comes from the scheduler's CoW hand-off
     # rather than the request block table.
     requires_cow_source: bool = False
-    # Number of this group's offloaded chunks per full-attention alignment
-    # segment. Used to skip storing SWA chunks that can never serve a load
-    # hit (e.g. DeepSeek V4 where SWA groups have much smaller block sizes
-    # than the MLA full-attention group).
+    # The local cache sparsifies this group's checkpoints according to
+    # VLLM_PREFIX_CACHE_RETENTION_INTERVAL. Chunked-local attention remains
+    # dense and therefore keeps its normal full-attention alignment.
+    uses_sparse_retention: bool = False
+    # Number of this group's offloaded chunks per sparsity segment (the
+    # full-attention alignment size, or VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+    # when sparse retention is configured). Used to skip storing SWA chunks
+    # that can never serve a load hit (e.g. DeepSeek V4 where SWA groups have
+    # much smaller block sizes than the MLA full-attention group).
     # None for full-attention groups or when the optimization doesn't apply.
     alignment_chunk_count: int | None = None
     # True for EAGLE/MTP draft-model attention groups. The trailing chunk
@@ -128,22 +134,28 @@ def get_sliding_window_size_in_chunks(
 
 def is_store_reachable_swa_chunk(
     absolute_chunk_index: int,
-    storable_chunk_count: int,
     alignment_chunk_count: int | None,
     sliding_window_chunks: int | None,
     is_eagle_group: bool,
+    reachable_tail_end_chunks: Sequence[int] = (),
 ) -> bool:
     """Return whether an SWA chunk can participate in an external-cache hit."""
     if alignment_chunk_count is None:
         return True
     assert sliding_window_chunks is not None
-    position_in_segment = absolute_chunk_index % alignment_chunk_count
-    segment_start = absolute_chunk_index - position_in_segment
-    actual_segment_length = min(
-        alignment_chunk_count, storable_chunk_count - segment_start
+    shift = int(is_eagle_group)
+    need = sliding_window_chunks + shift
+    if need >= alignment_chunk_count:
+        return True
+    if (
+        absolute_chunk_index >= shift
+        and (absolute_chunk_index - shift) % alignment_chunk_count
+        >= alignment_chunk_count - need
+    ):
+        return True
+    return any(
+        end - need <= absolute_chunk_index < end for end in reachable_tail_end_chunks
     )
-    reachable_tail = sliding_window_chunks + int(is_eagle_group)
-    return position_in_segment >= actual_segment_length - reachable_tail
 
 
 def resolve_mamba_align_size(
@@ -176,6 +188,11 @@ class SchedulerOffloadConfig(NamedTuple):
     num_workers: int
     offload_prompt_only: bool
     supports_partial_tail: bool
+    # Token alignment of the per-request "replay boundary" tail (see
+    # OffloadingConnectorScheduler._reachable_tail_end_chunks). Set to the
+    # full-attention alignment size when sparse retention
+    # (VLLM_PREFIX_CACHE_RETENTION_INTERVAL) is enabled, else None.
+    replay_alignment_tokens: int | None = None
 
     @classmethod
     def from_spec(
@@ -204,16 +221,28 @@ class SchedulerOffloadConfig(NamedTuple):
         if len(full_attn_tokens_per_chunk) == 1:
             alignment_tokens = full_attn_tokens_per_chunk.pop()
 
+        # Mirror the local cache managers' segment-size choice. SWA and Mamba
+        # use VLLM_PREFIX_CACHE_RETENTION_INTERVAL when configured, while
+        # chunked-local attention remains dense and aligned to full attention.
+        # An interval of 0 disables store-side pruning for the sparse groups
+        # (conservative: store all chunks).
+        retention_interval = envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+
         def _alignment_chunk_count(
             tokens_per_chunk: int,
             sliding_window_size_in_chunks: int | None,
+            is_eagle_group: bool,
+            segment_tokens: int | None,
         ) -> int | None:
-            if alignment_tokens is None or sliding_window_size_in_chunks is None:
+            if segment_tokens is None or sliding_window_size_in_chunks is None:
                 return None
-            if alignment_tokens <= tokens_per_chunk:
+            if segment_tokens <= tokens_per_chunk:
                 return None
-            per_segment = alignment_tokens // tokens_per_chunk
-            if sliding_window_size_in_chunks >= per_segment:
+            per_segment = segment_tokens // tokens_per_chunk
+            # Contiguous chunks a hit needs at a segment boundary, including
+            # the "+1 peek" chunk for EAGLE/MTP groups (see _lookup).
+            need = sliding_window_size_in_chunks + (1 if is_eagle_group else 0)
+            if need >= per_segment:
                 return None
             return per_segment
 
@@ -245,6 +274,14 @@ class SchedulerOffloadConfig(NamedTuple):
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
             )
+            uses_sparse_retention = retention_interval is not None and isinstance(
+                kv_spec, (SlidingWindowSpec, MambaSpec)
+            )
+            segment_tokens = (
+                alignment_tokens
+                if not uses_sparse_retention
+                else (None if retention_interval == 0 else retention_interval)
+            )
             kv_group_configs_list.append(
                 GroupOffloadConfig(
                     group_idx=idx,
@@ -256,7 +293,10 @@ class SchedulerOffloadConfig(NamedTuple):
                     ),
                     sliding_window_size_in_chunks=sw,
                     alignment_chunk_count=_alignment_chunk_count(
-                        tokens_per_block * spec.blocks_per_chunk, sw
+                        tokens_per_block * spec.blocks_per_chunk,
+                        sw,
+                        idx in eagle_groups,
+                        segment_tokens,
                     ),
                     kv_event_group_spec=get_offloading_event_group_spec(kv_cache_group),
                     is_eagle_group=idx in eagle_groups,
@@ -264,6 +304,7 @@ class SchedulerOffloadConfig(NamedTuple):
                         isinstance(kv_spec, MambaSpec)
                         and kv_spec.mamba_cache_mode == "align"
                     ),
+                    uses_sparse_retention=uses_sparse_retention,
                 )
             )
         kv_group_configs = tuple(kv_group_configs_list)
@@ -296,6 +337,11 @@ class SchedulerOffloadConfig(NamedTuple):
             tokens_per_hash=spec.tokens_per_hash,
             offload_prompt_only=spec.offload_prompt_only,
             supports_partial_tail=supports_partial_tail,
+            replay_alignment_tokens=(
+                alignment_tokens
+                if any(group.uses_sparse_retention for group in kv_group_configs)
+                else None
+            ),
         )
 
 
@@ -546,6 +592,20 @@ class OffloadingConnectorScheduler:
             config.group_idx
             for config in self.config.kv_group_configs
             if config.requires_cow_source
+        )
+
+        # Tokens that must remain past a replay boundary for it to be
+        # servable: the last prompt token is always recomputed (hence the
+        # default of 1), and each EAGLE/MTP group must be able to match one
+        # complete chunk past the boundary (its "+1 peek", dropped after
+        # verification in _lookup).
+        self._replay_reserve_tokens: int = max(
+            (
+                group_config.tokens_per_chunk
+                for group_config in self.config.kv_group_configs
+                if group_config.is_eagle_group
+            ),
+            default=1,
         )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
@@ -1259,6 +1319,37 @@ class OffloadingConnectorScheduler:
 
         return store_jobs
 
+    def _reachable_tail_end_chunks(
+        self, group_config: GroupOffloadConfig, req: Request, shift: int
+    ) -> tuple[int, ...]:
+        """End chunk indices (exclusive) of serviceable boundary tails.
+
+        Mirrors the replay-boundary handling of
+        SlidingWindowManager.reachable_block_mask: with sparse retention,
+        segment tails exist only once per retention interval. Retain tails at
+        the request replay boundary and at a detected shared-prefix junction.
+        Clamp each boundary to the latest point that every group can service,
+        including a complete EAGLE/MTP peek chunk.
+        """
+        alignment_tokens = self.config.replay_alignment_tokens
+        if alignment_tokens is None or not group_config.uses_sparse_retention:
+            return ()
+
+        latest_serviceable = req.num_prompt_tokens - self._replay_reserve_tokens
+        boundaries = [latest_serviceable]
+        if req.shared_prefix_boundary:
+            boundaries.append(min(req.shared_prefix_boundary, latest_serviceable))
+
+        ends: list[int] = []
+        for boundary in boundaries:
+            aligned = boundary // alignment_tokens * alignment_tokens
+            if aligned <= 0 or aligned % group_config.tokens_per_chunk != 0:
+                continue
+            end = aligned // group_config.tokens_per_chunk + shift
+            if end not in ends:
+                ends.append(end)
+        return tuple(ends)
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1311,25 +1402,43 @@ class OffloadingConnectorScheduler:
                 ]
                 assert len(offload_keys) == len(offload_block_ids)
 
+                alignment_chunk_count = group_config.alignment_chunk_count
+                tail = group_config.sliding_window_size_in_chunks
+                # Chunks reachable by _sliding_window_lookup, mirroring
+                # SlidingWindowManager.reachable_block_mask: a hit needs
+                # `need` contiguous chunks ending at a segment boundary. For
+                # EAGLE/MTP groups the run includes the "+1 peek" chunk and
+                # is shifted one chunk past the boundary, so that after
+                # _lookup drops the peek the hit lands exactly on it.
+                shift = 0
+                reachable_end_chunks: tuple[int, ...] = ()
+                if alignment_chunk_count is not None:
+                    assert tail is not None
+                    shift = 1 if group_config.is_eagle_group else 0
+                    reachable_end_chunks = self._reachable_tail_end_chunks(
+                        group_config, req, shift
+                    )
+
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
                         continue
-                    # Skip SWA chunks that can never serve a load hit:
-                    # within each full-attention alignment segment, only the
-                    # trailing chunks queried by _sliding_window_lookup are
-                    # reachable. EAGLE/MTP requires one additional chunk that
-                    # lookup later drops as its volatile draft tail.
-                    abs_chunk_idx = start_chunk_idx + key_idx
-                    if not is_store_reachable_swa_chunk(
-                        abs_chunk_idx,
-                        num_chunks,
-                        group_config.alignment_chunk_count,
-                        group_config.sliding_window_size_in_chunks,
-                        group_config.is_eagle_group,
-                    ):
-                        continue
+                    # Skip SWA chunks that can never serve a load hit: only
+                    # the trailing `need` chunks of each alignment segment
+                    # (plus the replay-boundary tail) are reachable by
+                    # _sliding_window_lookup. For DeepSeek V4 with 100K
+                    # tokens this reduces SWA stores by ~78%.
+                    if alignment_chunk_count is not None:
+                        abs_chunk_idx = start_chunk_idx + key_idx
+                        if not is_store_reachable_swa_chunk(
+                            abs_chunk_idx,
+                            alignment_chunk_count,
+                            tail,
+                            group_config.is_eagle_group,
+                            reachable_end_chunks,
+                        ):
+                            continue
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:

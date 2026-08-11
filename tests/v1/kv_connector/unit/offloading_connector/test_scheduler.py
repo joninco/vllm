@@ -373,47 +373,49 @@ def test_scheduler_reports_lookup_sync_delay(request_runner):
 @pytest.mark.parametrize(
     (
         "absolute_chunk_index",
-        "storable_chunk_count",
         "alignment_chunk_count",
         "sliding_window_chunks",
         "is_eagle_group",
+        "reachable_tail_end_chunks",
         "expected",
     ),
     [
-        # Full 64-chunk segment: ordinary SWA keeps 62-63; EAGLE also keeps 61.
-        (61, 64, 64, 2, False, False),
-        (62, 64, 64, 2, False, True),
-        (60, 64, 64, 2, True, False),
-        (61, 64, 64, 2, True, True),
-        # Partial 48-of-64 segment: the reachable tail ends at chunk 47.
-        (45, 48, 64, 2, False, False),
-        (46, 48, 64, 2, False, True),
-        (44, 48, 64, 2, True, False),
-        (45, 48, 64, 2, True, True),
-        # A later partial segment uses its own actual end (chunks 64-79).
-        (76, 80, 64, 3, False, False),
-        (77, 80, 64, 3, False, True),
+        # Full 64-chunk segment: ordinary SWA keeps 62-63. EAGLE shifts its
+        # three-chunk run right, keeping 62-64 so dropping 64 lands on 64.
+        (61, 64, 2, False, (), False),
+        (62, 64, 2, False, (), True),
+        (61, 64, 2, True, (), False),
+        (62, 64, 2, True, (), True),
+        (64, 64, 2, True, (), True),
+        # An incomplete segment has no implicit tail. Replay/shared-prefix
+        # boundaries add an explicit run instead.
+        (46, 64, 2, False, (), False),
+        (45, 64, 2, False, (48,), False),
+        (46, 64, 2, False, (48,), True),
+        (45, 64, 2, True, (49,), False),
+        (46, 64, 2, True, (49,), True),
+        (48, 64, 2, True, (49,), True),
         # No alignment means no store-pruning optimization.
-        (0, 1, None, None, False, True),
+        (0, None, None, False, (), True),
         # A tail at least as large as the segment keeps every chunk.
-        (0, 2, 64, 2, False, True),
+        (0, 2, 2, False, (), True),
     ],
 )
 def test_is_store_reachable_swa_chunk(
     absolute_chunk_index: int,
-    storable_chunk_count: int,
     alignment_chunk_count: int | None,
     sliding_window_chunks: int | None,
     is_eagle_group: bool,
+    reachable_tail_end_chunks: tuple[int, ...],
     expected: bool,
 ):
     assert (
         is_store_reachable_swa_chunk(
             absolute_chunk_index,
-            storable_chunk_count,
             alignment_chunk_count,
             sliding_window_chunks,
             is_eagle_group,
+            reachable_tail_end_chunks,
         )
         is expected
     )
@@ -2283,6 +2285,289 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
+def test_swa_alignment_skip_eagle(request_runner, async_scheduling: bool):
+    """EAGLE/MTP SWA groups store their per-segment tail run shifted one
+    block past the segment boundary.
+
+    _lookup requires sliding_window_size_in_chunks + 1 consecutive stored
+    blocks for eagle groups (the "+1 peek" block, dropped after matching).
+    Mirroring SlidingWindowManager.reachable_block_mask (shift=1), the store
+    path retains a run of tail + 1 blocks ending one block PAST each segment
+    boundary, so the post-drop hit lands exactly on the boundary.
+
+    Setup:
+      - Group 0: full attention, block_size=16
+      - Group 1: SWA + eagle, block_size=4, sliding_window=8
+
+    alignment_chunk_count = 16 / 4 = 4, tail = 2, need = 3 (incl. peek).
+    Reachable block positions: {2, 3, 4} and {6, 7, 8} (shifted by one).
+
+    With a 36-token prompt (2 full full-attn blocks, 9 SWA blocks):
+      - Group 0 stores: blocks 0, 1
+      - Group 1 stores: blocks 2, 3, 4, 6, 7, 8
+
+    A replay then hits exactly 32 tokens (the second segment boundary): the
+    eagle lookup matches the run [6, 7, 8], drops peek block 8, and the
+    load fetches window blocks [6, 7].
+    """
+    full_attn_block_size = 16
+    swa_block_size = 4
+    sliding_window = 8
+    num_gpu_blocks = 200
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=full_attn_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=swa_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+            is_eagle_group=True,
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=swa_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    assert kv_group_configs[1].is_eagle_group
+    assert kv_group_configs[1].alignment_chunk_count == 4
+    assert kv_group_configs[1].sliding_window_size_in_chunks == 2
+    # No sparse retention -> no per-request replay tail.
+    assert runner.connector_scheduler.config.replay_alignment_tokens is None
+
+    # Track stored keys so lookups reflect the actual store-side filtering.
+    stored_keys: set = set()
+
+    def _prepare_store(keys, req_context):
+        keys = list(keys)
+        stored_keys.update(keys)
+        return generate_store_output(keys)
+
+    runner.manager.prepare_store.side_effect = _prepare_store
+    runner.manager.lookup.side_effect = lambda key, req_context: (
+        LookupResult.HIT if key in stored_keys else LookupResult.MISS
+    )
+
+    num_tokens = 36
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.run(decoded_tokens=[0])
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (1, 6),
+            (1, 7),
+            (1, 8),
+        ),
+    )
+
+    # Replay the same prompt; the eagle group must hit exactly at the
+    # 32-token segment boundary via the shifted run [6, 7, 8].
+    runner.scheduler.reset_prefix_cache()
+    # Avoid re-storing the (unloaded) peek block during the replay.
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded=(
+            (0, 0),
+            (0, 1),
+            (1, 6),
+            (1, 7),
+        ),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_swa_alignment_retention_interval(
+    request_runner, monkeypatch, async_scheduling: bool
+):
+    """VLLM_PREFIX_CACHE_RETENTION_INTERVAL sets the sparsity segment size,
+    and a per-request replay-boundary tail keeps exact replays servable.
+
+    Mirrors SlidingWindowManager.reachable_block_mask: with sparse retention
+    the local GPU cache keeps SWA tails once per retention interval (not at
+    every full-attention block boundary), plus one tail run at the latest
+    full-attention-aligned boundary of the prompt (the "replay boundary") so
+    a replay of the same prompt does not fall back a whole retention segment.
+
+    Setup:
+      - retention interval = 32 tokens
+      - Group 0: full attention, block_size=16
+      - Group 1: SWA, block_size=4, sliding_window=8
+
+    alignment_chunk_count = 32 / 4 = 8 (retention-based, not 16 / 4 = 4).
+
+    With a 56-token prompt (3 full full-attn blocks, 14 SWA blocks):
+      - segment tails: blocks {6, 7} (the second segment is incomplete:
+        blocks 14, 15 never fill)
+      - replay boundary: (56 - 1) // 16 * 16 = 48 -> tail run {10, 11}
+      - Group 1 stores: blocks 6, 7, 10, 11
+
+    A replay of the prompt hits 48 tokens via the replay tail {10, 11};
+    without it, the hit would fall back to 32 (the only segment boundary).
+    """
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "32")
+
+    full_attn_block_size = 16
+    swa_block_size = 4
+    sliding_window = 8
+    num_gpu_blocks = 200
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=full_attn_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=swa_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=swa_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    config = runner.connector_scheduler.config
+    # Segment granularity comes from the retention interval.
+    assert config.kv_group_configs[1].alignment_chunk_count == 8
+    assert config.kv_group_configs[1].sliding_window_size_in_chunks == 2
+    assert config.kv_group_configs[1].uses_sparse_retention
+    # Replay tails align to the full-attention block size.
+    assert config.replay_alignment_tokens == full_attn_block_size
+
+    # Track stored keys so lookups reflect the actual store-side filtering.
+    stored_keys: set = set()
+
+    def _prepare_store(keys, req_context):
+        keys = list(keys)
+        stored_keys.update(keys)
+        return generate_store_output(keys)
+
+    runner.manager.prepare_store.side_effect = _prepare_store
+    runner.manager.lookup.side_effect = lambda key, req_context: (
+        LookupResult.HIT if key in stored_keys else LookupResult.MISS
+    )
+
+    num_tokens = 56
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.run(decoded_tokens=[0])
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (1, 6),
+            (1, 7),
+            (1, 10),
+            (1, 11),
+        ),
+    )
+
+    # Replay the same prompt; the hit must reach the 48-token replay
+    # boundary served by the replay tail run {10, 11}.
+    runner.scheduler.reset_prefix_cache()
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (1, 10),
+            (1, 11),
+        ),
+    )
+
+
+def test_swa_alignment_retains_shared_prefix_boundary(request_runner, monkeypatch):
+    """Native offload retains the same sparse shared-prefix tail as APC."""
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "64")
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=200,
+        async_scheduling=False,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    runner.new_request(token_ids=[0] * 56)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    request.shared_prefix_boundary = 32
+
+    group_config = runner.connector_scheduler.config.kv_group_configs[1]
+    assert runner.connector_scheduler._reachable_tail_end_chunks(
+        group_config, request, shift=0
+    ) == (
+        12,  # Latest replay boundary: floor((56 - 1) / 16) * 16 / 4.
+        8,  # Shared-prefix junction: 32 / 4.
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
 def test_stale_sliding_window_block_after_prepare_store_failure(
     request_runner, async_scheduling: bool
 ):
@@ -3423,3 +3708,54 @@ def test_chunked_local_attention_reports_its_chunk_window():
     assert get_sliding_window_size_in_chunks(spec, tokens_per_chunk=1024) == 8
     # Partial chunks round up, so the reachable tail is never understated.
     assert get_sliding_window_size_in_chunks(spec, tokens_per_chunk=3000) == 3
+
+
+def test_chunked_local_attention_ignores_sparse_retention_interval(
+    request_runner, monkeypatch
+):
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "64")
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["sliding_window"],
+            SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=16,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["chunked_local"],
+            ChunkedLocalAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                attention_chunk_size=32,
+            ),
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=16,
+        num_gpu_blocks=32,
+        async_scheduling=False,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    config = runner.connector_scheduler.config
+    assert config.kv_group_configs[1].uses_sparse_retention
+    chunked_local = config.kv_group_configs[2]
+    assert chunked_local.alignment_chunk_count is None
+    assert not chunked_local.uses_sparse_retention
+    assert config.replay_alignment_tokens == 16
