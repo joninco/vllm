@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import glob
+import json
 import os
 import time
 from collections.abc import Generator, Iterable
@@ -266,6 +267,16 @@ class DefaultModelLoader(BaseModelLoader):
             source.allow_patterns_overrides,
             source.weight_name_prefixes,
         )
+        indexed_tensor_files: dict[str, str] | None = None
+        if use_safetensors:
+            index_path = os.path.join(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
+            if os.path.isfile(index_path):
+                with open(index_path, encoding="utf-8") as index_handle:
+                    weight_map = json.load(index_handle)["weight_map"]
+                indexed_tensor_files = {
+                    name: os.path.abspath(os.path.join(hf_folder, filename))
+                    for name, filename in weight_map.items()
+                }
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -288,6 +299,7 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                     weight_name_prefixes=source.weight_name_prefixes,
+                    indexed_tensor_files=indexed_tensor_files,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):

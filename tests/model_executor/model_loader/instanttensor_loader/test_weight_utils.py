@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 import vllm.model_executor.model_loader.weight_utils as weight_utils
 from vllm.model_executor.model_loader.weight_utils import (
@@ -92,6 +93,73 @@ def test_instanttensor_copy_rejects_unknown_value(monkeypatch):
 
     with pytest.raises(ValueError, match="INSTANTTENSOR_COPY must be 0 or 1"):
         next(instanttensor_weights_iterator(["model.safetensors"], False))
+
+
+def test_instanttensor_restricts_io_to_indexed_shards(tmp_path):
+    base_shard = tmp_path / "model-00001-of-00002.safetensors"
+    overlay_shard = tmp_path / "model-00002-of-00002.safetensors"
+    save_file(
+        {
+            "model.dense.weight": torch.tensor([2.0]),
+            "model.expert.weight": torch.tensor([1.0, 1.0]),
+        },
+        base_shard,
+    )
+    save_file(
+        {"model.expert.weight": torch.tensor([3.0, 3.0, 3.0])},
+        overlay_shard,
+    )
+
+    buffer_sizes = []
+    instant_open = SimpleNamespace(
+        filename=[str(base_shard), str(overlay_shard)],
+        ordered_tensor_metadatas=[
+            ("model.dense.weight", {"data_offsets": [0, 4]}),
+            ("model.expert.weight", {"data_offsets": [4, 12]}),
+            ("model.expert.weight", {"data_offsets": [0, 12]}),
+        ],
+        tensor_offsets=[
+            (0, 0),
+            (0, 4),
+            (0, 12),
+            (1, 0),
+            (1, 12),
+        ],
+        tensor_sizes=[4, 8, 12],
+        total_tensor_size=24,
+        tensor_name_to_index={},
+        loader_handle=None,
+        _determine_buffer_size=lambda requested: buffer_sizes.append(requested),
+    )
+    indexed_tensor_files = {
+        "model.dense.weight": str(base_shard.resolve()),
+        "model.expert.weight": str(overlay_shard.resolve()),
+    }
+
+    weight_utils._restrict_instanttensor_to_selected_ranges(
+        instant_open,
+        indexed_tensor_files=indexed_tensor_files,
+        weight_name_prefixes=None,
+    )
+
+    assert instant_open.filename == [str(base_shard), str(overlay_shard)]
+    assert [name for name, _ in instant_open.ordered_tensor_metadatas] == [
+        "model.dense.weight",
+        "model.expert.weight",
+    ]
+    assert instant_open.tensor_offsets == [
+        (0, 0),
+        (0, 4),
+        (1, 0),
+        (1, 12),
+    ]
+    assert instant_open.tensor_sizes == [4, 12]
+    assert instant_open.total_tensor_size == 16
+    assert instant_open.tensor_name_to_index == {
+        "model.dense.weight": 0,
+        "model.expert.weight": 1,
+    }
+    assert buffer_sizes == [None]
 
 
 @pytest.mark.skipif(
