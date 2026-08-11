@@ -304,6 +304,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     rank=None,
                     kv_bytes_per_block=self.kv_bytes_per_chunk,
                     cpu_page_size=self.cpu_page_size_per_worker,
+                    # Workers already prefault every row. Repeating that work over
+                    # the full region provides no benefit to the scheduler's
+                    # zero-copy secondary-tier view.
+                    prefault=False,
                 )
                 self._scheduler_mmap = scheduler_mmap
 

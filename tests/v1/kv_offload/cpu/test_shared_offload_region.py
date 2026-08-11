@@ -10,11 +10,12 @@ import os
 import threading
 import time
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
 from vllm.utils.system_utils import get_mp_context
+from vllm.v1.kv_offload.cpu import shared_offload_region
 from vllm.v1.kv_offload.cpu.shared_offload_region import (
     SharedOffloadRegion,
     _wait_for_file_size,
@@ -565,6 +566,172 @@ def test_madvise_unexpected_oserror_propagates(iid, monkeypatch):
     assert exc_info.value.errno == errno.EIO
 
 
+def test_prefault_can_be_disabled_for_delayed_scheduler(iid, monkeypatch):
+    """A scheduler join must not issue MADV_POPULATE_WRITE for the full region."""
+    get_populate_write_fn = MagicMock()
+    monkeypatch.setattr(
+        shared_offload_region,
+        "_get_populate_write_fn",
+        get_populate_write_fn,
+    )
+    mmap_path = f"/dev/shm/vllm_offload_{iid}.mmap"
+    region = SharedOffloadRegion(
+        engine_id=iid,
+        num_blocks=4,
+        rank=None,
+        kv_bytes_per_block=PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        prefault=False,
+    )
+    try:
+        assert region.mmap_obj is not None
+        get_populate_write_fn.assert_not_called()
+    finally:
+        region.cleanup()
+        _cleanup_file(mmap_path)
+
+
+def test_unlink_after_replicated_workers_map_keeps_shared_mapping(iid):
+    """Replicated workers rendezvous independently despite sharing data rank 0."""
+    num_workers = 2
+    regions: list[SharedOffloadRegion | None] = [None, None]
+    errors: list[BaseException] = []
+    mmap_path = f"/dev/shm/vllm_offload_{iid}.mmap"
+
+    def create_rank0() -> None:
+        try:
+            regions[0] = SharedOffloadRegion(
+                engine_id=iid,
+                num_blocks=4,
+                rank=0,
+                kv_bytes_per_block=PAGE_SIZE,
+                cpu_page_size=PAGE_SIZE,
+                unlink_after_workers_map=True,
+                num_workers=num_workers,
+                worker_id=0,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    rank0_thread = threading.Thread(target=create_rank0)
+    rank0_thread.start()
+    marker0 = f"{mmap_path}.mapped.0"
+    deadline = time.monotonic() + 5
+    while not os.path.exists(marker0):
+        assert time.monotonic() < deadline, "rank 0 did not publish its mmap marker"
+        time.sleep(0.005)
+
+    assert os.path.exists(mmap_path), "joiners still need the pathname"
+    regions[1] = SharedOffloadRegion(
+        engine_id=iid,
+        num_blocks=4,
+        rank=0,
+        kv_bytes_per_block=PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        unlink_after_workers_map=True,
+        num_workers=num_workers,
+        worker_id=1,
+    )
+    rank0_thread.join(timeout=5)
+
+    try:
+        assert not rank0_thread.is_alive()
+        assert not errors
+        assert regions[0] is not None
+        assert regions[1] is not None
+        assert not os.path.exists(mmap_path)
+        assert not os.path.exists(marker0)
+        assert not os.path.exists(f"{mmap_path}.mapped.1")
+
+        regions[0].mmap_obj[0:1] = b"\x2a"
+        assert regions[1].mmap_obj[0:1] == b"\x2a"
+    finally:
+        for region in regions:
+            if region is not None:
+                region.cleanup()
+        _cleanup_file(mmap_path)
+
+
+def test_unlink_after_workers_map_requires_worker_count(iid):
+    with pytest.raises(ValueError, match="num_workers must be positive"):
+        SharedOffloadRegion(
+            engine_id=iid,
+            num_blocks=4,
+            rank=0,
+            kv_bytes_per_block=PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+            unlink_after_workers_map=True,
+        )
+
+
+def test_unlink_rendezvous_timeout_cleans_resources_and_markers(iid, monkeypatch):
+    """A missing worker must not leak the creator mapping or rendezvous files."""
+    mmap_path = f"/dev/shm/vllm_offload_{iid}.mmap"
+    cleanup_state: list[tuple[int | None, mmap.mmap | None]] = []
+    original_cleanup = SharedOffloadRegion.cleanup
+
+    def tracked_cleanup(region: SharedOffloadRegion) -> None:
+        original_cleanup(region)
+        cleanup_state.append((region.fd, region.mmap_obj))
+
+    monotonic = MagicMock(side_effect=[0.0, 31.0])
+    monkeypatch.setattr(shared_offload_region.time, "monotonic", monotonic)
+    monkeypatch.setattr(SharedOffloadRegion, "cleanup", tracked_cleanup)
+
+    with pytest.raises(TimeoutError, match="worker mmap markers"):
+        SharedOffloadRegion(
+            engine_id=iid,
+            num_blocks=4,
+            rank=0,
+            kv_bytes_per_block=2 * PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+            unlink_after_workers_map=True,
+            num_workers=2,
+        )
+
+    assert cleanup_state == [(None, None)]
+    assert not os.path.exists(mmap_path)
+    assert not os.path.exists(f"{mmap_path}.mapped.0")
+    assert not os.path.exists(f"{mmap_path}.mapped.1")
+
+
+def test_delayed_scheduler_joins_worker_backing(iid):
+    """Tiering's delayed scheduler mapping must observe the worker backing."""
+    mmap_path = f"/dev/shm/vllm_offload_{iid}.mmap"
+    regions: list[SharedOffloadRegion] = []
+    try:
+        for rank in range(2):
+            regions.append(
+                SharedOffloadRegion(
+                    engine_id=iid,
+                    num_blocks=4,
+                    rank=rank,
+                    kv_bytes_per_block=2 * PAGE_SIZE,
+                    cpu_page_size=PAGE_SIZE,
+                )
+            )
+
+        assert os.path.exists(mmap_path)
+        scheduler = SharedOffloadRegion(
+            engine_id=iid,
+            num_blocks=4,
+            rank=None,
+            kv_bytes_per_block=2 * PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+            prefault=False,
+        )
+        regions.append(scheduler)
+
+        regions[0].mmap_obj[0:1] = b"\x2a"
+        assert scheduler.mmap_obj[0:1] == b"\x2a"
+        scheduler.mmap_obj[PAGE_SIZE : PAGE_SIZE + 1] = b"\x3b"
+        assert regions[1].mmap_obj[PAGE_SIZE : PAGE_SIZE + 1] == b"\x3b"
+    finally:
+        for region in reversed(regions):
+            region.cleanup()
+        _cleanup_file(mmap_path)
+
+
 # ---------------------------------------------------------------------------
 # Multi-worker race — concurrent construction
 # ---------------------------------------------------------------------------
@@ -646,26 +813,36 @@ def test_multiprocess_race_construct_and_write(iid):
     for rank, r in results.items():
         assert r["error"] is None, f"rank {rank}: {r['error']}"
 
-    # Read the raw file while all workers still hold it open.
-    mmap_path = f"/dev/shm/vllm_offload_{iid}.mmap"
-    with open(mmap_path, "rb") as f:
-        raw = f.read()
+    # Attach through the scheduler API only after every worker has mapped and
+    # written the region. This mirrors TieringOffloadingSpec startup ordering.
+    scheduler = SharedOffloadRegion(
+        engine_id=iid,
+        num_blocks=num_blocks,
+        rank=None,
+        kv_bytes_per_block=num_workers * PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        prefault=False,
+    )
+    try:
+        assert scheduler.mmap_obj is not None
+        raw = bytes(scheduler.mmap_obj)
 
-    for blk in range(num_blocks):
-        for w in range(num_workers):
-            slot_start = (blk * num_workers + w) * PAGE_SIZE
-            slot = raw[slot_start : slot_start + PAGE_SIZE]
-            expected = w + 1  # fill_value = rank + 1
-            assert all(b == expected for b in slot), (
-                f"block {blk}, worker {w}: expected {expected} but got wrong bytes"
-            )
-
-    # Unblock all workers to clean up.
-    for _ in range(num_workers):
-        cleanup_queue.put(True)
-    for p in procs:
-        p.join(timeout=10)
-        assert p.exitcode == 0
+        for blk in range(num_blocks):
+            for w in range(num_workers):
+                slot_start = (blk * num_workers + w) * PAGE_SIZE
+                slot = raw[slot_start : slot_start + PAGE_SIZE]
+                expected = w + 1  # fill_value = rank + 1
+                assert all(b == expected for b in slot), (
+                    f"block {blk}, worker {w}: expected {expected} but got wrong bytes"
+                )
+    finally:
+        scheduler.cleanup()
+        # Unblock all workers to clean up.
+        for _ in range(num_workers):
+            cleanup_queue.put(True)
+        for proc in procs:
+            proc.join(timeout=10)
+            assert proc.exitcode == 0
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +904,34 @@ def test_cleanup_after_create_next_worker_view_releases_mmap(iid):
     r.cleanup()
 
     assert mmap_obj.closed, "mmap should be closed after releasing the tensor"
+
+
+def test_cleanup_unregisters_tracked_segments_in_reverse(iid, monkeypatch):
+    """cleanup() must unregister the exact segments accepted during pinning."""
+    r = _make_region(iid)
+    unregister = MagicMock(return_value=0)
+    monkeypatch.setattr(
+        shared_offload_region.current_platform,
+        "is_cuda_alike",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        shared_offload_region,
+        "unregister_host_memory",
+        unregister,
+    )
+    r._registered_host_ptrs = [0x1000, 0x2000, 0x3000]
+    r.is_pinned = True
+
+    r.cleanup()
+
+    assert unregister.call_args_list == [
+        call(0x3000),
+        call(0x2000),
+        call(0x1000),
+    ]
+    assert r._registered_host_ptrs == []
+    assert r.is_pinned is False
 
 
 # ---------------------------------------------------------------------------

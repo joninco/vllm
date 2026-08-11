@@ -151,19 +151,20 @@ class CPUOffloadingSpec(OffloadingSpec):
         # num_blocks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
         if self._uses_shared_region() and self.num_blocks > 0:
+            world_size = self.config.parallel.world_size
+            worker_id = torch.accelerator.current_device_index() % world_size
             # Replicated layout puts all ranks on slot 0 (single MLA copy);
             # otherwise each rank takes its own slot by physical device index.
-            if self.replicated_layout:
-                rank = 0
-            else:
-                world_size = self.config.parallel.world_size
-                rank = torch.accelerator.current_device_index() % world_size
+            rank = 0 if self.replicated_layout else worker_id
             mmap_region = SharedOffloadRegion(
                 engine_id=self.config.engine_id,
                 num_blocks=self.num_blocks,
                 rank=rank,
                 kv_bytes_per_block=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
+                unlink_after_workers_map=True,
+                num_workers=world_size,
+                worker_id=worker_id,
             )
         try:
             return CPUOffloadingWorker(

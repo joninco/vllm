@@ -182,6 +182,46 @@ def test_tiering_spec_aligns_row_size():
     assert spec.num_blocks == 3
 
 
+def test_tiering_spec_keeps_region_named_for_delayed_scheduler(monkeypatch):
+    import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
+
+    alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    spec = _create_spec(
+        spec_name="TieringOffloadingSpec",
+        cpu_bytes_to_use=alignment * 2,
+        worker_kv_bytes_per_block=alignment,
+        world_size=2,
+    )
+    assert isinstance(spec, TieringOffloadingSpec)
+
+    scheduler_region = MagicMock()
+    region_ctor = MagicMock(return_value=scheduler_region)
+    primary_tier = MagicMock()
+    primary_tier.get_kv_memoryview.return_value = memoryview(bytearray(1))
+    monkeypatch.setattr(tiering_spec_module, "SharedOffloadRegion", region_ctor)
+    monkeypatch.setattr(
+        tiering_spec_module,
+        "CPUPrimaryTierOffloadingManager",
+        MagicMock(return_value=primary_tier),
+    )
+    monkeypatch.setattr(
+        tiering_spec_module,
+        "TieringOffloadingManager",
+        MagicMock(return_value=MagicMock()),
+    )
+
+    spec.get_manager()
+
+    region_ctor.assert_called_once_with(
+        engine_id=spec._engine_id,
+        num_blocks=spec.num_blocks,
+        rank=None,
+        kv_bytes_per_block=spec.kv_bytes_per_chunk,
+        cpu_page_size=spec.cpu_page_size_per_worker,
+        prefault=False,
+    )
+
+
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_tiering_spec_replicated_sizing_removes_world_factor(world_size: int):
     worker_kv_bytes_per_block = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
@@ -236,6 +276,7 @@ def test_tiering_spec_create_worker_uses_single_slot_for_replicated_layout(monke
 
     assert region_calls[0]["rank"] == 0
     assert region_calls[0]["kv_bytes_per_block"] == worker_kv_bytes_per_block
+    assert "unlink_after_workers_map" not in region_calls[0]
     assert worker_calls[0]["kv_caches"] is kv_caches
     assert worker_calls[0]["mmap_region"] is region
 
@@ -376,8 +417,18 @@ def test_cpu_spec_create_worker_uses_mmap_on_cuda_alike(monkeypatch):
     kv_caches = MagicMock()
     spec.create_worker(kv_caches)
 
-    assert region_calls[0]["engine_id"] == "test-engine"
-    assert region_calls[0]["kv_bytes_per_block"] == worker_kv_bytes_per_block * 4
+    assert region_calls == [
+        {
+            "engine_id": "test-engine",
+            "num_blocks": spec.num_blocks,
+            "rank": 1,
+            "kv_bytes_per_block": worker_kv_bytes_per_block * 4,
+            "cpu_page_size": worker_kv_bytes_per_block,
+            "unlink_after_workers_map": True,
+            "num_workers": 4,
+            "worker_id": 1,
+        }
+    ]
     assert worker_calls[0]["kv_caches"] is kv_caches
     assert worker_calls[0]["mmap_region"] is region
 
@@ -480,6 +531,7 @@ def test_cpu_spec_create_worker_rank_assignment(
     spec.create_worker(MagicMock())
 
     assert region_calls[0]["rank"] == expected_rank
+    assert region_calls[0]["worker_id"] == device_index % world_size
 
 
 def test_offloading_spec_has_replicated_layout_default():
