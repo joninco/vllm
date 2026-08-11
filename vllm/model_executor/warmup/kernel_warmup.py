@@ -482,6 +482,28 @@ def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
     return None
 
 
+def _flashinfer_autotune_dummy_run_kwargs(
+    runner: "GPUModelRunner",
+) -> dict[str, object]:
+    kwargs: dict[str, object] = dict(
+        num_tokens=runner.scheduler_config.max_num_batched_tokens,
+        skip_eplb=True,
+        is_profile=True,
+        randomize_inputs=True,
+    )
+
+    # V2 initializes attention backends and block tables only after the initial
+    # memory profile.  Kernel autotuning runs during that profile, so execute
+    # the model kernels without attention until those tables exist.  Attention
+    # backends have their own warmup after KV-cache initialization.
+    if getattr(runner.vllm_config, "use_v2_model_runner", False) and not hasattr(
+        runner, "block_tables"
+    ):
+        kwargs["skip_attn"] = True
+
+    return kwargs
+
+
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     Autotune FlashInfer operations.
@@ -526,12 +548,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # which lead to some EP ranks receiving no tokens and skipping their
     # MoE kernel entirely, and cause hang due to all-reduce collective
     # during synchronized autotuning.
-    dummy_run_kwargs = dict(
-        num_tokens=runner.scheduler_config.max_num_batched_tokens,
-        skip_eplb=True,
-        is_profile=True,
-        randomize_inputs=True,
-    )
+    dummy_run_kwargs = _flashinfer_autotune_dummy_run_kwargs(runner)
 
     # Read cached autotune results and broadcast to all ranks.
     cached_results: bytes | None = None

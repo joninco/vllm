@@ -81,12 +81,14 @@ def _flashinfer_autotune_worker(model, *, attn_groups=None):
     )
     return SimpleNamespace(
         get_model=lambda: model,
+        use_v2_model_runner=True,
         model_runner=runner,
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=8,
             max_num_scheduled_tokens=None,
         ),
         vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(),
             compilation_config=SimpleNamespace(
                 cudagraph_capture_sizes=[],
                 compile_sizes=[],
@@ -94,6 +96,7 @@ def _flashinfer_autotune_worker(model, *, attn_groups=None):
             kernel_config=SimpleNamespace(
                 enable_flashinfer_autotune=True,
                 enable_cutedsl_warmup=False,
+                enable_jit_warmup=False,
             ),
         ),
         model_config=SimpleNamespace(dtype=torch.bfloat16),
@@ -126,6 +129,56 @@ def _patch_flashinfer_autotune_deps(monkeypatch):
         lambda runner: calls.append(runner),
     )
     return calls
+
+
+def test_flashinfer_autotune_dummy_run_skips_pre_kv_v2_attention() -> None:
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        vllm_config=SimpleNamespace(use_v2_model_runner=True),
+    )
+
+    kwargs = kernel_warmup._flashinfer_autotune_dummy_run_kwargs(runner)
+
+    assert kwargs == {
+        "num_tokens": 8192,
+        "skip_eplb": True,
+        "is_profile": True,
+        "randomize_inputs": True,
+        "skip_attn": True,
+    }
+
+
+def test_flashinfer_autotune_dummy_run_keeps_attention_after_kv_init() -> None:
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        vllm_config=SimpleNamespace(use_v2_model_runner=True),
+        block_tables=object(),
+    )
+
+    kwargs = kernel_warmup._flashinfer_autotune_dummy_run_kwargs(runner)
+
+    assert kwargs == {
+        "num_tokens": 8192,
+        "skip_eplb": True,
+        "is_profile": True,
+        "randomize_inputs": True,
+    }
+
+
+def test_flashinfer_autotune_dummy_run_keeps_v1_signature() -> None:
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        vllm_config=SimpleNamespace(use_v2_model_runner=False),
+    )
+
+    kwargs = kernel_warmup._flashinfer_autotune_dummy_run_kwargs(runner)
+
+    assert kwargs == {
+        "num_tokens": 8192,
+        "skip_eplb": True,
+        "is_profile": True,
+        "randomize_inputs": True,
+    }
 
 
 def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
