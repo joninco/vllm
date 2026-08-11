@@ -1567,6 +1567,11 @@ def _validate_indexer_shard_count(indexer_shards: int, dcp_size: int) -> None:
         )
 
 
+def _needs_indexer_replica_groups(indexer_shards: int, dcp_size: int) -> bool:
+    """Return whether the indexer needs replica-specific process groups."""
+    return 1 <= indexer_shards < dcp_size
+
+
 _DCP_CKV_PREFETCH: GroupCoordinator | None = None
 
 
@@ -2159,7 +2164,7 @@ def initialize_model_parallel(
     )
     indexer_shards = int(envs.VLLM_DCP_INDEXER_SHARDS)
     _validate_indexer_shard_count(indexer_shards, dcp_size)
-    if 1 < indexer_shards < dcp_size:
+    if _needs_indexer_replica_groups(indexer_shards, dcp_size):
         indexer_dcp_ranks, indexer_query_split_ranks = (
             _build_indexer_replica_group_ranks(tp_group_ranks, indexer_shards)
         )
