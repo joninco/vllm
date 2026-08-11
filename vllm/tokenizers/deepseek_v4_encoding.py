@@ -148,10 +148,19 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    if isinstance(tool_call["arguments"], str):
-        arguments = json.loads(tool_call["arguments"])
+    raw_arguments = tool_call.get("arguments")
+    if isinstance(raw_arguments, str):
+        try:
+            arguments = json.loads(raw_arguments)
+        except (TypeError, ValueError):
+            arguments = {"arguments": raw_arguments}
     else:
-        arguments = tool_call["arguments"]
+        arguments = raw_arguments
+
+    # Historical tool calls are not always normalized to an object. Preserve
+    # those values as one explicit parameter instead of failing prompt render.
+    if not isinstance(arguments, dict):
+        arguments = {"arguments": arguments}
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(

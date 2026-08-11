@@ -10,7 +10,10 @@ use super::DeepSeekV4ChatRenderer;
 use crate::ChatRenderer;
 use crate::event::{AssistantContentBlock, AssistantToolCall};
 use crate::renderer::test_utils::{FixtureRequestOptions, fixture_chat_request};
-use crate::request::{ChatMessage, ChatRequest, GenerationPromptMode, ReasoningEffort};
+use crate::request::{
+    ChatMessage, ChatRequest, ChatTool, ChatToolChoice, GenerationPromptMode, ReasoningEffort,
+    ResolvedToolContext,
+};
 
 fn render_request(request: &ChatRequest) -> String {
     DeepSeekV4ChatRenderer::new()
@@ -175,6 +178,47 @@ fn reasoning_effort_low_keeps_the_default_prompt() {
     let rendered = render_request(&request);
 
     expect!["<｜begin▁of▁sentence｜><｜User｜>solve it<｜Assistant｜><think>"].assert_eq(&rendered);
+}
+
+#[test]
+fn request_tools_follow_existing_system_prompt() {
+    let messages = vec![
+        ChatMessage::system("Follow policy."),
+        ChatMessage::user("Find it."),
+    ];
+    let tool_context = ResolvedToolContext::new(
+        &messages,
+        vec![ChatTool {
+            name: "lookup".to_string(),
+            description: Some("Look things up".to_string()),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+            }),
+            strict: None,
+        }],
+        Some(ChatToolChoice::Auto),
+        true,
+    )
+    .unwrap();
+    let mut request = ChatRequest {
+        messages,
+        tool_context,
+        ..ChatRequest::for_test()
+    };
+    request
+        .chat_options
+        .template_kwargs
+        .insert("thinking".to_string(), Value::Bool(true));
+    request.chat_options.reasoning_effort = Some(ReasoningEffort::Max);
+
+    let rendered = render_request(&request);
+
+    let prefix = rendered.find("Reasoning Effort: Beyond maximum").unwrap();
+    let system = rendered.find("Follow policy.").unwrap();
+    let tools = rendered.find("## Tools").unwrap();
+    let user = rendered.find("<｜User｜>Find it.").unwrap();
+    assert!(prefix < system && system < tools && tools < user);
 }
 
 #[test]

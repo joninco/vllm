@@ -146,6 +146,165 @@ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
     assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜><think>")
 
 
+def test_deepseek_v4_attaches_request_tools_after_existing_system_prompt():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look things up",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "system", "content": "Follow policy."},
+            {"role": "user", "content": "Find it."},
+        ],
+        tools=tools,
+        tokenize=False,
+        enable_thinking=True,
+        reasoning_effort="max",
+    )
+
+    max_prefix = "Reasoning Effort: Beyond maximum"
+    system = "Follow policy."
+    tool_block = "## Tools"
+    user = "<｜User｜>Find it."
+    assert prompt.index(max_prefix) < prompt.index(system)
+    assert prompt.index(system) < prompt.index(tool_block)
+    assert prompt.index(tool_block) < prompt.index(user)
+
+
+def test_deepseek_v4_attaches_request_tools_to_existing_developer_prompt():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look things up",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "developer", "content": "Follow policy."},
+            {"role": "user", "content": "Find it."},
+        ],
+        tools=tools,
+        tokenize=False,
+    )
+
+    assert prompt.index("Follow policy.") < prompt.index("## Tools")
+    assert prompt.index("## Tools") < prompt.index("<｜User｜>Find it.")
+    assert prompt.count("## Tools") == 1
+
+
+def test_deepseek_v4_merges_message_and_request_tools_into_one_block():
+    message_tools = [
+        {
+            "type": "function",
+            "function": {"name": "old_tool", "parameters": {"type": "object"}},
+        }
+    ]
+    request_tools = [
+        {
+            "type": "function",
+            "function": {"name": "new_tool", "parameters": {"type": "object"}},
+        }
+    ]
+
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {
+                "role": "system",
+                "content": "Follow policy.",
+                "tools": message_tools,
+            },
+            {"role": "user", "content": "Find it."},
+        ],
+        tools=request_tools,
+        tokenize=False,
+    )
+
+    assert prompt.count("## Tools") == 1
+    assert '"name": "new_tool"' in prompt
+    assert '"name": "old_tool"' in prompt
+
+
+def test_deepseek_v4_request_tool_replaces_same_named_message_tool():
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {
+                "role": "system",
+                "content": "Follow policy.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "description": "old definition",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+            {"role": "user", "content": "Find it."},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "new definition",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        tokenize=False,
+    )
+
+    assert prompt.count("## Tools") == 1
+    assert prompt.count('"name": "lookup"') == 1
+    assert "new definition" in prompt
+    assert "old definition" not in prompt
+
+
+def test_deepseek_v4_renders_message_level_system_tools():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look things up",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    messages = [
+        {"role": "system", "content": "Follow policy.", "tools": tools},
+        {"role": "user", "content": "Find it."},
+    ]
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        _model_config(),
+        content_format="string",
+    )
+
+    prompt = _tokenizer().apply_chat_template(
+        conversation=conversation,
+        messages=messages,
+        tokenize=False,
+    )
+
+    assert prompt.index("Follow policy.") < prompt.index("## Tools")
+    assert prompt.index("## Tools") < prompt.index("<｜User｜>Find it.")
+
+
 def test_deepseek_v4_renders_parsed_history_tool_arguments():
     messages = [
         {"role": "user", "content": "List the repo"},
@@ -201,6 +360,45 @@ def test_deepseek_v4_renders_parsed_history_tool_arguments():
     assert '<｜DSML｜parameter name="command" string="true">view' in prompt
     assert '<｜DSML｜parameter name="path" string="true">/testbed' in prompt
     assert 'parameter name="arguments"' not in prompt
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_value", "is_string"),
+    [
+        ("", "", True),
+        ("not json", "not json", True),
+        ('{"unterminated": 1', '{"unterminated": 1', True),
+        (None, "null", False),
+        ([1, 2], "[1, 2]", False),
+        ("[1, 2]", "[1, 2]", False),
+    ],
+)
+def test_deepseek_v4_renders_non_object_history_tool_arguments(
+    arguments,
+    expected_value,
+    is_string,
+):
+    prompt = _tokenizer().apply_chat_template(
+        [
+            {"role": "user", "content": "Run it"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "run", "arguments": arguments},
+                    }
+                ],
+            },
+        ],
+        tokenize=False,
+    )
+
+    parameter = (
+        f'<｜DSML｜parameter name="arguments" '
+        f'string="{str(is_string).lower()}">{expected_value}'
+    )
+    assert parameter in prompt
 
 
 @pytest.mark.parametrize(
