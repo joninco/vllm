@@ -22,6 +22,9 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_dspark_swa_index_width,
+)
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -522,7 +525,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # width. decode_swa_lens keeps the padding out of the attention result.
         self.is_dspark = spec_config is not None and spec_config.use_dspark()
         self.noncausal_index_width = (
-            cdiv(self.window_size + self.num_speculative_tokens, 512) * 512
+            get_dspark_swa_index_width(
+                self.window_size,
+                self.num_speculative_tokens,
+            )
             if self.is_dspark
             else 0
         )

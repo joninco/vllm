@@ -1,8 +1,94 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
+from functools import cache
+
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
+
+_C128A_TOPK_ALIGNMENT = 128
+_COMPRESSED_MLA_SPLIT_ALIGNMENT = 64
+_DSPARK_SWA_INDEX_ALIGNMENT = 512
+
+
+def get_c128a_topk_width(max_model_len: int, compress_ratio: int) -> int:
+    """Return C128 indexed width padded for FlashMLA B_TOPK divisibility.
+
+    Args:
+        max_model_len: Maximum model context length in tokens.
+        compress_ratio: Ratio used to compress the indexed KV cache.
+
+    Returns:
+        The aligned compressed top-k width.
+    """
+    compressed_width = cdiv(max_model_len, compress_ratio)
+    return cdiv(compressed_width, _C128A_TOPK_ALIGNMENT) * _C128A_TOPK_ALIGNMENT
+
+
+def get_dspark_swa_index_width(
+    window_size: int,
+    num_speculative_tokens: int,
+) -> int:
+    """Return the padded width of non-causal DSpark SWA indices.
+
+    Args:
+        window_size: Sliding-window attention width.
+        num_speculative_tokens: Number of DSpark draft tokens.
+
+    Returns:
+        The aligned non-causal index width.
+    """
+    width = max(int(window_size), 0) + max(int(num_speculative_tokens), 0)
+    return cdiv(width, _DSPARK_SWA_INDEX_ALIGNMENT) * _DSPARK_SWA_INDEX_ALIGNMENT
+
+
+def get_compressed_mla_split_cap(width: int) -> int:
+    """Return the maximum compressed-MLA split count for ``width``.
+
+    Args:
+        width: Combined SWA and indexed width.
+
+    Returns:
+        The split count capped by the kernel tile width.
+    """
+    return max(1, cdiv(max(int(width), 1), _COMPRESSED_MLA_SPLIT_ALIGNMENT))
+
+
+@cache
+def get_compressed_mla_max_q_chunks(
+    max_rows: int,
+    width: int,
+    max_chunks: int,
+    split_chunks_for_contract: Callable[..., int],
+    decode_row_capacity: int | None = None,
+) -> int:
+    """Return the q-chunk cap over every reachable row count.
+
+    Args:
+        max_rows: Maximum number of query rows in one scheduler step.
+        width: Combined SWA and indexed width.
+        max_chunks: Maximum chunks allowed for each row.
+        split_chunks_for_contract: Kernel contract split-count function.
+        decode_row_capacity: Integration-declared decode/verifier row capacity.
+
+    Returns:
+        The largest reachable product of rows and chunks per row.
+    """
+    max_rows = max(int(max_rows), 1)
+    width = max(int(width), 1)
+    max_chunks = max(int(max_chunks), 1)
+    return max(
+        rows
+        * split_chunks_for_contract(
+            rows=rows,
+            width=width,
+            max_chunks=max_chunks,
+            decode_row_capacity=decode_row_capacity,
+        )
+        for rows in range(1, max_rows + 1)
+    )
 
 
 @triton.jit
