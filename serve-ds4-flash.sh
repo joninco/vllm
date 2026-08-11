@@ -40,9 +40,10 @@ case "${mode}" in
   off|mtp0|standard-mtp0) mode=mtp0 ;;
   mtp2|standard-mtp2) mode=mtp2 ;;
   mtp3|standard-mtp3) mode=mtp3 ;;
+  dspark-off|dspark-mtp0) mode=dspark-mtp0 ;;
   dspark) ;;
   *)
-    echo "MODE must be mtp0, mtp2, mtp3, or dspark; got '${mode}'" >&2
+    echo "MODE must be mtp0, mtp2, mtp3, dspark-off, dspark-mtp0, or dspark; got '${mode}'" >&2
     exit 2
     ;;
 esac
@@ -59,13 +60,13 @@ case "${backend}" in
 esac
 
 standard_model=${STANDARD_MODEL:-deepseek-ai/DeepSeek-V4-Flash}
-dspark_model=${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-DSpark}
+dspark_model=${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-0731}
 standard_model_revision=${STANDARD_MODEL_REVISION:-60d8d70770c6776ff598c94bb586a859a38244f1}
-dspark_model_revision=${DSPARK_MODEL_REVISION:-62af8fffb2f7030cac4de2f0169f5b8d1101b646}
-if [[ "${mode}" == "dspark" ]]; then
+dspark_model_revision=${DSPARK_MODEL_REVISION:-9e165c30e2704aec5d9d593cce3eebd58bbef1cb}
+if [[ "${mode}" == "dspark" || "${mode}" == "dspark-mtp0" ]]; then
   model=${MODEL_PATH:-${MODEL:-${dspark_model}}}
   spec_model=${SPEC_MODEL_PATH:-${model}}
-  served_model_name=${SERVED_MODEL_NAME:-DeepSeek-V4-Flash-DSpark}
+  served_model_name=${SERVED_MODEL_NAME:-DeepSeek-V4-Flash-0731}
   default_model_revision=${dspark_model_revision}
 else
   model=${MODEL_PATH:-${MODEL:-${standard_model}}}
@@ -88,13 +89,21 @@ fi
 host=${HOST:-0.0.0.0}
 port=${PORT:-8000}
 tp_size=${TP_SIZE:-${TP:-2}}
-dcp_size=${DCP_SIZE:-1}
-max_num_seqs=${MAX_NUM_SEQS:-64}
-max_model_len=${MAX_MODEL_LEN:-262144}
+dcp_size=${DCP_SIZE:-${DCP:-1}}
+if [[ "${mode}" == "dspark" || "${mode}" == "dspark-mtp0" ]]; then
+  max_num_seqs=${MAX_NUM_SEQS:-16}
+  max_model_len=${MAX_MODEL_LEN:-131072}
+else
+  max_num_seqs=${MAX_NUM_SEQS:-64}
+  max_model_len=${MAX_MODEL_LEN:-262144}
+fi
 max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-}
 block_size=${BLOCK_SIZE:-256}
 load_format=${LOAD_FORMAT:-instanttensor}
+kv_offloading_size=${KV_OFFLOADING_SIZE:-}
+native_l2_path=${NATIVE_L2_PATH:-}
+native_l2_size=${NATIVE_L2_GB:-}
 prefix_cache=$(bool_value PREFIX_CACHE "${PREFIX_CACHE:-1}")
 enable_flashinfer_autotune=$(bool_value ENABLE_FLASHINFER_AUTOTUNE "${ENABLE_FLASHINFER_AUTOTUNE:-1}")
 draft_sample_method=${DRAFT_SAMPLE_METHOD:-probabilistic}
@@ -105,6 +114,33 @@ require_positive_int DCP_SIZE "${dcp_size}"
 require_positive_int MAX_NUM_SEQS "${max_num_seqs}"
 require_positive_int MAX_NUM_BATCHED_TOKENS "${max_num_batched_tokens}"
 require_positive_int BLOCK_SIZE "${block_size}"
+if [[ -n "${kv_offloading_size}" \
+  && ! "${kv_offloading_size}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+  echo "KV_OFFLOADING_SIZE must be a non-negative GiB value; got '${kv_offloading_size}'" >&2
+  exit 2
+fi
+native_l2_enabled=0
+if [[ -n "${native_l2_path}" || -n "${native_l2_size}" ]]; then
+  if [[ -z "${native_l2_path}" || -z "${native_l2_size}" ]]; then
+    echo "NATIVE_L2_PATH and NATIVE_L2_GB must be set together" >&2
+    exit 2
+  fi
+  if [[ "${native_l2_path}" != /* ]]; then
+    echo "NATIVE_L2_PATH must be an absolute container path" >&2
+    exit 2
+  fi
+  if [[ ! "${native_l2_size}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ \
+    || "${native_l2_size}" =~ ^0*([.]0*)?$ ]]; then
+    echo "NATIVE_L2_GB must be a positive GiB value; got '${native_l2_size}'" >&2
+    exit 2
+  fi
+  if [[ -z "${kv_offloading_size}" \
+    || "${kv_offloading_size}" =~ ^0*([.]0*)?$ ]]; then
+    echo "NATIVE_L2 requires a positive KV_OFFLOADING_SIZE for its L1 tier" >&2
+    exit 2
+  fi
+  native_l2_enabled=1
+fi
 if [[ "${mode}" == "dspark" && "${dcp_size}" != "1" ]]; then
   echo "DSpark non-causal attention currently requires DCP_SIZE=1" >&2
   exit 2
@@ -246,6 +282,7 @@ esac
 spec_args=()
 spec_tokens=0
 graph_multiplier=4
+dspark_depth_mode=disabled
 if [[ "${mode}" == "mtp2" || "${mode}" == "mtp3" ]]; then
   if [[ "${mode}" == "mtp2" ]]; then spec_tokens=2; else spec_tokens=3; fi
   mtp_moe_json=
@@ -259,7 +296,7 @@ if [[ "${mode}" == "mtp2" || "${mode}" == "mtp3" ]]; then
   spec_args=(--speculative-config "${spec_json}")
   graph_multiplier=8
 elif [[ "${mode}" == "dspark" ]]; then
-  spec_tokens=${DSPARK_TOKENS:-5}
+  spec_tokens=${DSPARK_TOKENS:-${NUM_SPECULATIVE_TOKENS:-7}}
   require_positive_int DSPARK_TOKENS "${spec_tokens}"
   # Target verification schedules at most one sampled token plus K drafts per
   # request. Capturing beyond that physical row count only consumes graph
@@ -278,9 +315,27 @@ elif [[ "${mode}" == "dspark" ]]; then
         ;;
     esac
     draft_attention_json=$(printf \
-      ',"draft_attention_backend":"%s"' "${draft_attention_backend}")
+      ',"attention_backend":"%s"' "${draft_attention_backend}")
   fi
-  dspark_capacity=$(bool_value DSPARK_CAPACITY "${DSPARK_CAPACITY:-0}")
+  dspark_depth_mode=${DSPARK_DEPTH_MODE:-fixed}
+  case "${dspark_depth_mode}" in
+    fixed)
+      default_dspark_capacity=0
+      default_dynamic_depth=0
+      default_activation_batch_size=0
+      ;;
+    dynamic)
+      default_dspark_capacity=1
+      default_dynamic_depth=1
+      default_activation_batch_size=1
+      ;;
+    *)
+      echo "DSPARK_DEPTH_MODE must be fixed or dynamic" >&2
+      exit 2
+      ;;
+  esac
+  dspark_capacity=$(bool_value DSPARK_CAPACITY \
+    "${DSPARK_CAPACITY:-${default_dspark_capacity}}")
   capacity_json=
   if [[ "${dspark_capacity}" == "1" ]]; then
     capacity_mode=${DSPARK_CAPACITY_VERIFICATION_MODE:-}
@@ -319,11 +374,14 @@ elif [[ "${mode}" == "dspark" ]]; then
     "${rejection_sample_method}" "${draft_attention_json}" "${capacity_json}")
   spec_args=(--speculative-config "${spec_json}")
   export VLLM_DSPARK_FP8_DRAFT_HEAD=$(bool_value DSPARK_FP8_DRAFT_HEAD "${DSPARK_FP8_DRAFT_HEAD:-0}")
-  export VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH=$(bool_value DSPARK_DYNAMIC_DRAFT_DEPTH "${DSPARK_DYNAMIC_DRAFT_DEPTH:-0}")
+  dynamic_depth=${DSPARK_DYNAMIC_DRAFT_DEPTH:-${VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH:-${default_dynamic_depth}}}
+  export VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH=$(bool_value \
+    DSPARK_DYNAMIC_DRAFT_DEPTH "${dynamic_depth}")
   export VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW=${DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW:-8}
   require_positive_int DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW \
     "${VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW}"
-  export VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE=${DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-0}
+  activation_batch_size=${DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-${VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-${default_activation_batch_size}}}
+  export VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE=${activation_batch_size}
   require_nonnegative_int DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE \
     "${VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE}"
   export VLLM_DSPARK_CAPACITY_LOG_INTERVAL=${DSPARK_CAPACITY_LOG_INTERVAL:-0}
@@ -358,8 +416,10 @@ if [[ "${sp_async_tp}" == "1" ]]; then
 fi
 
 if [[ -z "${gpu_memory_utilization}" ]]; then
-  # The v10 profiler includes attention and FULL-graph allocations. These
-  # defaults preserve the 262k serving limit used by v9 after that accounting.
+  # The 0731 DSpark draft head is larger than the historical MTP head. Its
+  # B12X TP2 profile needs 0.975 to retain the default 131k serving limit after
+  # attention and FULL-graph allocations are accounted for. At 0.97 the r15
+  # stack exposed 7.11 GiB of KV storage while this profile needs 7.37 GiB.
   if [[ "${mode}" == "dspark" ]]; then
     if [[ "${backend}" == "lucifer-default" ]]; then
       # The default DeepGEMM MoE path retains more model/runtime memory than
@@ -377,7 +437,7 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
     elif [[ "${backend}" == lucifer-* ]]; then
       gpu_memory_utilization=0.9465
     else
-      gpu_memory_utilization=0.95
+      gpu_memory_utilization=0.975
     fi
   elif [[ "${backend}" == lucifer-* \
     && ( "${mode}" == "mtp2" || "${mode}" == "mtp3" ) ]]; then
@@ -396,6 +456,54 @@ fi
 autotune_args=(--enable-flashinfer-autotune)
 if [[ "${enable_flashinfer_autotune}" == "0" ]]; then
   autotune_args=(--no-enable-flashinfer-autotune)
+fi
+
+offloading_args=()
+if [[ -n "${kv_offloading_size}" \
+  && ! "${kv_offloading_size}" =~ ^0*([.]0*)?$ ]]; then
+  # This is the total host-cache capacity across all TP ranks, matching the
+  # vLLM CLI contract. LMCache remains a separate deployment mode. Native KV
+  # offload pins/registers GPU cache allocations, so PyTorch's remappable VMM
+  # segments must be disabled while preserving any other allocator settings.
+  allocator_config=${PYTORCH_CUDA_ALLOC_CONF:-}
+  if [[ -z "${allocator_config}" ]]; then
+    allocator_config=expandable_segments:False
+  elif [[ "${allocator_config}" =~ (^|,)expandable_segments:True(,|$) ]]; then
+    allocator_config=${allocator_config//expandable_segments:True/expandable_segments:False}
+  fi
+  export PYTORCH_CUDA_ALLOC_CONF=${allocator_config}
+  offloading_args=(
+    --kv-offloading-size "${kv_offloading_size}"
+    --kv-offloading-backend native
+  )
+  if [[ "${native_l2_enabled}" == "1" ]]; then
+    export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
+    native_l2_config=$(python3 - "${native_l2_path}" "${native_l2_size}" <<'PY'
+import json
+import sys
+
+root_dir, max_size_gb = sys.argv[1:]
+config = {
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "spec_name": "TieringOffloadingSpec",
+        "secondary_tiers": [
+            {
+                "type": "fs",
+                "root_dir": root_dir,
+                "n_read_threads": 32,
+                "n_write_threads": 16,
+                "gc_max_size_gb": float(max_size_gb),
+            }
+        ],
+    },
+}
+print(json.dumps(config, separators=(",", ":")))
+PY
+    )
+    offloading_args+=(--kv-transfer-config "${native_l2_config}")
+  fi
 fi
 
 capture_args=()
@@ -465,6 +573,7 @@ command=(
   "${autotune_args[@]}"
   "${prefix_args[@]}"
   "${capture_args[@]}"
+  "${offloading_args[@]}"
   "${spec_args[@]}"
   "${backend_args[@]}"
   "${allreduce_args[@]}"
@@ -478,10 +587,13 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: mode=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s model=%s\n' \
-  "${mode}" "${backend}" "${allreduce_mode}" "${b12x_pcie_dma}" \
+printf 'DS4 launch: mode=%s depth=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s native_l2=%s allocator=%s model=%s\n' \
+  "${mode}" "${dspark_depth_mode}" \
+  "${backend}" "${allreduce_mode}" "${b12x_pcie_dma}" \
   "${indexer_backend}" "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
-  "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" "${model}" >&2
+  "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" \
+  "${native_l2_enabled}" \
+  "${PYTORCH_CUDA_ALLOC_CONF:-<unset>}" "${model}" >&2
 printf 'Command:' >&2
 printf ' %q' "${command[@]}" >&2
 printf '\n' >&2
