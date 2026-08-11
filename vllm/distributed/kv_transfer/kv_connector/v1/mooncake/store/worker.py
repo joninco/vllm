@@ -1364,9 +1364,9 @@ class MooncakeStoreWorker:
             )
             return
 
-        # Single-group + PCP/DCP > 1: scale the lone group's spec.block_size to
-        # self.block_size (= scheduler_block_size) so the coordinator's
-        # ``block_size % hash_block_size == 0`` invariant holds.
+        # Scale a lone group's spec.block_size to self.block_size
+        # (= scheduler_block_size) so the coordinator's
+        # ``block_size % hash_block_size == 0`` invariant holds under DCP.
         groups = list(kv_cache_config.kv_cache_groups)
         if len(groups) == 1 and groups[0].kv_cache_spec.block_size != self.block_size:
             g = groups[0]

@@ -72,7 +72,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
-    get_kv_cache_cp_shard_count,
+    get_kv_cache_dcp_shard_count,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
@@ -571,15 +571,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
-            # When using DCP, each request's KV cache is sharded among different ranks.
-            # As a result, one block on the current rank covers `block_size * cp_size`
-            # tokens in the full, global (unsharded) sequence. dcp_replicated
-            # groups keep the full cache on every rank instead.
-            group_cp_size = get_kv_cache_cp_shard_count(
-                spec,
-                self.dcp_size,
-                self.parallel_config.prefill_context_parallel_size,
-            )
+            # One local block covers `block_size * dcp_shard_count` tokens in
+            # the global sequence. Replicated groups keep the full cache on
+            # every rank instead.
+            group_cp_size = get_kv_cache_dcp_shard_count(spec, self.dcp_size)
             group_cp_sizes.append(group_cp_size)
             max_num_blocks = cdiv(
                 block_table_max_model_len, spec.block_size * group_cp_size
@@ -2107,7 +2102,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
-        copy_draft_with_output = (
+        copy_draft_with_output = bool(
             self.num_speculative_steps > 0
             and self.scheduler_config.async_scheduling
             and self.draft_tokens_handler.needs_host_copy(input_batch)

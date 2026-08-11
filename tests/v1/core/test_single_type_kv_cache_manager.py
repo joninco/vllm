@@ -16,10 +16,12 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
     RSWAManager,
     SlidingWindowManager,
+    get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     RSWASpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 
@@ -536,3 +538,34 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+def test_dcp_sharded_swa_admission_ignores_virtual_pcp():
+    spec = SlidingWindowMLASpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+        sliding_window=32,
+        dcp_sharded=True,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=100,
+        enable_caching=False,
+        hash_block_size=8,
+    )
+
+    manager = get_manager_for_kv_cache_spec(
+        kv_cache_spec=spec,
+        max_in_flight_tokens=16,
+        max_model_len=128,
+        block_pool=block_pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=8,
+        dcp_world_size=2,
+        pcp_world_size=4,
+    )
+
+    assert manager.block_size == 8
+    assert manager._max_admission_blocks_per_request == 7

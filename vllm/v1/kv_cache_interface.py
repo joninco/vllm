@@ -240,10 +240,8 @@ class AttentionSpec(KVCacheSpec):
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         parallel_config = vllm_config.parallel_config
-        kv_shard_count = get_kv_cache_cp_shard_count(
-            self,
-            parallel_config.decode_context_parallel_size,
-            parallel_config.prefill_context_parallel_size,
+        kv_shard_count = get_kv_cache_dcp_shard_count(
+            self, parallel_config.decode_context_parallel_size
         )
         return cdiv(max_len, self.block_size * kv_shard_count)
 
@@ -285,10 +283,10 @@ class FullAttentionSpec(AttentionSpec):
     dcp_kv_shard_count: int | None = None
     """Optional number of unique KV shards inside the configured DCP group.
 
-    ``None`` uses every configured DCP/PCP rank. A proper divisor creates
-    replicated shard groups; for example, four shards under DCP8 stores the
-    same shard on ranks ``r`` and ``r + 4``. Full replication continues to use
-    ``dcp_replicated=True``.
+    ``None`` uses every configured DCP rank. A proper divisor creates replicated
+    shard groups; for example, four shards under DCP8 stores the same shard on
+    ranks ``r`` and ``r + 4``. Virtual-batch PCP does not create distinct KV
+    shards. Full replication continues to use ``dcp_replicated=True``.
     """
 
     def __post_init__(self):
@@ -298,10 +296,9 @@ class FullAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
-        cp_shards = get_kv_cache_cp_shard_count(self, dcp_world_size, pcp_world_size)
-        if cp_shards > 1:
-            max_model_len = cdiv(max_model_len, cp_shards)
+        dcp_shards = get_kv_cache_dcp_shard_count(self, dcp_world_size)
+        if dcp_shards > 1:
+            max_model_len = cdiv(max_model_len, dcp_shards)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
     @classmethod
@@ -396,16 +393,16 @@ class FullAttentionSpec(AttentionSpec):
         )
 
 
-def get_kv_cache_cp_shard_count(
+def get_kv_cache_dcp_shard_count(
     spec: KVCacheSpec,
     dcp_world_size: int,
-    pcp_world_size: int = 1,
 ) -> int:
-    """Return the number of unique token-position shards for a cache group."""
-    configured_cp = int(dcp_world_size) * int(pcp_world_size)
-    if configured_cp < 1:
+    """Return the number of unique DCP token-position shards for a cache group."""
+    configured_dcp = int(dcp_world_size)
+    if configured_dcp < 1:
         raise ValueError(
-            f"Configured context-parallel size must be positive: {configured_cp}"
+            f"Configured decode-context-parallel size must be positive: "
+            f"{configured_dcp}"
         )
     replicated = bool(getattr(spec, "dcp_replicated", False))
     override = getattr(spec, "dcp_kv_shard_count", None)
@@ -416,26 +413,21 @@ def get_kv_cache_cp_shard_count(
             )
         return 1
     if override is None:
-        return configured_cp
+        return configured_dcp
     override = int(override)
-    if pcp_world_size != 1:
-        raise ValueError("Partial KV replication currently requires PCP1")
-    if override < 1 or override > configured_cp or configured_cp % override != 0:
+    if override < 1 or override > configured_dcp or configured_dcp % override != 0:
         raise ValueError(
             "dcp_kv_shard_count must be a positive divisor of the configured "
-            f"DCP size, got shards={override}, DCP={configured_cp}"
+            f"DCP size, got shards={override}, DCP={configured_dcp}"
         )
     return override
 
 
-def has_nondefault_kv_cp_layout(
+def has_nondefault_kv_dcp_layout(
     spec: KVCacheSpec,
     dcp_world_size: int,
-    pcp_world_size: int = 1,
 ) -> bool:
-    return get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size) != int(
-        dcp_world_size
-    ) * int(pcp_world_size)
+    return get_kv_cache_dcp_shard_count(spec, dcp_world_size) != int(dcp_world_size)
 
 
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):

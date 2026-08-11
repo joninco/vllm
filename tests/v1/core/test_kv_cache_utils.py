@@ -1877,6 +1877,36 @@ def test_resolve_kv_cache_block_sizes_single_attention_group(
     ) == (expected_block_size, expected_block_size)
 
 
+def test_resolve_kv_cache_block_sizes_ignores_virtual_pcp():
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=128),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=16,
+            prefill_context_parallel_size=2,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["indexer"],
+                MLAAttentionSpec(
+                    block_size=128,
+                    num_kv_heads=1,
+                    head_size=132,
+                    dtype=torch.uint8,
+                    dcp_kv_shard_count=4,
+                ),
+            )
+        ],
+    )
+
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    ) == (512, 512)
+
+
 def test_replicated_mla_uses_lockstep_pool_capacity_and_contiguous_tensors():
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=262144),

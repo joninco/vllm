@@ -366,6 +366,38 @@ def test_dcp_does_not_scale_replicated_group_blocks():
     )
 
 
+@pytest.mark.parametrize("use_uniform_group", [False, True], ids=["direct", "uniform"])
+def test_partial_dcp_uses_unique_kv_shard_count(use_uniform_group: bool):
+    config = _make_vllm_config(
+        tensor_parallel_size=8,
+        prefill_context_parallel_size=2,
+        decode_context_parallel_size=16,
+    )
+    indexer = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_kv_shard_count=4,
+    )
+    group_spec = (
+        UniformTypeKVCacheSpecs.from_specs({"indexer": indexer})
+        if use_uniform_group
+        else indexer
+    )
+    assert group_spec is not None
+    kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["indexer"], group_spec)],
+    )
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    assert tuple(group.tokens_per_block for group in offloading_config.groups) == (512,)
+    assert offloading_config.cache.tokens_per_hash == 512
+
+
 def test_preserves_data_parallel_index():
     config = _make_vllm_config()
     config.parallel_config.data_parallel_index = 2

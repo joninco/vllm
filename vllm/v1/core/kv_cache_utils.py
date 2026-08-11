@@ -33,8 +33,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
-    get_kv_cache_cp_shard_count,
-    has_nondefault_kv_cp_layout,
+    get_kv_cache_dcp_shard_count,
+    has_nondefault_kv_dcp_layout,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -605,11 +605,11 @@ def hash_block_tokens(
     )
 
 
-def _effective_kv_cache_block_size(
+def get_effective_kv_cache_block_size(
     spec: KVCacheSpec,
     dcp_world_size: int,
-    pcp_world_size: int,
 ) -> int:
+    """Return one local KV block's global token coverage under DCP."""
     is_attention_group = isinstance(spec, AttentionSpec) or (
         isinstance(spec, UniformTypeKVCacheSpecs)
         and bool(spec.kv_cache_specs)
@@ -620,9 +620,7 @@ def _effective_kv_cache_block_size(
     )
     if not is_attention_group:
         return spec.block_size
-    return spec.block_size * get_kv_cache_cp_shard_count(
-        spec, dcp_world_size, pcp_world_size
-    )
+    return spec.block_size * get_kv_cache_dcp_shard_count(spec, dcp_world_size)
 
 
 def resolve_kv_cache_block_sizes(
@@ -633,9 +631,9 @@ def resolve_kv_cache_block_sizes(
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size`` scaled by its unique CP shard count.
+      ``cache_config.block_size`` scaled by its unique DCP shard count.
       Multiple groups: LCM of every group's effective block size. Attention
-      groups are scaled by their unique CP shard count; Mamba and fully
+      groups are scaled by their unique DCP shard count; Mamba and fully
       replicated attention groups keep their full per-rank state.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
@@ -647,19 +645,18 @@ def resolve_kv_cache_block_sizes(
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
-    pcp = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
     groups = kv_cache_config.kv_cache_groups
 
     if not groups:
-        bs = cache_config.block_size * dcp * pcp
+        bs = cache_config.block_size * dcp
         return bs, bs
     if len(groups) == 1:
         spec = groups[0].kv_cache_spec
-        bs = _effective_kv_cache_block_size(spec, dcp, pcp)
+        bs = get_effective_kv_cache_block_size(spec, dcp)
         return bs, bs
 
     group_block_sizes = [
-        _effective_kv_cache_block_size(g.kv_cache_spec, dcp, pcp) for g in groups
+        get_effective_kv_cache_block_size(g.kv_cache_spec, dcp) for g in groups
     ]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
@@ -1353,28 +1350,25 @@ def _get_packed_kv_cache_layout(
 def _is_lockstep_mla_spec_layout(
     kv_cache_specs: Iterable[KVCacheSpec],
     dcp_world_size: int,
-    pcp_world_size: int,
+    _pcp_world_size: int,
 ) -> bool:
     specs = list(kv_cache_specs)
     if (
         len(specs) < 2
         or not isinstance(dcp_world_size, int)
-        or not isinstance(pcp_world_size, int)
+        or not isinstance(_pcp_world_size, int)
     ):
         return False
-    cp_world_size = dcp_world_size * pcp_world_size
-    if cp_world_size <= 1:
+    if dcp_world_size <= 1:
         return False
     if not all(isinstance(spec, MLAAttentionSpec) for spec in specs):
         return False
 
     shard_counts = {
-        get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
-        for spec in specs
+        get_kv_cache_dcp_shard_count(spec, dcp_world_size) for spec in specs
     }
     global_block_sizes = {
-        spec.block_size
-        * get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
+        spec.block_size * get_kv_cache_dcp_shard_count(spec, dcp_world_size)
         for spec in specs
     }
     return len(shard_counts) > 1 and len(global_block_sizes) == 1
@@ -1398,7 +1392,7 @@ def _use_lockstep_mla_allocation(
             else [group_spec]
         )
         group_layouts = {
-            get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size)
+            get_kv_cache_dcp_shard_count(spec, dcp_world_size)
             for spec in group_layer_specs
         }
         if len(group_layouts) != 1:
@@ -1762,14 +1756,14 @@ def group_and_unify_kv_cache_specs(
         dcp_world_size,
         pcp_world_size,
     )
-    # Any non-default CP layout needs a group separate from normally sharded
+    # Any non-default DCP layout needs a group separate from normally sharded
     # layers because token ownership and block-table semantics differ.
-    has_custom_cp = any(
-        has_nondefault_kv_cp_layout(spec, dcp_world_size, pcp_world_size)
+    has_custom_dcp = any(
+        has_nondefault_kv_dcp_layout(spec, dcp_world_size)
         and (not isinstance(spec, MLAAttentionSpec) or lockstep_mla_layout)
         for spec in kv_cache_spec.values()
     )
-    if not (has_swa or has_custom_cp):
+    if not (has_swa or has_custom_dcp):
         return None
 
     # Other uniform page layouts do not need tuple packing.
@@ -1781,7 +1775,7 @@ def group_and_unify_kv_cache_specs(
     grouped_swa_mla_specs: dict[tuple[int, int, bool, bool], dict[str, KVCacheSpec]] = (
         defaultdict(dict)
     )
-    # Keep incompatible custom-CP types and page layouts separate. This
+    # Keep incompatible custom-DCP types and page layouts separate. This
     # includes DFlash drafts and partially/fully replicated MLA indexer caches.
     grouped_repl_specs: dict[tuple[Any, ...], dict[str, KVCacheSpec]] = defaultdict(
         dict
@@ -1799,32 +1793,33 @@ def group_and_unify_kv_cache_specs(
                     spec.dcp_sharded,
                 )
             ][name] = spec
-        elif has_nondefault_kv_cp_layout(spec, dcp_world_size, pcp_world_size) and (
+        elif has_nondefault_kv_dcp_layout(spec, dcp_world_size) and (
             not isinstance(spec, MLAAttentionSpec) or lockstep_mla_layout
         ):
-            cp_layout = (
+            dcp_layout = (
                 getattr(spec, "dcp_replicated", False),
                 getattr(spec, "dcp_kv_shard_count", None),
-                get_kv_cache_cp_shard_count(spec, dcp_world_size, pcp_world_size),
+                get_kv_cache_dcp_shard_count(spec, dcp_world_size),
             )
+            group_key: tuple[Any, ...]
             if isinstance(spec, MLAAttentionSpec):
-                key = (
+                group_key = (
                     type(spec).__name__,
                     spec.block_size,
                     spec.page_size_bytes,
-                    *cp_layout,
+                    *dcp_layout,
                 )
             else:
                 sliding_window = (
                     spec.sliding_window if isinstance(spec, SlidingWindowSpec) else None
                 )
-                key = (
+                group_key = (
                     type(spec).__name__,
                     spec.block_size,
                     sliding_window,
-                    *cp_layout,
+                    *dcp_layout,
                 )
-            grouped_repl_specs[key][name] = spec
+            grouped_repl_specs[group_key][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
 

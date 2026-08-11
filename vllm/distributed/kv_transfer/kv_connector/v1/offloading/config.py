@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING
 from vllm.model_executor.layers.mla_cache_format import (
     NVFP4_MLA_CACHE_FORMAT,
 )
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import (
+    get_effective_kv_cache_block_size,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     FullAttentionSpec,
     MLAAttentionSpec,
 )
@@ -23,7 +25,7 @@ from vllm.v1.kv_offload.config import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, KVCacheTensor
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
 
 
 def is_kv_cache_tensor_packed(kv_cache_tensor: "KVCacheTensor") -> bool:
@@ -44,16 +46,12 @@ def build_offloading_config(
 
     parallel_config = vllm_config.parallel_config
 
-    def _tokens_per_block(kv_cache_spec: "KVCacheSpec") -> int:
-        if not isinstance(kv_cache_spec, AttentionSpec) or getattr(
-            kv_cache_spec, "dcp_replicated", False
-        ):
-            return kv_cache_spec.block_size
-        return kv_cache_spec.block_size * parallel_config.decode_context_parallel_size
-
     groups = tuple(
         OffloadingGroupConfig(
-            tokens_per_block=_tokens_per_block(group.kv_cache_spec),
+            tokens_per_block=get_effective_kv_cache_block_size(
+                group.kv_cache_spec,
+                parallel_config.decode_context_parallel_size,
+            ),
             layer_names=tuple(group.layer_names),
         )
         for group in kv_cache_config.kv_cache_groups

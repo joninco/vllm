@@ -28,7 +28,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
-    get_kv_cache_cp_shard_count,
+    get_kv_cache_dcp_shard_count,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -76,15 +76,15 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        # Under (D)CP a request's cache may be sharded across ranks, so one
-        # local block covers `block_size * unique_cp_shards` global tokens.
+        # Under DCP a request's cache may be sharded across ranks, so one local
+        # block covers `block_size * unique_dcp_shards` global tokens.
         # Scale the scheduler-visible block size to match.
         # dcp_replicated groups (e.g. the DFlash draft) instead keep the full
         # cache on every rank, so one block covers exactly `block_size` global
         # tokens and must not be scaled.
-        if dcp_world_size * pcp_world_size > 1:
-            self.block_size *= get_kv_cache_cp_shard_count(
-                kv_cache_spec, dcp_world_size, pcp_world_size
+        if dcp_world_size > 1:
+            self.block_size *= get_kv_cache_dcp_shard_count(
+                kv_cache_spec, dcp_world_size
             )
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
@@ -732,13 +732,10 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             "and chunked local attention groups"
         )
         block_size = kv_cache_spec.block_size
-        if dcp_world_size * pcp_world_size > 1:
-            # Hashes must use the effective block size after accounting for
-            # the number of unique CP shards. Replicated groups keep the model
-            # block size on every rank.
-            block_size *= get_kv_cache_cp_shard_count(
-                kv_cache_spec, dcp_world_size, pcp_world_size
-            )
+        if dcp_world_size > 1:
+            # Hashes use the effective block size after accounting for unique
+            # DCP shards. Replicated groups keep the model block size per rank.
+            block_size *= get_kv_cache_dcp_shard_count(kv_cache_spec, dcp_world_size)
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -1299,8 +1296,8 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         # Mamba layers use TP instead of DCP, so each rank holds the full
-        # recurrent state. Undo the DCP/PCP block_size scaling that the base
-        # class applies for attention groups whose KV cache is partitioned.
+        # recurrent state. Undo the DCP block_size scaling that the base class
+        # applies for attention groups whose KV cache is partitioned.
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
@@ -1911,8 +1908,7 @@ def get_manager_for_kv_cache_spec(
             and kv_cache_spec.dcp_sharded
         ):
             dcp_world_size = kwargs.get("dcp_world_size", 1)
-            pcp_world_size = kwargs.get("pcp_world_size", 1)
-            block_size = kv_cache_spec.block_size * dcp_world_size * pcp_world_size
+            block_size = kv_cache_spec.block_size * dcp_world_size
             num_tokens = min(
                 kv_cache_spec.sliding_window - 1 + max_in_flight_tokens,
                 max_model_len,
