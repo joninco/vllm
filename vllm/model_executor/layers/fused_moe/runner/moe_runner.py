@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -640,6 +641,18 @@ class MoERunner(MoERunnerInterface):
                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
                 input_ids=input_ids,
             )
+
+            if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+                from vllm.model_executor.layers.fused_moe.kquant_capture import (
+                    collect_kquant_route_input,
+                )
+
+                collect_kquant_route_input(
+                    self.layer_name,
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                )
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,

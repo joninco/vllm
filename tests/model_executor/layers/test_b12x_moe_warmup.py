@@ -169,7 +169,7 @@ def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
     topk_weights = torch.full((2, 4), 0.25, dtype=torch.float32)
     scratch = torch.empty(64, dtype=torch.uint8)
 
-    b12x_moe._run_b12x_moe_fp4(
+    binding = b12x_moe._run_b12x_moe_fp4(
         a=a,
         experts=experts,
         output=output,
@@ -181,6 +181,7 @@ def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
         scratch=scratch,
     )
 
+    assert binding == "binding"
     assert execute_calls == ["binding"]
     assert plan.bind_kwargs == {
         "scratch": scratch,
@@ -193,6 +194,7 @@ def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
         "unit_scale_contract": False,
         "activation_amax": None,
         "layer_idx": None,
+        "route_expert_map": None,
     }
 
 
@@ -529,6 +531,96 @@ def test_b12x_activation_amax_is_passed_as_separate_binding_arg(
     assert run_calls[0]["activation_amax"] is not workspace2
     assert run_calls[0]["activation_amax"].shape == (3, num_experts, 2)
     assert run_calls[0]["layer_idx"] == 2
+
+
+def test_b12x_w4a16_expert_map_sizes_workspace_for_global_routes(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    plan_calls = []
+
+    def fake_plan(**kwargs):
+        plan_calls.append(kwargs)
+        return _FakePlan()
+
+    monkeypatch.setattr(b12x_moe, "_plan_b12x_moe_fp4_scratch", fake_plan)
+    experts = _make_fake_b12x_experts()
+    experts._prepared_experts = _make_fake_prepared_experts(quant_mode="w4a16")
+
+    experts.workspace_shapes(
+        M=1,
+        N=32,
+        K=64,
+        topk=4,
+        global_num_experts=12,
+        local_num_experts=8,
+        expert_tokens_meta=None,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+    )
+
+    assert plan_calls[0]["route_num_experts"] == 12
+
+
+def test_b12x_w4a16_expert_map_plans_and_binds_global_routes(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+
+    plan_calls = []
+    run_calls = []
+
+    def fake_plan(**kwargs):
+        plan_calls.append(kwargs)
+        return _FakePlan()
+
+    def fake_run(**kwargs):
+        run_calls.append(kwargs)
+
+    monkeypatch.setattr(b12x_moe, "_plan_b12x_moe_fp4_scratch", fake_plan)
+    monkeypatch.setattr(b12x_moe, "_run_b12x_moe_fp4", fake_run)
+
+    local_num_experts = 8
+    global_num_experts = 12
+    hidden_size = 16
+    experts = _make_fake_b12x_experts()
+    experts._prepared_experts = _make_fake_prepared_experts(
+        quant_mode="w4a16",
+        num_experts=local_num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=32,
+    )
+    expert_map = torch.tensor(
+        [0, -1, 1, -1, 2, -1, 3, 4, -1, 5, 6, 7],
+        dtype=torch.int32,
+    )
+    hidden_states = torch.zeros(1, hidden_size, dtype=torch.bfloat16)
+    output = torch.empty_like(hidden_states)
+    topk_ids = torch.tensor([[0, 1, 10, 11]], dtype=torch.int32)
+    topk_weights = torch.full((1, 4), 0.25, dtype=torch.float32)
+
+    assert experts.supports_expert_map()
+    experts.apply(
+        output=output,
+        hidden_states=hidden_states,
+        w1=torch.empty(0, dtype=torch.uint8),
+        w2=torch.empty(0, dtype=torch.uint8),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        global_num_experts=global_num_experts,
+        expert_map=expert_map,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=torch.empty(64, dtype=torch.uint8),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert len(plan_calls) == 1
+    assert plan_calls[0]["route_num_experts"] == global_num_experts
+    assert len(run_calls) == 1
+    assert run_calls[0]["route_expert_map"] is expert_map
+    assert torch.equal(run_calls[0]["topk_ids"], topk_ids)
+    assert torch.equal(run_calls[0]["topk_weights"], topk_weights)
 
 
 def test_b12x_activation_amax_save_every_writes_main_and_mtp_files(

@@ -33,6 +33,7 @@ QuantizationMethods = Literal[
     "inc",
     "mxfp4",
     "gpt_oss_mxfp4",
+    "kquant_hybrid",
     "nvfp4_nf3_hybrid",
     "deepseek_v4_fp8",
     "online",
@@ -121,13 +122,14 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
-    from .experts_int8 import ExpertsInt8Config
     from .exl3 import Exl3Config
+    from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
     from .fp_quant import FPQuantConfig
     from .humming import HummingConfig
     from .inc import INCConfig
+    from .kquant_hybrid import KQuantHybridConfig
     from .modelopt import (
         ModelOptFp8Config,
         ModelOptMixedPrecisionConfig,
@@ -163,6 +165,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "inc": INCConfig,
         "mxfp4": Mxfp4Config,
         "gpt_oss_mxfp4": GptOssMxfp4Config,
+        "kquant_hybrid": KQuantHybridConfig,
         "nvfp4_nf3_hybrid": NvFp4Nf3HybridConfig,
         "deepseek_v4_fp8": DeepseekV4FP8Config,
         "humming": HummingConfig,

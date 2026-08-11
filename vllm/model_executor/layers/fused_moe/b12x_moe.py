@@ -402,6 +402,7 @@ def _plan_b12x_moe_fp4_scratch(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     collect_activation_amax: bool = False,
+    route_num_experts: int = 0,
 ):
     from b12x.moe.fused_moe import Caps as TPMoEScratchCaps
     from b12x.moe.fused_moe import plan as plan_tp_moe_scratch
@@ -413,7 +414,7 @@ def _plan_b12x_moe_fp4_scratch(
             device=device,
             weight_plan=experts.plan,
             core_token_counts=(max(int(tokens), 1),),
-            route_num_experts=0,
+            route_num_experts=max(int(route_num_experts), 0),
             quant_mode=quant_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             swiglu_limit=swiglu_limit,
@@ -558,7 +559,8 @@ def _run_b12x_moe_fp4(
     scratch: torch.Tensor,
     activation_amax: torch.Tensor | None = None,
     layer_idx: int | None = None,
-) -> None:
+    route_expert_map: torch.Tensor | None = None,
+) -> Any:
     """Call b12x MoE with caller-owned live scratch."""
     from b12x.moe.fused_moe import run as b12x_moe_fp4
 
@@ -578,8 +580,10 @@ def _run_b12x_moe_fp4(
         unit_scale_contract=unit_scale_contract,
         activation_amax=activation_amax,
         layer_idx=layer_idx,
+        route_expert_map=route_expert_map,
     )
     b12x_moe_fp4(binding=binding)
+    return binding
 
 
 def _b12x_activation_name(activation: MoEActivation) -> str:
@@ -659,6 +663,7 @@ def _maybe_repeat_check_b12x_moe(
     unit_scale_contract: bool,
     plan: Any,
     scratch: torch.Tensor,
+    route_expert_map: torch.Tensor | None = None,
 ) -> None:
     global _moe_repeat_check_reports
 
@@ -683,6 +688,7 @@ def _maybe_repeat_check_b12x_moe(
         unit_scale_contract=unit_scale_contract,
         plan=plan,
         scratch=scratch,
+        route_expert_map=route_expert_map,
     )
 
     original_f = original_output.float()
@@ -798,6 +804,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._activation_amax_base_num_layers = _current_config_num_hidden_layers()
         self._activation_amax_state_key: tuple[str, str, int] | None = None
         self._activation_amax_layer_idx: int | None = None
+        self._kquant_capture_prefix: str | None = None
 
     def _quant_mode(self) -> str:
         source_format = self._source_format()
@@ -991,6 +998,24 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             activation=activation,
             params_dtype=params_dtype,
         )
+        if os.getenv("VLLM_KQUANT_CAPTURE_DIR") and not bool(
+            getattr(layer, "_kquant_capture_parent_managed", False)
+        ):
+            from vllm.model_executor.layers.fused_moe.kquant_capture import (
+                register_kquant_capture_layer,
+            )
+
+            prefix = str(getattr(layer, "layer_name", ""))
+            register_kquant_capture_layer(
+                prefix=prefix,
+                device=device,
+                hidden_size=int(prepared.hidden_size),
+                local_intermediate_size=int(prepared.intermediate_size),
+                num_experts=int(prepared.num_experts),
+                topk=int(self.moe_config.experts_per_token),
+                quant_mode=self._quant_mode(),
+            )
+            self._kquant_capture_prefix = prefix
         if self._quant_mode() == "w4a16":
             self._register_activation_amax(
                 layer=layer,
@@ -1058,7 +1083,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         return True
 
     def supports_expert_map(self) -> bool:
-        return False
+        return self._quant_mode() == "w4a16"
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
@@ -1499,6 +1524,11 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             collect_activation_amax=(
                 self._activation_amax_enabled_for_layer() and quant_mode == "w4a16"
             ),
+            route_num_experts=(
+                int(global_num_experts)
+                if int(global_num_experts) != int(local_num_experts)
+                else 0
+            ),
         )
         scratch_elements = max(
             1,
@@ -1533,9 +1563,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         quant_mode = self._quant_mode()
 
         if expert_map is not None:
-            raise RuntimeError(
-                "B12X MoE does not support expert_map with the current b12x_moe_fp4 API"
-            )
+            if quant_mode != "w4a16":
+                raise RuntimeError(
+                    "B12X expert_map routing currently requires quant_mode='w4a16'"
+                )
+            if int(expert_map.numel()) != int(global_num_experts):
+                raise ValueError(
+                    "B12X expert_map length must match global_num_experts: "
+                    f"{int(expert_map.numel())} != {int(global_num_experts)}"
+                )
 
         num_experts = prepared.num_experts
         input_scales_static = True
@@ -1569,10 +1605,13 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             collect_activation_amax=activation_amax is not None,
+            route_num_experts=(
+                int(global_num_experts) if expert_map is not None else 0
+            ),
         )
         scratch = _workspace2_as_b12x_scratch(workspace2, plan)
 
-        _run_b12x_moe_fp4(
+        binding = _run_b12x_moe_fp4(
             a=hidden_states,
             experts=prepared,
             topk_weights=topk_weights,
@@ -1584,7 +1623,24 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             scratch=scratch,
             activation_amax=activation_amax,
             layer_idx=activation_layer_idx,
+            route_expert_map=expert_map,
         )
+        if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+            from vllm.model_executor.layers.fused_moe.kquant_capture import (
+                collect_kquant_mid,
+            )
+
+            prefix = self._kquant_capture_prefix
+            if prefix is None:
+                raise RuntimeError(
+                    "KQuant capture was enabled after B12X weight preparation"
+                )
+            collect_kquant_mid(
+                prefix=prefix,
+                binding=binding,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
         if activation_amax is None:
             _maybe_repeat_check_b12x_moe(
                 original_output=output,
@@ -1596,6 +1652,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 unit_scale_contract=unit_scale_contract,
                 plan=plan,
                 scratch=scratch,
+                route_expert_map=expert_map,
             )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

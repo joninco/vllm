@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from enum import IntEnum
 
 import torch
@@ -159,8 +160,10 @@ class LatentMoERunner(MoERunner):
     ) -> LatentTailTier:
         num_tokens = fused_output.shape[0]
         # tier 0
-        if self.enable_k3_latent_moe_tail_fusion and (
-            0 < num_tokens <= self._k3_latent_moe_tail_op.contract.max_num_tokens
+        if (
+            not os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+            and self.enable_k3_latent_moe_tail_fusion
+            and (0 < num_tokens <= self._k3_latent_moe_tail_op.contract.max_num_tokens)
         ):
             return LatentTailTier.TAIL_FUSION
 
@@ -217,6 +220,7 @@ class LatentMoERunner(MoERunner):
             fused_latent = self.allreduce_norm_latent_out(fused_output, transform.norm)
         else:
             fused_latent = tensor_model_parallel_all_reduce(fused_output)
+            self._capture_routed_latent(fused_latent)
 
         # Overlap the shared-expert all-reduce with the up-projection GEMM while
         # the batch is small enough for it to pay off.
@@ -250,6 +254,7 @@ class LatentMoERunner(MoERunner):
             latent = self.allreduce_norm_latent_out(fused_output, transform.norm)
         else:
             latent = tensor_model_parallel_all_reduce(fused_output)
+            self._capture_routed_latent(latent)
 
         weight = transform.up_proj.weight
         shard_size = weight.shape[0] // self.moe_config.tp_size
@@ -337,7 +342,7 @@ class LatentMoERunner(MoERunner):
         self,
         hidden_states: torch.Tensor,
         norm: RMSNorm,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """All-reduce + add residual + (standard) RMSNorm, fused via flashinfer."""
         from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
             _AR_RESIDUAL_RMS_NORM,
@@ -346,6 +351,7 @@ class LatentMoERunner(MoERunner):
         )
 
         if self.moe_config.tp_size == 1:
+            self._capture_routed_latent(hidden_states)
             return norm(hidden_states)
 
         if flashinfer_trtllm_fused_allreduce_norm is not None:
@@ -370,7 +376,15 @@ class LatentMoERunner(MoERunner):
                     pattern_code=_AR_RESIDUAL_RMS_NORM,
                     norm_out=norm_out,
                 )
+                self._capture_routed_latent(hidden_states)
                 return norm_out
 
         reduced = tensor_model_parallel_all_reduce(hidden_states)
+        self._capture_routed_latent(reduced)
         return norm(reduced)
+
+    def _capture_routed_latent(self, hidden_states: torch.Tensor) -> None:
+        transform = self.routed_output_transform
+        capture = getattr(transform, "capture_routed_latent", None)
+        if capture is not None:
+            capture(hidden_states)

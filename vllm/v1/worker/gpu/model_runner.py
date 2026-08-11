@@ -170,6 +170,15 @@ def _maybe_save_b12x_moe_activation_amax() -> None:
         maybe_save()
 
 
+def _maybe_flush_kquant_capture() -> None:
+    capture = sys.modules.get("vllm.model_executor.layers.fused_moe.kquant_capture")
+    if capture is None:
+        return
+    maybe_flush = getattr(capture, "maybe_flush_kquant_capture", None)
+    if maybe_flush is not None:
+        maybe_flush()
+
+
 def _profile_cg_mode(cg_mode: CUDAGraphMode) -> str:
     return cg_mode.name.lower()
 
@@ -2064,6 +2073,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             _maybe_save_b12x_moe_activation_amax()
+            _maybe_flush_kquant_capture()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         num_spec_tokens_to_schedule = execute_model_state.num_spec_tokens_to_schedule
@@ -2255,6 +2265,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
 
         _maybe_save_b12x_moe_activation_amax()
+        _maybe_flush_kquant_capture()
 
         return async_output
 

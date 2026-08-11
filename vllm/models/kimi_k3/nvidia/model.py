@@ -3,6 +3,7 @@
 """Kimi-K3 multimodal model implementation for vLLM."""
 
 import math
+import os
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -238,10 +239,20 @@ class KimiRoutedOutputTransform(nn.Module):
         self,
         norm: RMSNorm | None,
         up_proj: ReplicatedLinear,
+        layer_idx: int,
     ) -> None:
         super().__init__()
         self.norm = norm
         self.up_proj = up_proj
+        self.layer_idx = layer_idx
+
+    def capture_routed_latent(self, hidden_states: torch.Tensor) -> None:
+        if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+            from vllm.model_executor.layers.fused_moe.kquant_capture import (
+                collect_kquant_routed_latent,
+            )
+
+            collect_kquant_routed_latent(self.layer_idx, hidden_states)
 
     def forward(
         self,
@@ -256,6 +267,7 @@ class KimiRoutedOutputTransform(nn.Module):
                 accumulate into. It is consumed in the GEMM's beta-add
                 epilogue, so adding it costs no extra kernel.
         """
+        self.capture_routed_latent(hidden_states)
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
         if residual is not None:
@@ -582,7 +594,9 @@ class KimiMoE(nn.Module):
             )
 
             self.routed_output_transform = KimiRoutedOutputTransform(
-                self.routed_expert_norm, self.routed_expert_up_proj
+                self.routed_expert_norm,
+                self.routed_expert_up_proj,
+                self.layer_idx,
             )
             # Auxiliary CUDA stream to overlap the router gate with the routed
             # down projection on decode-sized batches (gated by

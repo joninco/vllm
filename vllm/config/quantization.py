@@ -168,6 +168,7 @@ _MODELOPT_ONLINE_OVERLAY_NAMES = frozenset(
         "modelopt_mxfp8",
         "modelopt_mixed",
         "mxfp4",
+        "kquant_hybrid",
         "nvfp4_nf3_hybrid",
     }
 )
