@@ -224,3 +224,20 @@ class TestAsyncLookupManager:
         with pytest.raises(AssertionError):
             mgr.drain_results()
         mgr.shutdown()
+
+    def test_authoritative_store_wins_over_pending_probe(self):
+        mgr = InMemoryLookupManager()
+        ctx = _ctx("reqA")
+
+        assert mgr.lookup(_key(1), ctx) is None
+        mgr.flush()
+        mgr._results_ready.wait()
+        mgr._results_ready.clear()
+
+        # The probe observed the tier before the store completed, but its
+        # result has not yet been drained on the scheduler thread.
+        mgr.mark_present([_key(1)])
+
+        assert mgr.lookup(_key(1), ctx) is True
+        assert mgr._pending_results.empty()
+        mgr.shutdown()

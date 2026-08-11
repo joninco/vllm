@@ -203,6 +203,19 @@ def test_partial_lookup_requires_every_cache_group():
     assert req_status.partial_tail_boundary is None
 
 
+def test_remove_pending_job_deduplicates_lockstep_mla_block_ids() -> None:
+    """Clean one shared physical block once per transfer job."""
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._block_id_to_pending_jobs = {
+        7: {42, 43},
+        9: {42},
+    }
+
+    scheduler._remove_pending_job(42, [7, 7, 9, 9])
+
+    assert scheduler._block_id_to_pending_jobs == {7: {43}}
+
+
 def test_scheduler_reports_allocation_failure(request_runner):
     runner = request_runner(
         block_size=4,

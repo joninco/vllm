@@ -315,6 +315,73 @@ def test_failed_load_missing_file(fs_tier):
     assert not results[0].success
 
 
+def test_failed_load_invalidates_cached_lookup(fs_tier):
+    """A block that vanished must not stay cached as a hit.
+
+    The cached existence result is what routes a promotion to this tier, and
+    nothing else clears it until every request that looked the key up has
+    finished. If a failed load left it cached as present, the scheduler would
+    re-submit the same failing promotion on every step and the request waiting
+    for those tokens would never finish, so the entry would never be cleaned
+    up either -- a livelock rather than a recompute.
+    """
+    tier, _ = fs_tier
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert lookup_and_wait(tier, [key(1)]) == [LookupResult.HIT]
+
+    # Removed behind the tier's back: by capacity management, by another
+    # instance sharing root_dir, or by any external cleanup.
+    os.unlink(tier.file_mapper.get_file_name(key(1)))
+
+    tier.submit_load(make_job(2, [key(1)], [0], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success
+
+    assert tier.lookup(key(1), _CTX) == LookupResult.MISS
+
+
+def test_successful_restore_revalidates_cached_lookup(fs_tier):
+    """A recomputed block must become visible before active requests finish.
+
+    Continuous overlapping requests can keep the shared lookup state alive, so
+    cleanup is not a sufficient way to recover from a failed load's cached
+    MISS. A successful store is the authoritative signal that the block exists
+    again.
+    """
+    tier, _ = fs_tier
+    block_key = key(1)
+    tier.submit_store(make_job(1, [block_key], [0]))
+    assert all(r.success for r in drain(tier))
+    assert lookup_and_wait(tier, [block_key]) == [LookupResult.HIT]
+
+    os.unlink(tier.file_mapper.get_file_name(block_key))
+    tier.submit_load(make_job(2, [block_key], [0], is_promotion=True))
+    assert not drain(tier)[0].success
+    assert tier.lookup(block_key, _CTX) == LookupResult.MISS
+
+    overlapping_ctx = ReqContext(req_id="overlapping-request")
+    assert tier.lookup(block_key, overlapping_ctx) == LookupResult.MISS
+
+    tier.submit_store(make_job(3, [block_key], [0]))
+    assert all(r.success for r in drain(tier))
+    assert tier.lookup(block_key, _CTX) == LookupResult.HIT
+    assert tier.lookup(block_key, overlapping_ctx) == LookupResult.HIT
+
+
+def test_successful_load_keeps_cached_lookup(fs_tier):
+    """The invalidation above must be scoped to failures."""
+    tier, _ = fs_tier
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert lookup_and_wait(tier, [key(1)]) == [LookupResult.HIT]
+
+    tier.submit_load(make_job(2, [key(1)], [0], is_promotion=True))
+    assert all(r.success for r in drain(tier))
+
+    assert tier.lookup(key(1), _CTX) == LookupResult.HIT
+
+
 def test_multiple_jobs_tracked_independently(fs_tier):
     tier, _ = fs_tier
     job1 = make_job(1, [key(1)], [0])

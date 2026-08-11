@@ -46,6 +46,7 @@ logger = init_logger(__name__)
 @dataclass(slots=True)
 class LookupState:
     result: bool | None = None  # True (found), False (not found), None
+    result_is_authoritative: bool = False
     request_ids: set[str] = field(default_factory=set)  # requests asking for the lookup
 
 
@@ -170,6 +171,8 @@ class AsyncLookupManager(ABC):
             for key, result in batch:
                 state = self._lookup_state.get(key)
                 if state is not None:
+                    if state.result_is_authoritative:
+                        continue
                     # A key is enqueued for probing exactly once, so a decided
                     # verdict must never receive a second result. Enforcing it
                     # keeps a late/duplicate result from resurrecting a stale
@@ -189,6 +192,22 @@ class AsyncLookupManager(ABC):
             state = self._lookup_state.get(key)
             if state is not None:
                 state.result = False
+                state.result_is_authoritative = True
+
+    def mark_present(self, keys: Iterable[OffloadKey]) -> None:
+        """Refresh cached states after an authoritative successful store.
+
+        A failed load marks an entry absent so the request can recompute it.
+        Overlapping requests may keep that shared state alive after the
+        recomputed block has been stored again, so waiting for cleanup would
+        leave a stale miss until all of them finish. Only update existing
+        states; a key nobody has looked up does not need a cache entry.
+        """
+        for key in keys:
+            state = self._lookup_state.get(key)
+            if state is not None:
+                state.result = True
+                state.result_is_authoritative = True
 
     def cleanup(self, req_id: str) -> None:
         """Remove entries no longer needed by any active request.

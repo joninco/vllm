@@ -139,7 +139,8 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
                     "emit events.",
                     tier_type,
                 )
-        # Keys of in-flight store jobs, tracked only when events are enabled.
+        # Keys of in-flight stores, used to refresh lookup state on success and
+        # to emit events when enabled.
         self._store_job_keys: dict[JobId, list[OffloadKey]] = {}
         # Keys of in-flight load (promotion) jobs, so a failed download can
         # mark its own cached lookup verdicts False (see get_finished_jobs).
@@ -280,14 +281,17 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         return LookupResult.HIT if result else LookupResult.MISS
 
     def submit_store(self, job_metadata: TransferJob) -> None:
-        if self.events is not None:
-            self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+        self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         obj_keys = (self._file_mapper.get_file_name(k) for k in job_metadata.keys)
         self._submit_transfer(
             job_metadata.job_id, job_metadata.block_ids, obj_keys, NIXL_WRITE
         )
 
     def submit_load(self, job_metadata: TransferJob) -> None:
+        # Recorded before _submit_transfer so its submission-time failure
+        # paths (register_memory, prep_xfer_dlist, make_prepped_xfer,
+        # transfer) also invalidate the cached lookups that routed this
+        # load here, not just transfers that fail in flight.
         self._load_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         obj_keys = (self._file_mapper.get_file_name(k) for k in job_metadata.keys)
         self._submit_transfer(
@@ -365,12 +369,13 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         results = self._pending_results
         self._pending_results = []
         for result in results:
-            if self.events is not None:
-                keys = self._store_job_keys.pop(result.job_id, None)
-                if result.success and keys:
+            store_keys = self._store_job_keys.pop(result.job_id, None)
+            if result.success and store_keys:
+                self._lookup_manager.mark_present(store_keys)
+                if self.events is not None:
                     self.events.append(
                         OffloadingEvent(
-                            keys=keys,
+                            keys=store_keys,
                             medium=self.medium,
                             removed=False,
                             locality=self.locality,
