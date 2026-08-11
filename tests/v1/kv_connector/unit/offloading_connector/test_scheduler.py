@@ -57,6 +57,10 @@ from vllm.v1.kv_offload.base import (
     get_offload_group_idx,
     make_offload_key,
 )
+from vllm.v1.kv_offload.tiering.manager import (
+    CPUPrimaryTierOffloadingManager,
+    TieringOffloadingManager,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
@@ -363,6 +367,44 @@ def test_abort_queued_request_does_not_build_store_job(
     assert isinstance(metadata, OffloadingConnectorMetadata)
     assert all(job.req_id != queued_req_id for job in metadata.store_jobs.values())
     assert queued_req_id not in runner.connector_scheduler._req_status
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_tiering_manager_final_store_precedes_request_finish(
+    request_runner, async_scheduling: bool
+):
+    """Regression for a final-store KeyError in TieringOffloadingManager."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=async_scheduling,
+    )
+
+    manager_events: list[str] = []
+    primary = MagicMock(spec=CPUPrimaryTierOffloadingManager)
+    primary._num_blocks = 10
+    primary.get_kv_memoryview.return_value = memoryview(bytearray(10))
+    primary.lookup.return_value = LookupResult.MISS
+    primary.get_stats.return_value = None
+    primary.take_events.return_value = []
+
+    def prepare_store(keys, req_context):
+        manager_events.append("prepare_store")
+        return generate_store_output(keys)
+
+    primary.prepare_store.side_effect = prepare_store
+    primary.on_request_finished.side_effect = lambda req_context: manager_events.append(
+        "on_request_finished"
+    )
+
+    tiering_manager = TieringOffloadingManager(primary_tier=primary)
+    runner.connector_scheduler.manager = tiering_manager
+
+    runner.new_request(token_ids=[0, 0, 0])
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
+
+    assert manager_events == ["prepare_store", "on_request_finished"]
+    assert tiering_manager._req_state == {}
 
 
 def test_scheduler_reports_lookup_sync_delay(request_runner):
