@@ -362,3 +362,108 @@ def test_ar_probabilistic_draft_uses_shared_sampler(monkeypatch):
 
     assert captured["positions"] is positions
     assert captured["active_rows"] is speculator.active_num_reqs
+
+
+def test_autoregressive_capture_ids_are_deterministic_and_phase_separated():
+    def capture_channel_ids() -> list[str]:
+        events = []
+
+        class FakeManager:
+            use_breakable_cg = False
+
+            def capture(self, *args, **kwargs):
+                events.append(kwargs["channel_id"])
+
+        speculator = object.__new__(_TestSpeculator)
+        speculator.last_token_indices = torch.zeros(1)
+        speculator.prefill_cudagraph_manager = FakeManager()
+        speculator.decode_cudagraph_manager = FakeManager()
+        speculator.model = object()
+        speculator._prefill = object()
+        speculator._generate_draft = object()
+        speculator.model_state = object()
+        speculator.target_input_buffers = object()
+        speculator.input_buffers = object()
+        speculator.block_tables = object()
+        speculator.target_attn_groups = object()
+        speculator.attn_groups = object()
+        speculator.kv_cache_config = object()
+        speculator.num_speculative_steps = 3
+        speculator.max_num_reqs = 1
+
+        speculator.capture(capture_phase="profile")
+        speculator.capture(capture_phase="production")
+        return events
+
+    expected = [
+        "vllm:draft:prefill:profile",
+        "vllm:draft:decode:profile",
+        "vllm:draft:prefill:production",
+        "vllm:draft:decode:production",
+    ]
+    assert capture_channel_ids() == capture_channel_ids() == expected
+
+
+def test_multi_module_mtp_capture_uses_phase_specific_channel():
+    events = []
+
+    class FakeManager:
+        use_breakable_cg = False
+
+        def capture(self, *args, **kwargs):
+            events.append(kwargs["channel_id"])
+
+    speculator = object.__new__(MultiModuleMTPSpeculator)
+    speculator.last_token_indices = torch.zeros(1)
+    speculator.cudagraph_manager = FakeManager()
+    speculator.model = object()
+    speculator._generate_drafts = object()
+    speculator.model_state = object()
+    speculator.input_buffers = object()
+    speculator.block_tables = object()
+    speculator.attn_groups = object()
+    speculator.kv_cache_config = object()
+
+    speculator.capture(capture_phase="profile")
+    speculator.capture(capture_phase="production")
+
+    assert events == [
+        "vllm:draft:multi-module-mtp:profile",
+        "vllm:draft:multi-module-mtp:production",
+    ]
+
+
+def test_autoregressive_graph_channel_is_bound_at_capture_not_construction(
+    monkeypatch,
+):
+    created = []
+
+    class FakeManager:
+        def __init__(self, vllm_config, device, cudagraph_mode, decode_query_len):
+            created.append((vllm_config, device, cudagraph_mode, decode_query_len))
+
+    monkeypatch.setattr(spec_module, "SpeculatorCudaGraphManager", FakeManager)
+    speculator = object.__new__(_TestSpeculator)
+    speculator.vllm_config = object()
+    speculator.device = torch.device("cpu")
+    speculator.num_speculative_steps = 3
+
+    AutoRegressiveSpeculator.init_cudagraph_manager(
+        speculator,
+        CUDAGraphMode.FULL,
+    )
+
+    assert created == [
+        (
+            speculator.vllm_config,
+            speculator.device,
+            CUDAGraphMode.FULL,
+            4,
+        ),
+        (
+            speculator.vllm_config,
+            speculator.device,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            1,
+        ),
+    ]

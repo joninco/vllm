@@ -10,7 +10,7 @@ Tests cover:
 
 import importlib.util
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import multiprocess as mp
@@ -596,7 +596,7 @@ def test_b12x_pool_uses_independent_stream_channels(
             return cls()
 
         def prepare_channels(self, channel_ids):
-            captured["prepared"] = channel_ids
+            captured["prepared"] = tuple(channel_ids)
 
         def for_stream(self, *, channel_id):
             captured["warmed"] = channel_id
@@ -623,8 +623,9 @@ def test_b12x_pool_uses_independent_stream_channels(
 
     assert pool is not None
     assert captured["single_channel"] is False
-    assert captured["prepared"] == ("eager:vllm-dcp-a2a",)
-    assert captured["warmed"] == "eager:vllm-dcp-a2a"
+    assert captured["max_concurrent_channels"] == 2
+    assert captured["prepared"] == ("vllm:eager:dcp",)
+    assert captured["warmed"] == "vllm:eager:dcp"
 
 
 def test_b12x_dcp_capture_selects_only_current_group_pools(monkeypatch):
@@ -657,17 +658,36 @@ def test_b12x_dcp_capture_selects_only_current_group_pools(monkeypatch):
     with dcp_alltoall.capture_b12x_dcp_a2a(  # type: ignore[arg-type]
         group,
         stream,
-        channel_id="graph:test",
+        channel_id="vllm:target:profile",
     ):
-        events.append(("body", None, stream))
+        events.append(("body", None, stream, "vllm:target:profile"))
 
     assert events == [
-        ("enter", "output", stream, "graph:test"),
-        ("enter", "query", stream, "graph:test"),
-        ("body", None, stream),
-        ("exit", "query", stream, "graph:test"),
-        ("exit", "output", stream, "graph:test"),
+        ("enter", "output", stream, "vllm:target:profile"),
+        ("enter", "query", stream, "vllm:target:profile"),
+        ("body", None, stream, "vllm:target:profile"),
+        ("exit", "query", stream, "vllm:target:profile"),
+        ("exit", "output", stream, "vllm:target:profile"),
     ]
+
+
+def test_b12x_dcp_capture_rejects_missing_semantic_id(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    device_group = object()
+    group = _FakeCPGroup(2, device_group)  # type: ignore[arg-type]
+    key = (id(device_group), 0, 64, 512, 576, 64)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_B12X_DCP_A2A_POOLS",
+        {key: object()},
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="semantic channel_id"),
+        dcp_alltoall.capture_b12x_dcp_a2a(group),
+    ):
+        pass
 
 
 def test_b12x_dcp_channel_rollback_restores_existing_and_closes_new_pools(
@@ -773,28 +793,38 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
     from vllm.distributed import parallel_state
     from vllm.v1.attention.ops import dcp_alltoall
 
-    events = []
+    events: list[Any] = []
 
     class _FakeGroup:
         world_size = 2
 
+        def __init__(self, name):
+            self.name = name
+
         @contextmanager
         def graph_capture(self, context):
-            yield context
+            events.append(("enter-group", self.name, context.channel_id))
+            try:
+                yield context
+            finally:
+                events.append(("exit-group", self.name, context.channel_id))
 
-    tp_group = _FakeGroup()
-    pp_group = _FakeGroup()
-    dcp_group = _FakeGroup()
+    tp_group = _FakeGroup("tp")
+    pp_group = _FakeGroup("pp")
+    dcp_group = _FakeGroup("dcp")
     stream = object()
     context = parallel_state.GraphCaptureContext(  # type: ignore[arg-type]
         stream,
-        channel_id="graph:test-global-capture",
+        channel_id="vllm:target:profile",
     )
 
     @contextmanager
     def fake_b12x_capture(group, selected_stream, *, channel_id):
-        events.append((group, selected_stream, channel_id))
-        yield
+        events.append(("enter-b12x", group, selected_stream, channel_id))
+        try:
+            yield
+        finally:
+            events.append(("exit-b12x", group, selected_stream, channel_id))
 
     monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
@@ -805,7 +835,75 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
     with parallel_state.graph_capture(torch.device("cpu"), context) as actual:
         assert actual is context
 
-    assert events == [(dcp_group, stream, "graph:test-global-capture")]
+    assert events == [
+        ("enter-group", "tp", "vllm:target:profile"),
+        ("enter-group", "pp", "vllm:target:profile"),
+        ("enter-group", "dcp", "vllm:target:profile"),
+        (
+            "enter-b12x",
+            dcp_group,
+            stream,
+            "vllm:target:profile",
+        ),
+        (
+            "exit-b12x",
+            dcp_group,
+            stream,
+            "vllm:target:profile",
+        ),
+        ("exit-group", "dcp", "vllm:target:profile"),
+        ("exit-group", "pp", "vllm:target:profile"),
+        ("exit-group", "tp", "vllm:target:profile"),
+    ]
+
+
+def test_group_capture_forwards_semantic_id_to_custom_allreduce(monkeypatch):
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.distributed import parallel_state
+    from vllm.distributed.device_communicators.cuda_communicator import (
+        CudaCommunicator,
+    )
+
+    events: list[Any] = []
+
+    class FakeCustomAllreduce:
+        @contextmanager
+        def capture(self, *, stream, channel_id):
+            events.append(("enter", stream, channel_id))
+            try:
+                yield
+            finally:
+                events.append(("exit", stream, channel_id))
+
+    communicator = object.__new__(CudaCommunicator)
+    communicator.ca_comm = FakeCustomAllreduce()
+    group = object.__new__(parallel_state.GroupCoordinator)
+    group.device_communicator = communicator
+    stream = object()
+    context = parallel_state.GraphCaptureContext(  # type: ignore[arg-type]
+        stream,
+        channel_id="vllm:draft:decode:production",
+    )
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
+    monkeypatch.setattr(
+        parallel_state.torch.cuda,
+        "current_stream",
+        lambda: stream,
+    )
+    monkeypatch.setattr(
+        parallel_state.torch.cuda,
+        "stream",
+        lambda selected: nullcontext(),
+    )
+
+    with parallel_state.GroupCoordinator.graph_capture(group, context) as actual:
+        assert actual is context
+
+    assert events == [
+        ("enter", stream, "vllm:draft:decode:production"),
+        ("exit", stream, "vllm:draft:decode:production"),
+    ]
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
@@ -827,7 +925,7 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
             is_lse_base_on_e,
             channel_id,
         ):
-            assert channel_id == "eager:vllm-dcp-a2a"
+            created["channel_id"] = channel_id
             return sentinel
 
     def fake_get_pool(
@@ -853,6 +951,7 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     # Batch within the cap uses B12X, with the staging pool capped too.
     assert result is sentinel
     assert created["max_batch_size"] == 4
+    assert created["channel_id"] == "vllm:eager:dcp"
 
     out_large = torch.zeros(8, 16, 64, dtype=torch.bfloat16, device="cuda")
     lse_large = torch.zeros(8, 16, dtype=torch.float32, device="cuda")
@@ -880,7 +979,7 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
 
     class _FakePool:
         def all_gather_heads(self, local_input, *, channel_id):
-            assert channel_id == "eager:vllm-dcp-a2a"
+            created["channel_id"] = channel_id
             return sentinel
 
     def fake_get_pool(
@@ -901,6 +1000,7 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     )
     assert result is sentinel
     assert created["max_batch_size"] == 4
+    assert created["channel_id"] == "vllm:eager:dcp"
 
     large = torch.zeros(8, 8, 64, dtype=torch.bfloat16, device="cuda")
     result = dcp_alltoall._try_b12x_dcp_all_gather_heads(
@@ -967,7 +1067,7 @@ def test_b12x_lse_reduce_preserves_supported_layouts(monkeypatch: pytest.MonkeyP
     assert received["partial"].is_contiguous()
     assert received["lse"].is_contiguous()
     assert received["out"].movedim(0, 1).is_contiguous()
-    assert received["channel_id"] == "eager:vllm-dcp-a2a"
+    assert received["channel_id"] == "vllm:eager:dcp"
 
     head_major_storage = torch.zeros(16, 8, 64, dtype=torch.bfloat16, device="cuda")
     head_major = head_major_storage.transpose(0, 1)[:4]
@@ -1405,12 +1505,12 @@ def _distributed_b12x_a2a_worker(env: dict[str, str]) -> None:
         dcp_alltoall._dcp_a2a_send_recv_buffers = fail_packed_nccl
         group.all_gather = fail_query_nccl  # type: ignore[attr-defined]
         graph = torch.cuda.CUDAGraph()
-        capture_stream = torch.cuda.Stream()
+        capture_stream = torch.cuda.Stream(device=f"cuda:{local_rank}")
         with (
             dcp_alltoall.capture_b12x_dcp_a2a(
                 group,  # type: ignore[arg-type]
                 capture_stream,
-                channel_id="graph:test-dcp-a2a",
+                channel_id="test:dcp:graph",
             ),
             torch.cuda.graph(graph, stream=capture_stream),
         ):

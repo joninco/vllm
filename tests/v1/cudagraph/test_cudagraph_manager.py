@@ -106,6 +106,6 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
             return_value=mock_cuda_graph_ctx,
         ) as mock_cuda_graph,
     ):
-        manager.capture(create_forward_fn)
+        manager.capture(create_forward_fn, channel_id="vllm:target:test")
 
     mock_cuda_graph.assert_called_once()
