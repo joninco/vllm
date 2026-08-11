@@ -1850,9 +1850,12 @@ class KimiK3ForConditionalGeneration(
                 quant_config=self._maybe_ignore_quant_config(quant_config),
                 prefix=maybe_prefix(prefix, "mm_projector"),
             )
-            self.mm_projector = self.mm_projector.to(
-                device=self.device, dtype=model_config.dtype
-            )
+            if self._maybe_ignore_quant_config(quant_config) is not None:
+                self.mm_projector = self.mm_projector.to(device=self.device)
+            else:
+                self.mm_projector = self.mm_projector.to(
+                    device=self.device, dtype=model_config.dtype
+                )
 
         self.quant_config = quant_config
         with self._mark_language_model(vllm_config):
@@ -2036,7 +2039,14 @@ class KimiK3ForConditionalGeneration(
         )
 
     def _project_encoder_features(self, image_features: torch.Tensor) -> torch.Tensor:
-        projector_dtype = next(self.mm_projector.parameters()).dtype
+        projector_norm = getattr(self.mm_projector, "pre_norm", None)
+        if projector_norm is None:
+            projector_norm = getattr(self.mm_projector, "post_norm", None)
+        projector_dtype = (
+            projector_norm.weight.dtype
+            if projector_norm is not None
+            else image_features.dtype
+        )
         if image_features.dtype != projector_dtype:
             image_features = image_features.to(projector_dtype)
         output = self.mm_projector(image_features)
@@ -2058,7 +2068,7 @@ class KimiK3ForConditionalGeneration(
     ) -> torch.Tensor:
         image_features = self.vision_tower(
             self._get_pixel_values(mm_kwargs).to(
-                next(self.vision_tower.parameters()).dtype
+                self.vision_tower.patch_embed.proj.weight.dtype
             ),
             self._get_grid_thws(mm_kwargs),
         )
@@ -2092,7 +2102,7 @@ class KimiK3ForConditionalGeneration(
                 pixel_values.shape[0] * pixel_values.shape[1], *pixel_values.shape[2:]
             )
 
-        target_dtype = next(self.vision_tower.parameters()).dtype
+        target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.to(target_dtype)
         assert isinstance(grid_thws, torch.Tensor), (
             f"expect grid_thws to be a tensor, got {type(grid_thws)}"

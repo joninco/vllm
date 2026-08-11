@@ -373,9 +373,12 @@ class KimiK25ForConditionalGeneration(
                 quant_config=self._maybe_ignore_quant_config(quant_config),
                 prefix=maybe_prefix(prefix, "mm_projector"),
             )
-            self.mm_projector = self.mm_projector.to(
-                device=self.device, dtype=model_config.dtype
-            )
+            if self._maybe_ignore_quant_config(quant_config) is not None:
+                self.mm_projector = self.mm_projector.to(device=self.device)
+            else:
+                self.mm_projector = self.mm_projector.to(
+                    device=self.device, dtype=model_config.dtype
+                )
 
         self.quant_config = quant_config
         with self._mark_language_model(vllm_config):
@@ -412,7 +415,7 @@ class KimiK25ForConditionalGeneration(
             )
 
         # The batch dimension of pixel_values has been flattened into shape[0]
-        target_dtype = next(self.vision_tower.parameters()).dtype
+        target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.to(target_dtype)
         assert isinstance(grid_thws, torch.Tensor), (
             f"expect grid_thws to be a tensor, got {type(grid_thws)}"

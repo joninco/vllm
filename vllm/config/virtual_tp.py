@@ -154,6 +154,30 @@ def _build_b12x_virtual_tp_plan(
         plan["output_groups"] = output_group_axis
     if shared_expert_axis is not None:
         plan["shared_expert_intermediate_size"] = shared_expert_axis
+    if _is_kimi_k3_config(model_config):
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        if vision_config is not None:
+            multimodal_config = getattr(model_config, "multimodal_config", None)
+            vision_tp_size = (
+                1
+                if multimodal_config is not None
+                and getattr(multimodal_config, "mm_encoder_tp_mode", None) == "data"
+                else attention_tp_size
+            )
+            plan["vision_intermediate_size"] = _make_virtual_axis(
+                _require_int_attr(vision_config, "intermediate_size"),
+                vision_tp_size,
+                _NVFP4_LOCAL_ALIGNMENT,
+            )
+            merge_kernel_size = getattr(vision_config, "merge_kernel_size", (2, 2))
+            projector_hidden_size = _require_int_attr(
+                vision_config, "hidden_size"
+            ) * math.prod(int(size) for size in merge_kernel_size)
+            plan["vision_projector_hidden_size"] = _make_virtual_axis(
+                projector_hidden_size,
+                vision_tp_size,
+                _NVFP4_LOCAL_ALIGNMENT,
+            )
     return plan
 
 
@@ -421,6 +445,16 @@ def _apply_b12x_virtual_tp_plan(
     )
     _set_existing_config_attr(configs, "moe_intermediate_size", moe_axis["padded_size"])
 
+    vision_axis = _optional_axis(plan, "vision_intermediate_size")
+    vision_config = getattr(model_config.hf_config, "vision_config", None)
+    if vision_axis is not None and vision_config is not None:
+        for attr in ("intermediate_size", "vt_intermediate_size"):
+            if not hasattr(vision_config, attr):
+                continue
+            setattr(vision_config, f"original_{attr}", vision_axis["original_size"])
+            setattr(vision_config, attr, vision_axis["padded_size"])
+        setattr(vision_config, VIRTUAL_TP_PLAN_ATTR, plan)
+
     for config in configs:
         setattr(config, VIRTUAL_TP_PLAN_ATTR, plan)
 
@@ -458,6 +492,27 @@ def _apply_b12x_virtual_tp_plan(
             "intermediate size %d -> %d.",
             shared_expert_axis["original_size"],
             shared_expert_axis["padded_size"],
+        )
+    if (
+        vision_axis is not None
+        and vision_axis["original_size"] != vision_axis["padded_size"]
+    ):
+        logger.warning(
+            "Automatically enabled B12X virtual TP padding for the vision MLP: "
+            "intermediate size %d -> %d.",
+            vision_axis["original_size"],
+            vision_axis["padded_size"],
+        )
+    projector_axis = _optional_axis(plan, "vision_projector_hidden_size")
+    if (
+        projector_axis is not None
+        and projector_axis["original_size"] != projector_axis["padded_size"]
+    ):
+        logger.warning(
+            "Automatically enabled B12X virtual TP padding for the vision "
+            "projector: hidden size %d -> %d.",
+            projector_axis["original_size"],
+            projector_axis["padded_size"],
         )
 
 

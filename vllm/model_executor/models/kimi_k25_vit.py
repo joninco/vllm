@@ -25,7 +25,6 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderA
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -34,6 +33,7 @@ from vllm.model_executor.models.vision import (
     is_vit_use_data_parallel,
     run_dp_sharded_mrope_vision_model,
 )
+from vllm.model_executor.virtual_tp import get_virtual_tp_axis_padded_size
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_k25 import KimiK25VisionConfig
 
@@ -840,7 +840,12 @@ def mm_projector_forward(mm_projector: torch.nn.Module, vt_output: list[torch.Te
     """Apply MM projector to vision tower outputs."""
     num_embedding_list = [x.shape[0] for x in vt_output]
     batched = torch.cat(vt_output, dim=0)
-    projector_dtype = next(mm_projector.parameters()).dtype
+    projector_norm = getattr(mm_projector, "pre_norm", None)
+    if projector_norm is None:
+        projector_norm = getattr(mm_projector, "post_norm", None)
+    projector_dtype = (
+        projector_norm.weight.dtype if projector_norm is not None else batched.dtype
+    )
     if batched.dtype != projector_dtype:
         batched = batched.to(projector_dtype)
     proj_out = mm_projector(batched)
@@ -901,20 +906,27 @@ class KimiK25MultiModalProjector(nn.Module):
         # Hidden size after patch merging
         merge_h, merge_w = config.merge_kernel_size
         self.hidden_size = config.hidden_size * merge_h * merge_w
+        self.parallel_hidden_size = get_virtual_tp_axis_padded_size(
+            "vision_projector_hidden_size",
+            self.hidden_size,
+            config=config,
+        )
 
         if self.mm_projector_type == "patchmergerv2":
-            self.linear_1 = ReplicatedLinear(
+            self.linear_1 = ColumnParallelLinear(
                 self.hidden_size,
-                self.hidden_size,
+                self.parallel_hidden_size,
                 bias=False,
                 quant_config=quant_config,
+                disable_tp=use_data_parallel,
                 prefix=f"{prefix}.linear_1",
             )
-            self.linear_2 = ReplicatedLinear(
-                self.hidden_size,
+            self.linear_2 = RowParallelLinear(
+                self.parallel_hidden_size,
                 getattr(config, "text_hidden_size", config.mm_hidden_size),
                 bias=False,
                 quant_config=quant_config,
+                disable_tp=use_data_parallel,
                 prefix=f"{prefix}.linear_2",
             )
             self.post_norm = torch.nn.RMSNorm(
@@ -925,18 +937,20 @@ class KimiK25MultiModalProjector(nn.Module):
             return
 
         self.pre_norm = torch.nn.LayerNorm(config.hidden_size, eps=1e-5)
-        self.linear_1 = ReplicatedLinear(
+        self.linear_1 = ColumnParallelLinear(
             self.hidden_size,
-            self.hidden_size,
+            self.parallel_hidden_size,
             bias=True,
             quant_config=quant_config,
+            disable_tp=use_data_parallel,
             prefix=f"{prefix}.linear_1",
         )
-        self.linear_2 = ReplicatedLinear(
-            self.hidden_size,
+        self.linear_2 = RowParallelLinear(
+            self.parallel_hidden_size,
             config.mm_hidden_size,
             bias=True,
             quant_config=quant_config,
+            disable_tp=use_data_parallel,
             prefix=f"{prefix}.linear_2",
         )
         self.act = GELUActivation()
