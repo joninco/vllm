@@ -459,6 +459,8 @@ class DefaultModelLoader(BaseModelLoader):
 
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
+        self.validate_required_checkpoint_parameters(model, loaded_weights)
+
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
             "Loading weights took %.2f seconds",
@@ -476,6 +478,30 @@ class DefaultModelLoader(BaseModelLoader):
         )
         if enable_weights_track:
             self.track_weights_loading(model, loaded_weights)
+
+    @staticmethod
+    def validate_required_checkpoint_parameters(
+        model: nn.Module, loaded_weights: set[str] | None
+    ) -> None:
+        if loaded_weights is None:
+            return
+
+        missing: set[str] = set()
+        for module_name, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            required = getattr(quant_method, "required_checkpoint_parameter_names", ())
+            for parameter_name in required:
+                full_name = (
+                    f"{module_name}.{parameter_name}" if module_name else parameter_name
+                )
+                if full_name not in loaded_weights:
+                    missing.add(full_name)
+
+        if missing:
+            raise ValueError(
+                "Following serialized quantization parameters were not "
+                f"initialized from checkpoint: {sorted(missing)}"
+            )
 
     def track_weights_loading(
         self, model: nn.Module, loaded_weights: set[str] | None

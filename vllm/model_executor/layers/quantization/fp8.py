@@ -94,6 +94,8 @@ class Mxfp8SerializedLinearMethod(LinearMethodBase):
     per-32 ue8m0 scales) inside an FP8-checkpoint config, delegating to the
     compressed-tensors MXFP8 scheme (weight [n,k] fp8 + weight_scale u8)."""
 
+    required_checkpoint_parameter_names = ("weight", "weight_scale")
+
     def __init__(self):
         from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_mxfp8 import (  # noqa: E501
             CompressedTensorsW8A8Mxfp8,
