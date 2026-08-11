@@ -491,7 +491,7 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 mode="decode" if d.decode_query_len == 1 else "extend",
                 q=q[:nd],
                 out=out[:nd],
-                topk=topk[:, :nd, :],
+                topk=decode_topk,
                 seq_lens=d.seq_lens,
             )
 
@@ -520,7 +520,7 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 mode="extend",
                 q=q[nd:],
                 out=out[nd:],
-                topk=topk[:, nd:num_tokens, :],
+                topk=prefill_topk,
                 seq_lens=p.seq_lens,
             )
         return output
