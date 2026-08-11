@@ -660,6 +660,11 @@ def test_b12x_force_a8_mxfp4_prepares_one_expert_owner(monkeypatch) -> None:
     assert torch.equal(prepare_calls[0]["w2_global_scale"], torch.ones(8))
 
 
+def test_b12x_supports_situ_activation() -> None:
+    assert MoEActivation.from_str("situ") is MoEActivation.SITU
+    assert b12x_moe.B12xExperts._supports_activation(MoEActivation.SITU)
+
+
 def test_warmup_b12x_moe_dynamic_dedupes_signatures(monkeypatch) -> None:
     calls = []
 

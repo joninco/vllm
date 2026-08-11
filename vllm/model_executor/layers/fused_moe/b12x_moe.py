@@ -1025,6 +1025,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
     def _supports_activation(activation: MoEActivation) -> bool:
         return activation in (
             MoEActivation.SILU,
+            MoEActivation.SITU,
             MoEActivation.SWIGLUOAI,
             MoEActivation.SWIGLUOAI_UNINTERLEAVE,
         )
