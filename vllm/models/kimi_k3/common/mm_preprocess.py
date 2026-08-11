@@ -29,6 +29,10 @@ from vllm.multimodal.processing import (
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.processor import cached_get_image_processor
 from vllm.transformers_utils.processors.kimi_k3 import KimiK3Processor
+from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
+    KimiK25FusedVisionProcessor,
+)
+from vllm.utils.import_utils import is_numba_available
 
 logger = init_logger(__name__)
 
@@ -101,10 +105,16 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
         self.hf_config = hf_config = self.get_hf_config()
 
         tokenizer = self.get_tokenizer()
+        processor_cls = KimiK25FusedVisionProcessor if is_numba_available() else None
+        logger.info_once(
+            "Using %s image preprocessing for Kimi-K3 images.",
+            "fused CPU" if processor_cls is not None else "remote HF",
+        )
         image_processor = cached_get_image_processor(
             self.ctx.model_config.model,
             revision=self.ctx.model_config.revision,
             trust_remote_code=self.ctx.model_config.trust_remote_code,
+            processor_cls_overrides=processor_cls,
         )
 
         # Resolve token ID from the tokenizer because transformers v5
