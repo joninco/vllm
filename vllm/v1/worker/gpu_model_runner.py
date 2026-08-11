@@ -5775,6 +5775,13 @@ class GPUModelRunner(
         if not num_prompt_logprobs_dict:
             return {}
 
+        chunk_size = envs.VLLM_PROMPT_LOGPROBS_CHUNK_SIZE
+        if chunk_size <= 0:
+            raise ValueError(
+                "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE must be greater than zero, "
+                f"got {chunk_size}"
+            )
+
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
 
         # Since prompt logprobs are a rare feature, prioritize simple,
@@ -5835,33 +5842,39 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
-
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
             # to gather the logprob for.
             tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
-
-            # Compute prompt scores respecting logprobs_mode.
-            # NOTE: prompt tokens skip sampling processors, so
-            # processed_* and raw_* yield the same scores here.
-            if self.model_config.logprobs_mode in ("raw_logits", "processed_logits"):
-                scores = logits.to(torch.float32)
-            else:
-                scores = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                scores, num_prompt_logprobs, tgt_token_ids
+            logits_mode = self.model_config.logprobs_mode in (
+                "raw_logits",
+                "processed_logits",
             )
-
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+            for chunk_start in range(0, num_logits, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, num_logits)
+                chunk_logits = self.model.compute_logits(
+                    prompt_hidden_states[chunk_start:chunk_end]
+                )
+                chunk_tgt = tgt_token_ids[chunk_start:chunk_end]
+                scores = (
+                    chunk_logits.to(torch.float32)
+                    if logits_mode
+                    else self.sampler.compute_logprobs(chunk_logits)
+                )
+                del chunk_logits
+                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                    scores, num_prompt_logprobs, chunk_tgt
+                )
+                del scores
+                # Transfer GPU->CPU async.
+                dst_slice = slice(start_idx + chunk_start, start_idx + chunk_end)
+                logprobs_tensors.logprob_token_ids[dst_slice].copy_(
+                    token_ids, non_blocking=True
+                )
+                logprobs_tensors.logprobs[dst_slice].copy_(logprobs, non_blocking=True)
+                logprobs_tensors.selected_token_ranks[dst_slice].copy_(
+                    ranks, non_blocking=True
+                )
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.

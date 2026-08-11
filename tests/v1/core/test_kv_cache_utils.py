@@ -11,7 +11,7 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import DeviceConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
@@ -2687,6 +2687,36 @@ def test_get_kv_cache_configs_attention_free():
             kv_cache_groups=[],
         )
     ]
+
+
+def test_warns_when_num_gpu_blocks_override_exceeds_profiled_capacity(monkeypatch):
+    model_config = ModelConfig(max_model_len=16)
+    vllm_config = VllmConfig(
+        model_config=model_config, device_config=DeviceConfig(device="cpu")
+    )
+    vllm_config.cache_config.num_gpu_blocks_override = 33
+    mem_per_block_per_layer = 16 * 2 * 64 * 4 * 2
+    kv_cache_specs = {
+        "layer_1": new_kv_cache_spec(),
+        "layer_2": new_kv_cache_spec(),
+    }
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        kv_cache_utils.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args),
+    )
+
+    get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs],
+        [mem_per_block_per_layer * 2 * 32],
+    )
+
+    assert any(
+        "exceeds the capacity of 32 blocks implied by available KV memory" in warning
+        for warning in warnings
+    )
 
 
 def test_generate_uniform_type_kv_cache_specs():
