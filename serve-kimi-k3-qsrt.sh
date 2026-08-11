@@ -91,6 +91,9 @@ exec "${K3_PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   "${K3_MODEL_DIR}" \
   --served-model-name "${K3_SERVED_MODEL_NAME:-Kimi-K3}" \
   --trust-remote-code \
+  --reasoning-parser kimi_k3 \
+  --tool-call-parser kimi_k3 \
+  --enable-auto-tool-choice \
   --host "${K3_HOST:-0.0.0.0}" \
   --port "${K3_PORT:-8000}" \
   --tensor-parallel-size "${K3_TP_SIZE:-12}" \
