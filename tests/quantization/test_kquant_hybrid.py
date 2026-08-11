@@ -227,3 +227,18 @@ def test_dense_short_exclusions_match_path_components(
     prefix, ignored, expected
 ) -> None:
     assert _is_dense_layer_ignored(prefix, ignored, {}) is expected
+
+
+def test_dense_kda_precision_groups_resolve_fused_children() -> None:
+    mapping = {
+        "in_proj_qkv": ["q_proj", "k_proj", "v_proj"],
+        "in_proj_gfab": ["g_proj", "f_a_proj", "b_proj"],
+    }
+    ignored = ["g_proj", "f_a_proj", "b_proj"]
+
+    assert not _is_dense_layer_ignored(
+        "model.layers.1.linear_attn.in_proj_qkv", ignored, mapping
+    )
+    assert _is_dense_layer_ignored(
+        "model.layers.1.linear_attn.in_proj_gfab", ignored, mapping
+    )

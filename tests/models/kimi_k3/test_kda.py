@@ -6,6 +6,8 @@ Compares chunk_kda against a naive recurrent reference (float32).
 Uses torch.rand for q/k/v to match FLA's test pattern.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -21,6 +23,7 @@ from vllm.models.kimi_k3.amd.ops.third_party.kda import (
 from vllm.models.kimi_k3.nvidia.kda import (
     is_flashkda_supported,
     is_fused_kda_decode_supported,
+    use_split_mixed_precision_input_projection,
 )
 from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
     chunk_kda,
@@ -40,6 +43,28 @@ PACKED_DECODE_IMPLS = {
     "nvidia": fused_recurrent_kda_packed_decode,
     "amd": fused_recurrent_kda_packed_decode_amd,
 }
+
+
+@pytest.mark.parametrize(
+    ("dense_format", "ignored_layers", "expected"),
+    [
+        ("mxfp8", ["g_proj", "f_a_proj", "b_proj"], True),
+        ("mxfp8", ["q_proj", "g_proj", "f_a_proj", "b_proj"], False),
+        ("mxfp8", ["g_proj", "f_a_proj"], False),
+        (None, ["g_proj", "f_a_proj", "b_proj"], False),
+    ],
+)
+def test_kda_mixed_precision_input_projection_selection(
+    dense_format: str | None,
+    ignored_layers: list[str],
+    expected: bool,
+):
+    quant_config = SimpleNamespace(
+        dense_format=dense_format,
+        dense_ignored_layers=ignored_layers,
+    )
+
+    assert use_split_mixed_precision_input_projection(quant_config) is expected
 
 
 @torch.inference_mode()

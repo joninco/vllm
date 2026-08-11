@@ -77,6 +77,16 @@ def a_log_weight_loader(
     return loader
 
 
+def use_split_mixed_precision_input_projection(quant_config: object | None) -> bool:
+    """Whether KDA QKV and gate/factor/beta need separate packed linears."""
+    dense_ignored = set(getattr(quant_config, "dense_ignored_layers", ()))
+    return (
+        getattr(quant_config, "dense_format", None) == "mxfp8"
+        and not dense_ignored.intersection({"q_proj", "k_proj", "v_proj"})
+        and {"g_proj", "f_a_proj", "b_proj"}.issubset(dense_ignored)
+    )
+
+
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with one output replicated across TP ranks."""
 
@@ -339,19 +349,52 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             4 * self.local_projection_size + self.head_dim + self.local_num_heads
         )
         self.in_proj_padding = -local_output_size % 16
-        if self.in_proj_padding:
-            in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
-        self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
-            self.hidden_size,
-            in_proj_output_sizes,
-            replicated_shard_id=4,
-            tp_size=self.tp_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_qkvgfab",
+        self.split_mixed_precision_input = use_split_mixed_precision_input_projection(
+            self.quant_config
         )
-        if self.in_proj_padding:
-            self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
+        if self.split_mixed_precision_input:
+            # Q/K/V are serialized as MXFP8 while the full-rank gate, factor,
+            # and beta projections remain BF16. Keep fusion within each wire
+            # dtype so BF16 shards never occupy an MXFP8 packed parameter.
+            self.in_proj_qkv = MergedColumnParallelLinear(
+                self.hidden_size,
+                [self.projection_size] * 3,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkv",
+            )
+            gfab_output_sizes = [
+                self.projection_size,
+                self.head_dim,
+                self.num_heads,
+            ]
+            if self.in_proj_padding:
+                gfab_output_sizes.append(self.in_proj_padding * self.tp_size)
+            self.in_proj_gfab = _KimiGDNMergedColumnParallelLinear(
+                self.hidden_size,
+                gfab_output_sizes,
+                replicated_shard_id=1,
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_gfab",
+            )
+            if self.in_proj_padding:
+                self.in_proj_gfab.weight.data[-self.in_proj_padding :].zero_()
+        else:
+            if self.in_proj_padding:
+                in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
+            self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
+                self.hidden_size,
+                in_proj_output_sizes,
+                replicated_shard_id=4,
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvgfab",
+            )
+            if self.in_proj_padding:
+                self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -474,17 +517,31 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
-        projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
-        split_sizes = [
-            3 * self.local_projection_size,
-            self.local_projection_size,
-            self.head_dim,
-            self.local_num_heads,
-        ]
-        if self.in_proj_padding:
-            split_sizes.append(self.in_proj_padding)
-        projected = projected_qkvgfab.split(split_sizes, dim=-1)
-        mixed_qkv, g_proj_states, f_a, beta = projected[:4]
+        if self.split_mixed_precision_input:
+            mixed_qkv = self.in_proj_qkv(hidden_states)[0]
+            gfab_split_sizes = [
+                self.local_projection_size,
+                self.head_dim,
+                self.local_num_heads,
+            ]
+            if self.in_proj_padding:
+                gfab_split_sizes.append(self.in_proj_padding)
+            projected_gfab = self.in_proj_gfab(hidden_states)[0].split(
+                gfab_split_sizes, dim=-1
+            )
+            g_proj_states, f_a, beta = projected_gfab[:3]
+        else:
+            projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+            split_sizes = [
+                3 * self.local_projection_size,
+                self.local_projection_size,
+                self.head_dim,
+                self.local_num_heads,
+            ]
+            if self.in_proj_padding:
+                split_sizes.append(self.in_proj_padding)
+            projected = projected_qkvgfab.split(split_sizes, dim=-1)
+            mixed_qkv, g_proj_states, f_a, beta = projected[:4]
 
         g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)

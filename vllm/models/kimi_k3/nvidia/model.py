@@ -1194,6 +1194,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvgfab": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"],
+        "in_proj_qkv": ["q_proj", "k_proj", "v_proj"],
+        "in_proj_gfab": ["g_proj", "f_a_proj", "b_proj"],
         "conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
     }
@@ -1438,6 +1440,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             (".in_proj_qkvgfab", ".v_proj", 2),
             (".in_proj_qkvgfab", ".b_proj", beta_shard_id),
             (".in_proj_qkvgfab", ".f_a_proj", 4),
+            (".in_proj_qkv", ".q_proj", 0),
+            (".in_proj_qkv", ".k_proj", 1),
+            (".in_proj_qkv", ".v_proj", 2),
+            (".in_proj_gfab", ".g_proj", 0),
+            (".in_proj_gfab", ".f_a_proj", 1),
+            (".in_proj_gfab", ".b_proj", 2),
             (".conv1d", ".q_conv1d", 0),
             (".conv1d", ".k_conv1d", 1),
             (".conv1d", ".v_conv1d", 2),
