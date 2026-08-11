@@ -17,6 +17,8 @@ from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -34,6 +36,7 @@ from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -150,6 +153,11 @@ def shard_sequence_parallel_mlp(
     )
 
 
+def shard_auxiliary_projections(use_sequence_parallel: bool) -> bool:
+    """Whether router and latent projections may use feature TP sharding."""
+    return get_tensor_model_parallel_world_size() > 1 and not use_sequence_parallel
+
+
 class KimiMLP(nn.Module):
     """Dense / shared-expert MLP, optionally TP-sharded under sequence parallel.
 
@@ -238,7 +246,7 @@ class KimiRoutedOutputTransform(nn.Module):
     def __init__(
         self,
         norm: RMSNorm | None,
-        up_proj: ReplicatedLinear,
+        up_proj: ReplicatedLinear | RowParallelLinear,
         layer_idx: int,
     ) -> None:
         super().__init__()
@@ -264,16 +272,147 @@ class KimiRoutedOutputTransform(nn.Module):
         Args:
             hidden_states: Routed expert output in latent space.
             residual: Optional tensor of the up-projection's output shape to
-                accumulate into. It is consumed in the GEMM's beta-add
-                epilogue, so adding it costs no extra kernel.
+                accumulate into. A replicated projection consumes it in the
+                GEMM's beta-add epilogue; a TP-sharded projection adds the two
+                rank-local partials before their shared all-reduce.
         """
         self.capture_routed_latent(hidden_states)
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
-        if residual is not None:
+        if residual is not None and isinstance(self.up_proj, ReplicatedLinear):
             return residual.addmm_(hidden_states, self.up_proj.weight.t())
         hidden_states, _ = self.up_proj(hidden_states)
+        if residual is not None:
+            hidden_states.add_(residual)
         return hidden_states
+
+    @property
+    def output_is_tp_partial(self) -> bool:
+        return (
+            isinstance(self.up_proj, RowParallelLinear)
+            and not self.up_proj.reduce_results
+        )
+
+
+def _load_padded_tp_shard(
+    param: nn.Parameter,
+    loaded_weight: torch.Tensor,
+    dim: int,
+    shard_rank: int,
+) -> None:
+    param_data = param.data
+    dim = dim if dim >= 0 else loaded_weight.ndim + dim
+    shard_size = param_data.shape[dim]
+    start = shard_rank * shard_size
+    available = max(min(loaded_weight.shape[dim] - start, shard_size), 0)
+    if available == shard_size:
+        loaded_shard = loaded_weight.narrow(dim, start, shard_size)
+    else:
+        shape = list(loaded_weight.shape)
+        shape[dim] = shard_size
+        loaded_shard = loaded_weight.new_zeros(shape)
+        if available:
+            loaded_shard.narrow(dim, 0, available).copy_(
+                loaded_weight.narrow(dim, start, available)
+            )
+    if param_data.shape != loaded_shard.shape:
+        raise ValueError(
+            f"Cannot load tensor with shape {tuple(loaded_weight.shape)} into "
+            f"TP shard with shape {tuple(param_data.shape)}"
+        )
+    param_data.copy_(loaded_shard)
+
+
+class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
+    """Column-parallel linear that zero-fills an indivisible output tail."""
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim is None or getattr(param, "is_sharded_weight", False):
+            default_weight_loader(param, loaded_weight)
+            return
+        _load_padded_tp_shard(param, loaded_weight, output_dim, self.tp_rank)
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        prefix: str,
+        *,
+        gather_output: bool = True,
+    ) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        self.logical_output_size = output_size
+        padded_output_size = cdiv(output_size, tp_size) * tp_size
+        super().__init__(
+            input_size,
+            padded_output_size,
+            bias=False,
+            gather_output=gather_output,
+            quant_config=None,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        output, bias = super().forward(x)
+        if self.gather_output:
+            output = output[..., : self.logical_output_size].contiguous()
+        return output, bias
+
+
+class KimiColumnParallelGate(KimiPaddedColumnParallelLinear):
+    """TP-sharded router with globally ordered FP32 logits."""
+
+    def __init__(self, input_size: int, output_size: int, prefix: str) -> None:
+        super().__init__(
+            input_size,
+            output_size,
+            prefix,
+            gather_output=False,
+        )
+
+    def forward(self, x: torch.Tensor):
+        if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
+            output_parallel = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+        else:
+            output_parallel = torch.nn.functional.linear(
+                x.to(self.weight.dtype), self.weight
+            ).float()
+        if self.tp_size > 1:
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        return output[..., : self.logical_output_size].contiguous(), None
+
+
+class KimiPaddedRowParallelLinear(RowParallelLinear):
+    """Row-parallel linear with a zero-padded input axis."""
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        input_dim = getattr(param, "input_dim", None)
+        if input_dim is None or getattr(param, "is_sharded_weight", False):
+            default_weight_loader(param, loaded_weight)
+            return
+        _load_padded_tp_shard(param, loaded_weight, input_dim, self.tp_rank)
+
+    def __init__(self, input_size: int, output_size: int, prefix: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        padded_input_size = cdiv(input_size, tp_size) * tp_size
+        self.input_pad = padded_input_size - input_size
+        super().__init__(
+            padded_input_size,
+            output_size,
+            bias=False,
+            input_is_parallel=False,
+            reduce_results=False,
+            quant_config=None,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        if self.input_pad:
+            x = torch.nn.functional.pad(x, (0, self.input_pad))
+        return super().forward(x)
 
 
 class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
@@ -499,6 +638,12 @@ class KimiMoE(nn.Module):
         self.moe_router_activation_func = config.moe_router_activation_func
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
+        # Feature-sharded collectives require every TP rank to own the same
+        # token rows. Sequence-parallel ranks own disjoint rows, so retain the
+        # replicated auxiliary projections in that mode.
+        self.auxiliary_projections_tp_sharded = shard_auxiliary_projections(
+            use_sequence_parallel
+        )
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
@@ -535,13 +680,20 @@ class KimiMoE(nn.Module):
         )
 
         # Route with fp32 logits for numerically stable expert selection.
-        self.gate = GateLinear(
-            input_size=hidden_size,
-            output_size=num_experts,
-            bias=False,
-            out_dtype=torch.float32,
-            prefix=f"{prefix}.gate",
-        )
+        if self.auxiliary_projections_tp_sharded:
+            self.gate = KimiColumnParallelGate(
+                hidden_size,
+                num_experts,
+                prefix=f"{prefix}.gate",
+            )
+        else:
+            self.gate = GateLinear(
+                input_size=hidden_size,
+                output_size=num_experts,
+                bias=False,
+                out_dtype=torch.float32,
+                prefix=f"{prefix}.gate",
+            )
 
         self.gate.e_score_correction_bias = nn.Parameter(
             torch.empty(num_experts, dtype=torch.float32)
@@ -563,35 +715,44 @@ class KimiMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        self.routed_expert_down_proj: ReplicatedLinear | None
+        self.routed_expert_down_proj: ReplicatedLinear | ColumnParallelLinear | None
         self.routed_expert_norm: RMSNorm | None
-        self.routed_expert_up_proj: ReplicatedLinear | None
+        self.routed_expert_up_proj: ReplicatedLinear | RowParallelLinear | None
         self.routed_output_transform: KimiRoutedOutputTransform | None
         if self.use_latent_moe:
-            self.routed_expert_down_proj = ReplicatedLinear(
-                hidden_size,
-                self.moe_hidden_size,
-                bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.routed_expert_down_proj",
-            )
+            if self.auxiliary_projections_tp_sharded:
+                self.routed_expert_down_proj = KimiPaddedColumnParallelLinear(
+                    hidden_size,
+                    self.moe_hidden_size,
+                    prefix=f"{prefix}.routed_expert_down_proj",
+                )
+            else:
+                self.routed_expert_down_proj = ReplicatedLinear(
+                    hidden_size,
+                    self.moe_hidden_size,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.routed_expert_down_proj",
+                )
             self.routed_expert_norm = (
                 RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
                 if self.latent_moe_use_norm
                 else None
             )
-            # Replicated up-proj: the full weight lives on every rank and
-            # produces the full hidden dim locally. This lets LatentMoERunner
-            # fuse the latent and shared reductions into a single all-reduce
-            # (concat the two partials, reduce once), then run the up-proj and
-            # shared add locally with no further collective.
-            self.routed_expert_up_proj = ReplicatedLinear(
-                self.moe_hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.routed_expert_up_proj",
-            )
+            if self.auxiliary_projections_tp_sharded:
+                self.routed_expert_up_proj = KimiPaddedRowParallelLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
+            else:
+                self.routed_expert_up_proj = ReplicatedLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
 
             self.routed_output_transform = KimiRoutedOutputTransform(
                 self.routed_expert_norm,
@@ -726,7 +887,8 @@ class KimiMoE(nn.Module):
                 self._down_proj_events[0],
                 self._down_proj_events[1],
                 self._down_proj_stream
-                if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+                if not self.auxiliary_projections_tp_sharded
+                and num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
                 else None,
             )
         )
@@ -760,6 +922,10 @@ class KimiMoE(nn.Module):
             final_hidden_states = self.routed_output_transform(
                 final_hidden_states, residual=shared_output
             )
+            if self.routed_output_transform.output_is_tp_partial:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
         else:
             # Routed experts consume the down-projected latent; shared experts
             # (inside MoERunner) get the original hidden states via

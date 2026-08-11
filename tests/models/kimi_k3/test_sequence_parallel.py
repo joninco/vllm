@@ -11,6 +11,7 @@ from torch import nn
 
 from vllm.config import ParallelConfig
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.models.common.ops import sequence_parallel as sp_ops
 from vllm.models.kimi_k3.nvidia import model as kimi_model
 from vllm.models.kimi_k3.nvidia import mtp as kimi_mtp
@@ -50,6 +51,16 @@ class _Projection(nn.Module):
             torch.ones(1, hidden_size),
             requires_grad=False,
         )
+
+
+class _PartialRowProjection(RowParallelLinear):
+    def __init__(self, weight: torch.Tensor) -> None:
+        nn.Module.__init__(self)
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.reduce_results = False
+
+    def forward(self, hidden_states: torch.Tensor):
+        return torch.nn.functional.linear(hidden_states, self.weight), None
 
 
 class _SequenceParallelMTPBlock:
@@ -296,6 +307,68 @@ def test_shard_sequence_parallel_mlp_gating(
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    ("use_sequence_parallel", "tp_size", "expected"),
+    [
+        (False, 6, True),
+        (True, 6, False),
+        (False, 1, False),
+    ],
+)
+def test_auxiliary_projection_sharding_requires_shared_token_rows(
+    monkeypatch,
+    use_sequence_parallel: bool,
+    tp_size: int,
+    expected: bool,
+):
+    monkeypatch.setattr(
+        kimi_model, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+
+    assert kimi_model.shard_auxiliary_projections(use_sequence_parallel) is expected
+
+
+def test_partial_routed_output_transform_adds_partial_residual(monkeypatch):
+    monkeypatch.delenv("VLLM_KQUANT_CAPTURE_DIR", raising=False)
+    weight = torch.arange(12, dtype=torch.float32).view(4, 3)
+    projection = _PartialRowProjection(weight)
+    transform = kimi_model.KimiRoutedOutputTransform(None, projection, layer_idx=0)
+    hidden_states = torch.arange(6, dtype=torch.float32).view(2, 3)
+    residual = torch.full((2, 4), 2.0)
+
+    actual = transform(hidden_states, residual=residual)
+    expected = torch.nn.functional.linear(hidden_states, weight) + residual
+
+    assert transform.output_is_tp_partial
+    torch.testing.assert_close(actual, expected)
+
+
+def test_kimi_column_parallel_loader_zero_fills_tail():
+    layer = object.__new__(kimi_model.KimiPaddedColumnParallelLinear)
+    layer.tp_rank = 1
+    param = nn.Parameter(torch.empty(3, 4), requires_grad=False)
+    param.output_dim = 0
+    loaded_weight = torch.arange(20, dtype=torch.float32).view(5, 4)
+
+    layer.weight_loader(param, loaded_weight)
+
+    expected = torch.cat([loaded_weight[3:], torch.zeros(1, 4)])
+    torch.testing.assert_close(param, expected)
+
+
+def test_kimi_row_parallel_loader_zero_fills_tail():
+    layer = object.__new__(kimi_model.KimiPaddedRowParallelLinear)
+    layer.tp_rank = 1
+    param = nn.Parameter(torch.empty(4, 3), requires_grad=False)
+    param.input_dim = 1
+    loaded_weight = torch.arange(20, dtype=torch.float32).view(4, 5)
+
+    layer.weight_loader(param, loaded_weight)
+
+    expected = torch.cat([loaded_weight[:, 3:], torch.zeros(4, 1)], dim=1)
+    torch.testing.assert_close(param, expected)
 
 
 def test_sharded_sequence_parallel_mlp_matches_replicated(default_vllm_config):
