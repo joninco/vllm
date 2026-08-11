@@ -131,7 +131,13 @@ def test_dsv4_packed_zeroer_geometry():
         )
         stride_order = tuple(range(len(kv_shape)))
         view = _reshape_attention_kv_cache(
-            backing, specs[0], kv_shape, stride_order, NUM_BLOCKS, packing
+            backing,
+            specs[0],
+            kv_shape,
+            stride_order,
+            num_blocks=NUM_BLOCKS,
+            num_blocks_per_kv_block=1,
+            packing=packing,
         )
         views[ln] = view
         assert view.data_ptr() - base == off, "data_ptr must be base+offset"
