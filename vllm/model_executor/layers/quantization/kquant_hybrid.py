@@ -416,18 +416,21 @@ class KQuantHybridConfig(ModelOptNvFp4Config):
                     )
             storage_format = qsrt.get("storage_format")
             storage_schemas = {
-                "qsrt_atoms_v1": "kquant_kimi_k3_qsrt_atoms_v1",
-                "qsrt_atoms_v2": "qsrt_kimi_k3_qsrt_atoms_v2",
+                "qsrt_atoms_v1": {"kquant_kimi_k3_qsrt_atoms_v1"},
+                "qsrt_atoms_v2": {
+                    "kquant_kimi_k3_qsrt_atoms_v2",
+                    "qsrt_kimi_k3_qsrt_atoms_v2",
+                },
             }
             if storage_format not in storage_schemas:
                 raise ValueError(
                     "QSRT storage_format must be 'qsrt_atoms_v1' or "
                     f"'qsrt_atoms_v2', got {storage_format!r}"
                 )
-            expected_schema = storage_schemas[storage_format]
-            if qsrt.get("schema") != expected_schema:
+            expected_schemas = storage_schemas[storage_format]
+            if qsrt.get("schema") not in expected_schemas:
                 raise ValueError(
-                    f"QSRT schema must be {expected_schema!r}, "
+                    f"QSRT schema must be one of {sorted(expected_schemas)!r}, "
                     f"got {qsrt.get('schema')!r}"
                 )
             profile = qsrt.get("profile")

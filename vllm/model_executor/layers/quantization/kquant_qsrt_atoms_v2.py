@@ -22,7 +22,10 @@ from vllm.model_executor.layers.quantization.kquant_qsrt_atoms import (
     balanced_atom_partition,
 )
 
-SCHEMA = "qsrt_kimi_k3_qsrt_atoms_v2"
+SCHEMAS = {
+    "kquant_kimi_k3_qsrt_atoms_v2",
+    "qsrt_kimi_k3_qsrt_atoms_v2",
+}
 ENCODING = "qsrt_sqg_e4m3"
 CODEBOOK = "sqg_xor_cheb_t12"
 PROFILE = "k3x22_k4x2"
@@ -154,7 +157,6 @@ def read_qsrt_atom_v2_layer_metadata(
         )
         expected_metadata = {
             "format": "pt",
-            "schema": SCHEMA,
             "version": str(VERSION),
             "encoding": ENCODING,
             "codebook": CODEBOOK,
@@ -168,6 +170,11 @@ def read_qsrt_atom_v2_layer_metadata(
             "atom_slots": str(ATOM_SLOTS),
             "alignment_bytes": "4096",
         }
+        if metadata.get("schema") not in SCHEMAS:
+            raise ValueError(
+                "QSRT atoms-v2 metadata schema mismatch: "
+                f"{metadata.get('schema')!r} not in {sorted(SCHEMAS)!r}"
+            )
         if pure_k2 or coupled_h308:
             expected_metadata.update(
                 {
