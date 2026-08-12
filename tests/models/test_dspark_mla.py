@@ -11,7 +11,9 @@ from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.model_executor.warmup.kimi_k3_triton_warmup import _get_kda_layer
 from vllm.models.kimi_k3.nvidia import dspark_mla
+from vllm.models.kimi_k3.nvidia import kda as kimi_k3_kda
 from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
 
 
@@ -188,3 +190,27 @@ def test_context_kv_weights_are_loaded_as_merged_linear_shards():
     assert [weight.shard_id for _, weight in mapped] == [1, 0, 1, 1]
     assert mapped[0][1].data_ptr() == mapped[1][1].data_ptr()
     assert mapped[2][1].data_ptr() == mapped[3][1].data_ptr()
+
+
+def test_kda_warmup_ignores_cacheless_dspark_layers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeKDA:
+        kv_cache: list[object]
+
+    draft_layer = FakeKDA()
+    target_layer = FakeKDA()
+    target_layer.kv_cache = []
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={
+                    "draft.layers.0": draft_layer,
+                    "target.layers.0": target_layer,
+                }
+            )
+        )
+    )
+    monkeypatch.setattr(kimi_k3_kda, "KimiK3DeltaAttention", FakeKDA)
+
+    assert _get_kda_layer(worker) is target_layer

@@ -17,6 +17,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonImpl,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
+    QueryLenSupport,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -85,9 +86,14 @@ def _create_dense_mla_plan(
     *,
     page_size: int,
     num_q_heads: int,
+    max_total_q: int | None = None,
 ) -> Any:
     dense_mla = _load_dense_mla()
-    max_total_q = int(vllm_config.scheduler_config.max_num_seqs)
+    max_total_q = int(
+        max_total_q
+        if max_total_q is not None
+        else vllm_config.scheduler_config.max_num_seqs
+    )
     max_cache_tokens = int(vllm_config.model_config.max_model_len)
     if max_total_q > _MAX_B12X_QUERY_ROWS:
         raise ValueError(
@@ -122,12 +128,15 @@ class B12xMLAMetadata(MLACommonMetadata):
     """Common MLA metadata plus the capture-static B12X launch plan."""
 
     dense_mla_plan: Any | None = None
+    dense_mla_flat_block_table: torch.Tensor | None = None
+    dense_mla_flat_seq_lens: torch.Tensor | None = None
+    dense_mla_flat_query_start_loc: torch.Tensor | None = None
 
 
 class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
+    supports_non_causal_multi_token_decode: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -143,21 +152,47 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             device,
             B12xMLAMetadata,
         )
+        max_dense_mla_rows = int(vllm_config.scheduler_config.max_num_seqs) * int(
+            self.reorder_batch_threshold
+        )
+        if max_dense_mla_rows > _MAX_B12X_QUERY_ROWS:
+            raise ValueError(
+                "B12X_MLA query capacity exceeds its limit: "
+                f"rows={max_dense_mla_rows}, limit={_MAX_B12X_QUERY_ROWS}."
+            )
+        self._max_dense_mla_rows = max_dense_mla_rows
         self._dense_mla_plan = _create_dense_mla_plan(
             vllm_config,
             device,
             page_size=self.page_size,
             num_q_heads=self.num_heads,
+            max_total_q=max_dense_mla_rows,
         )
         self._workspace_specs = self._dense_mla_plan.shapes_and_dtypes()
         if is_workspace_manager_initialized():
             current_workspace_manager().get_simultaneous(*self._workspace_specs)
+        max_table_width = int(self._dense_mla_plan.caps.max_page_table_width)
+        self._dense_mla_flat_block_table = torch.zeros(
+            (max_dense_mla_rows, max_table_width),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._dense_mla_flat_seq_lens = torch.empty(
+            max_dense_mla_rows,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._dense_mla_flat_query_start_loc = torch.arange(
+            max_dense_mla_rows + 1,
+            dtype=torch.int32,
+            device=device,
+        )
         logger.info_once(
             "B12X dense K3 MLA plan: heads=%d, page_size=%d, "
             "max_decode_rows=%d, max_cache_tokens=%d, splits=%d",
             self.num_heads,
             self.page_size,
-            vllm_config.scheduler_config.max_num_seqs,
+            max_dense_mla_rows,
             vllm_config.model_config.max_model_len,
             self._dense_mla_plan.num_splits,
         )
@@ -177,6 +212,47 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             ),
         )
         metadata.dense_mla_plan = self._dense_mla_plan
+        decode_metadata = metadata.decode
+        if (
+            not metadata.causal
+            and decode_metadata is not None
+            and metadata.num_decodes > 0
+            and metadata.num_decode_tokens > metadata.num_decodes
+        ):
+            total_q = int(metadata.num_decode_tokens)
+            if total_q > self._max_dense_mla_rows:
+                raise ValueError(
+                    "B12X_MLA non-causal query block exceeds its capacity: "
+                    f"rows={total_q}, capacity={self._max_dense_mla_rows}."
+                )
+            if total_q % metadata.num_decodes:
+                raise ValueError(
+                    "B12X_MLA requires a uniform non-causal query block, got "
+                    f"tokens={total_q}, requests={metadata.num_decodes}."
+                )
+            query_len = total_q // metadata.num_decodes
+            source_table = decode_metadata.block_table
+            source_width = int(source_table.shape[1])
+            flat_table = self._dense_mla_flat_block_table[:total_q]
+            if source_width > int(flat_table.shape[1]):
+                raise ValueError(
+                    "B12X_MLA block table exceeds its planned width: "
+                    f"actual={source_width}, planned={flat_table.shape[1]}."
+                )
+            flat_table[:, :source_width].copy_(
+                source_table[:, None, :]
+                .expand(-1, query_len, -1)
+                .reshape(total_q, source_width)
+            )
+            flat_lens = self._dense_mla_flat_seq_lens[:total_q]
+            flat_lens.copy_(
+                decode_metadata.seq_lens[:, None].expand(-1, query_len).reshape(total_q)
+            )
+            metadata.dense_mla_flat_block_table = flat_table
+            metadata.dense_mla_flat_seq_lens = flat_lens
+            metadata.dense_mla_flat_query_start_loc = (
+                self._dense_mla_flat_query_start_loc[: total_q + 1]
+            )
         return metadata
 
 
@@ -246,8 +322,11 @@ class B12xMLABackend(MLACommonBackend):
         if model_config is None:
             return None
         hf_text_config = model_config.hf_text_config
-        if getattr(hf_text_config, "model_type", None) != "kimi_linear":
-            return "B12X_MLA currently supports only Kimi K3"
+        if getattr(hf_text_config, "model_type", None) not in (
+            "kimi_linear",
+            "k3_dspark",
+        ):
+            return "B12X_MLA currently supports only Kimi K3 and K3 DSpark"
 
         dims = (
             getattr(hf_text_config, "kv_lora_rank", None),
@@ -285,6 +364,10 @@ class B12xMLABackend(MLACommonBackend):
                 f"{model_config.max_model_len}"
             )
         return None
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        return True
 
 
 class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
@@ -402,11 +485,27 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         if not q.is_contiguous():
             q = q.contiguous()
 
-        batch = int(attn_metadata.decode.seq_lens.shape[0])
-        if int(q.shape[0]) != batch:
+        block_table = attn_metadata.decode.block_table
+        seq_lens = attn_metadata.decode.seq_lens
+        query_start_loc = attn_metadata.query_start_loc
+        flat_block_table = getattr(attn_metadata, "dense_mla_flat_block_table", None)
+        if flat_block_table is not None:
+            block_table = flat_block_table
+            seq_lens = getattr(attn_metadata, "dense_mla_flat_seq_lens", None)
+            query_start_loc = getattr(
+                attn_metadata, "dense_mla_flat_query_start_loc", None
+            )
+            if seq_lens is None or query_start_loc is None:
+                raise RuntimeError(
+                    "B12X_MLA metadata is missing flattened non-causal rows."
+                )
+
+        batch = int(seq_lens.shape[0])
+        total_q = int(q.shape[0])
+        if total_q < batch:
             raise ValueError(
-                "B12X_MLA's single-token decode path requires one query row per "
-                f"request, got {q.shape[0]} rows for {batch} requests."
+                "B12X_MLA requires at least one query row per prepared decode "
+                f"sequence, got {total_q} rows for {batch} sequences."
             )
         if int(q.shape[1]) != self.num_heads:
             raise ValueError(
@@ -414,7 +513,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             )
 
         output = torch.empty(
-            (batch, self.num_heads, self.kv_lora_rank),
+            (total_q, self.num_heads, self.kv_lora_rank),
             dtype=torch.bfloat16,
             device=q.device,
         )
@@ -426,9 +525,9 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             q=q,
             kv_cache=kv_c_and_k_pe_cache,
             output=output,
-            page_table=attn_metadata.decode.block_table,
-            cache_seqlens=attn_metadata.decode.seq_lens,
-            cu_seqlens_q=attn_metadata.query_start_loc[: batch + 1],
+            page_table=block_table,
+            cache_seqlens=seq_lens,
+            cu_seqlens_q=query_start_loc[: batch + 1],
             q_scale=layer._q_scale if quantized else None,
             kv_scale=layer._k_scale if quantized else None,
             sm_scale=self.scale,
