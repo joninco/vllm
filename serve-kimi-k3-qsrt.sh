@@ -5,6 +5,10 @@ set -euo pipefail
 K3_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 K3_PYTHON_BIN="${K3_PYTHON_BIN:-${K3_SCRIPT_DIR}/.venv/bin/python}"
 K3_MODEL_DIR="${K3_MODEL_DIR:-/data/models/Kimi-K3-QSRT-SQG-XOR-CHEB-T12-3p08-v2-mm-mxfp8-model}"
+K3_ENABLE_DSPARK="${K3_ENABLE_DSPARK:-1}"
+K3_DSPARK_MODEL_DIR="${K3_DSPARK_MODEL_DIR:-/data/models/Inferact-Kimi-K3-DSpark}"
+K3_NUM_SPECULATIVE_TOKENS="${K3_NUM_SPECULATIVE_TOKENS:-7}"
+K3_DSPARK_ATTENTION_BACKEND="${K3_DSPARK_ATTENTION_BACKEND:-B12X_MLA}"
 
 if [[ ! -x "${K3_PYTHON_BIN}" ]]; then
   echo "Python interpreter not found or not executable: ${K3_PYTHON_BIN}" >&2
@@ -14,6 +18,25 @@ fi
 if [[ ! -d "${K3_MODEL_DIR}" ]]; then
   echo "QSRT checkpoint directory not found: ${K3_MODEL_DIR}" >&2
   exit 1
+fi
+if [[ "${K3_ENABLE_DSPARK}" != 0 && "${K3_ENABLE_DSPARK}" != 1 ]]; then
+  echo "K3_ENABLE_DSPARK must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "${K3_ENABLE_DSPARK}" == 1 ]]; then
+  if [[ ! -f "${K3_DSPARK_MODEL_DIR}/config.json" \
+    || ! -f "${K3_DSPARK_MODEL_DIR}/model.safetensors" ]]; then
+    echo "Kimi-K3 DSpark checkpoint is incomplete: ${K3_DSPARK_MODEL_DIR}" >&2
+    exit 1
+  fi
+  if [[ "${K3_NUM_SPECULATIVE_TOKENS}" != 7 ]]; then
+    echo "Kimi-K3 DSpark requires seven speculative tokens." >&2
+    exit 2
+  fi
+  if [[ "${K3_DSPARK_ATTENTION_BACKEND}" != B12X_MLA ]]; then
+    echo "Kimi-K3 DSpark is qualified with B12X_MLA." >&2
+    exit 2
+  fi
 fi
 
 # Kimi K3 otherwise defaults to breakable CUDA graphs. This launch profile
@@ -39,7 +62,7 @@ for arg in "$@"; do
     --moe-backend|--moe-backend=*|\
     --speculative-config|--speculative-config=*|\
     --speculative-model|--speculative-model=*)
-      echo "Argument ${arg} would override the full-graph B12X contract." >&2
+      echo "Argument ${arg} would override a launcher-owned runtime option." >&2
       exit 1
       ;;
   esac
@@ -87,6 +110,14 @@ fi
 # inside the outer graph; they are not eager regions or capture boundaries.
 K3_COMPILATION_CONFIG='{"cudagraph_mode":"FULL_DECODE_ONLY","custom_ops":["all"]}'
 
+K3_SPECULATIVE_ARGS=()
+if [[ "${K3_ENABLE_DSPARK}" == 1 ]]; then
+  printf -v K3_SPECULATIVE_CONFIG \
+    '{"method":"dspark","model":"%s","num_speculative_tokens":7,"attention_backend":"%s","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"block"}' \
+    "${K3_DSPARK_MODEL_DIR}" "${K3_DSPARK_ATTENTION_BACKEND}"
+  K3_SPECULATIVE_ARGS+=(--speculative-config "${K3_SPECULATIVE_CONFIG}")
+fi
+
 exec "${K3_PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   "${K3_MODEL_DIR}" \
   --served-model-name "${K3_SERVED_MODEL_NAME:-Kimi-K3}" \
@@ -102,6 +133,7 @@ exec "${K3_PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --linear-backend b12x \
   --attention-backend B12X_MLA \
   --compilation-config "${K3_COMPILATION_CONFIG}" \
+  "${K3_SPECULATIVE_ARGS[@]}" \
   --additional-config '{"kda_prefill_backend":"triton"}' \
   --enable-chunked-prefill \
   --enable-prefix-caching \
