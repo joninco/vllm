@@ -31,6 +31,9 @@ _SHARED_EXPERT_FP8_LOCAL_ALIGNMENT = 128
 _VOCAB_GLOBAL_ALIGNMENT = 64
 _MINIMAX_M3_VIRTUAL_TP_SIZE = 3
 _MINIMAX_M3_QK_PER_KV = 16
+_QSRT_COUPLED_INTERMEDIATE_LOCAL_ALIGNMENT = 128
+_QSRT_COUPLED_K2_PROFILE = "k2_coupled_h512_h128"
+_KIMI_K3_DSPARK_PROFILE = "kimi-k3-dspark"
 
 
 def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
@@ -88,6 +91,8 @@ def _build_b12x_virtual_tp_plan(
     model_config: ModelConfig,
     parallel_config: ParallelConfig,
 ) -> dict[str, dict[str, int] | str]:
+    if _is_kimi_k3_dspark_config(model_config):
+        return _build_kimi_k3_dspark_virtual_tp_plan(model_config, parallel_config)
     if _is_minimax_m3_config(model_config):
         return _build_minimax_m3_virtual_tp_plan(model_config, parallel_config)
     if _get_virtual_tp_profile(model_config) == _GQA_GDN_MOE_PROFILE:
@@ -155,6 +160,12 @@ def _build_b12x_virtual_tp_plan(
     if shared_expert_axis is not None:
         plan["shared_expert_intermediate_size"] = shared_expert_axis
     if _is_kimi_k3_config(model_config):
+        if _positive_int_attr(text_config, "intermediate_size"):
+            plan["dense_intermediate_size"] = _make_virtual_axis(
+                _require_int_attr(text_config, "intermediate_size"),
+                attention_tp_size,
+                _get_dense_linear_local_alignment(model_config),
+            )
         vision_config = getattr(model_config.hf_config, "vision_config", None)
         if vision_config is not None:
             multimodal_config = getattr(model_config, "multimodal_config", None)
@@ -179,6 +190,30 @@ def _build_b12x_virtual_tp_plan(
                 _NVFP4_LOCAL_ALIGNMENT,
             )
     return plan
+
+
+def _build_kimi_k3_dspark_virtual_tp_plan(
+    model_config: ModelConfig,
+    parallel_config: ParallelConfig,
+) -> dict[str, dict[str, int] | str]:
+    """Build exact zero-tail padding for the dense Kimi-K3 MLA draft."""
+    text_config = model_config.hf_text_config
+    tp_size = parallel_config.tensor_parallel_size
+    return {
+        "sharding": _VIRTUAL_TP_PLAN_KIND_B12X_PADDED,
+        "model_type": _KIMI_K3_DSPARK_PROFILE,
+        "attention_heads": _make_virtual_axis(
+            _require_int_attr(text_config, "num_attention_heads"), tp_size
+        ),
+        "dense_intermediate_size": _make_virtual_axis(
+            _require_int_attr(text_config, "intermediate_size"),
+            tp_size,
+            _get_dense_linear_local_alignment(model_config),
+        ),
+        "vocab_size": _make_virtual_vocab_axis(
+            _require_int_attr(text_config, "vocab_size"), tp_size
+        ),
+    }
 
 
 def _build_gqa_gdn_moe_virtual_tp_plan(
@@ -414,6 +449,9 @@ def _apply_b12x_virtual_tp_plan(
     model_config: ModelConfig,
     plan: dict[str, dict[str, int] | str],
 ) -> None:
+    if plan.get("model_type") == _KIMI_K3_DSPARK_PROFILE:
+        _apply_kimi_k3_dspark_virtual_tp_plan(model_config, plan)
+        return
     if plan.get("model_type") == "minimax_m3":
         _apply_minimax_m3_virtual_tp_plan(model_config, plan)
         return
@@ -434,6 +472,19 @@ def _apply_b12x_virtual_tp_plan(
     _set_existing_config_attr(
         configs, "num_attention_heads", attention_axis["padded_size"]
     )
+    if _is_kimi_k3_config(model_config):
+        linear_attn_config = getattr(
+            model_config.hf_text_config, "linear_attn_config", None
+        )
+        if isinstance(linear_attn_config, dict) and "num_heads" in linear_attn_config:
+            linear_attn_config["original_num_heads"] = linear_attn_config["num_heads"]
+            linear_attn_config["num_heads"] = attention_axis["padded_size"]
+
+    dense_intermediate_axis = _optional_axis(plan, "dense_intermediate_size")
+    if dense_intermediate_axis is not None:
+        _apply_virtual_axis_to_config_attr(
+            configs, plan, "dense_intermediate_size", "intermediate_size"
+        )
 
     if output_group_axis is not None:
         _set_all_config_attr(
@@ -494,6 +545,17 @@ def _apply_b12x_virtual_tp_plan(
             shared_expert_axis["padded_size"],
         )
     if (
+        dense_intermediate_axis is not None
+        and dense_intermediate_axis["original_size"]
+        != dense_intermediate_axis["padded_size"]
+    ):
+        logger.warning(
+            "Automatically enabled B12X virtual TP padding for the dense MLP: "
+            "intermediate size %d -> %d.",
+            dense_intermediate_axis["original_size"],
+            dense_intermediate_axis["padded_size"],
+        )
+    if (
         vision_axis is not None
         and vision_axis["original_size"] != vision_axis["padded_size"]
     ):
@@ -514,6 +576,38 @@ def _apply_b12x_virtual_tp_plan(
             projector_axis["original_size"],
             projector_axis["padded_size"],
         )
+
+
+def _apply_kimi_k3_dspark_virtual_tp_plan(
+    model_config: ModelConfig,
+    plan: dict[str, dict[str, int] | str],
+) -> None:
+    configs = tuple(_iter_virtual_tp_configs(model_config))
+    _apply_virtual_axis_to_config_attr(
+        configs, plan, "attention_heads", "num_attention_heads"
+    )
+    _apply_virtual_axis_to_config_attr(
+        configs, plan, "dense_intermediate_size", "intermediate_size"
+    )
+    for config in configs:
+        setattr(config, VIRTUAL_TP_PLAN_ATTR, plan)
+
+    model_config.model_arch_config = model_config.get_model_arch_config()
+
+    changes = []
+    for axis_name, label in (
+        ("attention_heads", "attention heads"),
+        ("dense_intermediate_size", "dense intermediate size"),
+        ("vocab_size", "vocab storage size"),
+    ):
+        axis = _require_axis(plan, axis_name)
+        if axis["original_size"] != axis["padded_size"]:
+            changes.append(f"{label} {axis['original_size']} -> {axis['padded_size']}")
+    logger.warning(
+        "Automatically enabled B12X virtual TP padding for the Kimi-K3 "
+        "DSpark draft: %s.",
+        ", ".join(changes),
+    )
 
 
 def _apply_gqa_gdn_moe_virtual_tp_plan(
@@ -769,11 +863,22 @@ def _get_virtual_tp_profile(model_config: ModelConfig) -> str | None:
 def _is_supported_b12x_virtual_tp_config(model_config: ModelConfig) -> bool:
     return (
         _get_virtual_tp_profile(model_config) == _GQA_GDN_MOE_PROFILE
+        or _is_kimi_k3_dspark_config(model_config)
         or _is_deepseek_v4_config(model_config)
         or _is_sparse_mla_config(model_config)
         or _is_minimax_m3_config(model_config)
         or _is_kimi_k3_config(model_config)
     )
+
+
+def _is_kimi_k3_dspark_config(model_config: ModelConfig) -> bool:
+    for config in _iter_virtual_tp_configs(model_config):
+        if getattr(config, "model_type", None) == "k3_dspark":
+            return True
+        architectures = getattr(config, "architectures", None) or ()
+        if "K3DSparkModel" in architectures:
+            return True
+    return False
 
 
 def _is_kimi_k3_config(model_config: ModelConfig) -> bool:
@@ -819,6 +924,8 @@ def _uses_minimax_m3_b12x_attention(vllm_config: VllmConfig) -> bool:
 
 
 def _get_moe_intermediate_local_alignment(model_config: ModelConfig) -> int:
+    if _get_qsrt_profile(model_config) == _QSRT_COUPLED_K2_PROFILE:
+        return _QSRT_COUPLED_INTERMEDIATE_LOCAL_ALIGNMENT
     force_a8 = _environment_flag("B12X_MOE_FORCE_A8") or _environment_flag(
         "B12X_FORCE_MOE_A8"
     )
@@ -828,7 +935,25 @@ def _get_moe_intermediate_local_alignment(model_config: ModelConfig) -> int:
     return _MOE_INTERMEDIATE_LOCAL_ALIGNMENT
 
 
+def _get_qsrt_profile(model_config: ModelConfig) -> str | None:
+    for config in _iter_virtual_tp_configs(model_config):
+        quantization_config = getattr(config, "quantization_config", None)
+        if not isinstance(quantization_config, dict):
+            continue
+        qsrt = quantization_config.get("qsrt")
+        if isinstance(qsrt, dict) and isinstance(qsrt.get("profile"), str):
+            return qsrt["profile"]
+    return None
+
+
 def _get_dense_linear_local_alignment(model_config: ModelConfig) -> int:
+    for config in _iter_virtual_tp_configs(model_config):
+        quantization_config = getattr(config, "quantization_config", None)
+        if (
+            isinstance(quantization_config, dict)
+            and quantization_config.get("dense_format") == "mxfp8"
+        ):
+            return 32
     is_nvfp4_quantized = getattr(model_config, "is_nvfp4_quantized", None)
     if callable(is_nvfp4_quantized) and is_nvfp4_quantized():
         return _NVFP4_LOCAL_ALIGNMENT

@@ -124,6 +124,27 @@ def _coupled_pair_extent(physical_pair: int) -> tuple[int, int, int]:
     return begin, ATOMS_PER_PAIR * row_bytes, row_bytes
 
 
+def _balanced_pure_k2_atom_partition(
+    shard_count: int, shard_index: int
+) -> tuple[int, int]:
+    """Partition each preactivation half into complete H128 atom groups."""
+
+    if shard_count == 1:
+        return 0, ATOM_SLOTS
+    if shard_count < 1 or shard_count > ATOM_SLOTS or shard_count % 2:
+        raise ValueError("pure-K2 atom sharding requires an even shard count")
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(f"shard_index must lie in 0..{shard_count - 1}")
+    ranks_per_half = shard_count // 2
+    half = shard_index // ranks_per_half
+    rank_in_half = shard_index % ranks_per_half
+    blocks_per_half = (ATOM_SLOTS // 2) // 4
+    quotient, remainder = divmod(blocks_per_half, ranks_per_half)
+    block_count = quotient + int(rank_in_half < remainder)
+    first_block = rank_in_half * quotient + min(rank_in_half, remainder)
+    return half * (ATOM_SLOTS // 2) + 4 * first_block, 4 * block_count
+
+
 COUPLED_H308_ATOM_SLAB_BYTES = sum(
     ATOMS_PER_PAIR * _align_up(EXPERTS * bundle_bytes)
     for bundle_bytes in COUPLED_H308_PAIR_BUNDLE_BYTES
@@ -365,7 +386,11 @@ def open_qsrt_atom_v2_extent(
 ) -> Iterator[tuple[int, torch.Tensor]]:
     """Yield one shard's contiguous padded atom rows as ``[A, stride]``."""
 
-    first, rows = balanced_atom_partition(shard_count, shard_index)
+    first, rows = (
+        _balanced_pure_k2_atom_partition(shard_count, shard_index)
+        if metadata.profile == PURE_K2_PROFILE
+        else balanced_atom_partition(shard_count, shard_index)
+    )
     if metadata.coupled_h308:
         if rows != ATOMS_PER_PAIR or first % ATOMS_PER_PAIR:
             raise ValueError(

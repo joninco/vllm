@@ -584,16 +584,17 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
         layer.hybrid_state = state
 
         if state.uses_qsrt_atoms:
-            if hidden != 3584 or inter * tp_size != 3072 or num_experts != 896:
+            if hidden != 3584 or num_experts != 896:
                 raise ValueError(
                     "QSRT serving requires Kimi-K3's global "
                     "H=3584, I=3072, E=896 geometry"
                 )
             if qsrt_profile == _QSRT_ATOMS_V2_PROFILE_COUPLED_K2:
-                if inter % 128:
+                if inter % 128 or inter * tp_size < 3072:
                     raise ValueError(
-                        "the coupled pure-K2 QSRT profile requires a local "
-                        f"intermediate extent divisible by 128, got I={inter}"
+                        "the coupled pure-K2 QSRT profile requires a padded "
+                        "local intermediate extent divisible by 128 and at "
+                        f"least 3,072 global channels, got I={inter} at TP={tp_size}"
                     )
                 state.tiles = (128, 128, 128, 128)
             elif inter != 256:

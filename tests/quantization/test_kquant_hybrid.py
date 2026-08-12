@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.kquant_qsrt_atoms_v2 import (
     PROFILE,
     PURE_K2_PROFILE,
     _atom_slot_stride_for_profile,
+    _balanced_pure_k2_atom_partition,
     _coupled_pair_extent,
 )
 from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
@@ -49,6 +50,26 @@ def _qsrt_descriptor(**updates):
     }
     descriptor.update(updates)
     return descriptor
+
+
+def test_pure_k2_tp10_atom_partition_preserves_coupled_blocks() -> None:
+    extents = [_balanced_pure_k2_atom_partition(10, rank) for rank in range(10)]
+
+    assert extents == [
+        (0, 12),
+        (12, 12),
+        (24, 8),
+        (32, 8),
+        (40, 8),
+        (48, 12),
+        (60, 12),
+        (72, 8),
+        (80, 8),
+        (88, 8),
+    ]
+    assert sum(count for _first, count in extents) == 96
+    assert all(first % 4 == 0 and count % 4 == 0 for first, count in extents)
+    assert all(not (first < 48 < first + count) for first, count in extents)
 
 
 @pytest.mark.parametrize(

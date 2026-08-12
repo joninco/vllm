@@ -38,6 +38,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.virtual_tp import pad_or_narrow_weight
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
@@ -71,7 +72,9 @@ def a_log_weight_loader(
             )
             loaded_weight = loaded_weight.view(loaded_weight.shape[2])
 
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
+        loaded_weight = pad_or_narrow_weight(
+            loaded_weight, shard_axis, start_idx, shard_size
+        )
         return default_weight_loader(param, loaded_weight)
 
     return loader
@@ -272,7 +275,7 @@ def _make_decode_conv1d_weight_loader(
         shard_size = sharded_dims[loaded_shard_id]
         source_start = tp_rank * shard_size
         target_start = sum(sharded_dims[:loaded_shard_id])
-        loaded_shard = loaded_weight[source_start : source_start + shard_size]
+        loaded_shard = pad_or_narrow_weight(loaded_weight, 0, source_start, shard_size)
         param.data[target_start : target_start + shard_size].copy_(loaded_shard)
         if decode_conv1d_weight is not None and not param.is_meta:
             decode_conv1d_weight[loaded_shard_id].copy_(
