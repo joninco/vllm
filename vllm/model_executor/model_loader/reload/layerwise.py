@@ -183,6 +183,14 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         bound_args = loader_signature.bind(*args, **kwargs)
         bound_args.apply_defaults()
 
+        # Deferred loaders retain their arguments beyond the caller's yield.
+        # Materialize InstantTensor views before its staging buffer is reused.
+        for name, value in bound_args.arguments.items():
+            if isinstance(value, torch.Tensor) and getattr(
+                value, "_vllm_instanttensor_borrowed", False
+            ):
+                bound_args.arguments[name] = value.clone()
+
         # Buffer loaded weights, track loading progress
         info.loaded_weights.append((param_name, bound_args))
         num_loaded, ret = get_numel_loaded(original_loader, bound_args)

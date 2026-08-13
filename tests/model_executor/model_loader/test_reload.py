@@ -686,6 +686,19 @@ def test_online_processing_waits_for_late_registered_bias():
     assert torch.equal(quant_method.bias_at_process, loaded_bias)
 
 
+def test_online_processing_owns_deferred_instanttensor_weight():
+    quant_method = _RecordingQuantMethod()
+    layer = _LateBiasLayer(quant_method)
+    loaded_weight = torch.full((4, 2), 2.0)
+    loaded_weight._vllm_instanttensor_borrowed = True
+
+    layer.weight.weight_loader(layer.weight, loaded_weight)
+    loaded_weight.fill_(9.0)
+    layer.bias.weight_loader(layer.bias, torch.zeros(4))
+
+    assert torch.equal(layer.weight, torch.full((4, 2), 2.0))
+
+
 def test_layerwise_reload_skips_non_persistent_parameter_alias_buffers(monkeypatch):
     layer = _AliasedBufferLayer()
     model = torch.nn.Sequential(layer)
