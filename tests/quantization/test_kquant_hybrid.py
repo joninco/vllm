@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.kquant_qsrt_atoms_v2 import (
     PURE_K2_PROFILE,
     _atom_slot_stride_for_profile,
     _balanced_pure_k2_atom_partition,
+    _coupled_h308_pair_for_rank,
     _coupled_pair_extent,
 )
 from vllm.model_executor.layers.quantization.nvfp4_nf3_hybrid import (
@@ -189,6 +190,20 @@ def test_coupled_high_rate_atom_extents_cover_flat_slab() -> None:
         assert row_bytes % 4096 == 0
         cursor += extent
     assert cursor == COUPLED_H308_ATOM_SLAB_BYTES
+
+
+def test_coupled_high_rate_rank_assignment_balances_physical_pairs() -> None:
+    assignments = [
+        [_coupled_h308_pair_for_rank(layer, 12, rank) for rank in range(12)]
+        for layer in range(1, 93)
+    ]
+
+    assert all(sorted(layer) == list(range(12)) for layer in assignments)
+    for rank in range(12):
+        high_rate_layers = sum(
+            assignments[layer][rank] in (5, 11) for layer in range(92)
+        )
+        assert high_rate_layers in (15, 16)
 
 
 @pytest.mark.parametrize(

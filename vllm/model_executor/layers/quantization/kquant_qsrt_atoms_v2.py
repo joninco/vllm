@@ -124,6 +124,18 @@ def _coupled_pair_extent(physical_pair: int) -> tuple[int, int, int]:
     return begin, ATOMS_PER_PAIR * row_bytes, row_bytes
 
 
+def _coupled_h308_pair_for_rank(layer: int, shard_count: int, shard_index: int) -> int:
+    """Assign one complete physical pair while balancing high-rate pairs."""
+
+    if shard_count != PAIRS:
+        raise ValueError(f"coupled H308 serving requires TP={PAIRS}")
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(f"shard_index must lie in 0..{shard_count - 1}")
+    if not 1 <= layer <= 92:
+        raise ValueError("layer must identify a Kimi-K3 MoE layer")
+    return (shard_index + layer - 1) % PAIRS
+
+
 def _balanced_pure_k2_atom_partition(
     shard_count: int, shard_index: int
 ) -> tuple[int, int]:
@@ -396,7 +408,11 @@ def open_qsrt_atom_v2_extent(
             raise ValueError(
                 "coupled H308 serving requires one aligned eight-atom pair per rank"
             )
-        begin, extent, row_bytes = _coupled_pair_extent(first // ATOMS_PER_PAIR)
+        physical_pair = _coupled_h308_pair_for_rank(
+            metadata.layer, shard_count, shard_index
+        )
+        first = physical_pair * ATOMS_PER_PAIR
+        begin, extent, row_bytes = _coupled_pair_extent(physical_pair)
         if extent != rows * row_bytes:
             raise AssertionError("coupled H308 extent accounting drifted")
         if device is None or torch.device(device).type == "cpu":
