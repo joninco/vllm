@@ -638,6 +638,7 @@ class KimiMoE(nn.Module):
         self.moe_router_activation_func = config.moe_router_activation_func
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
+        self.expert_capture_prefix = f"{prefix}.experts"
         # Feature-sharded collectives require every TP rank to own the same
         # token rows. Sequence-parallel ranks own disjoint rows, so retain the
         # replicated auxiliary projections in that mode.
@@ -906,6 +907,17 @@ class KimiMoE(nn.Module):
         if self.use_mega_moe:
             assert self.routed_output_transform is not None
             assert topk_ids is not None
+            if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+                from vllm.model_executor.layers.fused_moe.kquant_capture import (
+                    collect_kquant_route_input,
+                )
+
+                collect_kquant_route_input(
+                    self.expert_capture_prefix,
+                    routed_hidden_states,
+                    router_output,
+                    topk_ids,
+                )
             final_hidden_states = self.experts(
                 routed_hidden_states,
                 router_output,

@@ -1538,6 +1538,8 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 )
             if (
                 os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+                and os.getenv("VLLM_KQUANT_CAPTURE_PROFILE", "sampled_hessian")
+                == "sampled_hessian"
                 and runtime.kquant_logical_mid is None
             ):
                 runtime.kquant_logical_mid = torch.empty(
@@ -1781,7 +1783,11 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             # The unified full-rotation top-k sum emits fp32; downstream
             # layers expect the model dtype.
             out_trellis = fused_moe.run(binding=binding)[:m].to(x.dtype)
-            if os.getenv("VLLM_KQUANT_CAPTURE_DIR"):
+            if (
+                os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+                and os.getenv("VLLM_KQUANT_CAPTURE_PROFILE", "sampled_hessian")
+                == "sampled_hessian"
+            ):
                 from vllm.model_executor.layers.fused_moe.kquant_capture import (
                     collect_kquant_exl3_mid,
                 )

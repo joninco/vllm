@@ -51,7 +51,16 @@ _INTERMEDIATE_SIZE = 3072
 _TOP_K = 16
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
-_state: _KQuantCaptureState | None = None
+_state: Any | None = None
+
+
+def _capture_profile() -> str:
+    profile = os.getenv("VLLM_KQUANT_CAPTURE_PROFILE", "sampled_hessian").strip()
+    if profile not in ("sampled_hessian", "all_routed_rows"):
+        raise ValueError(
+            "VLLM_KQUANT_CAPTURE_PROFILE must be sampled_hessian or all_routed_rows"
+        )
+    return profile
 
 
 def _capture_routed_latent_impl(
@@ -126,11 +135,16 @@ def kquant_capture_enabled() -> bool:
     return bool(os.getenv("VLLM_KQUANT_CAPTURE_DIR", "").strip())
 
 
+def kquant_mid_capture_enabled() -> bool:
+    return kquant_capture_enabled() and _capture_profile() == "sampled_hessian"
+
+
 def _capture_root() -> Path:
     value = os.environ["VLLM_KQUANT_CAPTURE_DIR"].strip()
     root = Path(value)
-    if not root.name.endswith(".kqcapture"):
-        root = root.with_name(root.name + ".kqcapture")
+    suffix = ".kqrows" if _capture_profile() == "all_routed_rows" else ".kqcapture"
+    if not root.name.endswith(suffix):
+        root = root.with_name(root.name + suffix)
     return root
 
 
@@ -768,12 +782,16 @@ def register_kquant_capture_layer(
             "VLLM_KQUANT_CAPTURE_DIR is currently a strict Kimi-K3 collector; "
             f"got hidden/experts/top-k={hidden_size}/{num_experts}/{topk}"
         )
+    profile = _capture_profile()
     if quant_mode not in ("w4a16", "hybrid_exl3_3"):
         raise RuntimeError(
             "KQuant reference capture requires ordinary W4A16 or the trellis "
             f"path, got {quant_mode!r}"
         )
-    if os.getenv("B12X_W4A16_SMALL_M_DIRECT", "1") != "0":
+    if (
+        profile == "sampled_hessian"
+        and os.getenv("B12X_W4A16_SMALL_M_DIRECT", "1") != "0"
+    ):
         raise RuntimeError(
             "KQuant canonical mid capture requires route-major W4A16 cache2; "
             "set B12X_W4A16_SMALL_M_DIRECT=0 to bypass the micro decode "
@@ -794,15 +812,37 @@ def register_kquant_capture_layer(
 
     global _state
     if _state is None:
-        _state = _KQuantCaptureState(
-            device=device,
-            local_intermediate_size=int(local_intermediate_size),
-            max_tokens=max_tokens,
-        )
+        if profile == "all_routed_rows":
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            from vllm.model_executor.layers.fused_moe.kquant_all_row_capture import (
+                AllRowCaptureState,
+            )
+
+            _state = AllRowCaptureState(
+                device=device,
+                rank=int(get_tensor_model_parallel_rank()),
+                world_size=int(get_tensor_model_parallel_world_size()),
+                max_tokens=max_tokens,
+                root=_capture_root(),
+                model=_MODEL,
+                revision=_REVISION,
+            )
+        else:
+            _state = _KQuantCaptureState(
+                device=device,
+                local_intermediate_size=int(local_intermediate_size),
+                max_tokens=max_tokens,
+            )
     elif (
         _state.device != device
-        or _state.local_intermediate_size != int(local_intermediate_size)
         or _state.max_tokens != max_tokens
+        or (
+            profile == "sampled_hessian"
+            and _state.local_intermediate_size != int(local_intermediate_size)
+        )
     ):
         raise RuntimeError("inconsistent KQuant capture geometry across MoE layers")
     _state.register(prefix)
@@ -832,6 +872,8 @@ def collect_kquant_mid(
         return
     if _state is None:
         raise RuntimeError("KQuant mid capture ran before B12X layer registration")
+    if not bool(getattr(_state, "captures_mid", True)):
+        return
     if binding.implementation != "w4a16" or binding.quant_mode != "w4a16":
         raise RuntimeError(
             "KQuant canonical mid capture requires the ordinary W4A16 binding"
@@ -907,7 +949,7 @@ def collect_kquant_exl3_mid(
 ) -> None:
     """Restore EXL3 cache2 to canonical pre-w2 coordinates and collect it."""
 
-    if not kquant_capture_enabled():
+    if not kquant_mid_capture_enabled():
         return
     if _state is None:
         raise RuntimeError("KQuant EXL3 mid capture ran before layer registration")
@@ -943,6 +985,13 @@ def maybe_flush_kquant_capture() -> None:
         _state.flush_and_arm()
 
 
+def prepare_kquant_capture_batch(input_batch: Any) -> None:
+    """Bind real request and token identities before MoE execution."""
+
+    if _state is not None and hasattr(_state, "prepare_batch"):
+        _state.prepare_batch(input_batch)
+
+
 def _reset_kquant_capture_for_tests() -> None:
     global _state
     _state = None
@@ -955,6 +1004,8 @@ __all__ = [
     "collect_kquant_routed_latent",
     "collect_kquant_route_input",
     "kquant_capture_enabled",
+    "kquant_mid_capture_enabled",
     "maybe_flush_kquant_capture",
+    "prepare_kquant_capture_batch",
     "register_kquant_capture_layer",
 ]

@@ -179,6 +179,15 @@ def _maybe_flush_kquant_capture() -> None:
         maybe_flush()
 
 
+def _prepare_kquant_capture_batch(input_batch: InputBatch) -> None:
+    capture = sys.modules.get("vllm.model_executor.layers.fused_moe.kquant_capture")
+    if capture is None:
+        return
+    prepare = getattr(capture, "prepare_kquant_capture_batch", None)
+    if prepare is not None:
+        prepare(input_batch)
+
+
 def _profile_cg_mode(cg_mode: CUDAGraphMode) -> str:
     return cg_mode.name.lower()
 
@@ -1794,6 +1803,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch = self.prepare_inputs(
                     scheduler_output, batch_desc, max_query_len
                 )
+            _prepare_kquant_capture_batch(input_batch)
             phase = _profile_batch_phase(input_batch)
             with record_function_or_nullcontext(
                 f"vllm:v2/target/{phase}/prepare_attn_tables"
