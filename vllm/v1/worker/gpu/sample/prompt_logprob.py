@@ -1,23 +1,88 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from vllm import envs
 from vllm.config.model import LogprobsMode
+from vllm.distributed.parallel_state import is_global_first_rank
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 
+logger = init_logger(__name__)
+
+
+def _should_capture_kld_batch(req_ids: list[str]) -> bool:
+    if not os.environ.get("VLLM_KLD_CAPTURE_DIR"):
+        return False
+    synthetic_prefixes = ("_warmup_", "_dummy_req_")
+    return not all(req_id.startswith(synthetic_prefixes) for req_id in req_ids)
+
+
+def _maybe_capture_kld_prompt_logits(
+    logits: torch.Tensor,
+    *,
+    req_id: str,
+    start_idx: int,
+    vocab_size: int,
+) -> None:
+    """Persist full-vocabulary prompt logits for an explicit KLD run."""
+    capture_dir = os.environ.get("VLLM_KLD_CAPTURE_DIR")
+    if not capture_dir or not is_global_first_rank():
+        return
+
+    safe_req_id = "".join(
+        char if char.isalnum() or char in "-_." else "_" for char in req_id
+    )
+    request_dir = Path(capture_dir) / safe_req_id
+    request_dir.mkdir(parents=True, exist_ok=True)
+    end_idx = start_idx + logits.shape[0]
+    output_path = request_dir / (
+        f"logits.rows-{start_idx:06d}-{end_idx:06d}.safetensors"
+    )
+    if output_path.exists():
+        raise RuntimeError(f"Refusing to overwrite KLD capture chunk: {output_path}")
+
+    logits_cpu = logits[:, :vocab_size].detach().to(device="cpu").float().contiguous()
+    from safetensors.torch import save_file
+
+    save_file(
+        {"logits": logits_cpu},
+        str(output_path),
+        metadata={
+            "request_id": req_id,
+            "row_start": str(start_idx),
+            "row_end": str(end_idx),
+            "vocab_size": str(vocab_size),
+        },
+    )
+    logger.info(
+        "Saved KLD prompt-logit rows [%d, %d) shape=%s to %s",
+        start_idx,
+        end_idx,
+        tuple(logits_cpu.shape),
+        output_path,
+    )
+
 
 class PromptLogprobsWorker:
-    def __init__(self, max_num_reqs: int, logprobs_mode: LogprobsMode = "raw_logprobs"):
+    def __init__(
+        self,
+        max_num_reqs: int,
+        logprobs_mode: LogprobsMode = "raw_logprobs",
+        vocab_size: int | None = None,
+    ):
         self.max_num_reqs = max_num_reqs
         self.logprobs_mode = logprobs_mode
+        self.vocab_size = vocab_size
         self.chunk_size = envs.VLLM_PROMPT_LOGPROBS_CHUNK_SIZE
         if self.chunk_size <= 0:
             raise ValueError(
@@ -97,6 +162,34 @@ class PromptLogprobsWorker:
             else int(requested_num_prompt_logprobs.max())
         )
 
+        pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
+        is_prompt_chunked = pos_after_step < prompt_lens
+        query_start_loc_np = input_batch.query_start_loc_np
+
+        logits_capture: Callable[[torch.Tensor, int], None] | None = None
+        if _should_capture_kld_batch(input_batch.req_ids):
+            if len(input_batch.req_ids) != 1 or int(needs_prompt_logprobs.sum()) != 1:
+                raise RuntimeError(
+                    "VLLM_KLD_CAPTURE_DIR requires exactly one prompt-logprob "
+                    "request in the batch"
+                )
+            req_id = input_batch.req_ids[0]
+            capture_start = int(computed_prefill[0])
+            capture_rows = int(query_start_loc_np[1] - query_start_loc_np[0])
+            if not is_prompt_chunked[0]:
+                capture_rows -= 1
+
+            def logits_capture(logits: torch.Tensor, relative_start: int) -> None:
+                if relative_start >= capture_rows:
+                    return
+                rows = min(logits.shape[0], capture_rows - relative_start)
+                _maybe_capture_kld_prompt_logits(
+                    logits[:rows],
+                    req_id=req_id,
+                    start_idx=capture_start + relative_start,
+                    vocab_size=self.vocab_size or logits.shape[-1],
+                )
+
         # Get the prompt logprobs token_ids.
         prompt_logprobs_token_ids = get_prompt_logprobs_token_ids(
             input_batch.num_tokens,
@@ -113,13 +206,9 @@ class PromptLogprobsWorker:
                 max_num_prompt_logprobs,
                 logprobs_mode=self.logprobs_mode,
                 chunk_size=self.chunk_size,
+                logits_capture=logits_capture,
             )
         )
-
-        pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
-        is_prompt_chunked = pos_after_step < prompt_lens
-
-        query_start_loc_np = input_batch.query_start_loc_np
         prompt_logprobs_dict: dict[str, LogprobsTensors] = {}
         for i, req_id in enumerate(input_batch.req_ids):
             if not needs_prompt_logprobs[i]:
@@ -233,6 +322,7 @@ def compute_prompt_logprobs_with_chunking(
     num_prompt_logprobs: int,
     logprobs_mode: LogprobsMode = "raw_logprobs",
     chunk_size: int = 1024,
+    logits_capture: Callable[[torch.Tensor, int], None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be greater than zero, got {chunk_size}")
@@ -247,6 +337,8 @@ def compute_prompt_logprobs_with_chunking(
         end_idx = start_idx + chunk_size
         # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
         prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+        if logits_capture is not None:
+            logits_capture(prompt_logits, start_idx)
         requested_num = (
             prompt_logits.shape[-1]
             if num_prompt_logprobs == -1
