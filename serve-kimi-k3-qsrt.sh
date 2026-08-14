@@ -9,6 +9,10 @@ K3_ENABLE_DSPARK="${K3_ENABLE_DSPARK:-1}"
 K3_DSPARK_MODEL_DIR="${K3_DSPARK_MODEL_DIR:-/data/models/Inferact-Kimi-K3-DSpark}"
 K3_NUM_SPECULATIVE_TOKENS="${K3_NUM_SPECULATIVE_TOKENS:-7}"
 K3_DSPARK_ATTENTION_BACKEND="${K3_DSPARK_ATTENTION_BACKEND:-B12X_MLA}"
+K3_LANGUAGE_MODEL_ONLY="${K3_LANGUAGE_MODEL_ONLY:-0}"
+K3_ENFORCE_EAGER="${K3_ENFORCE_EAGER:-0}"
+K3_KLD_CAPTURE_DIR="${K3_KLD_CAPTURE_DIR:-}"
+K3_ENABLE_PREFIX_CACHE="${K3_ENABLE_PREFIX_CACHE:-1}"
 
 if [[ ! -x "${K3_PYTHON_BIN}" ]]; then
   echo "Python interpreter not found or not executable: ${K3_PYTHON_BIN}" >&2
@@ -23,14 +27,27 @@ if [[ "${K3_ENABLE_DSPARK}" != 0 && "${K3_ENABLE_DSPARK}" != 1 ]]; then
   echo "K3_ENABLE_DSPARK must be 0 or 1." >&2
   exit 2
 fi
+if [[ "${K3_LANGUAGE_MODEL_ONLY}" != 0 && "${K3_LANGUAGE_MODEL_ONLY}" != 1 ]]; then
+  echo "K3_LANGUAGE_MODEL_ONLY must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "${K3_ENFORCE_EAGER}" != 0 && "${K3_ENFORCE_EAGER}" != 1 ]]; then
+  echo "K3_ENFORCE_EAGER must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "${K3_ENABLE_PREFIX_CACHE}" != 0 && "${K3_ENABLE_PREFIX_CACHE}" != 1 ]]; then
+  echo "K3_ENABLE_PREFIX_CACHE must be 0 or 1." >&2
+  exit 2
+fi
 if [[ "${K3_ENABLE_DSPARK}" == 1 ]]; then
   if [[ ! -f "${K3_DSPARK_MODEL_DIR}/config.json" \
     || ! -f "${K3_DSPARK_MODEL_DIR}/model.safetensors" ]]; then
     echo "Kimi-K3 DSpark checkpoint is incomplete: ${K3_DSPARK_MODEL_DIR}" >&2
     exit 1
   fi
-  if [[ "${K3_NUM_SPECULATIVE_TOKENS}" != 7 ]]; then
-    echo "Kimi-K3 DSpark requires seven speculative tokens." >&2
+  if [[ "${K3_NUM_SPECULATIVE_TOKENS}" != 5 \
+    && "${K3_NUM_SPECULATIVE_TOKENS}" != 7 ]]; then
+    echo "Kimi-K3 DSpark supports five or seven speculative tokens." >&2
     exit 2
   fi
   if [[ "${K3_DSPARK_ATTENTION_BACKEND}" != B12X_MLA ]]; then
@@ -105,23 +122,45 @@ if [[ -n "${K3_KV_CACHE_MEMORY_BYTES}" \
   )
 fi
 
-# FULL_DECODE_ONLY captures the whole model for uniform single-token decode
-# while leaving prefill outside CUDA graphs. Custom ops remain opaque launches
-# inside the outer graph; they are not eager regions or capture boundaries.
-K3_COMPILATION_CONFIG='{"cudagraph_mode":"FULL_DECODE_ONLY","custom_ops":["all"]}'
+K3_EXECUTION_ARGS=()
+if [[ "${K3_ENFORCE_EAGER}" == 1 ]]; then
+  K3_EXECUTION_ARGS+=(--enforce-eager)
+else
+  # FULL_DECODE_ONLY captures the whole model for uniform single-token decode
+  # while leaving prefill outside CUDA graphs. Custom ops remain opaque launches
+  # inside the outer graph; they are not eager regions or capture boundaries.
+  K3_COMPILATION_CONFIG='{"cudagraph_mode":"FULL_DECODE_ONLY","custom_ops":["all"]}'
+  K3_EXECUTION_ARGS+=(--compilation-config "${K3_COMPILATION_CONFIG}")
+fi
 
 K3_SPECULATIVE_ARGS=()
 if [[ "${K3_ENABLE_DSPARK}" == 1 ]]; then
   printf -v K3_SPECULATIVE_CONFIG \
-    '{"method":"dspark","model":"%s","num_speculative_tokens":7,"attention_backend":"%s","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"block"}' \
-    "${K3_DSPARK_MODEL_DIR}" "${K3_DSPARK_ATTENTION_BACKEND}"
+    '{"method":"dspark","model":"%s","num_speculative_tokens":%s,"attention_backend":"%s","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"block"}' \
+    "${K3_DSPARK_MODEL_DIR}" "${K3_NUM_SPECULATIVE_TOKENS}" \
+    "${K3_DSPARK_ATTENTION_BACKEND}"
   K3_SPECULATIVE_ARGS+=(--speculative-config "${K3_SPECULATIVE_CONFIG}")
+fi
+
+K3_LANGUAGE_MODEL_ARGS=()
+if [[ "${K3_LANGUAGE_MODEL_ONLY}" == 1 ]]; then
+  K3_LANGUAGE_MODEL_ARGS+=(--language-model-only)
+fi
+
+K3_PREFIX_CACHE_ARGS=(--no-enable-prefix-caching)
+if [[ "${K3_ENABLE_PREFIX_CACHE}" == 1 ]]; then
+  K3_PREFIX_CACHE_ARGS=(--enable-prefix-caching)
+fi
+if [[ -n "${K3_KLD_CAPTURE_DIR}" ]]; then
+  export VLLM_KLD_CAPTURE_DIR="${K3_KLD_CAPTURE_DIR}"
+  K3_PREFIX_CACHE_ARGS=(--no-enable-prefix-caching)
 fi
 
 exec "${K3_PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   "${K3_MODEL_DIR}" \
   --served-model-name "${K3_SERVED_MODEL_NAME:-Kimi-K3}" \
   --trust-remote-code \
+  "${K3_LANGUAGE_MODEL_ARGS[@]}" \
   --reasoning-parser kimi_k3 \
   --tool-call-parser kimi_k3 \
   --enable-auto-tool-choice \
@@ -132,11 +171,11 @@ exec "${K3_PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --moe-backend b12x \
   --linear-backend b12x \
   --attention-backend B12X_MLA \
-  --compilation-config "${K3_COMPILATION_CONFIG}" \
+  "${K3_EXECUTION_ARGS[@]}" \
   "${K3_SPECULATIVE_ARGS[@]}" \
   --additional-config '{"kda_prefill_backend":"triton"}' \
   --enable-chunked-prefill \
-  --enable-prefix-caching \
+  "${K3_PREFIX_CACHE_ARGS[@]}" \
   --max-model-len "${K3_MAX_MODEL_LEN:-262144}" \
   --kv-cache-dtype fp8 \
   --block-size "${K3_BLOCK_SIZE:-128}" \
