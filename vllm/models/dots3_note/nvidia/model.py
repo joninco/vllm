@@ -51,6 +51,7 @@ from vllm.models.deepseek_v32.nvidia.model import (
     DeepseekV32Model,
 )
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from .attention import (
@@ -58,6 +59,15 @@ from .attention import (
     Dots3NotePaddedSparseBackend,
     Dots3NoteTritonMLABackend,
 )
+from .b12x_attention import (
+    B12xHybridMLABackend,
+    B12xHybridMLACompressedPrefillBackend,
+    B12xHybridMLASlidingBackend,
+)
+
+
+def _use_b12x_hybrid_mla(vllm_config: VllmConfig) -> bool:
+    return vllm_config.attention_config.backend == AttentionBackendEnum.B12X_HYBRID_MLA
 
 
 def _padded_mlp_size(
@@ -204,8 +214,18 @@ def _forward_note_mla(
 class Dots3NotePaddedMLAAttention(MLAAttention):
     """MLA layer whose physical cache rows match NOTE's SWA rows."""
 
-    def __init__(self, *args, physical_head_size: int, **kwargs) -> None:
-        kwargs["attn_backend"] = Dots3NotePaddedSparseBackend
+    def __init__(
+        self,
+        *args,
+        physical_head_size: int,
+        use_b12x_hybrid_mla: bool = False,
+        **kwargs,
+    ) -> None:
+        kwargs["attn_backend"] = (
+            B12xHybridMLABackend
+            if use_b12x_hybrid_mla
+            else Dots3NotePaddedSparseBackend
+        )
         super().__init__(*args, **kwargs)
         assert physical_head_size >= self.head_size
         self.physical_head_size = physical_head_size
@@ -281,6 +301,7 @@ class Dots3NoteFullAttention(DeepseekV2MLAAttention):
             topk_indices_buffer=topk_indices_buffer,
             prefill_backend_cls=prefill_backend_cls,
             physical_head_size=(config.swa_kv_lora_rank + config.swa_qk_rope_head_dim),
+            use_b12x_hybrid_mla=_use_b12x_hybrid_mla(vllm_config),
         )
         gate_type = config.attention_gate_type
         gate_cls = ReplicatedLinear if gate_type == "headwise" else ColumnParallelLinear
@@ -441,6 +462,7 @@ class Dots3NoteSlidingAttention(nn.Module):
         self.kv_lora_scale = (
             (config.hidden_size / kv_lora_rank) ** 0.5 if apply_rescale else 1.0
         )
+        use_b12x_hybrid_mla = _use_b12x_hybrid_mla(vllm_config)
         self.mla_attn = MLAAttention(
             num_heads=self.num_heads,
             scale=qk_head_dim**-0.5,
@@ -455,8 +477,16 @@ class Dots3NoteSlidingAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             sliding_window=config.sliding_window_size,
-            attn_backend=Dots3NoteTritonMLABackend,
-            prefill_backend_cls=Dots3NoteFlashAttnPrefillBackend,
+            attn_backend=(
+                B12xHybridMLASlidingBackend
+                if use_b12x_hybrid_mla
+                else Dots3NoteTritonMLABackend
+            ),
+            prefill_backend_cls=(
+                B12xHybridMLACompressedPrefillBackend
+                if use_b12x_hybrid_mla
+                else Dots3NoteFlashAttnPrefillBackend
+            ),
         )
 
     def forward(
@@ -497,6 +527,10 @@ class Dots3NoteDecoderLayer(DeepseekV32DecoderLayer):
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
         self.use_mha = False
+        self.use_sequence_parallel = (
+            parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+        )
         attention_cls = (
             Dots3NoteSlidingAttention
             if config.layer_types[layer_idx] == "sliding_attention"
@@ -535,6 +569,7 @@ class Dots3NoteDecoderLayer(DeepseekV32DecoderLayer):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
                 reduce_results=False,
+                is_sequence_parallel=self.use_sequence_parallel,
             )
         self.use_sequence_parallel_moe = (
             parallel_config.use_sequence_parallel_moe
@@ -559,6 +594,11 @@ class Dots3NoteModel(DeepseekV32Model):
         self.config = config
         self.device = current_platform.device_type
         self.vocab_size = config.vocab_size
+        parallel_config = vllm_config.parallel_config
+        self.use_sequence_parallel = (
+            parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+        )
         self.is_v32 = True
         self._weight_block_size = getattr(quant_config, "weight_block_size", None)
         topk_indices_buffer = torch.empty(
@@ -593,9 +633,7 @@ class Dots3NoteModel(DeepseekV32Model):
             ["hidden_states", "residual"], config.hidden_size
         )
         self.aux_hidden_state_layers = tuple[int, ...]()
-        self.num_redundant_experts = (
-            vllm_config.parallel_config.eplb_config.num_redundant_experts
-        )
+        self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
 
     def _pad_dense_mlp_weight(
         self, name: str, loaded_weight: torch.Tensor

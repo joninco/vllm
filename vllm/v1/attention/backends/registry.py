@@ -100,6 +100,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     B12X_MLA_SPARSE = (
         "vllm.v1.attention.backends.mla.b12x_mla_sparse.B12xMLASparseBackend"
     )
+    B12X_HYBRID_MLA = (
+        "vllm.models.dots3_note.nvidia.b12x_attention.B12xHybridMLABackend"
+    )
     B12X_ATTN = "vllm.v1.attention.backends.b12x_attn.B12XPagedAttentionBackend"
     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
     FLASH_ATTN_MLA_SPARSE = (

@@ -44,7 +44,15 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}" \
   --port "${PORT}" \
   --tensor-parallel-size "${TP_SIZE}" \
   --enable-expert-parallel \
+  --load-format instanttensor \
   --moe-backend deep_gemm \
+  --attention-backend B12X_HYBRID_MLA \
+  --enable-auto-tool-choice \
+  --tool-call-parser dots \
+  --reasoning-parser deepseek_v3 \
+  --default-chat-template-kwargs '{"enable_thinking": true}' \
+  --kv-cache-dtype fp8 \
+  --block-size 64 \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
