@@ -77,6 +77,7 @@ class DSparkSpeculator(DFlashSpeculator):
         self._draft_topk: int | None = getattr(
             self.draft_model_config.hf_config, "dspark_draft_topk", None
         )
+        self._use_local_draft_argmax = False
 
         self.draft_token_confidence_logits = torch.empty(
             self.max_num_reqs,
@@ -192,6 +193,19 @@ class DSparkSpeculator(DFlashSpeculator):
                 dtype=self.draft_logits.dtype,
                 device=self.device,
             )
+        if envs.VLLM_DSPARK_SHARD_MARKOV_HEAD:
+            supports_local_argmax = getattr(model, "supports_local_draft_argmax", None)
+            if supports_local_argmax is None or not supports_local_argmax():
+                raise RuntimeError(
+                    "A TP-sharded DSpark Markov head requires matching "
+                    "rank-local target and Markov vocabulary projections."
+                )
+            if self._draft_topk is not None:
+                raise ValueError(
+                    "TP-sharded DSpark Markov sampling does not support "
+                    "dspark_draft_topk."
+                )
+            self._use_local_draft_argmax = True
         return model
 
     def _sample_logits(
@@ -240,9 +254,14 @@ class DSparkSpeculator(DFlashSpeculator):
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
         sample_hidden = sample_hidden.view(num_reqs, n_spec, -1)
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
-        base_logits = self.model.compute_draft_logits(
-            sample_hidden.reshape(num_sample, -1)
-        )
+        if self._use_local_draft_argmax:
+            base_logits = self.model.compute_local_draft_logits(
+                sample_hidden.reshape(num_sample, -1)
+            )
+        else:
+            base_logits = self.model.compute_draft_logits(
+                sample_hidden.reshape(num_sample, -1)
+            )
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
         base_values = draft_indices = None
@@ -279,7 +298,24 @@ class DSparkSpeculator(DFlashSpeculator):
                     )
                 confidence_logits[:, i] = confidence_i
             if draft_indices is None:
-                logits_i = base_logits[:, i] + self.model.markov_bias(markov_embed)
+                if self._use_local_draft_argmax:
+                    markov_bias = self.model.compute_local_markov_bias(markov_embed)
+                    if self.draft_logits is None:
+                        draft_sampled_i = self.model.sample_local_draft_logits(
+                            base_logits[:, i], markov_bias
+                        )
+                    else:
+                        logits_i = self.model.gather_local_draft_logits(
+                            base_logits[:, i], markov_bias
+                        )
+                        draft_sampled_i = self._sample_logits(
+                            logits_i, idx_map[:, i], sample_pos[:, i], i
+                        )
+                else:
+                    logits_i = base_logits[:, i] + self.model.markov_bias(markov_embed)
+                    draft_sampled_i = self._sample_logits(
+                        logits_i, idx_map[:, i], sample_pos[:, i], i
+                    )
             else:
                 assert base_values is not None
                 logits_i = self.model.apply_markov_bias_gathered(
@@ -288,9 +324,9 @@ class DSparkSpeculator(DFlashSpeculator):
                     base_values[:, i],
                     draft_indices[:, i],
                 )
-            draft_sampled_i = self._sample_logits(
-                logits_i, idx_map[:, i], sample_pos[:, i], i
-            )
+                draft_sampled_i = self._sample_logits(
+                    logits_i, idx_map[:, i], sample_pos[:, i], i
+                )
             valid_prefix.logical_and_(
                 (draft_sampled_i >= 0) & (draft_sampled_i < self.vocab_size)
             )
