@@ -706,6 +706,46 @@ def test_initial_online_processing_loads_into_materialized_parameters():
     assert not get_layerwise_info(layer).loaded_weights
 
 
+def test_online_processing_finalizes_checkpoint_omitted_padding():
+    class RecordingWeightQuantMethod(QuantizeMethodBase):
+        uses_meta_device = True
+
+        def __init__(self):
+            self.weight_at_process = None
+
+        def create_weights(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def apply(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer):
+            self.weight_at_process = layer.weight.detach().clone()
+
+    def shard_loader(param, loaded_weight, shard_id):
+        start = shard_id * loaded_weight.shape[0]
+        param.data[start : start + loaded_weight.shape[0]].copy_(loaded_weight)
+
+    quant_method = RecordingWeightQuantMethod()
+    layer = torch.nn.Module()
+    layer.quant_method = quant_method
+    weight = torch.nn.Parameter(torch.empty(6, 2, device="meta"))
+    weight.weight_loader = shard_loader
+    layer.register_parameter("weight", weight)
+    initialize_online_processing(layer)
+    layer._vllm_online_processing_unloaded = {"weight": 4}
+
+    first = torch.full((2, 2), 3.0)
+    second = torch.full((2, 2), 7.0)
+    layer.weight.weight_loader(layer.weight, first, 0)
+    assert quant_method.weight_at_process is None
+    layer.weight.weight_loader(layer.weight, second, 1)
+
+    expected = torch.cat((first, second, torch.zeros(2, 2)))
+    assert torch.equal(quant_method.weight_at_process, expected)
+    assert not get_layerwise_info(layer).can_load()
+
+
 def test_layerwise_reload_skips_non_persistent_parameter_alias_buffers(monkeypatch):
     layer = _AliasedBufferLayer()
     model = torch.nn.Sequential(layer)

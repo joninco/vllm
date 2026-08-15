@@ -52,6 +52,54 @@ LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
 # Global set used to track loading for logging purposes only
 LOADING_LAYERS: WeakSet[torch.nn.Module] = WeakSet()
 
+_ONLINE_PROCESSING_UNLOADED_ATTR = "_vllm_online_processing_unloaded"
+
+
+def _online_processing_load_numel_total(layer: torch.nn.Module) -> int:
+    """Count checkpoint elements required before processing a layer.
+
+    A layer can allocate padded tensor tails that have no corresponding
+    checkpoint payload. The layer declares those omitted element counts in a
+    ``dict[str, int]`` named ``_vllm_online_processing_unloaded``.
+
+    Args:
+        layer: Layer whose registered tensors and unloaded-tail annotations
+            define the expected checkpoint payload.
+
+    Returns:
+        Number of tensor elements that checkpoint weight loaders must provide.
+
+    Raises:
+        TypeError: If the unloaded-tail annotation is not a dictionary.
+        ValueError: If an annotated tensor is absent or its unloaded element
+            count is outside the tensor's bounds.
+    """
+    total = get_layer_size(layer)
+    unloaded = getattr(layer, _ONLINE_PROCESSING_UNLOADED_ATTR, {})
+    if not isinstance(unloaded, dict):
+        raise TypeError(
+            f"{_ONLINE_PROCESSING_UNLOADED_ATTR} must be a dict, "
+            f"got {type(unloaded).__name__}"
+        )
+    for name, numel in unloaded.items():
+        tensor = get_layer_tensors(layer).get(name)
+        if tensor is None:
+            raise ValueError(f"Annotated unloaded tensor {name!r} is missing")
+        if not isinstance(numel, int) or not 0 <= numel <= tensor.numel():
+            raise ValueError(
+                f"Invalid unloaded element count for {name}: {numel} "
+                f"(tensor numel={tensor.numel()})"
+            )
+        total -= numel
+    return total
+
+
+def _zero_online_processing_unloaded(layer: torch.nn.Module) -> None:
+    unloaded = getattr(layer, _ONLINE_PROCESSING_UNLOADED_ATTR, {})
+    for name, numel in unloaded.items():
+        if numel:
+            getattr(layer, name).data.view(-1)[-numel:].zero_()
+
 
 def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
     """
@@ -132,7 +180,7 @@ def initialize_online_processing(layer: torch.nn.Module):
 
     # Track loading progress to determine when to process/copy
     info.load_numel = 0
-    info.load_numel_total = get_layer_size(layer)
+    info.load_numel_total = _online_processing_load_numel_total(layer)
     _wrap_parameters_weight_loader(layer)
 
 
@@ -198,7 +246,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         # Re-run on each load: layers may register parameters later (e.g., `bias`).
         # Wrap late parameters and refresh `load_numel_total` so processing waits
         # until all parameters are loaded.
-        info.load_numel_total = get_layer_size(layer)
+        info.load_numel_total = _online_processing_load_numel_total(layer)
         _wrap_parameters_weight_loader(layer)
 
         # Bind and normalize arguments
@@ -391,6 +439,8 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         param = getattr(layer, name)
         args.arguments["param"] = param
         param.weight_loader(*args.args, **args.kwargs)
+
+    _zero_online_processing_unloaded(layer)
 
     # Process weights (quantization, repacking, etc.)
     quant_method = getattr(layer, "quant_method", None)
