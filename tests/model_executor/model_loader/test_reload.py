@@ -16,6 +16,7 @@ from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
+    get_layerwise_info,
     initialize_layerwise_reload,
     initialize_online_processing,
     record_metadata_for_reloading,
@@ -684,6 +685,25 @@ def test_online_processing_waits_for_late_registered_bias():
     layer.bias.weight_loader(layer.bias, loaded_bias)
     assert quant_method.bias_at_process is not None
     assert torch.equal(quant_method.bias_at_process, loaded_bias)
+
+
+def test_initial_online_processing_loads_into_materialized_parameters():
+    quant_method = _RecordingQuantMethod()
+    layer = _LateBiasLayer(quant_method)
+    loaded_weight = torch.full((4, 2), 2.0)
+    loaded_bias = torch.full((4,), 3.0)
+
+    layer.weight.weight_loader(layer.weight, loaded_weight)
+
+    assert not layer.weight.is_meta
+    assert torch.equal(layer.weight, loaded_weight)
+    assert not get_layerwise_info(layer).loaded_weights
+    assert quant_method.bias_at_process is None
+
+    layer.bias.weight_loader(layer.bias, loaded_bias)
+
+    assert torch.equal(quant_method.bias_at_process, loaded_bias)
+    assert not get_layerwise_info(layer).loaded_weights
 
 
 def test_layerwise_reload_skips_non_persistent_parameter_alias_buffers(monkeypatch):

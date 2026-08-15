@@ -205,11 +205,22 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         bound_args = loader_signature.bind(*args, **kwargs)
         bound_args.apply_defaults()
 
-        _own_deferred_accelerator_tensors(bound_args)
+        direct_load = info.kernel_tensors is None and not is_deferred_attention_layer(
+            layer
+        )
+        if direct_load:
+            # Initial online quantization can write each checkpoint shard into
+            # its materialized TP-local destination before the iterator
+            # advances. Reloading and deferred attention retain their queued
+            # arguments because their processing has different lifetime rules.
+            materialize_layer(layer, info)
+            bound_args.arguments["param"] = getattr(layer, param_name)
+            num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+        else:
+            _own_deferred_accelerator_tensors(bound_args)
+            info.loaded_weights.append((param_name, bound_args))
+            num_loaded, ret = get_numel_loaded(original_loader, bound_args)
 
-        # Buffer loaded weights, track loading progress
-        info.loaded_weights.append((param_name, bound_args))
-        num_loaded, ret = get_numel_loaded(original_loader, bound_args)
         info.load_numel += num_loaded
 
         logger.debug(
@@ -224,7 +235,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             return ret
 
         # Log warnings allocating excessive buffers on device
-        if has_device_tensors(bound_args):
+        if not direct_load and has_device_tensors(bound_args):
             LOADING_LAYERS.add(layer)
             if len(LOADING_LAYERS) >= 2:
                 names = sorted([layer.__class__.__name__ for layer in LOADING_LAYERS])
