@@ -29,10 +29,6 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm.v1.worker.workspace import (
-    current_workspace_manager,
-    is_workspace_manager_initialized,
-)
 
 logger = init_logger(__name__)
 
@@ -128,6 +124,7 @@ class B12xMLAMetadata(MLACommonMetadata):
     """Common MLA metadata plus the capture-static B12X launch plan."""
 
     dense_mla_plan: Any | None = None
+    dense_mla_scratch: torch.Tensor | None = None
     dense_mla_flat_block_table: torch.Tensor | None = None
     dense_mla_flat_seq_lens: torch.Tensor | None = None
     dense_mla_flat_query_start_loc: torch.Tensor | None = None
@@ -169,8 +166,18 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             max_total_q=max_dense_mla_rows,
         )
         self._workspace_specs = self._dense_mla_plan.shapes_and_dtypes()
-        if is_workspace_manager_initialized():
-            current_workspace_manager().get_simultaneous(*self._workspace_specs)
+        if len(self._workspace_specs) != 1:
+            raise RuntimeError("B12X_MLA expected exactly one scratch buffer.")
+        scratch_shape, scratch_dtype = self._workspace_specs[0]
+        # Every attention layer represented by this builder executes serially
+        # on the model stream. One builder-owned buffer therefore gives each
+        # eager bind a stable caller-owned address without a backend workspace
+        # cache or one allocation per layer.
+        self._dense_mla_scratch = torch.empty(
+            scratch_shape,
+            dtype=scratch_dtype,
+            device=device,
+        )
         max_table_width = int(self._dense_mla_plan.caps.max_page_table_width)
         self._dense_mla_flat_block_table = torch.zeros(
             (max_dense_mla_rows, max_table_width),
@@ -212,6 +219,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             ),
         )
         metadata.dense_mla_plan = self._dense_mla_plan
+        metadata.dense_mla_scratch = self._dense_mla_scratch
         decode_metadata = metadata.decode
         if (
             not metadata.causal
@@ -447,23 +455,6 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
 
         self._dense_mla = _load_dense_mla()
         self._compiled_bindings: set[tuple[object, ...]] = set()
-        self._fallback_scratch: dict[int, torch.Tensor] = {}
-
-    def _borrow_scratch(self, plan: Any, device: torch.device) -> torch.Tensor:
-        specs = plan.shapes_and_dtypes()
-        if is_workspace_manager_initialized():
-            (scratch,) = current_workspace_manager().get_simultaneous(*specs)
-            return scratch
-
-        key = id(plan)
-        scratch = self._fallback_scratch.get(key)
-        if scratch is None:
-            if len(specs) != 1:
-                raise RuntimeError("B12X_MLA expected exactly one scratch buffer.")
-            shape, dtype = specs[0]
-            scratch = torch.empty(shape, dtype=dtype, device=device)
-            self._fallback_scratch[key] = scratch
-        return scratch
 
     def forward_mqa(
         self,
@@ -517,7 +508,11 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             dtype=torch.bfloat16,
             device=q.device,
         )
-        scratch = self._borrow_scratch(plan, q.device)
+        scratch = getattr(attn_metadata, "dense_mla_scratch", None)
+        if scratch is None:
+            raise RuntimeError(
+                "B12X_MLA metadata is missing caller-owned dense MLA scratch."
+            )
         quantized = q.dtype == torch.float8_e4m3fn
         binding = self._dense_mla.bind(
             plan,
