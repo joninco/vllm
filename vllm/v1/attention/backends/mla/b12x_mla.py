@@ -219,6 +219,9 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             B12xMLAMetadata,
             supports_dcp_with_varlen=True,
         )
+        self._dcp_rank = (
+            int(get_dcp_group().rank_in_group) if self.dcp_world_size > 1 else 0
+        )
         max_dense_mla_rows = int(vllm_config.scheduler_config.max_num_seqs) * int(
             self.reorder_batch_threshold
         )
@@ -280,6 +283,30 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             dtype=torch.int32,
             device=device,
         )
+        self._dense_mla_causal_offsets = torch.arange(
+            1 - int(self.reorder_batch_threshold),
+            1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._dense_mla_flat_global_seq_lens = (
+            torch.empty(
+                max_dense_mla_rows,
+                dtype=torch.int32,
+                device=device,
+            )
+            if self.dcp_world_size > 1
+            else None
+        )
+        self._dense_mla_flat_dcp_remainder = (
+            torch.empty(
+                max_dense_mla_rows,
+                dtype=torch.int32,
+                device=device,
+            )
+            if self.dcp_world_size > 1
+            else None
+        )
         logger.info_once(
             "B12X dense K3 MLA plan: local_heads=%d, effective_heads=%d, "
             "kernel_heads=%d, page_size=%d, "
@@ -312,41 +339,84 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         metadata.dense_mla_padded_q = self._dense_mla_padded_q
         metadata.dense_mla_padded_output = self._dense_mla_padded_output
         decode_metadata = metadata.decode
-        if (
-            not metadata.causal
-            and decode_metadata is not None
-            and metadata.num_decodes > 0
-            and metadata.num_decode_tokens > metadata.num_decodes
-        ):
+        flatten_decode = False
+        if decode_metadata is not None and metadata.num_decodes > 0:
+            flatten_decode = metadata.num_decode_tokens > metadata.num_decodes or int(
+                decode_metadata.block_table.shape[1]
+            ) > int(self._dense_mla_plan.caps.max_page_table_width)
+        if flatten_decode:
+            assert decode_metadata is not None
             total_q = int(metadata.num_decode_tokens)
             if total_q > self._max_dense_mla_rows:
                 raise ValueError(
-                    "B12X_MLA non-causal query block exceeds its capacity: "
+                    "B12X_MLA query block exceeds its flattened capacity: "
                     f"rows={total_q}, capacity={self._max_dense_mla_rows}."
                 )
             if total_q % metadata.num_decodes:
                 raise ValueError(
-                    "B12X_MLA requires a uniform non-causal query block, got "
+                    "B12X_MLA requires a uniform query block, got "
                     f"tokens={total_q}, requests={metadata.num_decodes}."
                 )
             query_len = total_q // metadata.num_decodes
             source_table = decode_metadata.block_table
-            source_width = int(source_table.shape[1])
             flat_table = self._dense_mla_flat_block_table[:total_q]
-            if source_width > int(flat_table.shape[1]):
-                raise ValueError(
-                    "B12X_MLA block table exceeds its planned width: "
-                    f"actual={source_width}, planned={flat_table.shape[1]}."
-                )
+            # A bounded speculative cache can retain a position-indexed worker
+            # table wider than the resident cache. Sequence lengths make the
+            # omitted suffix unreachable by the dense-MLA kernel.
+            source_width = min(int(source_table.shape[1]), int(flat_table.shape[1]))
             flat_table[:, :source_width].copy_(
-                source_table[:, None, :]
+                source_table[:, None, :source_width]
                 .expand(-1, query_len, -1)
                 .reshape(total_q, source_width)
             )
             flat_lens = self._dense_mla_flat_seq_lens[:total_q]
-            flat_lens.copy_(
-                decode_metadata.seq_lens[:, None].expand(-1, query_len).reshape(total_q)
-            )
+            if metadata.causal:
+                offsets = self._dense_mla_causal_offsets[-query_len:]
+                if self.dcp_world_size > 1:
+                    global_source_lens = decode_metadata.dcp_tot_seq_lens
+                    if global_source_lens is None:
+                        raise RuntimeError(
+                            "B12X_MLA causal DCP verification requires global "
+                            "decode sequence lengths."
+                        )
+                    assert self._dense_mla_flat_global_seq_lens is not None
+                    assert self._dense_mla_flat_dcp_remainder is not None
+                    global_flat_lens = self._dense_mla_flat_global_seq_lens[:total_q]
+                    torch.add(
+                        global_source_lens[:, None],
+                        offsets,
+                        out=global_flat_lens.view(metadata.num_decodes, query_len),
+                    )
+                    virtual_block = (
+                        self.dcp_world_size * self.cp_kv_cache_interleave_size
+                    )
+                    torch.div(
+                        global_flat_lens,
+                        virtual_block,
+                        rounding_mode="floor",
+                        out=flat_lens,
+                    )
+                    flat_lens.mul_(self.cp_kv_cache_interleave_size)
+                    remainder = self._dense_mla_flat_dcp_remainder[:total_q]
+                    torch.remainder(global_flat_lens, virtual_block, out=remainder)
+                    remainder.sub_(self._dcp_rank * self.cp_kv_cache_interleave_size)
+                    remainder.clamp_(
+                        min=0,
+                        max=self.cp_kv_cache_interleave_size,
+                    )
+                    flat_lens.add_(remainder)
+                else:
+                    torch.add(
+                        decode_metadata.seq_lens[:, None],
+                        offsets,
+                        out=flat_lens.view(metadata.num_decodes, query_len),
+                    )
+            else:
+                flat_lens.copy_(
+                    decode_metadata.seq_lens[:, None]
+                    .expand(-1, query_len)
+                    .reshape(total_q)
+                )
             metadata.dense_mla_flat_block_table = flat_table
             metadata.dense_mla_flat_seq_lens = flat_lens
             metadata.dense_mla_flat_query_start_loc = (
@@ -590,15 +660,15 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             )
             if seq_lens is None or query_start_loc is None:
                 raise RuntimeError(
-                    "B12X_MLA metadata is missing flattened non-causal rows."
+                    "B12X_MLA metadata is missing flattened decode rows."
                 )
 
         batch = int(seq_lens.shape[0])
         total_q = int(q.shape[0])
-        if total_q < batch:
+        if total_q != batch:
             raise ValueError(
-                "B12X_MLA requires at least one query row per prepared decode "
-                f"sequence, got {total_q} rows for {batch} sequences."
+                "B12X_MLA requires one query row per prepared decode sequence, "
+                f"got {total_q} rows for {batch} sequences."
             )
         if int(q.shape[1]) != self.num_heads:
             raise ValueError(

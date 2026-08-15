@@ -122,6 +122,10 @@ def test_b12x_mla_rejects_unsupported_parallel_geometry(monkeypatch) -> None:
 
 
 class _FakePlan:
+    caps = SimpleNamespace(max_page_table_width=4)
+    num_splits = 1
+    chunks_per_split = 1
+
     def shapes_and_dtypes(self):
         return (((256,), torch.uint8),)
 
@@ -239,12 +243,27 @@ def test_b12x_mla_adapter_binds_causal_multiquery_blocks(monkeypatch) -> None:
     q = torch.randn(total_q, 8, 576, dtype=torch.bfloat16)
     cache = torch.randn(8, 16, 576, dtype=torch.bfloat16)
     query_start_loc = torch.tensor([0, 8, 16], dtype=torch.int32)
+    source_table = torch.tensor(
+        [[0, 1, 2, 3], [4, 5, 6, 7]],
+        dtype=torch.int32,
+    )
+    flat_table = source_table[:, None, :].expand(-1, query_len, -1).reshape(total_q, -1)
+    flat_lens = torch.cat(
+        (
+            torch.arange(25, 33, dtype=torch.int32),
+            torch.arange(41, 49, dtype=torch.int32),
+        )
+    )
+    flat_query_start = torch.arange(total_q + 1, dtype=torch.int32)
     metadata = SimpleNamespace(
         dense_mla_plan=_FakePlan(),
         dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
+        dense_mla_flat_block_table=flat_table,
+        dense_mla_flat_seq_lens=flat_lens,
+        dense_mla_flat_query_start_loc=flat_query_start,
         query_start_loc=query_start_loc,
         decode=SimpleNamespace(
-            block_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
+            block_table=source_table,
             seq_lens=torch.tensor([32, 48], dtype=torch.int32),
         ),
     )
@@ -259,8 +278,8 @@ def test_b12x_mla_adapter_binds_causal_multiquery_blocks(monkeypatch) -> None:
     assert output.shape == (total_q, 8, 512)
     assert lse is not None and lse.shape == (total_q, 8)
     assert binding.q.shape[0] == total_q
-    assert binding.cache_seqlens.shape[0] == batch
-    assert binding.cu_seqlens_q.data_ptr() == query_start_loc.data_ptr()
+    assert binding.cache_seqlens.data_ptr() == flat_lens.data_ptr()
+    assert binding.cu_seqlens_q.data_ptr() == flat_query_start.data_ptr()
 
 
 def test_b12x_mla_builder_flattens_non_causal_draft_block(monkeypatch) -> None:
@@ -304,6 +323,144 @@ def test_b12x_mla_builder_flattens_non_causal_draft_block(monkeypatch) -> None:
     torch.testing.assert_close(
         result.dense_mla_flat_query_start_loc,
         torch.arange(9, dtype=torch.int32),
+    )
+
+
+def test_b12x_mla_builder_flattens_causal_verification_block(monkeypatch) -> None:
+    builder = object.__new__(B12xMLAMetadataBuilder)
+    builder._dense_mla_plan = _FakePlan()
+    builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
+    builder._dense_mla_padded_q = None
+    builder._dense_mla_padded_output = None
+    builder._max_dense_mla_rows = 16
+    builder._dense_mla_flat_block_table = torch.zeros(16, 4, dtype=torch.int32)
+    builder._dense_mla_flat_seq_lens = torch.empty(16, dtype=torch.int32)
+    builder._dense_mla_flat_query_start_loc = torch.arange(17, dtype=torch.int32)
+    builder._dense_mla_causal_offsets = torch.arange(-7, 1, dtype=torch.int32)
+    builder._dense_mla_flat_global_seq_lens = None
+    builder._dense_mla_flat_dcp_remainder = None
+    builder.dcp_world_size = 1
+
+    source_table = torch.tensor([[3, 4, 5, 6]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        causal=True,
+        num_decodes=1,
+        num_decode_tokens=8,
+        decode=SimpleNamespace(
+            block_table=source_table,
+            seq_lens=torch.tensor([32], dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_mla.MLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: metadata,
+    )
+
+    result = builder.build(0, SimpleNamespace())
+
+    torch.testing.assert_close(
+        result.dense_mla_flat_block_table,
+        source_table.expand(8, -1),
+    )
+    torch.testing.assert_close(
+        result.dense_mla_flat_seq_lens,
+        torch.arange(25, 33, dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        result.dense_mla_flat_query_start_loc,
+        torch.arange(9, dtype=torch.int32),
+    )
+
+
+def test_b12x_mla_builder_maps_causal_verification_lengths_to_dcp_rank(
+    monkeypatch,
+) -> None:
+    builder = object.__new__(B12xMLAMetadataBuilder)
+    builder._dense_mla_plan = _FakePlan()
+    builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
+    builder._dense_mla_padded_q = None
+    builder._dense_mla_padded_output = None
+    builder._max_dense_mla_rows = 8
+    builder._dense_mla_flat_block_table = torch.zeros(8, 4, dtype=torch.int32)
+    builder._dense_mla_flat_seq_lens = torch.empty(8, dtype=torch.int32)
+    builder._dense_mla_flat_query_start_loc = torch.arange(9, dtype=torch.int32)
+    builder._dense_mla_causal_offsets = torch.arange(-3, 1, dtype=torch.int32)
+    builder._dense_mla_flat_global_seq_lens = torch.empty(8, dtype=torch.int32)
+    builder._dense_mla_flat_dcp_remainder = torch.empty(8, dtype=torch.int32)
+    builder.dcp_world_size = 4
+    builder._dcp_rank = 3
+    builder.cp_kv_cache_interleave_size = 2
+
+    metadata = SimpleNamespace(
+        causal=True,
+        num_decodes=1,
+        num_decode_tokens=4,
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[3, 4, 5, 6]], dtype=torch.int32),
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            dcp_tot_seq_lens=torch.tensor([17], dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_mla.MLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: metadata,
+    )
+
+    result = builder.build(0, SimpleNamespace())
+
+    torch.testing.assert_close(
+        result.dense_mla_flat_seq_lens,
+        torch.tensor([2, 3, 4, 4], dtype=torch.int32),
+    )
+
+
+def test_b12x_mla_builder_bounds_single_token_draft_table(monkeypatch) -> None:
+    builder = object.__new__(B12xMLAMetadataBuilder)
+    builder._dense_mla_plan = _FakePlan()
+    builder._dense_mla_scratch = torch.empty(256, dtype=torch.uint8)
+    builder._dense_mla_padded_q = None
+    builder._dense_mla_padded_output = None
+    builder._max_dense_mla_rows = 2
+    builder._dense_mla_flat_block_table = torch.zeros(2, 4, dtype=torch.int32)
+    builder._dense_mla_flat_seq_lens = torch.empty(2, dtype=torch.int32)
+    builder._dense_mla_flat_query_start_loc = torch.arange(3, dtype=torch.int32)
+    builder._dense_mla_causal_offsets = torch.zeros(1, dtype=torch.int32)
+    builder._dense_mla_flat_global_seq_lens = None
+    builder._dense_mla_flat_dcp_remainder = None
+    builder.dcp_world_size = 1
+
+    source_table = torch.tensor(
+        [[0, 1, 2, 3, 90, 91], [4, 5, 6, 7, 92, 93]],
+        dtype=torch.int32,
+    )
+    source_lens = torch.tensor([32, 48], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        causal=False,
+        num_decodes=2,
+        num_decode_tokens=2,
+        decode=SimpleNamespace(
+            block_table=source_table,
+            seq_lens=source_lens,
+        ),
+    )
+    monkeypatch.setattr(
+        b12x_mla.MLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: metadata,
+    )
+
+    result = builder.build(0, SimpleNamespace())
+
+    torch.testing.assert_close(
+        result.dense_mla_flat_block_table,
+        source_table[:, :4],
+    )
+    torch.testing.assert_close(result.dense_mla_flat_seq_lens, source_lens)
+    torch.testing.assert_close(
+        result.dense_mla_flat_query_start_loc,
+        torch.arange(3, dtype=torch.int32),
     )
 
 
