@@ -1719,6 +1719,45 @@ def test_b12x_kimi_pair_topk_rejects_non_contract_inputs(monkeypatch):
         )
 
 
+def test_kimi_projection_warmup_respects_transport_token_cap(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "4")
+    group = _FakeCPGroup(8, object())  # type: ignore[arg-type]
+    calls: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+
+    def pair(local_down, local_router, projection_group, *, max_batch_size):
+        assert projection_group is group
+        assert max_batch_size == 8
+        calls.append(("pair", tuple(local_down.shape), tuple(local_router.shape)))
+        return local_down, local_router
+
+    def topk(local_down, local_router, correction_bias, projection_group):
+        assert projection_group is group
+        assert correction_bias.shape == (896,)
+        calls.append(("topk", tuple(local_down.shape), tuple(local_router.shape)))
+        return local_down, torch.empty(2, 16)
+
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_all_gather_pair", pair)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "try_dcp_b12x_all_gather_pair_kimi_topk",
+        topk,
+    )
+
+    warmed = dcp_alltoall.warmup_b12x_kimi_projection_gathers(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+    )
+
+    assert warmed == 2
+    assert calls == [
+        ("pair", (4, 448), (4, 112)),
+        ("topk", (1, 448), (1, 112)),
+    ]
+
+
 def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
 

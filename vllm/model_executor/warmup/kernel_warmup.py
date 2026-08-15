@@ -262,6 +262,40 @@ def _warmup_b12x_dcp_a2a(worker: "Worker") -> int:
     return len(warmed_signatures)
 
 
+def _warmup_b12x_kimi_projection_gathers(worker: "Worker") -> int:
+    """Warm projection collectives only for feature-sharded Kimi MoE layers."""
+    if not envs.VLLM_USE_B12X_DCP_A2A:
+        return 0
+
+    from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
+    from vllm.models.kimi_k3.nvidia.model import KimiMoE
+    from vllm.v1.attention.ops.dcp_alltoall import (
+        warmup_b12x_kimi_projection_gathers,
+    )
+
+    model = worker.get_model()
+    uses_sharded_projections = any(
+        isinstance(module, KimiMoE)
+        and bool(getattr(module, "auxiliary_projections_tp_sharded", False))
+        for module in model.modules()
+    )
+    if not uses_sharded_projections:
+        return 0
+
+    dcp_group = get_dcp_group()
+    tp_group = get_tp_group()
+    projection_group = (
+        dcp_group
+        if dcp_group.world_size == tp_group.world_size
+        and list(dcp_group.ranks) == list(tp_group.ranks)
+        else tp_group
+    )
+    return warmup_b12x_kimi_projection_gathers(
+        projection_group,
+        device=next(model.parameters()).device,
+    )
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool:
     if not worker.use_v2_model_runner:
         # Pooling models do not use the generation slot-mapping path.
@@ -322,6 +356,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False) -> bool
         logger.info(
             "Warmed up %d B12X DCP collective signature(s).",
             warmed_dcp_a2a,
+        )
+    warmed_projection_gathers = _warmup_b12x_kimi_projection_gathers(worker)
+    if warmed_projection_gathers:
+        logger.info(
+            "Warmed up %d B12X Kimi projection operation(s).",
+            warmed_projection_gathers,
         )
 
     flashinfer_sparse_mla_decode_autotune_warmup(worker)

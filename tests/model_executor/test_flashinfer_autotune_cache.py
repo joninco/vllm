@@ -244,6 +244,41 @@ def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
     ]
 
 
+def test_b12x_projection_warmup_uses_complete_projection_group(monkeypatch) -> None:
+    from vllm.distributed import parallel_state
+    from vllm.models.kimi_k3.nvidia.model import KimiMoE
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    moe = object.__new__(KimiMoE)
+    torch.nn.Module.__init__(moe)
+    moe.auxiliary_projections_tp_sharded = True
+    moe.register_parameter("device_probe", torch.nn.Parameter(torch.empty(1)))
+    model = torch.nn.Module()
+    model.add_module("moe", moe)
+    worker = SimpleNamespace(get_model=lambda: model)
+    tp_group = SimpleNamespace(world_size=16, ranks=list(range(16)))
+    dcp_group = SimpleNamespace(world_size=8, ranks=list(range(8)))
+    calls = []
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: dcp_group)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "warmup_b12x_kimi_projection_gathers",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 2,
+    )
+
+    warmed = kernel_warmup._warmup_b12x_kimi_projection_gathers(worker)
+
+    assert warmed == 2
+    assert calls == [
+        (
+            (tp_group,),
+            {"device": torch.device("cpu")},
+        )
+    ]
+
+
 def test_kernel_warmup_runs_b12x_mxfp8_linear_warmup(monkeypatch) -> None:
     calls = []
     model = torch.nn.Linear(2, 2)
