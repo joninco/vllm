@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_COMPACT_ROPE: bool = False
     VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
     VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
+    VLLM_KIMI_K3_B12X_DSPARK_ARGMAX: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
@@ -1170,6 +1171,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DSPARK_REPLICATE_MARKOV_W1": lambda: bool(
         int(os.getenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0"))
+    ),
+    # Select a Kimi-K3 DSpark token without gathering full vocabulary shards.
+    # B12X performs an exact BF16 add and global greedy argmax for compatible
+    # unpadded vocabulary layouts. Unsupported layouts retain the exact vLLM
+    # all-gather fallback.
+    "VLLM_KIMI_K3_B12X_DSPARK_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_B12X_DSPARK_ARGMAX", "0"))
     ),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.

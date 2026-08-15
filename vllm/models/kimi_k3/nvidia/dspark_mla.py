@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ import torch.nn as nn
 import vllm._custom_ops as ops
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -19,6 +21,9 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -35,6 +40,19 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 _COMPACT_ROPE_PROTECTED_IDS: set[int] = set()
+
+
+def _load_b12x_vocab_parallel_argmax() -> Any | None:
+    """Return B12X's exact vocabulary reducer when its API is complete."""
+    try:
+        from b12x.comm.pcie import VocabParallelArgmax
+    except ImportError:
+        return None
+    if not callable(getattr(VocabParallelArgmax, "from_exchange_group", None)):
+        return None
+    if not callable(getattr(VocabParallelArgmax, "fused_add_argmax", None)):
+        return None
+    return VocabParallelArgmax
 
 
 @contextmanager
@@ -613,6 +631,21 @@ class K3DSparkForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
+        argmax_requested = bool(envs.VLLM_KIMI_K3_B12X_DSPARK_ARGMAX)
+        self._b12x_dspark_argmax_cls = (
+            _load_b12x_vocab_parallel_argmax() if argmax_requested else None
+        )
+        self._b12x_dspark_argmax_enabled = self._b12x_dspark_argmax_cls is not None
+        if argmax_requested and not self._b12x_dspark_argmax_enabled:
+            logger.warning_once(
+                "B12X does not provide the complete VocabParallelArgmax API; "
+                "Kimi-K3 DSpark uses the exact vocabulary all-gather fallback."
+            )
+        self._b12x_dspark_argmax_max_batch = min(
+            vllm_config.scheduler_config.max_num_seqs, 8
+        )
+        self._b12x_dspark_argmax_runtime: Any = None
+        self._b12x_dspark_argmax_output: torch.Tensor | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -647,6 +680,112 @@ class K3DSparkForCausalLM(nn.Module):
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)
+
+    def supports_local_draft_argmax(self) -> bool:
+        """Return whether rank-local target and Markov logits can be combined."""
+        markov_head = self.model.markov_head
+        if not markov_head.shard_across_tp:
+            return False
+        if not isinstance(self.lm_head, VocabParallelEmbedding):
+            return False
+        markov_w2 = markov_head.markov_w2
+        if not isinstance(markov_w2, VocabParallelEmbedding):
+            return False
+        layout_fields = (
+            "tp_size",
+            "tp_rank",
+            "num_embeddings",
+            "org_vocab_size",
+            "num_embeddings_padded",
+            "num_embeddings_per_partition",
+        )
+        if any(
+            getattr(self.lm_head, field) != getattr(markov_w2, field)
+            for field in layout_fields
+        ):
+            return False
+        if self.lm_head.shard_indices != markov_w2.shard_indices:
+            return False
+        # B12X maps every local row to a global token. Restrict its fast path
+        # to a dense vocabulary so a zero-filled padding row cannot win.
+        if self.lm_head.num_embeddings_padded != self.lm_head.org_vocab_size:
+            return False
+        if self.logits_processor.soft_cap is not None:
+            return False
+        return self.logits_processor.scale > 0.0
+
+    def compute_local_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project target hidden states into this rank's vocabulary shard."""
+        assert isinstance(self.lm_head, VocabParallelEmbedding)
+        return self.logits_processor._apply_head(self.lm_head, hidden_states, None)
+
+    def compute_local_markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """Project a Markov embedding into the matching vocabulary shard."""
+        return self.model.markov_head.local_bias(markov_embed, self.logits_processor)
+
+    def gather_local_draft_logits(
+        self,
+        base_logits: torch.Tensor,
+        markov_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add matching shards and gather the exact complete distribution."""
+        logits = tensor_model_parallel_all_gather(base_logits + markov_bias, dim=-1)
+        return logits[..., : self.logits_processor.org_vocab_size]
+
+    def _get_b12x_dspark_argmax(self, base_logits: torch.Tensor) -> Any | None:
+        runtime = self._b12x_dspark_argmax_runtime
+        if runtime is not None:
+            return runtime
+
+        argmax_cls = self._b12x_dspark_argmax_cls
+        if argmax_cls is None:
+            self._b12x_dspark_argmax_enabled = False
+            return None
+
+        runtime = argmax_cls.from_exchange_group(
+            exchange_group=get_tp_group().cpu_group,
+            device=base_logits.device,
+            local_vocab_size=base_logits.shape[-1],
+            max_batch_size=self._b12x_dspark_argmax_max_batch,
+        )
+        self._b12x_dspark_argmax_output = torch.empty(
+            self._b12x_dspark_argmax_max_batch,
+            dtype=torch.int64,
+            device=base_logits.device,
+        )
+        self._b12x_dspark_argmax_runtime = runtime
+        logger.info_once(
+            "Kimi-K3 DSpark uses B12X TP%d fused BF16 add and global argmax "
+            "for up to %d requests.",
+            self.lm_head.tp_size,
+            self._b12x_dspark_argmax_max_batch,
+        )
+        return runtime
+
+    def sample_local_draft_logits(
+        self,
+        base_logits: torch.Tensor,
+        markov_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return exact greedy tokens through B12X or the full-logit fallback."""
+        assert isinstance(self.lm_head, VocabParallelEmbedding)
+        batch_size = int(base_logits.shape[0])
+        if (
+            self._b12x_dspark_argmax_enabled
+            and self.lm_head.tp_size in (8, 12, 16)
+            and base_logits.dtype == torch.bfloat16
+            and markov_bias.dtype == torch.bfloat16
+            and 0 < batch_size <= self._b12x_dspark_argmax_max_batch
+        ):
+            runtime = self._get_b12x_dspark_argmax(base_logits)
+            if runtime is not None:
+                assert self._b12x_dspark_argmax_output is not None
+                return runtime.fused_add_argmax(
+                    base_logits,
+                    markov_bias,
+                    out=self._b12x_dspark_argmax_output[:batch_size],
+                )
+        return self.gather_local_draft_logits(base_logits, markov_bias).argmax(dim=-1)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids

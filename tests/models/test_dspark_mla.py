@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.model_executor.warmup.kimi_k3_triton_warmup import _get_kda_layer
@@ -337,3 +338,114 @@ def test_kda_warmup_ignores_cacheless_dspark_layers(
     monkeypatch.setattr(kimi_k3_kda, "KimiK3DeltaAttention", FakeKDA)
 
     assert _get_kda_layer(worker) is target_layer
+
+
+def _make_local_argmax_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> K3DSparkForCausalLM:
+    from vllm.model_executor.layers import logits_processor, vocab_parallel_embedding
+
+    monkeypatch.setenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "1")
+    monkeypatch.delenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", raising=False)
+    monkeypatch.setattr(
+        vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding,
+        "get_tensor_model_parallel_world_size",
+        lambda: 8,
+    )
+    monkeypatch.setattr(
+        logits_processor,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=None),
+    )
+
+    model = object.__new__(K3DSparkForCausalLM)
+    nn.Module.__init__(model)
+    model.lm_head = ParallelLMHead(128, 8, prefix="lm_head")
+    model.model = nn.Module()
+    model.model.markov_head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
+    model.logits_processor = LogitsProcessor(128)
+    model._b12x_dspark_argmax_enabled = False
+    model._b12x_dspark_argmax_cls = None
+    model._b12x_dspark_argmax_runtime = None
+    model._b12x_dspark_argmax_output = None
+    model._b12x_dspark_argmax_max_batch = 8
+    return model
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_local_argmax_requires_matching_unpadded_shards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _make_local_argmax_model(monkeypatch)
+    assert model.supports_local_draft_argmax()
+
+    model.model.markov_head.markov_w2.num_embeddings_padded += 64
+    assert not model.supports_local_draft_argmax()
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_cutedsl_argmax_uses_tp8_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _make_local_argmax_model(monkeypatch)
+    calls = []
+
+    class FakeArgmax:
+        @classmethod
+        def from_exchange_group(cls, **kwargs):
+            calls.append(("construct", kwargs))
+            return cls()
+
+        def fused_add_argmax(self, base, bias, out):
+            calls.append(("sample", base.clone(), bias.clone(), out))
+            return out.fill_(7)
+
+    monkeypatch.setattr(
+        dspark_mla,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group="tp-metadata-group"),
+    )
+    model._b12x_dspark_argmax_cls = FakeArgmax
+    model._b12x_dspark_argmax_enabled = True
+    base = torch.randn((3, 16), dtype=torch.bfloat16)
+    bias = torch.randn_like(base)
+
+    sampled = model.sample_local_draft_logits(base, bias)
+
+    assert sampled.tolist() == [7, 7, 7]
+    assert calls[0] == (
+        "construct",
+        {
+            "exchange_group": "tp-metadata-group",
+            "device": torch.device("cpu"),
+            "local_vocab_size": 16,
+            "max_batch_size": 8,
+        },
+    )
+    assert calls[1][0] == "sample"
+    assert calls[1][3].shape == (3,)
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_local_argmax_falls_back_to_exact_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _make_local_argmax_model(monkeypatch)
+    gathered = []
+
+    def fake_all_gather(logits: torch.Tensor, dim: int) -> torch.Tensor:
+        gathered.append((logits.clone(), dim))
+        return logits
+
+    monkeypatch.setattr(dspark_mla, "tensor_model_parallel_all_gather", fake_all_gather)
+    base = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.bfloat16)
+    bias = torch.tensor([[0.0, 4.0, 0.0, 0.0]], dtype=torch.bfloat16)
+
+    sampled = model.sample_local_draft_logits(base, bias)
+
+    assert sampled.tolist() == [1]
+    torch.testing.assert_close(gathered[0][0], base + bias)
+    assert gathered[0][1] == -1
