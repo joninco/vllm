@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     VLLM_NVFP4_MLA_SCALES_FILE: str = ""
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
+    VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
     VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
@@ -1139,6 +1140,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # retain target-model semantics. Requires fp8 tensor cores (SM89+).
     "VLLM_DSPARK_FP8_DRAFT_HEAD": lambda: bool(
         int(os.getenv("VLLM_DSPARK_FP8_DRAFT_HEAD", "0"))
+    ),
+    # Bound the number of context tokens expanded into dense MLA K/V tensors
+    # per attention call. Zero selects the automatic memory bound.
+    "VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE": lambda: int(
+        os.getenv("VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE", "0")
     ),
     # Bound the number of physical Kimi-K3 layers sharing each hybrid-cache
     # block table. Zero preserves the general grouping heuristic.
