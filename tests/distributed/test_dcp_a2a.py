@@ -749,23 +749,25 @@ def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
             events.append(("rollback-tp", checkpoint))
 
     class _FakeGroup:
-        def __init__(self, *, world_size, communicator=None):
+        def __init__(self, name, *, world_size, communicator=None):
+            self.name = name
             self.world_size = world_size
+            self.device_group = object()
             self.device_communicator = type(
                 "DeviceCommunicator", (), {"ca_comm": communicator}
             )()
 
     communicator = _FakeCommunicator()
-    tp_group = _FakeGroup(world_size=8, communicator=communicator)
-    pp_group = _FakeGroup(world_size=1, communicator=communicator)
-    dcp_group = _FakeGroup(world_size=2)
+    tp_group = _FakeGroup("tp", world_size=8, communicator=communicator)
+    pp_group = _FakeGroup("pp", world_size=1, communicator=communicator)
+    dcp_group = _FakeGroup("dcp", world_size=2)
     monkeypatch.setattr(parallel_state, "_TP", tp_group)
     monkeypatch.setattr(parallel_state, "_PP", pp_group)
     monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
 
     def checkpoint_dcp(group):
-        events.append("checkpoint-dcp")
-        return "dcp-checkpoint"
+        events.append(("checkpoint-pool", group.name))
+        return f"{group.name}-pool-checkpoint"
 
     monkeypatch.setattr(
         dcp_alltoall,
@@ -783,13 +785,46 @@ def test_profile_channel_checkpoint_rolls_back_all_b12x_transports(monkeypatch):
 
     assert events == [
         "checkpoint-tp",
-        "checkpoint-dcp",
-        ("rollback-dcp", "dcp-checkpoint"),
+        ("checkpoint-pool", "tp"),
+        ("checkpoint-pool", "dcp"),
+        ("rollback-dcp", "dcp-pool-checkpoint"),
+        ("rollback-dcp", "tp-pool-checkpoint"),
         ("rollback-tp", "tp-checkpoint"),
     ]
 
 
-def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
+def test_profile_channel_checkpoint_deduplicates_shared_b12x_pool(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    class _FakeGroup:
+        def __init__(self, name, *, world_size, device_group):
+            self.name = name
+            self.world_size = world_size
+            self.device_group = device_group
+            self.device_communicator = type(
+                "DeviceCommunicator", (), {"ca_comm": None}
+            )()
+
+    events: list[str] = []
+    shared_device_group = object()
+    tp_group = _FakeGroup("tp", world_size=16, device_group=shared_device_group)
+    dcp_group = _FakeGroup("dcp", world_size=16, device_group=shared_device_group)
+    monkeypatch.setattr(parallel_state, "_TP", tp_group)
+    monkeypatch.setattr(parallel_state, "_PP", None)
+    monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "checkpoint_b12x_dcp_a2a_channels",
+        lambda group: events.append(group.name) or group.name,
+    )
+
+    parallel_state.checkpoint_b12x_graph_channels()
+
+    assert events == ["tp"]
+
+
+def test_global_graph_capture_enters_b12x_tp_and_dcp_pools(monkeypatch):
     from vllm.distributed import parallel_state
     from vllm.v1.attention.ops import dcp_alltoall
 
@@ -800,6 +835,7 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
 
         def __init__(self, name):
             self.name = name
+            self.device_group = object()
 
         @contextmanager
         def graph_capture(self, context):
@@ -841,6 +877,12 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
         ("enter-group", "dcp", "vllm:target:profile"),
         (
             "enter-b12x",
+            tp_group,
+            stream,
+            "vllm:target:profile",
+        ),
+        (
+            "enter-b12x",
             dcp_group,
             stream,
             "vllm:target:profile",
@@ -851,10 +893,58 @@ def test_global_graph_capture_enters_b12x_dcp_pool(monkeypatch):
             stream,
             "vllm:target:profile",
         ),
+        (
+            "exit-b12x",
+            tp_group,
+            stream,
+            "vllm:target:profile",
+        ),
         ("exit-group", "dcp", "vllm:target:profile"),
         ("exit-group", "pp", "vllm:target:profile"),
         ("exit-group", "tp", "vllm:target:profile"),
     ]
+
+
+def test_global_graph_capture_keeps_distinct_b12x_coordinator_scopes(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    class _FakeGroup:
+        world_size = 16
+
+        def __init__(self, name, device_group):
+            self.name = name
+            self.device_group = device_group
+
+        @contextmanager
+        def graph_capture(self, context):
+            yield context
+
+    shared_device_group = object()
+    tp_group = _FakeGroup("tp", shared_device_group)
+    dcp_group = _FakeGroup("dcp", shared_device_group)
+    pp_group = _FakeGroup("pp", object())
+    entered_pools: list[str] = []
+
+    @contextmanager
+    def fake_b12x_capture(group, selected_stream, *, channel_id):
+        entered_pools.append(group.name)
+        yield
+
+    monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: dcp_group)
+    monkeypatch.setattr(dcp_alltoall, "capture_b12x_dcp_a2a", fake_b12x_capture)
+    context = parallel_state.GraphCaptureContext(  # type: ignore[arg-type]
+        object(),
+        channel_id="vllm:target:decode",
+    )
+
+    with parallel_state.graph_capture(torch.device("cpu"), context):
+        pass
+
+    assert entered_pools == ["tp", "dcp"]
 
 
 def test_group_capture_forwards_semantic_id_to_custom_allreduce(monkeypatch):
