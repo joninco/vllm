@@ -109,6 +109,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 num_tokens_across_dp,
                 cg_mode,
                 num_query_per_req=desc.uniform_token_count,
+                capture_only=True,
             )
 
         super().capture(

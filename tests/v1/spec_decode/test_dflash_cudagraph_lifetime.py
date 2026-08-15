@@ -8,7 +8,10 @@ import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+from vllm.v1.worker.gpu.spec_decode.dflash import cudagraph as cudagraph_module
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as spec_module
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 
@@ -65,6 +68,55 @@ def test_dflash_does_not_retain_eager_backbone_output(monkeypatch):
     )
 
     assert speculator._captured_backbone_outputs == []
+
+
+def test_dflash_graph_capture_marks_forward_as_capture_only(monkeypatch):
+    forward = Mock()
+    manager = object.__new__(DFlashCudaGraphManager)
+    manager.max_num_reqs = 4
+    manager.dp_size = 1
+    desc = SimpleNamespace(
+        num_tokens=6,
+        num_reqs=2,
+        cg_mode=CUDAGraphMode.FULL,
+        uniform_token_count=3,
+    )
+
+    monkeypatch.setattr(
+        cudagraph_module,
+        "_prepare_dflash_inputs_to_capture",
+        lambda *args, **kwargs: ("attention", "slots"),
+    )
+
+    def fake_capture(_manager, create_forward_fn, **kwargs):
+        create_forward_fn(desc, warmup=True)(CUDAGraphMode.FULL)
+
+    monkeypatch.setattr(CudaGraphManager, "capture", fake_capture)
+
+    DFlashCudaGraphManager.capture(
+        manager,
+        forward_fn=forward,
+        input_buffers=object(),
+        block_tables=object(),
+        attn_groups=[],
+        kv_cache_config=object(),
+        max_model_len=1024,
+        causal=False,
+        channel_id="draft-query",
+    )
+
+    assert forward.call_args.args == (
+        2,
+        6,
+        "attention",
+        "slots",
+        None,
+        CUDAGraphMode.FULL,
+    )
+    assert forward.call_args.kwargs == {
+        "num_query_per_req": 3,
+        "capture_only": True,
+    }
 
 
 def test_dflash_capture_uses_phase_specific_draft_channel_ids():

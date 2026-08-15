@@ -514,6 +514,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         is_profile: bool = False,
         num_query_per_req: int | None = None,
+        capture_only: bool = False,
     ) -> None:
         if num_query_per_req is None:
             num_speculative_steps = self.num_speculative_steps
@@ -548,6 +549,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_tokens[:num_reqs, :num_speculative_steps] = draft_tokens.view(
             num_reqs, num_speculative_steps
         )
+
+    def _finish_captured_draft(
+        self,
+        *,
+        num_reqs: int,
+        num_tokens_padded: int,
+        num_query_per_req: int,
+        is_profile: bool,
+    ) -> None:
+        """Run speculator work that is intentionally excluded from its graph."""
 
     def _build_draft_attn_metadata(
         self,
@@ -789,6 +800,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            self._finish_captured_draft(
+                num_reqs=num_reqs,
+                num_tokens_padded=num_tokens_padded,
+                num_query_per_req=active_query_len,
+                is_profile=is_profile,
+            )
         else:
             self._generate_draft(
                 num_reqs,
