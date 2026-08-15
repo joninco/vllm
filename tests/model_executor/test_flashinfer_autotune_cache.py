@@ -284,6 +284,66 @@ def test_b12x_projection_warmup_uses_complete_projection_group(monkeypatch) -> N
     ]
 
 
+def test_b12x_dcp_warmup_finds_kimi_dense_mla_attention(monkeypatch) -> None:
+    from vllm.distributed import parallel_state
+    from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    attention = MultiHeadLatentAttention.__new__(MultiHeadLatentAttention)
+    torch.nn.Module.__init__(attention)
+    attention.register_parameter(
+        "device_probe",
+        torch.nn.Parameter(torch.empty(1)),
+    )
+    attention.attn_backend = SimpleNamespace(get_name=lambda: "B12X_MLA")
+    attention.impl = SimpleNamespace(dcp_world_size=16)
+    attention.num_local_heads = 6
+    attention.head_size = 576
+    attention.kv_lora_rank = 512
+
+    model = torch.nn.Module()
+    model.add_module("attention", attention)
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        model_runner=SimpleNamespace(),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=16,
+                dcp_comm_backend="a2a",
+            ),
+            compilation_config=SimpleNamespace(
+                static_forward_context={"model.layers.0.attn": attention}
+            ),
+        ),
+    )
+    group = object()
+    calls = []
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "warmup_b12x_dcp_a2a",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    assert kernel_warmup._warmup_b12x_dcp_a2a(worker) == 1
+    assert calls == [
+        (
+            (group,),
+            {
+                "device": torch.device("cpu"),
+                "dtype": torch.bfloat16,
+                "max_batch_size": 4096,
+                "total_heads": 96,
+                "head_dim": 512,
+                "query_head_dim": 576,
+            },
+        )
+    ]
+
+
 def test_kernel_warmup_runs_b12x_mxfp8_linear_warmup(monkeypatch) -> None:
     calls = []
     model = torch.nn.Linear(2, 2)
