@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
@@ -20,7 +21,9 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
 from vllm.models.kimi_k3.amd.ops.third_party.kda import (
     fused_recurrent_kda_packed_decode as fused_recurrent_kda_packed_decode_amd,
 )
+from vllm.models.kimi_k3.nvidia import kda as kimi_kda
 from vllm.models.kimi_k3.nvidia.kda import (
+    get_kda_f_a_partition,
     is_flashkda_supported,
     is_fused_kda_decode_supported,
     use_split_mixed_precision_input_projection,
@@ -65,6 +68,92 @@ def test_kda_mixed_precision_input_projection_selection(
     )
 
     assert use_split_mixed_precision_input_projection(quant_config) is expected
+
+
+@pytest.mark.parametrize(
+    ("additional_config", "tp_size", "expected"),
+    [
+        (None, 16, (False, 128)),
+        ({}, 16, (False, 128)),
+        ({"kda_shard_f_a": False}, 8, (False, 128)),
+        ({"kda_shard_f_a": True}, 8, (True, 16)),
+        ({"kda_shard_f_a": True}, 16, (True, 8)),
+    ],
+)
+def test_kda_f_a_partition(
+    additional_config: object,
+    tp_size: int,
+    expected: tuple[bool, int],
+):
+    assert get_kda_f_a_partition(128, tp_size, additional_config) == expected
+
+
+def test_kda_f_a_partition_rejects_nondivisible_tp_size():
+    with pytest.raises(ValueError, match="head_dim=128, TP=12"):
+        get_kda_f_a_partition(128, 12, {"kda_shard_f_a": True})
+
+
+class _StaticLinear(nn.Module):
+    def __init__(self, output: torch.Tensor):
+        super().__init__()
+        self.output = output
+
+    def forward(self, _input: torch.Tensor):
+        return self.output, None
+
+
+class _CaptureLinear(nn.Module):
+    def __init__(self, output_width: int):
+        super().__init__()
+        self.output_width = output_width
+        self.input: torch.Tensor | None = None
+
+    def forward(self, input_: torch.Tensor):
+        self.input = input_.clone()
+        return input_.new_zeros(input_.shape[0], self.output_width), None
+
+
+class _IdentityLinear(nn.Module):
+    def forward(self, input_: torch.Tensor):
+        return input_, None
+
+
+def test_sharded_kda_f_a_is_gathered_before_f_b(monkeypatch):
+    layer = object.__new__(kimi_kda.KimiK3DeltaAttention)
+    nn.Module.__init__(layer)
+    layer.split_mixed_precision_input = False
+    layer.local_projection_size = 2
+    layer.local_fa_size = 1
+    layer.local_num_heads = 1
+    layer.in_proj_padding = 0
+    layer.shard_f_a = True
+    layer.head_dim = 2
+
+    projected = torch.arange(20, dtype=torch.float32).view(2, 10)
+    layer.in_proj_qkvgfab = _StaticLinear(projected)
+    f_b_proj = _CaptureLinear(output_width=2)
+    layer.f_b_proj = f_b_proj
+    layer.o_proj = _IdentityLinear()
+    layer._forward = lambda **kwargs: kwargs["core_attn_out"].zero_()
+
+    gathered: dict[str, torch.Tensor] = {}
+
+    def gather_f_a(local_f_a: torch.Tensor) -> torch.Tensor:
+        gathered["local"] = local_f_a.clone()
+        return torch.cat((local_f_a, local_f_a + 100), dim=-1)
+
+    monkeypatch.setattr(kimi_kda, "gather_kimi_sharded_projection", gather_f_a)
+
+    output = layer(torch.empty(2, 1), positions=torch.arange(2))
+
+    expected_local = projected[:, 8:9]
+    torch.testing.assert_close(gathered["local"], expected_local)
+    assert f_b_proj.input is not None
+    torch.testing.assert_close(
+        f_b_proj.input,
+        torch.cat((expected_local, expected_local + 100), dim=-1),
+    )
+    torch.testing.assert_close(output, torch.zeros(2, 2))
 
 
 @torch.inference_mode()
