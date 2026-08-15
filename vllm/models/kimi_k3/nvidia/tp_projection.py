@@ -43,7 +43,6 @@ def _try_b12x_kimi_projection_gather(
         not envs.VLLM_USE_B12X_DCP_A2A
         or output_parallel.ndim != 2
         or output_parallel.shape[0] != 1
-        or output_parallel.dtype not in (torch.float16, torch.bfloat16)
         or not output_parallel.is_cuda
         or not output_parallel.is_contiguous()
     ):
@@ -55,15 +54,31 @@ def _try_b12x_kimi_projection_gather(
     projection_group = _get_kimi_projection_group()
 
     local_width = output_parallel.shape[1]
+    restore_dtype: torch.dtype | None = None
     strip_local_width: int | None = None
-    if local_width % 8 == 0:
+    if output_parallel.dtype in (torch.float16, torch.bfloat16):
+        if local_width % 8 == 0:
+            transport = output_parallel.view(1, 1, local_width)
+        else:
+            padded_width = (local_width + 7) // 8 * 8
+            transport = torch.nn.functional.pad(
+                output_parallel, (0, padded_width - local_width)
+            ).view(1, 1, padded_width)
+            strip_local_width = local_width
+    elif output_parallel.dtype == torch.float32:
+        raw_width = local_width * output_parallel.element_size()
+        if raw_width % 8 != 0:
+            return None
+        # The FP8 view exposes one-byte transport lanes without converting the
+        # FP32 payload. The gathered result is restored to the original dtype.
+        transport = output_parallel.view(torch.float8_e4m3fn).view(1, 1, raw_width)
+        restore_dtype = torch.float32
+    elif output_parallel.dtype == torch.float8_e4m3fn:
+        if local_width % 16 != 0:
+            return None
         transport = output_parallel.view(1, 1, local_width)
     else:
-        padded_width = (local_width + 7) // 8 * 8
-        transport = torch.nn.functional.pad(
-            output_parallel, (0, padded_width - local_width)
-        ).view(1, 1, padded_width)
-        strip_local_width = local_width
+        return None
 
     gathered = dcp_b12x_all_gather_heads(
         transport,
@@ -72,7 +87,10 @@ def _try_b12x_kimi_projection_gather(
     )
     if strip_local_width is not None:
         gathered = gathered.narrow(-1, 0, strip_local_width).contiguous()
-    return gathered.flatten(1)
+    gathered = gathered.flatten(1)
+    if restore_dtype is not None:
+        gathered = gathered.view(restore_dtype)
+    return gathered
 
 
 def gather_kimi_sharded_projection(output_parallel: torch.Tensor) -> torch.Tensor:
