@@ -368,12 +368,14 @@ def test_b12x_mla_adapter_gathers_and_combines_dcp(monkeypatch) -> None:
 
     monkeypatch.setattr(b12x_mla, "get_dcp_group", lambda: group)
 
-    def gather(local_q, actual_group, *, max_batch_size, output_head_dim):
+    def gather(local_q, actual_group, *, max_batch_size, output_head_dim, out):
         assert actual_group is group
         assert max_batch_size == 16
         assert output_head_dim == 512
+        assert out.shape == (batch, 48, 576)
         calls.append("gather")
-        return local_q.repeat(1, 8, 1)
+        out.copy_(local_q.repeat(1, 8, 1))
+        return out
 
     def reduce(output, lse, actual_group, **kwargs):
         assert actual_group is group
@@ -408,6 +410,7 @@ def test_b12x_mla_adapter_gathers_and_combines_dcp(monkeypatch) -> None:
 
     assert calls == ["gather", "reduce"]
     assert dense_mla.bindings[0].q.shape == (batch, 48, 576)
+    assert dense_mla.bindings[0].q.data_ptr() == metadata.dense_mla_padded_q.data_ptr()
     torch.testing.assert_close(output, torch.ones_like(output))
     assert lse is None
 

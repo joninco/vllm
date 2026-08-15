@@ -590,11 +590,28 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         dcp_group = None
         if self.dcp_world_size > 1:
             dcp_group = get_dcp_group()
+            gathered_q = getattr(attn_metadata, "dense_mla_padded_q", None)
+            if gathered_q is None:
+                raise RuntimeError(
+                    "B12X_MLA DCP metadata is missing caller-owned query storage."
+                )
+            if int(gathered_q.shape[0]) < total_q:
+                raise ValueError(
+                    "B12X_MLA DCP query capacity is smaller than the decode "
+                    f"batch: capacity={gathered_q.shape[0]}, required={total_q}."
+                )
+            if gathered_q.dtype != q.dtype:
+                raise TypeError(
+                    "B12X_MLA DCP query storage does not match the live query: "
+                    f"buffer={gathered_q.dtype}, query={q.dtype}."
+                )
+            gathered_q = gathered_q[:total_q, : self._effective_heads]
             q = dcp_b12x_all_gather_heads(
                 q,
                 dcp_group,
                 max_batch_size=self._dcp_max_batch_size,
                 output_head_dim=self.kv_lora_rank,
+                out=gathered_q,
             )
 
         effective_heads = int(q.shape[1])
