@@ -62,6 +62,13 @@ logger = init_logger(__name__)
 _SLIDING_ATTENTION = "sliding_attention"
 
 
+def _retain_dflash_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Give a retained streaming-loader tensor storage with stable ownership."""
+    if weight.is_cuda:
+        return weight.to("cpu", copy=True)
+    return weight
+
+
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     """``dflash_config.causal`` overrides all layers; else only SWA layers causal."""
     override = (getattr(config, "dflash_config", None) or {}).get("causal")
@@ -866,7 +873,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 name = "model." + name
             if "embed_tokens" in name:
                 includes_embed_tokens = True
-            model_weights[name] = loaded_weight
+            model_weights[name] = _retain_dflash_weight(loaded_weight)
             process_eagle_weight(self, name)
 
         # Route the separately-trained mask embedding (if shipped) through the
