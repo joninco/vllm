@@ -48,6 +48,7 @@ _B12X_DCP_MAX_CONCURRENT_CHANNELS = 2
 # its first operation. Each entry is keyed by the process-group identity and
 # owns the graph's semantic channel, stream, and cleanup stack.
 _B12X_DCP_ACTIVE_CAPTURE: dict[int, tuple[str, Any, ExitStack]] = {}
+_B12X_DCP_WORLD_SIZES = (2, 4, 8, 16)
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
@@ -289,7 +290,7 @@ def _try_b12x_dcp_lse_reduce(
         or not cp_attn_out.is_cuda
         or cp_attn_out.dtype not in (torch.float16, torch.bfloat16)
         or cp_attn_lse.dtype != torch.float32
-        or world_size not in (2, 4, 8)
+        or world_size not in _B12X_DCP_WORLD_SIZES
         or cp_attn_out.ndim != 3
         or cp_attn_lse.shape != cp_attn_out.shape[:2]
     ):
@@ -372,7 +373,7 @@ def _try_b12x_dcp_all_gather_heads(
     if (
         not local_input.is_cuda
         or local_input.dtype not in (torch.float16, torch.bfloat16)
-        or world_size not in (2, 4, 8)
+        or world_size not in _B12X_DCP_WORLD_SIZES
         or local_input.ndim != 3
         or not local_input.is_contiguous()
     ):
@@ -447,12 +448,12 @@ def warmup_b12x_dcp_a2a(
     """Create and exercise the B12X DCP channel before CUDA graph capture."""
     if not envs.VLLM_USE_B12X_DCP_A2A:
         return
-    if cp_group.world_size not in (2, 4, 8):
+    if cp_group.world_size not in _B12X_DCP_WORLD_SIZES:
         # The PCIe channel only exists for these world sizes. The runtime
         # dispatchers already fall back to NCCL collectives per call, so an
         # unsupported DCP size (e.g. TP6 with DCP3/DCP6) must not fail boot.
         logger.warning_once(
-            "B12X PCIe DCP collectives support world sizes 2/4/8; "
+            "B12X PCIe DCP collectives support world sizes 2/4/8/16; "
             "DCP world size %d uses NCCL collectives instead.",
             cp_group.world_size,
         )

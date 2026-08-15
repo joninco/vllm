@@ -1064,7 +1064,10 @@ def test_group_capture_forwards_semantic_id_to_custom_allreduce(monkeypatch):
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
-def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("world_size", [4, 16])
+def test_b12x_lse_reduce_honors_token_cap(
+    monkeypatch: pytest.MonkeyPatch, world_size: int
+):
     from vllm.v1.attention.ops import dcp_alltoall
 
     monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
@@ -1092,7 +1095,7 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
         return _FakePool()
 
     monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
-    group = _FakeCPGroup(4, None)  # type: ignore[arg-type]
+    group = _FakeCPGroup(world_size, None)  # type: ignore[arg-type]
 
     out = torch.zeros(4, 16, 64, dtype=torch.bfloat16, device="cuda")
     lse = torch.zeros(4, 16, dtype=torch.float32, device="cuda")
@@ -1143,7 +1146,10 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
-def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("world_size", [4, 16])
+def test_b12x_query_gather_honors_token_cap(
+    monkeypatch: pytest.MonkeyPatch, world_size: int
+):
     from vllm.v1.attention.ops import dcp_alltoall
 
     monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
@@ -1163,7 +1169,7 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
         return _FakePool()
 
     monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
-    group = _FakeCPGroup(4, None)  # type: ignore[arg-type]
+    group = _FakeCPGroup(world_size, None)  # type: ignore[arg-type]
 
     small = torch.zeros(4, 8, 64, dtype=torch.bfloat16, device="cuda")
     result = dcp_alltoall._try_b12x_dcp_all_gather_heads(
@@ -1320,6 +1326,40 @@ def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
         head_dim=512,
         query_head_dim=576,
     )
+
+
+def test_warmup_accepts_dcp16_geometry(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    calls: list[tuple[str, tuple[int, ...]]] = []
+
+    def gather(local_input, *args, **kwargs):
+        calls.append(("gather", tuple(local_input.shape)))
+        return torch.empty(1)
+
+    def reduce(partial_output, *args, **kwargs):
+        calls.append(("reduce", tuple(partial_output.shape)))
+        return torch.empty(1)
+
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_all_gather_heads", gather)
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_lse_reduce", reduce)
+    group = _FakeCPGroup(16, None)  # type: ignore[arg-type]
+
+    dcp_alltoall.warmup_b12x_dcp_a2a(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_batch_size=8192,
+        total_heads=96,
+        head_dim=512,
+        query_head_dim=576,
+    )
+
+    assert calls == [
+        ("gather", (1, 6, 576)),
+        ("reduce", (1, 96, 512)),
+    ]
 
 
 class TestPackedA2AKernels:
