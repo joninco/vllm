@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
+
 import torch.nn as nn
 
 from vllm.config import VllmConfig
@@ -41,7 +43,21 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # The draft must not inherit the target checkpoint's quantization method.
     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
 
-    with set_model_tag("dspark_head"):
+    target_language_model = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    if getattr(draft_model_config.hf_config, "model_type", None) == "k3_dspark":
+        from vllm.models.kimi_k3.nvidia.dspark_mla import (
+            protect_k3_compact_rope_sources,
+        )
+
+        rope_ownership = protect_k3_compact_rope_sources(target_language_model)
+    else:
+        rope_ownership = nullcontext()
+
+    with rope_ownership, set_model_tag("dspark_head"):
         draft_model = get_model(
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
@@ -49,11 +65,6 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     if get_pp_group().world_size != 1:
         raise NotImplementedError("DSpark does not support pipeline parallelism.")
 
-    target_language_model = (
-        target_model.get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
     target_inner = target_language_model.model
     draft_inner = draft_model.model
 

@@ -597,6 +597,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attention front-end: fused qkv-a proj -> norms -> q_b -> attention.
 
@@ -635,13 +636,21 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        self._attention(positions, q, kv_c_normed, k_pe, attn_out)
+        self._attention(
+            positions,
+            q,
+            kv_c_normed,
+            k_pe,
+            attn_out,
+            rope_cos_sin_cache=rope_cos_sin_cache,
+        )
         return attn_out
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Both branches produce (attn_out, gate); they differ only in whether
         # the g_proj GEMM is overlapped on the aux stream.
@@ -654,14 +663,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             and hidden_states.shape[0] < _GATE_MULTI_STREAM_TOKEN_THRESHOLD
         ):
             attn_out, gate = maybe_execute_in_parallel(
-                lambda: self._forward_attn(positions, hidden_states),
+                lambda: self._forward_attn(
+                    positions, hidden_states, rope_cos_sin_cache
+                ),
                 lambda: g_proj(hidden_states)[0],
                 events[0],
                 events[1],
                 self.aux_stream,
             )
         else:
-            attn_out = self._forward_attn(positions, hidden_states)
+            attn_out = self._forward_attn(positions, hidden_states, rope_cos_sin_cache)
             gate = g_proj(hidden_states)[0] if g_proj is not None else None
 
         if gate is not None:
@@ -681,6 +692,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         attn_out: torch.Tensor,
+        *,
+        rope_cos_sin_cache: torch.Tensor | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_by_layer = forward_context.attn_metadata
@@ -712,7 +725,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         if self.rotary_emb is not None:
             # Pass the fp32 cos/sin table straight to the fused epilogue (it reads
             # fp32 and does the RoPE math in fp32) -- no per-forward dtype cast.
-            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            cos_sin_cache = (
+                rope_cos_sin_cache
+                if rope_cos_sin_cache is not None
+                else self.rotary_emb.cos_sin_cache
+            )
             rope_positions = positions
 
         # Decode tokens are laid out first, prefill tokens after. The fused
