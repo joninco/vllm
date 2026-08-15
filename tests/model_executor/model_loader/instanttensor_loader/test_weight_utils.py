@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import glob
+import inspect
 import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -11,6 +12,9 @@ import torch
 from safetensors.torch import save_file
 
 import vllm.model_executor.model_loader.weight_utils as weight_utils
+from vllm.model_executor.model_loader.reload.layerwise import (
+    _own_deferred_accelerator_tensors,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     instanttensor_weights_iterator,
@@ -232,6 +236,73 @@ def test_instanttensor_loads_tensor_larger_than_staging_buffer(tmp_path, monkeyp
     assert devices == {"model.small": "cuda", "model.large": "cpu"}
     torch.testing.assert_close(weights["model.small"], small)
     torch.testing.assert_close(weights["model.large"], large)
+
+
+def test_deferred_loader_preserves_destination_and_cpu_tensors():
+    def loader(param, loaded_weight):
+        pass
+
+    destination = torch.empty(4)
+    source = torch.arange(4)
+    bound_args = inspect.signature(loader).bind(destination, source)
+
+    _own_deferred_accelerator_tensors(bound_args)
+
+    assert bound_args.arguments["param"] is destination
+    assert bound_args.arguments["loaded_weight"] is source
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Borrowed accelerator storage requires CUDA",
+)
+def test_deferred_loader_owns_accelerator_tensor():
+    def loader(param, loaded_weight):
+        pass
+
+    destination = torch.empty(8, device="cuda")
+    source = torch.arange(8, device="cuda")
+    bound_args = inspect.signature(loader).bind(destination, source)
+
+    _own_deferred_accelerator_tensors(bound_args)
+
+    owned = bound_args.arguments["loaded_weight"]
+    assert bound_args.arguments["param"] is destination
+    assert owned.data_ptr() != source.data_ptr()
+    assert torch.equal(owned, source)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="InstantTensor requires NVIDIA GPUs",
+)
+def test_instanttensor_deferred_tensors_survive_ring_reuse(tmp_path, monkeypatch):
+    shard = tmp_path / "model.safetensors"
+    source = {
+        f"model.weight_{index}": torch.full(
+            (2 * 1024 * 1024,), index, dtype=torch.bfloat16
+        )
+        for index in range(5)
+    }
+    save_file(source, shard)
+    monkeypatch.setenv("INSTANTTENSOR_BUFFER_SIZE", str(8 * 1024 * 1024))
+    monkeypatch.setenv("INSTANTTENSOR_COPY", "0")
+
+    def deferred_loader(param, loaded_weight):
+        raise AssertionError("Deferred arguments must not execute while queued")
+
+    signature = inspect.signature(deferred_loader)
+    retained = {}
+    for name, tensor in instanttensor_weights_iterator(
+        [str(shard)], use_tqdm_on_load=False
+    ):
+        bound_args = signature.bind(None, tensor)
+        _own_deferred_accelerator_tensors(bound_args)
+        retained[name] = bound_args.arguments["loaded_weight"]
+    torch.cuda.synchronize()
+
+    for name, expected in source.items():
+        assert torch.equal(retained[name].cpu(), expected)
 
 
 @pytest.mark.skipif(

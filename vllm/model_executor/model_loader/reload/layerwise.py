@@ -146,6 +146,28 @@ def _wrap_parameters_weight_loader(layer: torch.nn.Module) -> None:
             tensor.weight_loader = make_online_process_loader(layer, name)
 
 
+def _own_deferred_accelerator_tensors(bound_args: inspect.BoundArguments) -> None:
+    """Give deferred weight-loader arguments independent device storage.
+
+    Streaming model loaders may yield views into reusable staging storage.
+    Layerwise processing replays bound arguments only after every checkpoint
+    shard for a layer arrives, so accelerator tensors must be cloned before
+    they enter the deferred queue. This also covers views created by name or
+    shard mapping because custom attributes on the source tensor are not
+    guaranteed to propagate to those views.
+
+    Args:
+        bound_args: Normalized weight-loader arguments to update in place.
+    """
+    for name, value in tuple(bound_args.arguments.items()):
+        if (
+            name != "param"
+            and isinstance(value, torch.Tensor)
+            and value.device.type not in ("meta", "cpu")
+        ):
+            bound_args.arguments[name] = value.clone()
+
+
 def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Callable:
     """Create a wrapped weight loader that defers processing."""
     info = get_layerwise_info(layer)
@@ -182,6 +204,8 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         # Bind and normalize arguments
         bound_args = loader_signature.bind(*args, **kwargs)
         bound_args.apply_defaults()
+
+        _own_deferred_accelerator_tensors(bound_args)
 
         # Buffer loaded weights, track loading progress
         info.loaded_weights.append((param_name, bound_args))
