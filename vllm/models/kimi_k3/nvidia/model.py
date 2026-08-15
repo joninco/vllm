@@ -29,6 +29,9 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.router.base_router import (
     eplb_map_to_physical_and_record,
 )
+from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    FusedTopKBiasRouter,
+)
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     fused_grouped_topk,
@@ -628,6 +631,41 @@ def make_kimi_k3_mega_moe_expert_params_mapping(
     return mapping
 
 
+class KimiK3PrecomputedTopKRouter(FusedTopKBiasRouter):
+    """Consume Kimi's compact, already-selected routed-expert payload."""
+
+    def _compute_routing(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        indices_type: torch.dtype | None,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        if (
+            self.top_k == 16
+            and self.global_num_experts == 896
+            and self.scoring_func == "sigmoid"
+            and self.renormalize
+            and self.routed_scaling_factor == 1.0
+            and indices_type in (None, torch.int32)
+            and router_logits.shape == (num_tokens * 2, self.top_k)
+            and router_logits.dtype == torch.float32
+            and router_logits.device == hidden_states.device
+            and router_logits.is_contiguous()
+        ):
+            topk_weights = router_logits[:num_tokens]
+            topk_ids = router_logits[num_tokens:].view(torch.int32)
+            return topk_weights, topk_ids
+        return super()._compute_routing(
+            hidden_states,
+            router_logits,
+            indices_type,
+            input_ids=input_ids,
+        )
+
+
 class KimiMoE(nn.Module):
     def __init__(
         self,
@@ -837,6 +875,25 @@ class KimiMoE(nn.Module):
                 activation_linear_beta=activation_situ_linear_beta,
             )
         else:
+            router = None
+            if (
+                num_experts == 896
+                and num_experts_per_token == 16
+                and config.use_grouped_topk
+                and config.num_expert_group == 1
+                and config.topk_group == 1
+                and config.moe_router_activation_func == "sigmoid"
+                and moe_renormalize
+                and self.routed_scaling_factor == 1.0
+            ):
+                router = KimiK3PrecomputedTopKRouter(
+                    top_k=num_experts_per_token,
+                    global_num_experts=num_experts,
+                    e_score_correction_bias=self.gate.e_score_correction_bias,
+                    renormalize=moe_renormalize,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    scoring_func=self.moe_router_activation_func,
+                )
             self.experts = FusedMoEFactory(
                 shared_experts=self.shared_experts,
                 num_experts=num_experts,
@@ -855,6 +912,7 @@ class KimiMoE(nn.Module):
                 scoring_func=config.moe_router_activation_func,
                 e_score_correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
+                router=router,
                 # Down projection runs outside MoERunner so it can overlap the
                 # router gate on the aux stream (see forward()); the original
                 # hidden states are passed to forward() as shared_experts_input

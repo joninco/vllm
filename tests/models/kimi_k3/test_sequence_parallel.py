@@ -451,6 +451,84 @@ def test_kimi_gate_gathers_fp32_local_projection(monkeypatch):
     assert bias is None
 
 
+def test_kimi_router_decodes_precomputed_topk_payload_without_copy():
+    router = kimi_model.KimiK3PrecomputedTopKRouter(
+        top_k=16,
+        global_num_experts=896,
+        e_score_correction_bias=nn.Parameter(torch.zeros(896)),
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        scoring_func="sigmoid",
+    )
+    num_tokens = 3
+    hidden_states = torch.empty(num_tokens, 4)
+    payload = torch.empty(num_tokens * 2, 16, dtype=torch.float32)
+    expected_weights = torch.arange(num_tokens * 16, dtype=torch.float32).view(
+        num_tokens, 16
+    )
+    expected_ids = torch.arange(num_tokens * 16, dtype=torch.int32).view(num_tokens, 16)
+    payload[:num_tokens].copy_(expected_weights)
+    payload[num_tokens:].view(torch.int32).copy_(expected_ids)
+
+    weights, ids = router._compute_routing(hidden_states, payload, torch.int32)
+
+    assert weights.data_ptr() == payload.data_ptr()
+    assert ids.data_ptr() == payload[num_tokens:].data_ptr()
+    torch.testing.assert_close(weights, expected_weights)
+    torch.testing.assert_close(ids, expected_ids)
+
+
+def test_kimi_router_uses_standard_routing_for_non_payload(monkeypatch):
+    router = kimi_model.KimiK3PrecomputedTopKRouter(
+        top_k=16,
+        global_num_experts=896,
+        e_score_correction_bias=nn.Parameter(torch.zeros(896)),
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        scoring_func="sigmoid",
+    )
+    hidden_states = torch.empty(2, 4)
+    router_logits = torch.empty(2, 896)
+    input_ids = torch.tensor([1, 2])
+    expected = (torch.empty(2, 16), torch.empty(2, 16, dtype=torch.int32))
+    received: dict[str, object] = {}
+
+    def standard_routing(
+        _self,
+        hidden_states_arg,
+        router_logits_arg,
+        indices_type_arg,
+        *,
+        input_ids=None,
+    ):
+        received.update(
+            hidden_states=hidden_states_arg,
+            router_logits=router_logits_arg,
+            indices_type=indices_type_arg,
+            input_ids=input_ids,
+        )
+        return expected
+
+    monkeypatch.setattr(
+        kimi_model.FusedTopKBiasRouter,
+        "_compute_routing",
+        standard_routing,
+    )
+
+    actual = router._compute_routing(
+        hidden_states,
+        router_logits,
+        torch.int32,
+        input_ids=input_ids,
+    )
+
+    assert actual is expected
+    assert received["hidden_states"] is hidden_states
+    assert received["router_logits"] is router_logits
+    assert received["indices_type"] is torch.int32
+    assert received["input_ids"] is input_ids
+
+
 def test_kimi_merged_projection_restores_logical_output_order(monkeypatch):
     layer = object.__new__(kimi_mla.KimiShardedMergedColumnParallelLinear)
     nn.Module.__init__(layer)
