@@ -1019,6 +1019,26 @@ def dcp_a2a_lse_reduce(
         )
         if b12x_result is not None:
             return b12x_result
+        token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+        if (
+            token_cap > 0
+            and cp_attn_out.shape[0] > token_cap
+            and envs.VLLM_DCP_A2A_LARGE_BACKEND == "ag_rs"
+        ):
+            # PyNccl AG+RS uses the DCP communicator warmed during startup.
+            # This avoids ProcessGroupNCCL's first-use all-to-all workspace
+            # allocation after a near-capacity KV cache has been allocated.
+            from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+
+            return cp_lse_ag_out_rs(
+                cp_attn_out,
+                cp_attn_lse,
+                cp_group,
+                ctx=ctx,
+                return_lse=return_lse,
+                is_lse_base_on_e=is_lse_base_on_e,
+                head_major_output=True,
+            )
 
     B, H, D = cp_attn_out.shape
     if H % world_size != 0:

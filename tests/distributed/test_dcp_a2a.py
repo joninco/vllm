@@ -467,6 +467,55 @@ def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
     }
 
 
+def test_b12x_large_batch_uses_configured_ag_rs(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops import common, dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "4")
+    monkeypatch.setenv("VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs")
+    partial_output = torch.zeros(5, 4, 8, dtype=torch.bfloat16)
+    partial_lse = torch.zeros(5, 4, dtype=torch.float32)
+    expected = torch.ones(5, 2, 8, dtype=torch.bfloat16)
+    captured: dict[str, Any] = {}
+    group = _FakeCPGroup(2, object())  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_try_b12x_dcp_lse_reduce",
+        lambda *args, **kwargs: None,
+    )
+
+    def fake_ag_rs(output, lse, cp_group, **kwargs):
+        captured.update(output=output, lse=lse, group=cp_group, **kwargs)
+        return expected
+
+    monkeypatch.setattr(common, "cp_lse_ag_out_rs", fake_ag_rs)
+    monkeypatch.setattr(
+        dcp_alltoall.dist,
+        "all_to_all_single",
+        lambda *args, **kwargs: pytest.fail("packed NCCL A2A must not run"),
+    )
+
+    actual = dcp_alltoall.dcp_a2a_lse_reduce(
+        partial_output,
+        partial_lse,
+        group,  # type: ignore[arg-type]
+        use_b12x=True,
+        b12x_max_batch_size=4,
+    )
+
+    assert actual is expected
+    assert captured == {
+        "output": partial_output,
+        "lse": partial_lse,
+        "group": group,
+        "ctx": None,
+        "return_lse": False,
+        "is_lse_base_on_e": True,
+        "head_major_output": True,
+    }
+
+
 def test_packed_a2a_capture_buffers_stay_live_per_shape(
     monkeypatch: pytest.MonkeyPatch,
 ):
