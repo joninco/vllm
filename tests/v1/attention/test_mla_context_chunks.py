@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.attention.mla_attention import (
+    _gather_dcp_context_kv,
     build_mla_chunked_context_metadata,
     init_mla_context_partial,
     reorg_kvcache,
@@ -27,6 +28,7 @@ def build_chunked_context(
     block_size: int = BLOCK_SIZE,
     dcp_world_size: int = 1,
     dcp_local_block_size: int = 1,
+    direct_dcp_kv_gather: bool = False,
 ):
     query_start_loc = torch.zeros(len(query_lens) + 1, dtype=torch.int32)
     query_start_loc[1:] = torch.tensor(query_lens, dtype=torch.int32).cumsum(0)
@@ -42,6 +44,7 @@ def build_chunked_context(
         dcp_world_size=dcp_world_size,
         dcp_local_block_size=dcp_local_block_size,
         dcp_virtual_block_size=dcp_local_block_size * dcp_world_size,
+        direct_dcp_kv_gather=direct_dcp_kv_gather,
     )
 
 
@@ -231,6 +234,57 @@ def test_dcp_chunks_fit_the_per_rank_row_budget():
     for request, length in enumerate(context_lens):
         padded_local = -(-length // virtual_block_size) * interleave
         assert local_cursor[request] == padded_local
+
+
+def test_dcp_metadata_preserves_direct_kv_gather_capability():
+    """Manager-free DCP prefill records the process-group gather contract."""
+    metadata = build_chunked_context(
+        [256],
+        [4],
+        1024,
+        dcp_world_size=2,
+        dcp_local_block_size=64,
+        direct_dcp_kv_gather=True,
+    )
+
+    assert metadata is not None
+    assert metadata.dcp_manager is None
+    assert metadata.direct_dcp_kv_gather
+
+
+def test_direct_dcp_kv_gather_writes_caller_storage(monkeypatch):
+    local = torch.tensor([[1.0], [2.0]])
+    gathered = torch.empty(4, 1)
+
+    class FakeGroup:
+        def all_gather(self, value, *, dim):
+            assert value is local
+            assert dim == 0
+            return torch.cat((value, value + 10), dim=0)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.attention.mla_attention.get_dcp_group",
+        lambda: FakeGroup(),
+    )
+
+    _gather_dcp_context_kv(
+        gathered,
+        local,
+        dcp_manager=None,
+        direct_dcp_kv_gather=True,
+    )
+
+    torch.testing.assert_close(gathered, torch.tensor([[1.0], [2.0], [11.0], [12.0]]))
+
+
+def test_dcp_kv_gather_requires_manager_or_direct_path():
+    with pytest.raises(RuntimeError, match="no configured KV gather path"):
+        _gather_dcp_context_kv(
+            torch.empty(2, 1),
+            torch.empty(1, 1),
+            dcp_manager=None,
+            direct_dcp_kv_gather=False,
+        )
 
 
 def test_dcp_reorg_uses_each_chunks_local_starts():
