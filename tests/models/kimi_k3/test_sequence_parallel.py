@@ -13,6 +13,7 @@ from vllm.config import ParallelConfig
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.models.common.ops import sequence_parallel as sp_ops
+from vllm.models.kimi_k3.nvidia import mla as kimi_mla
 from vllm.models.kimi_k3.nvidia import model as kimi_model
 from vllm.models.kimi_k3.nvidia import mtp as kimi_mtp
 from vllm.platforms import current_platform
@@ -382,6 +383,54 @@ def test_kimi_column_parallel_loader_zero_fills_tail():
 
     expected = torch.cat([loaded_weight[3:], torch.zeros(1, 4)])
     torch.testing.assert_close(param, expected)
+
+
+def test_kimi_merged_projection_restores_logical_output_order(monkeypatch):
+    layer = object.__new__(kimi_mla.KimiShardedMergedColumnParallelLinear)
+    nn.Module.__init__(layer)
+    layer.tp_size = 4
+    layer.output_sizes = [8, 4]
+    local_output = torch.empty(1, 3)
+    rank_major_output = torch.tensor(
+        [[0, 1, 8, 2, 3, 9, 4, 5, 10, 6, 7, 11]],
+        dtype=torch.float32,
+    )
+    monkeypatch.setattr(
+        kimi_mla.MergedColumnParallelLinear,
+        "forward",
+        lambda _self, _x: (local_output, None),
+    )
+    monkeypatch.setattr(
+        kimi_mla,
+        "tensor_model_parallel_all_gather",
+        lambda output, dim: rank_major_output,
+    )
+
+    output, bias = layer(torch.empty(1, 1))
+
+    torch.testing.assert_close(output, torch.arange(12).view(1, 12).float())
+    assert bias is None
+
+
+@pytest.mark.parametrize(
+    ("output_sizes", "tp_size", "width", "message"),
+    [
+        ([7, 4], 4, 11, "must be divisible"),
+        ([8, 4], 4, 11, "Unexpected gathered"),
+    ],
+)
+def test_kimi_merged_projection_rejects_invalid_shard_geometry(
+    output_sizes: list[int],
+    tp_size: int,
+    width: int,
+    message: str,
+):
+    with pytest.raises(ValueError, match=message):
+        kimi_mla._restore_merged_output_order(
+            torch.empty(1, width),
+            output_sizes,
+            tp_size,
+        )
 
 
 def test_kimi_row_parallel_loader_zero_fills_tail():

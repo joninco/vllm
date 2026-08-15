@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -41,7 +42,10 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
@@ -103,6 +107,67 @@ _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
 def _gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Apply the sigmoid output gate to a precomputed ``g_proj`` projection."""
     return attn_out * gate.sigmoid()
+
+
+def _restore_merged_output_order(
+    rank_major_output: torch.Tensor,
+    output_sizes: list[int],
+    tp_size: int,
+) -> torch.Tensor:
+    """Convert rank-major merged shards into logical projection order."""
+    if tp_size == 1:
+        return rank_major_output
+    if any(size % tp_size for size in output_sizes):
+        raise ValueError(
+            f"Merged output sizes {output_sizes} must be divisible by TP={tp_size}"
+        )
+    local_sizes = [size // tp_size for size in output_sizes]
+    local_total = sum(local_sizes)
+    expected_width = local_total * tp_size
+    if rank_major_output.shape[-1] != expected_width:
+        raise ValueError(
+            "Unexpected gathered merged projection width: "
+            f"got {rank_major_output.shape[-1]}, expected {expected_width}"
+        )
+    rank_major = rank_major_output.unflatten(-1, (tp_size, local_total))
+    logical_local_shards = rank_major.split(local_sizes, dim=-1)
+    return torch.cat(
+        [shards.flatten(-2) for shards in logical_local_shards],
+        dim=-1,
+    )
+
+
+class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
+    """Merged column projection with one gather and logical-shard reorder."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        super().__init__(
+            input_size,
+            output_sizes,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def forward(self, x: torch.Tensor):
+        output_parallel, output_bias = super().forward(x)
+        if self.tp_size == 1:
+            return output_parallel, output_bias
+        rank_major_output = tensor_model_parallel_all_gather(output_parallel, dim=-1)
+        output = _restore_merged_output_order(
+            rank_major_output,
+            self.output_sizes,
+            self.tp_size,
+        )
+        return output, output_bias
 
 
 class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
@@ -190,14 +255,26 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             # the low-rank latents are shared across TP ranks; TP splitting
             # happens at q_b_proj / kv_b_proj. Checkpoint weights ``q_a_proj``
             # and ``kv_a_proj_with_mqa`` map onto shards 0 and 1 respectively.
-            self.fused_qkv_a_proj = MergedColumnParallelLinear(
-                self.hidden_size,
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.fused_qkv_a_proj",
-                disable_tp=True,
-            )
+            qkv_a_output_sizes = [
+                self.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ]
+            if envs.VLLM_KIMI_SHARD_QKV_A and tp_size > 1:
+                self.fused_qkv_a_proj = KimiShardedMergedColumnParallelLinear(
+                    self.hidden_size,
+                    qkv_a_output_sizes,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                )
+            else:
+                self.fused_qkv_a_proj = MergedColumnParallelLinear(
+                    self.hidden_size,
+                    qkv_a_output_sizes,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.fused_qkv_a_proj",
+                    disable_tp=True,
+                )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
