@@ -11,6 +11,7 @@ import torch
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
@@ -27,6 +28,11 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
     MultipleOf,
+)
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import (
+    dcp_a2a_lse_reduce,
+    dcp_b12x_all_gather_heads,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -77,12 +83,41 @@ def _planned_kv_dtype(vllm_config: VllmConfig) -> torch.dtype:
     )
 
 
-def _kernel_query_heads(num_heads: int) -> int:
-    """Pad independent query heads to the B12X launch tile."""
-    if num_heads <= 0:
-        raise ValueError(f"B12X_MLA requires positive query heads, got {num_heads}.")
+def _max_dcp_local_cache_tokens(
+    vllm_config: VllmConfig, *, dcp_size: int | None = None
+) -> int:
+    """Return the largest interleaved KV shard held by one DCP rank."""
+    parallel_config = vllm_config.parallel_config
+    dcp_size = int(
+        parallel_config.decode_context_parallel_size if dcp_size is None else dcp_size
+    )
+    interleave = int(parallel_config.cp_kv_cache_interleave_size)
+    if dcp_size <= 0 or interleave <= 0:
+        raise ValueError(
+            "B12X_MLA requires positive DCP and KV-interleave sizes, got "
+            f"DCP={dcp_size}, interleave={interleave}."
+        )
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    partitions = dcp_size * interleave
+    return ((max_model_len + partitions - 1) // partitions) * interleave
+
+
+def _kernel_query_heads(local_heads: int, dcp_size: int = 1) -> int:
+    """Return the tiled head count after an optional DCP query gather."""
+    if local_heads <= 0 or dcp_size <= 0:
+        raise ValueError(
+            "B12X_MLA requires positive query-head and DCP sizes, got "
+            f"heads={local_heads}, DCP={dcp_size}."
+        )
+    effective_heads = local_heads * dcp_size
+    if dcp_size > 1 and effective_heads % _B12X_QUERY_HEAD_TILE:
+        raise ValueError(
+            "B12X_MLA requires a multiple of eight query heads after DCP "
+            f"gather, got local={local_heads}, DCP={dcp_size}, "
+            f"effective={effective_heads}."
+        )
     return (
-        (num_heads + _B12X_QUERY_HEAD_TILE - 1)
+        (effective_heads + _B12X_QUERY_HEAD_TILE - 1)
         // _B12X_QUERY_HEAD_TILE
         * _B12X_QUERY_HEAD_TILE
     )
@@ -95,6 +130,7 @@ def _create_dense_mla_plan(
     page_size: int,
     num_q_heads: int,
     max_total_q: int | None = None,
+    dcp_size: int | None = None,
 ) -> Any:
     dense_mla = _load_dense_mla()
     max_total_q = int(
@@ -102,7 +138,7 @@ def _create_dense_mla_plan(
         if max_total_q is not None
         else vllm_config.scheduler_config.max_num_seqs
     )
-    max_cache_tokens = int(vllm_config.model_config.max_model_len)
+    max_cache_tokens = _max_dcp_local_cache_tokens(vllm_config, dcp_size=dcp_size)
     if max_total_q > _MAX_B12X_QUERY_ROWS:
         raise ValueError(
             "B12X_MLA supports at most "
@@ -148,6 +184,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
+    supports_direct_dcp_kv_gather: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -162,6 +199,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             vllm_config,
             device,
             B12xMLAMetadata,
+            supports_dcp_with_varlen=True,
         )
         max_dense_mla_rows = int(vllm_config.scheduler_config.max_num_seqs) * int(
             self.reorder_batch_threshold
@@ -172,13 +210,15 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
                 f"rows={max_dense_mla_rows}, limit={_MAX_B12X_QUERY_ROWS}."
             )
         self._max_dense_mla_rows = max_dense_mla_rows
-        self._kernel_heads = _kernel_query_heads(self.num_heads)
+        self._effective_heads = self.num_heads * self.dcp_world_size
+        self._kernel_heads = _kernel_query_heads(self.num_heads, self.dcp_world_size)
         self._dense_mla_plan = _create_dense_mla_plan(
             vllm_config,
             device,
             page_size=self.page_size,
             num_q_heads=self._kernel_heads,
             max_total_q=max_dense_mla_rows,
+            dcp_size=self.dcp_world_size,
         )
         self._workspace_specs = self._dense_mla_plan.shapes_and_dtypes()
         if len(self._workspace_specs) != 1:
@@ -223,13 +263,15 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             device=device,
         )
         logger.info_once(
-            "B12X dense K3 MLA plan: logical_heads=%d, kernel_heads=%d, page_size=%d, "
+            "B12X dense K3 MLA plan: local_heads=%d, effective_heads=%d, "
+            "kernel_heads=%d, page_size=%d, "
             "max_decode_rows=%d, max_cache_tokens=%d, splits=%d",
             self.num_heads,
+            self._effective_heads,
             self._kernel_heads,
             self.page_size,
             max_dense_mla_rows,
-            vllm_config.model_config.max_model_len,
+            _max_dcp_local_cache_tokens(vllm_config, dcp_size=self.dcp_world_size),
             self._dense_mla_plan.num_splits,
         )
 
@@ -411,7 +453,6 @@ class B12xMLABackend(MLACommonBackend):
 
 class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
     can_return_lse_for_decode: bool = True
-    supports_dcp: bool = False
 
     def __init__(
         self,
@@ -479,13 +520,19 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             raise ValueError(
                 f"B12xMLAImpl requires a positive query-head count, got {num_heads}."
             )
-        if get_current_vllm_config().parallel_config.decode_context_parallel_size != 1:
+        vllm_config = get_current_vllm_config()
+        self.dcp_world_size = int(
+            vllm_config.parallel_config.decode_context_parallel_size
+        )
+        if vllm_config.parallel_config.prefill_context_parallel_size != 1:
             raise NotImplementedError(
-                "B12xMLAImpl does not support decode context parallelism."
+                "B12xMLAImpl does not support prefill context parallelism."
             )
-
         self._dense_mla = _load_dense_mla()
-        self._kernel_heads = _kernel_query_heads(num_heads)
+        self._effective_heads = num_heads * self.dcp_world_size
+        self._kernel_heads = _kernel_query_heads(num_heads, self.dcp_world_size)
+        self._dcp_comm_backend = vllm_config.parallel_config.dcp_comm_backend
+        self._dcp_max_batch_size = vllm_config.scheduler_config.max_num_batched_tokens
         self._compiled_bindings: set[tuple[object, ...]] = set()
 
     def forward_mqa(
@@ -535,35 +582,58 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 f"B12X_MLA expected {self.num_heads} query heads, got {q.shape[1]}."
             )
 
-        if self._kernel_heads == self.num_heads:
+        dcp_group = None
+        if self.dcp_world_size > 1:
+            dcp_group = get_dcp_group()
+            q = dcp_b12x_all_gather_heads(
+                q,
+                dcp_group,
+                max_batch_size=self._dcp_max_batch_size,
+                output_head_dim=self.kv_lora_rank,
+            )
+
+        effective_heads = int(q.shape[1])
+        if effective_heads != self._effective_heads:
+            raise ValueError(
+                "B12X_MLA gathered an unexpected query-head count: "
+                f"expected {self._effective_heads}, got {effective_heads}."
+            )
+        if self._kernel_heads == effective_heads and self.dcp_world_size == 1:
             output = torch.empty(
-                (total_q, self.num_heads, self.kv_lora_rank),
+                (total_q, effective_heads, self.kv_lora_rank),
                 dtype=torch.bfloat16,
                 device=q.device,
             )
         else:
             padded_q = getattr(attn_metadata, "dense_mla_padded_q", None)
             output = getattr(attn_metadata, "dense_mla_padded_output", None)
-            if padded_q is None or output is None:
+            if output is None or (
+                self._kernel_heads != effective_heads and padded_q is None
+            ):
                 raise RuntimeError(
                     "B12X_MLA metadata is missing caller-owned padded query buffers."
                 )
-            if int(padded_q.shape[0]) < total_q or int(output.shape[0]) < total_q:
+            query_capacity = (
+                int(padded_q.shape[0]) if padded_q is not None else int(output.shape[0])
+            )
+            if query_capacity < total_q or int(output.shape[0]) < total_q:
                 raise ValueError(
                     "B12X_MLA padded query capacity is smaller than the decode "
-                    f"batch: query={padded_q.shape[0]}, output={output.shape[0]}, "
+                    f"batch: query={query_capacity}, output={output.shape[0]}, "
                     f"required={total_q}."
                 )
-            padded_q = padded_q[:total_q]
             output = output[:total_q]
-            if padded_q.dtype != q.dtype:
-                raise TypeError(
-                    "B12X_MLA padded query dtype does not match the live query: "
-                    f"buffer={padded_q.dtype}, query={q.dtype}."
-                )
-            padded_q[:, : self.num_heads].copy_(q)
-            padded_q[:, self.num_heads :].zero_()
-            q = padded_q
+            if self._kernel_heads != effective_heads:
+                assert padded_q is not None
+                padded_q = padded_q[:total_q]
+                if padded_q.dtype != q.dtype:
+                    raise TypeError(
+                        "B12X_MLA padded query dtype does not match the live query: "
+                        f"buffer={padded_q.dtype}, query={q.dtype}."
+                    )
+                padded_q[:, :effective_heads].copy_(q)
+                padded_q[:, effective_heads:].zero_()
+                q = padded_q
         scratch = getattr(attn_metadata, "dense_mla_scratch", None)
         if scratch is None:
             raise RuntimeError(
@@ -601,7 +671,30 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             self._compiled_bindings.add(compile_key)
 
         output, lse = self._dense_mla.run(binding=binding)
-        return output[:, : self.num_heads], lse[:, : self.num_heads]
+        output = output[:, : self._effective_heads]
+        lse = lse[:, : self._effective_heads]
+        if dcp_group is None:
+            return output, lse
+        if self._dcp_comm_backend == "a2a":
+            reduced = dcp_a2a_lse_reduce(
+                output,
+                lse,
+                dcp_group,
+                is_lse_base_on_e=True,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc[: batch + 1],
+                use_b12x=True,
+                b12x_max_batch_size=self._dcp_max_batch_size,
+                b12x_query_head_dim=_K3_ABSORBED_HEAD_DIM,
+            )
+        else:
+            reduced = cp_lse_ag_out_rs(
+                output,
+                lse,
+                dcp_group,
+                is_lse_base_on_e=True,
+            )
+        return reduced, None
 
 
 __all__ = [
