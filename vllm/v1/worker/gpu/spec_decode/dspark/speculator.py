@@ -67,6 +67,10 @@ class DSparkSpeculator(DFlashSpeculator):
             self.max_num_tokens, draft_hidden, dtype=self.dtype, device=device
         )
 
+        self._markov_outside_cudagraph = envs.VLLM_DSPARK_SHARD_MARKOV_HEAD
+        self._captured_markov_hidden: torch.Tensor | None = None
+        self._captured_base_logits: torch.Tensor | None = None
+
         self._step_cols = torch.arange(
             self.num_speculative_steps, dtype=torch.int32, device=device
         )
@@ -208,6 +212,40 @@ class DSparkSpeculator(DFlashSpeculator):
             self._use_local_draft_argmax = True
         return model
 
+    def _ensure_captured_markov_buffers(self) -> None:
+        """Allocate graph handoff buffers before stream capture begins."""
+        if (
+            self._captured_markov_hidden is not None
+            and self._captured_base_logits is not None
+        ):
+            return
+        if (
+            self._captured_markov_hidden is not None
+            or self._captured_base_logits is not None
+        ):
+            raise RuntimeError("DSpark graph handoff buffers are only partly set")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DSpark graph handoff buffers must be allocated by eager "
+                "graph warmup before stream capture"
+            )
+
+        max_markov_rows = self.max_num_reqs * self.num_speculative_steps
+        local_vocab_size = self.model.lm_head.num_embeddings_per_partition
+        logits_dtype = self.model.logits_processor.head_dtype or self.dtype
+        self._captured_markov_hidden = torch.empty(
+            max_markov_rows,
+            self.draft_model_config.get_hidden_size(),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self._captured_base_logits = torch.empty(
+            max_markov_rows,
+            local_vocab_size,
+            dtype=logits_dtype,
+            device=self.device,
+        )
+
     def _sample_logits(
         self,
         logits: torch.Tensor,
@@ -241,20 +279,28 @@ class DSparkSpeculator(DFlashSpeculator):
     def _sample_sequential(
         self,
         num_reqs: int,
-        head_hidden: torch.Tensor,
+        head_hidden: torch.Tensor | None,
         num_speculative_steps: int,
         num_query_per_req: int,
         is_profile: bool = False,
         use_capacity: bool = True,
+        prepared_sample_hidden: torch.Tensor | None = None,
+        precomputed_base_logits: torch.Tensor | None = None,
     ) -> None:
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = num_speculative_steps
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
-        sample_hidden = sample_hidden.view(num_reqs, n_spec, -1)
+        if prepared_sample_hidden is None:
+            assert head_hidden is not None
+            sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+            sample_hidden = sample_hidden.view(num_reqs, n_spec, -1)
+        else:
+            sample_hidden = prepared_sample_hidden.view(num_reqs, n_spec, -1)
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
-        if self._use_local_draft_argmax:
+        if precomputed_base_logits is not None:
+            base_logits = precomputed_base_logits
+        elif self._use_local_draft_argmax:
             base_logits = self.model.compute_local_draft_logits(
                 sample_hidden.reshape(num_sample, -1)
             )
@@ -460,6 +506,7 @@ class DSparkSpeculator(DFlashSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         is_profile: bool = False,
         num_query_per_req: int | None = None,
+        capture_only: bool = False,
     ) -> None:
         if num_query_per_req is None:
             num_query_per_req = self.num_query_per_req
@@ -473,6 +520,24 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
+        if self._markov_outside_cudagraph and (
+            capture_only or torch.cuda.is_current_stream_capturing()
+        ):
+            self._ensure_captured_markov_buffers()
+            assert self._captured_markov_hidden is not None
+            assert self._captured_base_logits is not None
+            num_sample = num_reqs * num_speculative_steps
+            if num_sample > self._captured_markov_hidden.shape[0]:
+                raise ValueError(
+                    "DSpark graph handoff buffer is too small: "
+                    f"rows={num_sample}, "
+                    f"capacity={self._captured_markov_hidden.shape[0]}."
+                )
+            sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+            base_logits = self.model.compute_local_draft_logits(sample_hidden)
+            self._captured_markov_hidden[:num_sample].copy_(sample_hidden)
+            self._captured_base_logits[:num_sample].copy_(base_logits)
+            return
         self._sample_sequential(
             num_reqs,
             head_hidden,
@@ -483,4 +548,32 @@ class DSparkSpeculator(DFlashSpeculator):
                 self.capacity_activation_batch_size <= 0
                 or num_reqs >= self.capacity_activation_batch_size
             ),
+        )
+
+    def _finish_captured_draft(
+        self,
+        *,
+        num_reqs: int,
+        num_tokens_padded: int,
+        num_query_per_req: int,
+        is_profile: bool,
+    ) -> None:
+        if not self._markov_outside_cudagraph:
+            return
+        assert self._captured_markov_hidden is not None
+        assert self._captured_base_logits is not None
+        num_speculative_steps = self._speculative_steps_for_query_len(num_query_per_req)
+        num_sample = num_reqs * num_speculative_steps
+        self._sample_sequential(
+            num_reqs,
+            None,
+            num_speculative_steps,
+            num_query_per_req,
+            is_profile=is_profile,
+            use_capacity=(
+                self.capacity_activation_batch_size <= 0
+                or num_reqs >= self.capacity_activation_batch_size
+            ),
+            prepared_sample_hidden=self._captured_markov_hidden[:num_sample],
+            precomputed_base_logits=self._captured_base_logits[:num_sample],
         )
