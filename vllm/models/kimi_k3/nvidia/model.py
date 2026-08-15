@@ -17,7 +17,6 @@ from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -107,6 +106,9 @@ from vllm.models.kimi_k3.nvidia.low_latency_gemm import (
 )
 from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
 from vllm.models.kimi_k3.nvidia.ops import attn_res
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    gather_kimi_sharded_projection,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
@@ -359,19 +361,24 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
     ) -> None:
         tp_size = get_tensor_model_parallel_world_size()
         self.logical_output_size = output_size
+        self.kimi_gather_output = gather_output
         padded_output_size = cdiv(output_size, tp_size) * tp_size
         super().__init__(
             input_size,
             padded_output_size,
             bias=False,
-            gather_output=gather_output,
+            gather_output=False,
             quant_config=None,
             prefix=prefix,
         )
 
+    def forward_local(self, x: torch.Tensor):
+        return super().forward(x)
+
     def forward(self, x: torch.Tensor):
-        output, bias = super().forward(x)
-        if self.gather_output:
+        output, bias = self.forward_local(x)
+        if self.kimi_gather_output:
+            output = gather_kimi_sharded_projection(output)
             output = output[..., : self.logical_output_size].contiguous()
         return output, bias
 
@@ -387,17 +394,20 @@ class KimiColumnParallelGate(KimiPaddedColumnParallelLinear):
             gather_output=False,
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward_local(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
-            output_parallel = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
         else:
-            output_parallel = torch.nn.functional.linear(
+            output = torch.nn.functional.linear(
                 x.to(self.weight.dtype), self.weight
             ).float()
-        if self.tp_size > 1:
-            output = tensor_model_parallel_all_gather(output_parallel)
-        else:
-            output = output_parallel
+        return output, None
+
+    def forward(self, x: torch.Tensor):
+        output_parallel, _ = self.forward_local(x)
+        output = gather_kimi_sharded_projection(output_parallel)
         return output[..., : self.logical_output_size].contiguous(), None
 
 

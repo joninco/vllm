@@ -385,6 +385,72 @@ def test_kimi_column_parallel_loader_zero_fills_tail():
     torch.testing.assert_close(param, expected)
 
 
+def test_kimi_padded_column_gathers_and_removes_logical_tail(monkeypatch):
+    layer = object.__new__(kimi_model.KimiPaddedColumnParallelLinear)
+    nn.Module.__init__(layer)
+    layer.kimi_gather_output = True
+    layer.logical_output_size = 5
+    local_output = torch.arange(3, dtype=torch.float32).view(1, 3)
+    gathered_output = torch.arange(6, dtype=torch.float32).view(1, 6)
+    monkeypatch.setattr(
+        kimi_model.ColumnParallelLinear,
+        "forward",
+        lambda _self, _x: (local_output, None),
+    )
+    monkeypatch.setattr(
+        kimi_model,
+        "gather_kimi_sharded_projection",
+        lambda output: gathered_output,
+    )
+
+    output, bias = layer(torch.empty(1, 1))
+
+    torch.testing.assert_close(output, gathered_output[:, :5])
+    assert output.is_contiguous()
+    assert bias is None
+
+
+def test_kimi_gate_local_projection_preserves_linear_return_contract():
+    layer = object.__new__(kimi_model.KimiColumnParallelGate)
+    nn.Module.__init__(layer)
+    layer.weight = nn.Parameter(torch.arange(12).view(3, 4).float())
+    hidden_states = torch.arange(8).view(2, 4).float()
+
+    output, bias = layer.forward_local(hidden_states)
+
+    torch.testing.assert_close(
+        output,
+        torch.nn.functional.linear(hidden_states, layer.weight),
+    )
+    assert output.dtype == torch.float32
+    assert bias is None
+
+
+def test_kimi_gate_gathers_fp32_local_projection(monkeypatch):
+    layer = object.__new__(kimi_model.KimiColumnParallelGate)
+    nn.Module.__init__(layer)
+    layer.logical_output_size = 5
+    layer.weight = nn.Parameter(torch.arange(12).view(3, 4).float())
+    hidden_states = torch.arange(8).view(2, 4).float()
+    gathered = torch.arange(12).view(2, 6).float()
+    received: dict[str, torch.Tensor] = {}
+
+    def gather(output: torch.Tensor) -> torch.Tensor:
+        received["local"] = output
+        return gathered
+
+    monkeypatch.setattr(kimi_model, "gather_kimi_sharded_projection", gather)
+
+    output, bias = layer(hidden_states)
+
+    torch.testing.assert_close(
+        received["local"],
+        torch.nn.functional.linear(hidden_states, layer.weight),
+    )
+    torch.testing.assert_close(output, gathered[:, :5])
+    assert bias is None
+
+
 def test_kimi_merged_projection_restores_logical_output_order(monkeypatch):
     layer = object.__new__(kimi_mla.KimiShardedMergedColumnParallelLinear)
     nn.Module.__init__(layer)
