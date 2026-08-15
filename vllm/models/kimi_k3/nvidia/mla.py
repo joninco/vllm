@@ -464,6 +464,17 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        raw_shard_draft = envs.VLLM_DCP_SHARD_DRAFT
+        shard_draft = (
+            False
+            if raw_shard_draft is None
+            else raw_shard_draft.lower() in ("1", "true", "yes")
+        )
+        dcp_replicated = bool(
+            self.non_causal_multi_token_decode
+            and not shard_draft
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
         # TODO: Remove this mypy workaround once the K3 PR is fully merged.
         return MLAAttentionSpec(  # type: ignore[call-arg]
             block_size=vllm_config.cache_config.block_size,
@@ -473,6 +484,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+            dcp_replicated=dcp_replicated,
         )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:

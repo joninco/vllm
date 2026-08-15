@@ -1172,10 +1172,12 @@ class SpeculativeConfig:
                     self.method == "dspark"
                     and "K3DSparkModel" in self.draft_model_config.architectures
                     and self.target_parallel_config.decode_context_parallel_size > 1
+                    and self.attention_backend != AttentionBackendEnum.B12X_MLA
                 ):
                     raise ValueError(
-                        "MLA DSpark does not currently support decode context "
-                        "parallelism; set decode_context_parallel_size=1."
+                        "K3 DSpark decode context parallelism requires "
+                        "attention_backend=B12X_MLA; otherwise set "
+                        "decode_context_parallel_size=1."
                     )
 
                 if self.num_speculative_tokens is not None and hasattr(

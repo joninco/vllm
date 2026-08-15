@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.online.base import (
 from vllm.model_executor.model_loader.weight_utils import get_quant_config
 from vllm.transformers_utils.config import get_config
 from vllm.transformers_utils.configs.k3_dspark import K3DSparkConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
 def _write_dspark_config(path, **overrides):
@@ -184,7 +185,7 @@ def test_dspark_mla_accepts_draft_online_quantization(tmp_path):
     assert quant_config.args == draft.quantization_config
 
 
-def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):
+def test_dspark_mla_dcp_requires_b12x_backend(tmp_path):
     target_path = tmp_path / "target"
     draft_path = tmp_path / "draft"
     _write_target_config(target_path)
@@ -193,7 +194,7 @@ def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):
         model=str(target_path), tokenizer_mode="skip", max_model_len=32768
     )
 
-    with pytest.raises(ValueError, match="does not currently support decode context"):
+    with pytest.raises(ValueError, match="requires attention_backend=B12X_MLA"):
         SpeculativeConfig(
             model=str(draft_path),
             method="dspark",
@@ -205,3 +206,29 @@ def test_dspark_mla_rejects_decode_context_parallelism(tmp_path):
                 distributed_executor_backend="external_launcher",
             ),
         )
+
+
+def test_dspark_mla_allows_dcp_with_b12x_backend(tmp_path):
+    target_path = tmp_path / "target"
+    draft_path = tmp_path / "draft"
+    _write_target_config(target_path)
+    _write_dspark_config(draft_path)
+    target_config = ModelConfig(
+        model=str(target_path), tokenizer_mode="skip", max_model_len=32768
+    )
+
+    config = SpeculativeConfig(
+        model=str(draft_path),
+        method="dspark",
+        num_speculative_tokens=7,
+        attention_backend=AttentionBackendEnum.B12X_MLA,
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(
+            tensor_parallel_size=8,
+            decode_context_parallel_size=8,
+            distributed_executor_backend="external_launcher",
+        ),
+    )
+
+    assert config.attention_backend is AttentionBackendEnum.B12X_MLA
+    assert config.target_parallel_config.decode_context_parallel_size == 8
