@@ -40,6 +40,7 @@ _K3_QK_HEAD_DIM = 192
 _K3_V_HEAD_DIM = 128
 _MAX_B12X_QUERY_ROWS = 1024
 _MAX_B12X_CACHE_TOKENS = 1_048_576
+_B12X_QUERY_HEAD_TILE = 8
 _MAX_I32 = torch.iinfo(torch.int32).max
 
 
@@ -73,6 +74,17 @@ def _planned_kv_dtype(vllm_config: VllmConfig) -> torch.dtype:
         return fp8_dtype
     raise ValueError(
         f"B12X_MLA supports only BF16 or E4M3 KV cache storage, got {cache_dtype!r}."
+    )
+
+
+def _kernel_query_heads(num_heads: int) -> int:
+    """Pad independent query heads to the B12X launch tile."""
+    if num_heads <= 0:
+        raise ValueError(f"B12X_MLA requires positive query heads, got {num_heads}.")
+    return (
+        (num_heads + _B12X_QUERY_HEAD_TILE - 1)
+        // _B12X_QUERY_HEAD_TILE
+        * _B12X_QUERY_HEAD_TILE
     )
 
 
@@ -125,6 +137,8 @@ class B12xMLAMetadata(MLACommonMetadata):
 
     dense_mla_plan: Any | None = None
     dense_mla_scratch: torch.Tensor | None = None
+    dense_mla_padded_q: torch.Tensor | None = None
+    dense_mla_padded_output: torch.Tensor | None = None
     dense_mla_flat_block_table: torch.Tensor | None = None
     dense_mla_flat_seq_lens: torch.Tensor | None = None
     dense_mla_flat_query_start_loc: torch.Tensor | None = None
@@ -158,11 +172,12 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
                 f"rows={max_dense_mla_rows}, limit={_MAX_B12X_QUERY_ROWS}."
             )
         self._max_dense_mla_rows = max_dense_mla_rows
+        self._kernel_heads = _kernel_query_heads(self.num_heads)
         self._dense_mla_plan = _create_dense_mla_plan(
             vllm_config,
             device,
             page_size=self.page_size,
-            num_q_heads=self.num_heads,
+            num_q_heads=self._kernel_heads,
             max_total_q=max_dense_mla_rows,
         )
         self._workspace_specs = self._dense_mla_plan.shapes_and_dtypes()
@@ -178,6 +193,19 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             dtype=scratch_dtype,
             device=device,
         )
+        self._dense_mla_padded_q: torch.Tensor | None = None
+        self._dense_mla_padded_output: torch.Tensor | None = None
+        if self._kernel_heads != self.num_heads:
+            self._dense_mla_padded_q = torch.empty(
+                (max_dense_mla_rows, self._kernel_heads, _K3_ABSORBED_HEAD_DIM),
+                dtype=_planned_kv_dtype(vllm_config),
+                device=device,
+            )
+            self._dense_mla_padded_output = torch.empty(
+                (max_dense_mla_rows, self._kernel_heads, _K3_KV_LORA_RANK),
+                dtype=torch.bfloat16,
+                device=device,
+            )
         max_table_width = int(self._dense_mla_plan.caps.max_page_table_width)
         self._dense_mla_flat_block_table = torch.zeros(
             (max_dense_mla_rows, max_table_width),
@@ -195,9 +223,10 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             device=device,
         )
         logger.info_once(
-            "B12X dense K3 MLA plan: heads=%d, page_size=%d, "
+            "B12X dense K3 MLA plan: logical_heads=%d, kernel_heads=%d, page_size=%d, "
             "max_decode_rows=%d, max_cache_tokens=%d, splits=%d",
             self.num_heads,
+            self._kernel_heads,
             self.page_size,
             max_dense_mla_rows,
             vllm_config.model_config.max_model_len,
@@ -220,6 +249,8 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         )
         metadata.dense_mla_plan = self._dense_mla_plan
         metadata.dense_mla_scratch = self._dense_mla_scratch
+        metadata.dense_mla_padded_q = self._dense_mla_padded_q
+        metadata.dense_mla_padded_output = self._dense_mla_padded_output
         decode_metadata = metadata.decode
         if (
             not metadata.causal
@@ -454,6 +485,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             )
 
         self._dense_mla = _load_dense_mla()
+        self._kernel_heads = _kernel_query_heads(num_heads)
         self._compiled_bindings: set[tuple[object, ...]] = set()
 
     def forward_mqa(
@@ -503,11 +535,35 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 f"B12X_MLA expected {self.num_heads} query heads, got {q.shape[1]}."
             )
 
-        output = torch.empty(
-            (total_q, self.num_heads, self.kv_lora_rank),
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
+        if self._kernel_heads == self.num_heads:
+            output = torch.empty(
+                (total_q, self.num_heads, self.kv_lora_rank),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+        else:
+            padded_q = getattr(attn_metadata, "dense_mla_padded_q", None)
+            output = getattr(attn_metadata, "dense_mla_padded_output", None)
+            if padded_q is None or output is None:
+                raise RuntimeError(
+                    "B12X_MLA metadata is missing caller-owned padded query buffers."
+                )
+            if int(padded_q.shape[0]) < total_q or int(output.shape[0]) < total_q:
+                raise ValueError(
+                    "B12X_MLA padded query capacity is smaller than the decode "
+                    f"batch: query={padded_q.shape[0]}, output={output.shape[0]}, "
+                    f"required={total_q}."
+                )
+            padded_q = padded_q[:total_q]
+            output = output[:total_q]
+            if padded_q.dtype != q.dtype:
+                raise TypeError(
+                    "B12X_MLA padded query dtype does not match the live query: "
+                    f"buffer={padded_q.dtype}, query={q.dtype}."
+                )
+            padded_q[:, : self.num_heads].copy_(q)
+            padded_q[:, self.num_heads :].zero_()
+            q = padded_q
         scratch = getattr(attn_metadata, "dense_mla_scratch", None)
         if scratch is None:
             raise RuntimeError(
@@ -544,7 +600,8 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             self._dense_mla.compile(binding=binding)
             self._compiled_bindings.add(compile_key)
 
-        return self._dense_mla.run(binding=binding)
+        output, lse = self._dense_mla.run(binding=binding)
+        return output[:, : self.num_heads], lse[:, : self.num_heads]
 
 
 __all__ = [
