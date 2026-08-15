@@ -533,6 +533,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
         dcp_replicated_set = set(spec.dcp_replicated for spec in specs)
         dcp_kv_shard_count_set = set(spec.dcp_kv_shard_count for spec in specs)
+        non_causal_set = set(spec.non_causal_multi_token_decode for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(dtype_set) == 1
@@ -542,10 +543,11 @@ class MLAAttentionSpec(FullAttentionSpec):
             and len(block_stride_set) == 1
             and len(dcp_replicated_set) == 1
             and len(dcp_kv_shard_count_set) == 1
+            and len(non_causal_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "dtype, quantization method, compress ratio, model version, and "
-            "KV block stride indexing, and DCP replication mode."
+            "KV block stride indexing, DCP replication mode, and causal mode."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -558,9 +560,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
-            non_causal_multi_token_decode=any(
-                spec.non_causal_multi_token_decode for spec in specs
-            ),
+            non_causal_multi_token_decode=non_causal_set.pop(),
             dcp_replicated=dcp_replicated_set.pop(),
             dcp_kv_shard_count=dcp_kv_shard_count_set.pop(),
         )
@@ -750,6 +750,9 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     compress_ratio: int = 1
     model_version: str | None = None
     dcp_sharded: bool = False
+    # Parallel draft blocks are flattened into independent decode rows by MLA
+    # backends. Preserve that execution property when the cache is windowed.
+    non_causal_multi_token_decode: bool = False
 
     def __post_init__(self):
         _apply_alignment_padding(self)
@@ -812,6 +815,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
         dcp_replicated_set = set(spec.dcp_replicated for spec in specs)
         dcp_sharded_set = set(spec.dcp_sharded for spec in specs)
+        non_causal_set = set(spec.non_causal_multi_token_decode for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(dtype_set) == 1
@@ -822,11 +826,12 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and len(block_stride_set) == 1
             and len(dcp_replicated_set) == 1
             and len(dcp_sharded_set) == 1
+            and len(non_causal_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "dtype, quantization method, compress ratio, model version, "
             "sliding window size, KV block stride indexing, and DCP sharding "
-            "mode."
+            "mode and causal mode."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -842,6 +847,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
             dcp_sharded=dcp_sharded_set.pop(),
+            non_causal_multi_token_decode=non_causal_set.pop(),
         )
 
     def is_uniform_with_collection(
@@ -852,6 +858,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and spec.sliding_window == self.sliding_window
             and spec.dcp_replicated == self.dcp_replicated
             and spec.dcp_sharded == self.dcp_sharded
+            and spec.non_causal_multi_token_decode == self.non_causal_multi_token_decode
             for spec in kv_cache_specs.values()
         )
 
