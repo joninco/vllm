@@ -14,6 +14,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
 )
@@ -189,14 +190,37 @@ class K3DSparkModel(nn.Module):
         # The frozen target embedding is aliased after the draft checkpoint loads.
         self.embed_tokens: nn.Module | None = None
 
-        self.context_proj = ReplicatedLinear(
-            self.config.target_hidden_size * self.config.num_target_layers,
-            self.config.hidden_size,
-            bias=False,
-            return_bias=False,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "context_proj"),
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1))
+        self.context_proj_sharded = (
+            tp_size > 1 and self.config.hidden_size % tp_size == 0
         )
+        context_input_size = (
+            self.config.target_hidden_size * self.config.num_target_layers
+        )
+        context_prefix = maybe_prefix(prefix, "context_proj")
+        if self.context_proj_sharded:
+            # Target auxiliary states are identical across TP ranks. Each rank
+            # retains and evaluates only its output rows; the gathered result
+            # preserves the draft hidden-state layout exactly.
+            self.context_proj = ColumnParallelLinear(
+                context_input_size,
+                self.config.hidden_size,
+                bias=False,
+                gather_output=True,
+                return_bias=False,
+                quant_config=self.quant_config,
+                prefix=context_prefix,
+            )
+        else:
+            self.context_proj = ReplicatedLinear(
+                context_input_size,
+                self.config.hidden_size,
+                bias=False,
+                return_bias=False,
+                quant_config=self.quant_config,
+                prefix=context_prefix,
+            )
         self.context_norm = RMSNorm(
             self.config.hidden_size, eps=self.config.rms_norm_eps
         )

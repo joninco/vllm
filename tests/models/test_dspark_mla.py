@@ -166,6 +166,68 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
     ]
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("tp_size", "expect_sharded"),
+    [(1, False), (8, True), (12, False), (16, True)],
+)
+def test_k3_dspark_context_projection_uses_divisible_tp_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    expect_sharded: bool,
+) -> None:
+    context_projection_calls = []
+
+    class DummyModule(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    def make_sharded_projection(*args, **kwargs):
+        context_projection_calls.append((args, kwargs))
+        return DummyModule()
+
+    monkeypatch.setattr(dspark_mla, "get_draft_quant_config", lambda _: None)
+    monkeypatch.setattr(dspark_mla, "ColumnParallelLinear", make_sharded_projection)
+    monkeypatch.setattr(dspark_mla, "ReplicatedLinear", DummyModule)
+    monkeypatch.setattr(dspark_mla, "MergedColumnParallelLinear", DummyModule)
+    monkeypatch.setattr(dspark_mla, "RMSNorm", DummyModule)
+    monkeypatch.setattr(dspark_mla, "K3DSparkDecoderLayer", DummyModule)
+    monkeypatch.setattr(dspark_mla, "DSparkMarkovHead", DummyModule)
+
+    config = SimpleNamespace(
+        target_hidden_size=7168,
+        num_target_layers=5,
+        hidden_size=7168,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=1,
+        vocab_size=163840,
+        draft_vocab_size=163840,
+        markov_rank=256,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=config)
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+    )
+
+    model = K3DSparkModel(
+        vllm_config=vllm_config,
+        start_layer_id=0,
+        prefix="model",
+    )
+
+    assert model.context_proj_sharded is expect_sharded
+    assert bool(context_projection_calls) is expect_sharded
+    if expect_sharded:
+        args, kwargs = context_projection_calls[0]
+        assert args == (7168 * 5, 7168)
+        assert kwargs["gather_output"] is True
+
+
 def test_context_kv_weights_are_loaded_as_merged_linear_shards():
     weights = [
         (
