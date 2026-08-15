@@ -367,12 +367,13 @@ def _try_b12x_dcp_all_gather_heads(
     *,
     max_batch_size: int | None,
     output_head_dim: int | None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Gather rank-local query heads with the B12X PCIe channel."""
     world_size = cp_group.world_size
     if (
         not local_input.is_cuda
-        or local_input.dtype not in (torch.float16, torch.bfloat16)
+        or local_input.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         or world_size not in _B12X_DCP_WORLD_SIZES
         or local_input.ndim != 3
         or not local_input.is_contiguous()
@@ -380,7 +381,8 @@ def _try_b12x_dcp_all_gather_heads(
         return None
 
     batch, local_heads, head_dim = local_input.shape
-    if local_heads <= 0 or head_dim % 8 != 0:
+    gather_alignment = 16 if local_input.dtype == torch.float8_e4m3fn else 8
+    if local_heads <= 0 or head_dim % gather_alignment != 0:
         return None
     if max_batch_size is None:
         max_batch_size = batch
@@ -408,6 +410,12 @@ def _try_b12x_dcp_all_gather_heads(
     )
     if pool is None:
         return None
+    if out is not None:
+        return pool.all_gather_heads(
+            local_input,
+            out=out,
+            channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        )
     return pool.all_gather_heads(
         local_input,
         channel_id=_b12x_dcp_channel_id(cp_group),
@@ -420,19 +428,33 @@ def dcp_b12x_all_gather_heads(
     *,
     max_batch_size: int | None = None,
     output_head_dim: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Gather query heads with B12X, falling back to the group backend."""
+    """Gather query heads into optional caller-owned output storage."""
     local_input = local_input.contiguous()
     if envs.VLLM_USE_B12X_DCP_A2A:
-        result = _try_b12x_dcp_all_gather_heads(
-            local_input,
-            cp_group,
-            max_batch_size=max_batch_size,
-            output_head_dim=output_head_dim,
-        )
+        if out is None:
+            result = _try_b12x_dcp_all_gather_heads(
+                local_input,
+                cp_group,
+                max_batch_size=max_batch_size,
+                output_head_dim=output_head_dim,
+            )
+        else:
+            result = _try_b12x_dcp_all_gather_heads(
+                local_input,
+                cp_group,
+                max_batch_size=max_batch_size,
+                output_head_dim=output_head_dim,
+                out=out,
+            )
         if result is not None:
             return result
-    return cp_group.all_gather(local_input, dim=1)
+    result = cp_group.all_gather(local_input, dim=1)
+    if out is None:
+        return result
+    out.copy_(result)
+    return out
 
 
 def warmup_b12x_dcp_a2a(

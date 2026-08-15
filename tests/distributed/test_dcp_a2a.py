@@ -1302,6 +1302,86 @@ def test_b12x_query_gather_honors_token_cap(
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_query_gather_supports_fp8_caller_output(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    received: dict[str, Any] = {}
+
+    class _FakePool:
+        def all_gather_heads(self, local_input, *, out, channel_id):
+            received.update(input=local_input, out=out, channel_id=channel_id)
+            return out
+
+    def fake_get_pool(
+        cp_group, *, device, total_heads, head_dim, query_head_dim, max_batch_size
+    ):
+        received.update(
+            total_heads=total_heads,
+            head_dim=head_dim,
+            query_head_dim=query_head_dim,
+            max_batch_size=max_batch_size,
+        )
+        return _FakePool()
+
+    monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
+    group = _FakeCPGroup(4, object())  # type: ignore[arg-type]
+    local_input = torch.zeros(2, 2, 64, dtype=torch.float8_e4m3fn, device="cuda")
+    out = torch.empty(2, 8, 64, dtype=local_input.dtype, device=local_input.device)
+
+    actual = dcp_alltoall._try_b12x_dcp_all_gather_heads(
+        local_input,
+        group,  # type: ignore[arg-type]
+        max_batch_size=8,
+        output_head_dim=512,
+        out=out,
+    )
+
+    assert actual is out
+    assert received.pop("input") is local_input
+    assert received.pop("out") is out
+    assert received == {
+        "channel_id": "vllm:eager:dcp",
+        "total_heads": 8,
+        "head_dim": 512,
+        "query_head_dim": 64,
+        "max_batch_size": 8,
+    }
+
+    unaligned = torch.zeros(
+        2, 2, 24, dtype=torch.float8_e4m3fn, device=local_input.device
+    )
+    assert (
+        dcp_alltoall._try_b12x_dcp_all_gather_heads(
+            unaligned,
+            group,  # type: ignore[arg-type]
+            max_batch_size=8,
+            output_head_dim=512,
+        )
+        is None
+    )
+
+
+def test_query_gather_fallback_copies_into_caller_output(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.delenv("VLLM_USE_B12X_DCP_A2A", raising=False)
+    local_input = torch.zeros(2, 2, 8, dtype=torch.bfloat16)
+    gathered = torch.arange(64, dtype=torch.bfloat16).reshape(2, 4, 8)
+    out = torch.empty_like(gathered)
+    group = _FakeCPGroup(2, object())  # type: ignore[arg-type]
+    group.all_gather = lambda _value, dim: gathered  # type: ignore[attr-defined]
+
+    actual = dcp_alltoall.dcp_b12x_all_gather_heads(
+        local_input,
+        group,  # type: ignore[arg-type]
+        out=out,
+    )
+
+    assert actual is out
+    torch.testing.assert_close(actual, gathered)
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
 def test_b12x_lse_reduce_preserves_supported_layouts(monkeypatch: pytest.MonkeyPatch):
     """Preserve head-major input while materializing legacy head slices."""
     from vllm.v1.attention.ops import dcp_alltoall
