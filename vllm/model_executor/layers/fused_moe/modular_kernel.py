@@ -43,6 +43,22 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+
+def _can_alias_fused_moe_output(
+    output_alias: torch.Tensor | None,
+    allocated_output: torch.Tensor,
+) -> bool:
+    """Return whether the expert kernel may write into caller-owned output."""
+    return bool(
+        not envs.VLLM_DISABLE_FUSED_MOE_OUTPUT_ALIAS
+        and output_alias is not None
+        and output_alias.shape == allocated_output.shape
+        and output_alias.dtype == allocated_output.dtype
+        and output_alias.device == allocated_output.device
+        and output_alias.is_contiguous()
+    )
+
+
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
 # The goal is to be able to utilize different communication mechanisms with
@@ -1306,13 +1322,7 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
-        use_output_alias = (
-            output_alias is not None
-            and output_alias.shape == fused_out.shape
-            and output_alias.dtype == fused_out.dtype
-            and output_alias.device == fused_out.device
-            and output_alias.is_contiguous()
-        )
+        use_output_alias = _can_alias_fused_moe_output(output_alias, fused_out)
 
         # If caller's output buffer already matches fused_out shape/dtype, alias
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
