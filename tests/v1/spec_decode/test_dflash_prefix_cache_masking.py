@@ -168,3 +168,35 @@ def test_shift_copy_bounded_by_seq_len():
 
     torch.testing.assert_close(block_table[0, :4], original[0, 4:8])
     torch.testing.assert_close(block_table[0, 4:], original[0, 4:])
+
+
+def test_window_shift_updates_shared_sequence_length_once_for_two_groups():
+    tables = [_make_block_table(1), _make_block_table(1)]
+    originals = [table.clone() for table in tables]
+    idx_mapping = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    num_cached_tokens = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    seq_lens = torch.full((1,), 8 * BLOCK_SIZE, dtype=torch.int32, device=DEVICE)
+    draft_kv_window = 4 * BLOCK_SIZE
+
+    shift_draft_block_tables(
+        tables[0],
+        idx_mapping,
+        num_cached_tokens,
+        seq_lens,
+        BLOCK_SIZE,
+        draft_kv_window,
+        update_seq_lens=False,
+    )
+    shift_draft_block_tables(
+        tables[1],
+        idx_mapping,
+        num_cached_tokens,
+        seq_lens,
+        BLOCK_SIZE,
+        draft_kv_window,
+        update_seq_lens=True,
+    )
+
+    assert seq_lens.item() == draft_kv_window
+    for table, original in zip(tables, originals, strict=True):
+        torch.testing.assert_close(table[0, :4], original[0, 4:8])

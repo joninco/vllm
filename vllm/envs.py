@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
     VLLM_K3_KV_GROUP_SIZE: int = 0
+    VLLM_DSPARK_DRAFT_KV_WINDOW: int = 0
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
@@ -1150,6 +1151,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Bound the number of physical Kimi-K3 layers sharing each hybrid-cache
     # block table. Zero preserves the general grouping heuristic.
     "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
+    # Limit an external DSpark draft to a replicated rolling MLA KV tail while
+    # the target model retains its complete context. Target verification makes
+    # the setting quality-safe, but acceptance may change with the window.
+    "VLLM_DSPARK_DRAFT_KV_WINDOW": lambda: int(
+        os.getenv("VLLM_DSPARK_DRAFT_KV_WINDOW", "0")
+    ),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.
     "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(

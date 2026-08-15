@@ -318,7 +318,7 @@ class DraftModelSpeculator(BaseSpeculator):
             step,
             out=draft_seq_lens_cpu_upper_bound[:num_reqs],
         )
-        draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
+        draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.draft_max_seq_len)
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
         dcp_local_seq_lens = None
         if self.block_tables.cp_size > 1:

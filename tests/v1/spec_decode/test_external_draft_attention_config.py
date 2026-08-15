@@ -81,9 +81,43 @@ def test_dflash_attention_metadata_uses_external_draft_geometry(monkeypatch) -> 
     speculator = object.__new__(dflash_speculator.DFlashSpeculator)
     speculator.vllm_config = target_config
     speculator.requires_non_causal = True
+    speculator.draft_kv_window = None
+    speculator.draft_kv_window_block_size = None
 
     attention_config = speculator.attn_vllm_config
 
     assert attention_config.parallel_config.decode_context_parallel_size == 1
     assert attention_config.attention_config.use_non_causal
     assert not draft_config.attention_config.use_non_causal
+
+
+def test_bounded_draft_attention_preserves_derived_model_attributes(
+    monkeypatch,
+) -> None:
+    """Bounded plan sizing copies runtime objects without reconstructing them."""
+    draft_model_config = SimpleNamespace(
+        max_model_len=1_048_576,
+        model_arch_config=object(),
+    )
+    draft_config = SimpleNamespace(
+        model_config=draft_model_config,
+        attention_config=SimpleNamespace(use_non_causal=False),
+    )
+    target_config = object()
+    monkeypatch.setattr(
+        dflash_speculator,
+        "_create_draft_vllm_config",
+        lambda config: draft_config if config is target_config else None,
+    )
+    speculator = object.__new__(dflash_speculator.DFlashSpeculator)
+    speculator.vllm_config = target_config
+    speculator.requires_non_causal = True
+    speculator.draft_kv_window = 65_536
+    speculator.draft_kv_window_block_size = 768
+
+    attention_config = speculator.attn_vllm_config
+
+    assert draft_model_config.max_model_len == 1_048_576
+    assert attention_config.model_config.max_model_len == 65_536 + 768 - 1
+    assert attention_config.model_config.model_arch_config is not None
+    assert attention_config.attention_config.use_non_causal
