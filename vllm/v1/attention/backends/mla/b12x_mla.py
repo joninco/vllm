@@ -123,6 +123,24 @@ def _kernel_query_heads(local_heads: int, dcp_size: int = 1) -> int:
     )
 
 
+def _active_dense_mla_splits(plan: Any, max_seq_len: int | None) -> int:
+    """Return the split-plan prefix that can contain live cache rows."""
+    num_splits = int(getattr(plan, "num_splits", 1))
+    chunks_per_split = int(getattr(plan, "chunks_per_split", 1))
+    if num_splits <= 0 or chunks_per_split <= 0:
+        raise ValueError(
+            "B12X_MLA received invalid split geometry: "
+            f"splits={num_splits}, chunks_per_split={chunks_per_split}."
+        )
+    if max_seq_len is None:
+        return num_splits
+    valid_chunks = max(1, (max(0, int(max_seq_len)) + 63) // 64)
+    return min(
+        num_splits,
+        (valid_chunks + chunks_per_split - 1) // chunks_per_split,
+    )
+
+
 def _create_dense_mla_plan(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -662,6 +680,17 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 "B12X_MLA metadata is missing caller-owned dense MLA scratch."
             )
         quantized = q.dtype == torch.float8_e4m3fn
+        # Direct CUDA graph capture fixes the launch grid and therefore uses
+        # every planned split. Piecewise eager attention may omit only trailing
+        # splits whose first 64-token chunk lies beyond every live sequence.
+        active_splits = (
+            int(plan.num_splits)
+            if q.is_cuda and torch.cuda.is_current_stream_capturing()
+            else _active_dense_mla_splits(
+                plan,
+                getattr(attn_metadata, "max_seq_len", None),
+            )
+        )
         binding = self._dense_mla.bind(
             plan,
             scratch=scratch,
@@ -674,6 +703,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             q_scale=layer._q_scale if quantized else None,
             kv_scale=layer._k_scale if quantized else None,
             sm_scale=self.scale,
+            active_splits=active_splits,
         )
 
         compile_key = (

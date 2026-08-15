@@ -49,6 +49,17 @@ def test_b12x_mla_uses_gathered_dcp_head_geometry() -> None:
         b12x_mla._kernel_query_heads(6, 2)
 
 
+@pytest.mark.parametrize(
+    ("max_seq_len", "expected"),
+    ((None, 8), (0, 1), (64, 1), (65, 1), (256, 1), (257, 2), (4096, 8)),
+)
+def test_b12x_mla_limits_active_cache_splits(
+    max_seq_len: int | None, expected: int
+) -> None:
+    plan = SimpleNamespace(num_splits=8, chunks_per_split=4)
+    assert b12x_mla._active_dense_mla_splits(plan, max_seq_len) == expected
+
+
 def test_b12x_mla_plans_local_interleaved_dcp_cache() -> None:
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -190,6 +201,7 @@ def test_b12x_mla_adapter_binds_common_decode_metadata(monkeypatch) -> None:
     assert binding.q_scale is None
     assert binding.kv_scale is None
     assert binding.sm_scale == impl.scale
+    assert binding.active_splits == 1
     assert binding.scratch is metadata.dense_mla_scratch
 
 
