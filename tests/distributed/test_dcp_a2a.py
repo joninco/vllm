@@ -10,7 +10,7 @@ Tests cover:
 
 import importlib.util
 import math
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
 
 import multiprocess as mp
@@ -690,6 +690,73 @@ def test_b12x_dcp_capture_rejects_missing_semantic_id(monkeypatch):
         pass
 
 
+def test_b12x_pool_initialized_inside_graph_context_joins_graph_channel(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    events: list[Any] = []
+
+    class _FakePool:
+        @classmethod
+        def from_exchange_group(cls, **kwargs):
+            events.append(("create", kwargs["exchange_group"]))
+            return cls()
+
+        def prepare_channels(self, channel_ids):
+            events.append(("prepare", tuple(channel_ids)))
+
+        def for_stream(self, *, channel_id):
+            events.append(("eager", channel_id))
+
+        @contextmanager
+        def capture(self, *, stream, channel_id):
+            events.append(("enter", stream, channel_id))
+            try:
+                yield
+            finally:
+                events.append(("exit", stream, channel_id))
+
+    device_group = object()
+    group = _FakeCPGroup(2, device_group)  # type: ignore[arg-type]
+    stream = object()
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_A2A_POOLS", {})
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_A2A_DISABLED", set())
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_ACTIVE_CAPTURE", {})
+    monkeypatch.setattr(dcp_alltoall, "_load_b12x_dcp_a2a_pool", lambda: _FakePool)
+    monkeypatch.setattr(dcp_alltoall, "_b12x_dcp_init_failed", lambda *args: False)
+    monkeypatch.setattr(
+        dcp_alltoall.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: False,
+    )
+
+    with dcp_alltoall.capture_b12x_dcp_a2a(
+        group,  # type: ignore[arg-type]
+        stream,
+        channel_id="vllm:target:decode",
+    ):
+        pool = dcp_alltoall._get_b12x_dcp_a2a_pool(
+            group,  # type: ignore[arg-type]
+            device=torch.device("cuda:0"),
+            total_heads=64,
+            head_dim=512,
+            query_head_dim=576,
+            max_batch_size=64,
+        )
+        assert pool is not None
+        assert (
+            dcp_alltoall._b12x_dcp_channel_id(group)  # type: ignore[arg-type]
+            == "vllm:target:decode"
+        )
+
+    assert dcp_alltoall._b12x_dcp_channel_id(group) == "vllm:eager:dcp"  # type: ignore[arg-type]
+    assert events == [
+        ("create", device_group),
+        ("prepare", ("vllm:eager:dcp", "vllm:target:decode")),
+        ("enter", stream, "vllm:target:decode"),
+        ("exit", stream, "vllm:target:decode"),
+    ]
+
+
 def test_b12x_dcp_channel_rollback_restores_existing_and_closes_new_pools(
     monkeypatch,
 ):
@@ -1043,6 +1110,23 @@ def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     assert created["max_batch_size"] == 4
     assert created["channel_id"] == "vllm:eager:dcp"
 
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_B12X_DCP_ACTIVE_CAPTURE",
+        {id(group.device_group): ("vllm:target:decode", None, ExitStack())},
+    )
+    result = dcp_alltoall._try_b12x_dcp_lse_reduce(
+        out,
+        lse,
+        group,  # type: ignore[arg-type]
+        return_lse=False,
+        is_lse_base_on_e=True,
+        max_batch_size=8192,
+        query_head_dim=64,
+    )
+    assert result is sentinel
+    assert created["channel_id"] == "vllm:target:decode"
+
     out_large = torch.zeros(8, 16, 64, dtype=torch.bfloat16, device="cuda")
     lse_large = torch.zeros(8, 16, dtype=torch.float32, device="cuda")
     result = dcp_alltoall._try_b12x_dcp_lse_reduce(
@@ -1091,6 +1175,20 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     assert result is sentinel
     assert created["max_batch_size"] == 4
     assert created["channel_id"] == "vllm:eager:dcp"
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_B12X_DCP_ACTIVE_CAPTURE",
+        {id(group.device_group): ("vllm:target:decode", None, ExitStack())},
+    )
+    result = dcp_alltoall._try_b12x_dcp_all_gather_heads(
+        small,
+        group,  # type: ignore[arg-type]
+        max_batch_size=8192,
+        output_head_dim=64,
+    )
+    assert result is sentinel
+    assert created["channel_id"] == "vllm:target:decode"
 
     large = torch.zeros(8, 8, 64, dtype=torch.bfloat16, device="cuda")
     result = dcp_alltoall._try_b12x_dcp_all_gather_heads(

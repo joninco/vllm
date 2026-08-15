@@ -42,14 +42,24 @@ logger = init_logger(__name__)
 
 _B12X_DCP_A2A_POOLS: dict[tuple[int, int, int, int, int, int], Any] = {}
 _B12X_DCP_A2A_DISABLED: set[tuple[int, int, int, int, int, int]] = set()
-# DCP likewise has one stable eager scheduler owner.  Graph target/draft/encoder
-# identities are supplied separately by their GraphCaptureContext.
 _B12X_DCP_EAGER_CHANNEL_ID = "vllm:eager:dcp"
 _B12X_DCP_MAX_CONCURRENT_CHANNELS = 2
+# A pool initialized after a graph context opens must join that graph before
+# its first operation. Each entry is keyed by the process-group identity and
+# owns the graph's semantic channel, stream, and cleanup stack.
+_B12X_DCP_ACTIVE_CAPTURE: dict[int, tuple[str, Any, ExitStack]] = {}
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
+
+
+def _b12x_dcp_channel_id(cp_group: GroupCoordinator) -> str:
+    """Return the B12X channel owned by the group's active execution mode."""
+    active = _B12X_DCP_ACTIVE_CAPTURE.get(id(cp_group.device_group))
+    if active is not None:
+        return active[0]
+    return _B12X_DCP_EAGER_CHANNEL_ID
 
 
 def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
@@ -135,8 +145,16 @@ def _get_b12x_dcp_a2a_pool(
             single_channel=False,
             max_concurrent_channels=_B12X_DCP_MAX_CONCURRENT_CHANNELS,
         )
-        pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
-        pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
+        active = _B12X_DCP_ACTIVE_CAPTURE.get(id(cp_group.device_group))
+        if active is None:
+            pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID,))
+            pool.for_stream(channel_id=_B12X_DCP_EAGER_CHANNEL_ID)
+        else:
+            active_channel, active_stream, active_stack = active
+            pool.prepare_channels((_B12X_DCP_EAGER_CHANNEL_ID, active_channel))
+            active_stack.enter_context(
+                pool.capture(stream=active_stream, channel_id=active_channel)
+            )
     except Exception as exc:
         init_error = exc
 
@@ -198,15 +216,27 @@ def capture_b12x_dcp_a2a(
         ),
         key=lambda item: item[0][1:],
     )
-    if matching_pools and channel_id is None:
-        raise RuntimeError(
-            "distributed PCIe DCP graph capture requires an explicit semantic "
-            "channel_id"
-        )
-    with ExitStack() as stack:
-        for _, pool in matching_pools:
-            stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
+    if channel_id is None:
+        if matching_pools or envs.VLLM_USE_B12X_DCP_A2A:
+            raise RuntimeError(
+                "distributed PCIe DCP graph capture requires an explicit "
+                "semantic channel_id"
+            )
         yield
+        return
+
+    previous_active = _B12X_DCP_ACTIVE_CAPTURE.get(group_id)
+    try:
+        with ExitStack() as stack:
+            _B12X_DCP_ACTIVE_CAPTURE[group_id] = (channel_id, stream, stack)
+            for _, pool in matching_pools:
+                stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
+            yield
+    finally:
+        if previous_active is None:
+            _B12X_DCP_ACTIVE_CAPTURE.pop(group_id, None)
+        else:
+            _B12X_DCP_ACTIVE_CAPTURE[group_id] = previous_active
 
 
 def checkpoint_b12x_dcp_a2a_channels(
@@ -326,7 +356,7 @@ def _try_b12x_dcp_lse_reduce(
         cp_attn_lse,
         out=reduced,
         is_lse_base_on_e=is_lse_base_on_e,
-        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        channel_id=_b12x_dcp_channel_id(cp_group),
     )
 
 
@@ -379,7 +409,7 @@ def _try_b12x_dcp_all_gather_heads(
         return None
     return pool.all_gather_heads(
         local_input,
-        channel_id=_B12X_DCP_EAGER_CHANNEL_ID,
+        channel_id=_b12x_dcp_channel_id(cp_group),
     )
 
 
