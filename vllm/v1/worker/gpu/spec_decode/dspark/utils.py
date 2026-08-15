@@ -3,11 +3,12 @@
 
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+    _create_draft_vllm_config,
     _should_share,
     get_target_lm_head,
 )
@@ -28,24 +29,16 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         # auto-selection may pick one that downgrades the spec-decode
         # cudagraph to PIECEWISE.
         backend = AttentionBackendEnum.FLASH_ATTN
-    draft_vllm_config = replace(
-        vllm_config,
-        attention_config=replace(
-            vllm_config.attention_config,
-            use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
-            backend=backend,
-        ),
-        cache_config=(
-            replace(
-                vllm_config.cache_config,
-                cache_dtype=speculative_config.kv_cache_dtype,
-            )
-            if speculative_config.kv_cache_dtype is not None
-            else vllm_config.cache_config
-        ),
+    # External drafts own their model, cache dtype, and DCP1 attention geometry.
+    # Reusing target DCP geometry would partition a cache that every target rank
+    # must populate and consume independently.
+    draft_vllm_config = _create_draft_vllm_config(vllm_config)
+    draft_vllm_config.attention_config.backend = backend
+    draft_vllm_config.attention_config.use_non_causal = dflash_has_any_non_causal(
+        draft_model_config.hf_config
     )
-    # VllmConfig post-init restores the target's quant config because the target
-    # config is retained for DSpark's target-layer metadata, so we must override it.
+    # Replacing the model config does not recompute VllmConfig.quant_config.
+    # The draft must not inherit the target checkpoint's quantization method.
     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
 
     with set_model_tag("dspark_head"):

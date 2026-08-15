@@ -9,6 +9,7 @@ states, which are fc-combined, normed, projected to K/V by every draft
 layer, and written into the draft KV cache.
 """
 
+import copy
 from collections.abc import Mapping
 from typing import Any, NamedTuple
 
@@ -17,7 +18,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig, replace
+from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -42,6 +43,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
     load_dflash_model,
     maybe_load_mask_embedding,
 )
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import _create_draft_vllm_config
 from vllm.v1.worker.gpu.spec_decode.speculator import (
     CUDAGraphCapturePhase,
     DraftModelSpeculator,
@@ -169,14 +171,12 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        # The draft's attention differs from the target's in causality.
-        return replace(
-            self.vllm_config,
-            attention_config=replace(
-                self.vllm_config.attention_config,
-                use_non_causal=self.requires_non_causal,
-            ),
-        )
+        """Return an isolated attention view with draft parallel geometry."""
+        draft_vllm_config = copy.copy(_create_draft_vllm_config(self.vllm_config))
+        draft_attention_config = copy.copy(draft_vllm_config.attention_config)
+        draft_attention_config.use_non_causal = self.requires_non_causal
+        draft_vllm_config.attention_config = draft_attention_config
+        return draft_vllm_config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
