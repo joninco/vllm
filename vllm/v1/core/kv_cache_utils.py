@@ -1745,6 +1745,12 @@ def group_and_unify_kv_cache_specs(
     Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
     Currently, this is only used for DeepseekV4.
     """
+    # Recurrent state pages require the generic hybrid-cache planner. Packing
+    # them into the heterogeneous MLA tuple layout would charge the larger
+    # state page to every packed block and reduce attention-cache capacity.
+    if any(isinstance(spec, MambaSpec) for spec in kv_cache_spec.values()):
+        return None
+
     has_swa = any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
     )

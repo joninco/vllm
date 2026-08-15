@@ -2857,6 +2857,16 @@ def test_group_and_unify_kv_cache_specs_uniform_page_size_returns_none():
     assert group_and_unify_kv_cache_specs(specs) is None
 
 
+def test_group_and_unify_kv_cache_specs_defers_recurrent_state():
+    specs = {
+        "mla.0": new_mla_spec(),
+        "swa.0": new_bf16_swa_mla_spec(head_size=1024),
+        "state.0": new_mamba_spec(),
+    }
+
+    assert group_and_unify_kv_cache_specs(specs) is None
+
+
 def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     # DeepseekV4-style: differing page sizes across MLA and sliding-window MLA
     # layers do require tuple packing, so grouping must still be produced.
