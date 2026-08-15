@@ -369,6 +369,52 @@ class TestLSEWeightedCombine:
         assert _dcp_a2a_lse_pack_dim(torch.float32) == 1
 
 
+def test_a2a_converts_activation_dtype_lse_before_packing(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    output = torch.zeros(2, 4, 8, dtype=torch.bfloat16)
+    lse = torch.zeros(2, 4, dtype=torch.bfloat16)
+    send = torch.empty(2, 2, 2, 10, dtype=torch.bfloat16)
+    recv = torch.empty_like(send)
+    result = torch.empty(2, 2, 8, dtype=torch.bfloat16)
+    received: dict[str, torch.dtype] = {}
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_dcp_a2a_send_recv_buffers",
+        lambda *args, **kwargs: (send, recv),
+    )
+
+    def record_pack(_cp_attn_out, cp_attn_lse, *_args, **_kwargs):
+        received["dtype"] = cp_attn_lse.dtype
+
+    class _Work:
+        def wait(self):
+            return None
+
+    monkeypatch.setattr(dcp_alltoall, "_dcp_a2a_pack_send", record_pack)
+    monkeypatch.setattr(
+        dcp_alltoall.dist,
+        "all_to_all_single",
+        lambda *args, **kwargs: _Work(),
+    )
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_dcp_a2a_unpack_combine",
+        lambda *args, **kwargs: result,
+    )
+    group = _FakeCPGroup(2, object())  # type: ignore[arg-type]
+
+    actual = dcp_alltoall.dcp_a2a_lse_reduce(
+        output,
+        lse,
+        group,  # type: ignore[arg-type]
+    )
+
+    assert actual is result
+    assert received == {"dtype": torch.float32}
+
+
 def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
 
@@ -1387,7 +1433,7 @@ class TestPackedA2AKernels:
         world_size, B, h_per_rank, D = 4, 7, 2, 32
         H = world_size * h_per_rank
         cp_attn_out = torch.randn(B, H, D, device=device, dtype=dtype)
-        cp_attn_lse = torch.randn(B, H, device=device, dtype=dtype)
+        cp_attn_lse = torch.randn(B, H, device=device, dtype=torch.float32)
         lse_pack_dim = _dcp_a2a_lse_pack_dim(dtype)
         send_buffer = torch.empty(
             (world_size, B, h_per_rank, D + lse_pack_dim),
@@ -1583,7 +1629,7 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
         lses = torch.stack(
             [t[:, rank * h_per_rank : (rank + 1) * h_per_rank] for t in gathered_lse],
             dim=0,
-        )
+        ).float()
         from vllm.v1.attention.ops.dcp_alltoall import _lse_weighted_combine
 
         expected_out, expected_lse = _lse_weighted_combine(

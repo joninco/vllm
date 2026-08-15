@@ -740,7 +740,7 @@ def _dcp_a2a_pack_send_kernel(
 
         lse_val = tl.load(
             lse_ptr + batch_idx * lse_stride_B + src_head_idx * lse_stride_H
-        ).to(tl.float32)
+        )
         if LSE_PACK_DIM == 1:
             tl.store(
                 send_ptr + send_base + HEAD_DIM * send_stride_D,
@@ -978,12 +978,13 @@ def dcp_a2a_lse_reduce(
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
 
-    The output and LSE are packed into a single output-dtype buffer, sent
+    The output and FP32 LSE are packed into a single output-dtype buffer, sent
     with one All-to-All, then unpacked and combined with exact LSE weighting.
 
     Args:
         cp_attn_out: [B, H, D] where B=num_tokens, H=total_heads, D=head_dim
-        cp_attn_lse: [B, H] floating-point log-sum-exp values
+        cp_attn_lse: [B, H] floating-point log-sum-exp values; non-FP32 input
+            is converted before bit packing
         cp_group: GroupCoordinator for DCP communication
         ctx: CPTritonContext (unused, for signature compatibility)
         return_lse: If True, also return the combined global LSE
@@ -1023,6 +1024,10 @@ def dcp_a2a_lse_reduce(
     if H % world_size != 0:
         raise ValueError(f"H={H} must be divisible by DCP world size {world_size}.")
     H_per_rank = H // world_size
+    # The pack kernel preserves the FP32 bit pattern across an output-dtype
+    # transport buffer. Normalize backends that emit LSE in activation dtype.
+    if cp_attn_lse.dtype != torch.float32:
+        cp_attn_lse = cp_attn_lse.to(torch.float32)
     lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
 
     send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
