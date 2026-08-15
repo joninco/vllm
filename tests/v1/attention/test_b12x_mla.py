@@ -61,6 +61,55 @@ def test_b12x_mla_plans_local_interleaved_dcp_cache() -> None:
     assert b12x_mla._max_dcp_local_cache_tokens(config) == 131_072
 
 
+def _support_reason(monkeypatch, *, dcp_size: int, pcp_size: int = 1) -> str | None:
+    parallel_config = SimpleNamespace(
+        decode_context_parallel_size=dcp_size,
+        prefill_context_parallel_size=pcp_size,
+        cp_kv_cache_interleave_size=64,
+    )
+    model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            model_type="kimi_linear",
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+        ),
+        max_model_len=1_048_576,
+        get_num_attention_heads=lambda _: 6,
+    )
+    config = SimpleNamespace(
+        parallel_config=parallel_config,
+        model_config=model_config,
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+    )
+    monkeypatch.setattr(b12x_mla, "_load_dense_mla", lambda: object())
+    monkeypatch.setattr(b12x_mla, "get_current_vllm_config", lambda: config)
+    return B12xMLABackend.supports_combination(
+        head_size=576,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="fp8",
+        block_size=944,
+        use_mla=True,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        device_capability=DeviceCapability(12, 0),
+    )
+
+
+def test_b12x_mla_selects_supported_native_dcp_geometry(monkeypatch) -> None:
+    assert _support_reason(monkeypatch, dcp_size=8) is None
+    assert _support_reason(monkeypatch, dcp_size=16) is None
+
+
+def test_b12x_mla_rejects_unsupported_parallel_geometry(monkeypatch) -> None:
+    assert "multiple of eight" in _support_reason(monkeypatch, dcp_size=2)
+    assert "prefill context parallelism" in _support_reason(
+        monkeypatch, dcp_size=8, pcp_size=2
+    )
+
+
 class _FakePlan:
     def shapes_and_dtypes(self):
         return (((256,), torch.uint8),)

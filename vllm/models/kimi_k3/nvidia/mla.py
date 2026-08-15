@@ -172,6 +172,13 @@ class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
         return output, output_bias
 
 
+def _backend_owns_decode_dcp(impl: object, dcp_world_size: int) -> bool:
+    """Return whether the selected backend gathers and combines DCP itself."""
+    return dcp_world_size > 1 and bool(
+        getattr(impl, "owns_decode_dcp_collectives", False)
+    )
+
+
 class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     """Kimi-K3 Multi-head Latent Attention with optional RoPE and output gate."""
 
@@ -400,13 +407,19 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             "parallelism."
         )
         self.dcp_world_size = parallel_config.decode_context_parallel_size
-        assert self.dcp_world_size <= 1 or self.rotary_emb is None, (
-            "Kimi-K3 MultiHeadLatentAttention does not support RoPE with decode "
-            "context parallelism because gathered queries require gathered "
-            "positions."
+        self.backend_owns_decode_dcp = _backend_owns_decode_dcp(
+            self.impl, self.dcp_world_size
+        )
+        assert (
+            self.dcp_world_size <= 1
+            or self.rotary_emb is None
+            or self.backend_owns_decode_dcp
+        ), (
+            "Kimi-K3 RoPE with decode context parallelism requires an attention "
+            "backend that owns its DCP query and output collectives."
         )
         self.dcp_manager: MLADCPManager | None = None
-        if self.dcp_world_size > 1:
+        if self.dcp_world_size > 1 and not self.backend_owns_decode_dcp:
             query_dtype = (
                 torch.float8_e4m3fn
                 if is_quantized_kv_cache(self.kv_cache_dtype)
@@ -699,16 +712,14 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
                 slot_mapping[:num_mqa_tokens],
             )
-            if self.dcp_world_size > 1:
-                assert self.dcp_manager is not None
+            if self.dcp_manager is not None:
                 assert self.dcp_manager.query_gather is not None
                 mqa_q = self.dcp_manager.query_gather(mqa_q)
             latent_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
                 mqa_q, self._attn_read_kv_cache(), attn_metadata, self
             )
-            if self.dcp_world_size > 1:
+            if self.dcp_manager is not None:
                 assert lse is not None
-                assert self.dcp_manager is not None
                 assert attn_metadata.decode is not None
                 latent_out = self.dcp_manager.combine(
                     latent_out,

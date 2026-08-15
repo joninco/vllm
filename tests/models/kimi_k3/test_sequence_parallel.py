@@ -78,6 +78,17 @@ class _SequenceParallelMTPBlock:
         return hidden_states * 2, None, hidden_states * 3
 
 
+@pytest.mark.parametrize(
+    ("dcp_world_size", "backend_owns", "expected"),
+    ((1, True, False), (8, False, False), (8, True, True)),
+)
+def test_kimi_detects_backend_owned_decode_dcp(
+    dcp_world_size: int, backend_owns: bool, expected: bool
+) -> None:
+    impl = SimpleNamespace(owns_decode_dcp_collectives=backend_owns)
+    assert kimi_mla._backend_owns_decode_dcp(impl, dcp_world_size) is expected
+
+
 def _mock_sequence_parallel_collectives(monkeypatch):
     monkeypatch.setattr(
         kimi_model,

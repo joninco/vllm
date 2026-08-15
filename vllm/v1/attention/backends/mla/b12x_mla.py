@@ -429,20 +429,24 @@ class B12xMLABackend(MLACommonBackend):
             )
 
         parallel_config = vllm_config.parallel_config
-        if parallel_config.decode_context_parallel_size != 1:
-            return "B12X_MLA does not support decode context parallelism"
+        if parallel_config.prefill_context_parallel_size != 1:
+            return "B12X_MLA does not support prefill context parallelism"
+        dcp_size = int(parallel_config.decode_context_parallel_size)
         local_heads = model_config.get_num_attention_heads(parallel_config)
-        if local_heads <= 0:
-            return f"B12X_MLA requires a positive query-head count, got {local_heads}"
+        try:
+            _kernel_query_heads(local_heads, dcp_size)
+        except ValueError as exc:
+            return str(exc)
         if vllm_config.scheduler_config.max_num_seqs > _MAX_B12X_QUERY_ROWS:
             return (
                 "B12X_MLA max_num_seqs exceeds its 1024-row decode capacity: "
                 f"{vllm_config.scheduler_config.max_num_seqs}"
             )
-        if model_config.max_model_len > _MAX_B12X_CACHE_TOKENS:
+        local_cache_tokens = _max_dcp_local_cache_tokens(vllm_config)
+        if local_cache_tokens > _MAX_B12X_CACHE_TOKENS:
             return (
-                "B12X_MLA max_model_len exceeds its 1048576-token capacity: "
-                f"{model_config.max_model_len}"
+                "B12X_MLA local DCP cache exceeds its 1048576-token capacity: "
+                f"{local_cache_tokens}"
             )
         return None
 
@@ -453,6 +457,7 @@ class B12xMLABackend(MLACommonBackend):
 
 class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
     can_return_lse_for_decode: bool = True
+    owns_decode_dcp_collectives: bool = True
 
     def __init__(
         self,
