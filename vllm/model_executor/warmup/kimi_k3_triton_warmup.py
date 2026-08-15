@@ -103,12 +103,25 @@ def _warm_recurrent_kda(
     if num_speculative_tokens <= 0:
         return
 
-    kv_cache = layer.kv_cache
-    if not isinstance(kv_cache, (list, tuple)) or len(kv_cache) < 2:
-        return
-    state = kv_cache[1]
-    if not isinstance(state, torch.Tensor) or not state.numel():
-        return
+    kv_cache = getattr(layer, "kv_cache", None)
+    state = (
+        kv_cache[1]
+        if isinstance(kv_cache, (list, tuple))
+        and len(kv_cache) >= 2
+        and isinstance(kv_cache[1], torch.Tensor)
+        and kv_cache[1].numel()
+        else None
+    )
+    if state is None:
+        # Kernel warmup runs before production KV-cache binding. One temporary
+        # state page preserves the production layout and dtype for compilation.
+        state_shape = layer.get_state_shape()[1]
+        state_dtype = layer.get_state_dtype()[1]
+        state = torch.empty(
+            (1, *state_shape),
+            dtype=state_dtype,
+            device=layer.A_log.device,
+        )
 
     logger.info("Warming up Kimi-K3 speculative KDA kernels.")
     h = int(layer.local_num_heads)
