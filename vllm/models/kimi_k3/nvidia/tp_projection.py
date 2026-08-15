@@ -11,7 +11,12 @@ from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_gather,
 )
-from vllm.v1.attention.ops.dcp_alltoall import dcp_b12x_all_gather_heads
+from vllm.v1.attention.ops.dcp_alltoall import (
+    dcp_b12x_all_gather_heads,
+    dcp_b12x_all_gather_pair,
+)
+
+_KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS = 8
 
 
 def _get_kimi_projection_group():
@@ -102,3 +107,34 @@ def gather_kimi_sharded_projection(output_parallel: torch.Tensor) -> torch.Tenso
     if gathered is not None:
         return gathered
     return tensor_model_parallel_all_gather(output_parallel, dim=-1)
+
+
+def gather_kimi_sharded_projection_pair(
+    local_first: torch.Tensor,
+    local_second: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather two decode projections behind one lossless B12X barrier."""
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size <= 1:
+        return local_first, local_second
+    if (
+        local_first.ndim == local_second.ndim == 2
+        and local_first.shape[0] == local_second.shape[0]
+        and 0 < local_first.shape[0] <= _KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS
+        and local_first.is_cuda
+        and local_second.is_cuda
+        and local_first.is_contiguous()
+        and local_second.is_contiguous()
+    ):
+        projection_group = _get_kimi_projection_group()
+        if projection_group.world_size == tp_size:
+            return dcp_b12x_all_gather_pair(
+                local_first,
+                local_second,
+                projection_group,
+                max_batch_size=_KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS,
+            )
+    return (
+        gather_kimi_sharded_projection(local_first),
+        gather_kimi_sharded_projection(local_second),
+    )

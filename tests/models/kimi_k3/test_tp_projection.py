@@ -189,3 +189,76 @@ def test_projection_gather_uses_standard_collective_outside_decode(monkeypatch):
     actual = tp_projection.gather_kimi_sharded_projection(local)
 
     assert actual is expected
+
+
+def test_projection_pair_is_identity_at_tp1(monkeypatch):
+    first = torch.empty(2, 8)
+    second = torch.empty(2, 4)
+    monkeypatch.setattr(
+        tp_projection, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    actual = tp_projection.gather_kimi_sharded_projection_pair(first, second)
+
+    assert actual[0] is first
+    assert actual[1] is second
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_projection_pair_uses_one_b12x_barrier(monkeypatch):
+    tp_size = 2
+    first = torch.empty(2, 8, dtype=torch.bfloat16, device="cuda")
+    second = torch.empty(2, 4, dtype=torch.float32, device="cuda")
+    expected = (
+        torch.empty(2, 16, dtype=first.dtype, device=first.device),
+        torch.empty(2, 8, dtype=second.dtype, device=second.device),
+    )
+    group = SimpleNamespace(world_size=tp_size, ranks=list(range(tp_size)))
+    received: dict[str, object] = {}
+    monkeypatch.setattr(
+        tp_projection, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    monkeypatch.setattr(tp_projection, "_get_kimi_projection_group", lambda: group)
+
+    def gather_pair(local_first, local_second, projection_group, *, max_batch_size):
+        received.update(
+            local_first=local_first,
+            local_second=local_second,
+            projection_group=projection_group,
+            max_batch_size=max_batch_size,
+        )
+        return expected
+
+    monkeypatch.setattr(tp_projection, "dcp_b12x_all_gather_pair", gather_pair)
+
+    actual = tp_projection.gather_kimi_sharded_projection_pair(first, second)
+
+    assert actual is expected
+    assert received["local_first"] is first
+    assert received["local_second"] is second
+    assert received["projection_group"] is group
+    assert received["max_batch_size"] == 8
+
+
+def test_projection_pair_uses_exact_separate_fallback(monkeypatch):
+    first = torch.empty(9, 8)
+    second = torch.empty(9, 4)
+    gathered_first = torch.empty(9, 16)
+    gathered_second = torch.empty(9, 8)
+    calls: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        tp_projection, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+
+    def gather_one(local: torch.Tensor) -> torch.Tensor:
+        calls.append(local)
+        return gathered_first if local is first else gathered_second
+
+    monkeypatch.setattr(tp_projection, "gather_kimi_sharded_projection", gather_one)
+
+    actual = tp_projection.gather_kimi_sharded_projection_pair(first, second)
+
+    assert actual[0] is gathered_first
+    assert actual[1] is gathered_second
+    assert calls[0] is first
+    assert calls[1] is second
