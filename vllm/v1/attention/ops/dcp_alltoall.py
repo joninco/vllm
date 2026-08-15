@@ -457,6 +457,92 @@ def dcp_b12x_all_gather_heads(
     return out
 
 
+def _try_b12x_dcp_all_gather_pair(
+    local_first: torch.Tensor,
+    local_second: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    max_batch_size: int | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Gather two projection rows behind one B12X IPC barrier."""
+    supported_dtypes = (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float8_e4m3fn,
+    )
+    if (
+        cp_group.world_size not in _B12X_DCP_WORLD_SIZES
+        or local_first.dtype not in supported_dtypes
+        or local_second.dtype not in supported_dtypes
+        or not local_first.is_cuda
+        or not local_second.is_cuda
+        or local_first.device != local_second.device
+        or local_first.ndim != 2
+        or local_second.ndim != 2
+        or local_first.shape[0] != local_second.shape[0]
+        or not local_first.is_contiguous()
+        or not local_second.is_contiguous()
+    ):
+        return None
+
+    batch = int(local_first.shape[0])
+    first_row_bytes = int(local_first.shape[1]) * local_first.element_size()
+    second_row_bytes = int(local_second.shape[1]) * local_second.element_size()
+    if batch < 1 or first_row_bytes % 16 != 0 or second_row_bytes % 16 != 0:
+        return None
+    if max_batch_size is None:
+        max_batch_size = batch
+    max_batch_size = int(max_batch_size)
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    if token_cap > 0:
+        if batch > token_cap:
+            return None
+        max_batch_size = min(max_batch_size, token_cap)
+    if max_batch_size < batch:
+        return None
+
+    combined_row_bytes = first_row_bytes + second_row_bytes
+    pool = _get_b12x_dcp_a2a_pool(
+        cp_group,
+        device=local_first.device,
+        total_heads=cp_group.world_size,
+        head_dim=combined_row_bytes,
+        query_head_dim=combined_row_bytes,
+        max_batch_size=max_batch_size,
+    )
+    if pool is None or not hasattr(pool, "all_gather_pair"):
+        return None
+    return pool.all_gather_pair(
+        local_first,
+        local_second,
+        channel_id=_b12x_dcp_channel_id(cp_group),
+    )
+
+
+def dcp_b12x_all_gather_pair(
+    local_first: torch.Tensor,
+    local_second: torch.Tensor,
+    cp_group: GroupCoordinator,
+    *,
+    max_batch_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather two rank-local rows together, with exact separate fallbacks."""
+    if envs.VLLM_USE_B12X_DCP_A2A:
+        result = _try_b12x_dcp_all_gather_pair(
+            local_first,
+            local_second,
+            cp_group,
+            max_batch_size=max_batch_size,
+        )
+        if result is not None:
+            return result
+    return (
+        cp_group.all_gather(local_first, dim=-1),
+        cp_group.all_gather(local_second, dim=-1),
+    )
+
+
 def warmup_b12x_dcp_a2a(
     cp_group: GroupCoordinator,
     *,

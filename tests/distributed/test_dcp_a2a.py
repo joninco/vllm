@@ -1477,6 +1477,96 @@ def test_b12x_query_gather_requires_env(monkeypatch: pytest.MonkeyPatch):
     assert actual is expected
 
 
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_pair_gather_uses_one_pool_operation_at_dcp16(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    received: dict[str, Any] = {}
+    local_first = torch.zeros(2, 224, dtype=torch.bfloat16, device="cuda")
+    local_second = torch.zeros(2, 56, dtype=torch.float32, device="cuda")
+    expected = (
+        torch.empty(2, 224 * 16, dtype=local_first.dtype, device="cuda"),
+        torch.empty(2, 56 * 16, dtype=local_second.dtype, device="cuda"),
+    )
+
+    class _FakePool:
+        def all_gather_pair(self, first, second, *, channel_id):
+            received.update(first=first, second=second, channel_id=channel_id)
+            return expected
+
+    def fake_get_pool(cp_group, **kwargs):
+        received.update(kwargs)
+        return _FakePool()
+
+    monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_b12x_dcp_channel_id",
+        lambda _group: "vllm:target:decode:graph-1",
+    )
+    group = _FakeCPGroup(16, object())  # type: ignore[arg-type]
+
+    actual = dcp_alltoall.dcp_b12x_all_gather_pair(
+        local_first,
+        local_second,
+        group,  # type: ignore[arg-type]
+        max_batch_size=8,
+    )
+
+    assert actual is expected
+    assert received.pop("first") is local_first
+    assert received.pop("second") is local_second
+    assert received.pop("device") == local_first.device
+    assert received == {
+        "channel_id": "vllm:target:decode:graph-1",
+        "total_heads": 16,
+        "head_dim": 672,
+        "query_head_dim": 672,
+        "max_batch_size": 8,
+    }
+    unaligned_first = local_first[:, :223].contiguous()
+    assert (
+        dcp_alltoall._try_b12x_dcp_all_gather_pair(
+            unaligned_first,
+            local_second,
+            group,  # type: ignore[arg-type]
+            max_batch_size=8,
+        )
+        is None
+    )
+
+
+def test_pair_gather_fallback_preserves_tensor_order(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.delenv("VLLM_USE_B12X_DCP_A2A", raising=False)
+    local_first = torch.zeros(2, 8)
+    local_second = torch.ones(2, 4)
+    gathered_first = torch.full((2, 16), 2.0)
+    gathered_second = torch.full((2, 8), 3.0)
+    calls: list[tuple[torch.Tensor, int]] = []
+
+    def gather(value, dim):
+        calls.append((value, dim))
+        return gathered_first if value is local_first else gathered_second
+
+    group = _FakeCPGroup(2, object())  # type: ignore[arg-type]
+    group.all_gather = gather  # type: ignore[attr-defined]
+
+    actual = dcp_alltoall.dcp_b12x_all_gather_pair(
+        local_first,
+        local_second,
+        group,  # type: ignore[arg-type]
+    )
+
+    assert actual[0] is gathered_first
+    assert actual[1] is gathered_second
+    assert len(calls) == 2
+    assert calls[0][0] is local_first and calls[0][1] == -1
+    assert calls[1][0] is local_second and calls[1][1] == -1
+
+
 def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
 
