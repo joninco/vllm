@@ -24,6 +24,8 @@ def test_sharded_markov_model_selects_local_sampling(
         draft_logits=None,
         _draft_topk=None,
         _use_local_draft_argmax=False,
+        _capture_sharded_markov=False,
+        _markov_outside_cudagraph=False,
     )
     monkeypatch.setenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "1")
     monkeypatch.setattr(
@@ -55,6 +57,8 @@ def test_sharded_markov_model_rejects_reduced_topk(
         draft_logits=None,
         _draft_topk=32,
         _use_local_draft_argmax=False,
+        _capture_sharded_markov=False,
+        _markov_outside_cudagraph=False,
     )
     monkeypatch.setenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "1")
     monkeypatch.setattr(

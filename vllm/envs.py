@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_SHARD_MARKOV_HEAD: bool = False
     VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
     VLLM_KIMI_K3_B12X_DSPARK_ARGMAX: bool = False
+    VLLM_DSPARK_CAPTURE_SHARDED_MARKOV: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
@@ -1178,6 +1179,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather fallback.
     "VLLM_KIMI_K3_B12X_DSPARK_ARGMAX": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_B12X_DSPARK_ARGMAX", "0"))
+    ),
+    # Capture TP-sharded deterministic Markov sampling only when every
+    # collective in the tail uses a CUDA-graph-safe B12X implementation.
+    "VLLM_DSPARK_CAPTURE_SHARDED_MARKOV": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_CAPTURE_SHARDED_MARKOV", "0"))
     ),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.

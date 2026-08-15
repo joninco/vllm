@@ -30,6 +30,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.triton_utils import triton
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -39,6 +40,8 @@ from vllm.v1.worker.gpu.spec_decode.dspark.capacity import (
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+
+logger = init_logger(__name__)
 
 
 class DSparkSpeculator(DFlashSpeculator):
@@ -67,7 +70,15 @@ class DSparkSpeculator(DFlashSpeculator):
             self.max_num_tokens, draft_hidden, dtype=self.dtype, device=device
         )
 
-        self._markov_outside_cudagraph = envs.VLLM_DSPARK_SHARD_MARKOV_HEAD
+        self._capture_sharded_markov = envs.VLLM_DSPARK_CAPTURE_SHARDED_MARKOV
+        if self._capture_sharded_markov and not envs.VLLM_DSPARK_SHARD_MARKOV_HEAD:
+            raise ValueError(
+                "VLLM_DSPARK_CAPTURE_SHARDED_MARKOV requires "
+                "VLLM_DSPARK_SHARD_MARKOV_HEAD=1."
+            )
+        self._markov_outside_cudagraph = (
+            envs.VLLM_DSPARK_SHARD_MARKOV_HEAD and not self._capture_sharded_markov
+        )
         self._captured_markov_hidden: torch.Tensor | None = None
         self._captured_base_logits: torch.Tensor | None = None
 
@@ -210,6 +221,44 @@ class DSparkSpeculator(DFlashSpeculator):
                     "dspark_draft_topk."
                 )
             self._use_local_draft_argmax = True
+        if self._capture_sharded_markov:
+            if not getattr(model, "_b12x_dspark_argmax_enabled", False):
+                raise RuntimeError(
+                    "Captured TP-sharded Markov sampling requires B12X "
+                    "vocabulary argmax."
+                )
+            markov_head = model.model.markov_head
+            if not markov_head.replicate_w1:
+                from vllm.distributed.device_communicators.custom_all_reduce import (
+                    get_active_b12x_pcie_allreduce,
+                )
+
+                custom_allreduce = get_active_b12x_pcie_allreduce()
+                if custom_allreduce is None:
+                    raise RuntimeError(
+                        "Captured TP-sharded Markov sampling requires an active "
+                        "B12X TP all-reduce runtime."
+                    )
+                probe = torch.empty(
+                    self.max_num_reqs * self.num_speculative_steps,
+                    self.draft_model_config.hf_config.markov_rank,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                if not custom_allreduce.should_custom_ar(probe):
+                    raise RuntimeError(
+                        "The active B12X TP all-reduce cannot capture the "
+                        f"Markov W1 output shape {tuple(probe.shape)}."
+                    )
+            logger.info_once(
+                "DSpark captures its TP-sharded Markov tail with B12X collectives."
+            )
+        elif self._markov_outside_cudagraph:
+            logger.info_once(
+                "DSpark keeps TP-sharded Markov collectives outside the draft "
+                "CUDA graph. The graph retains the draft backbone and local "
+                "base-logit projection."
+            )
         return model
 
     def _ensure_captured_markov_buffers(self) -> None:
