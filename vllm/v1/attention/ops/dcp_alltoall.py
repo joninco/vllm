@@ -49,6 +49,9 @@ _B12X_DCP_MAX_CONCURRENT_CHANNELS = 2
 # owns the graph's semantic channel, stream, and cleanup stack.
 _B12X_DCP_ACTIVE_CAPTURE: dict[int, tuple[str, Any, ExitStack]] = {}
 _B12X_DCP_WORLD_SIZES = (2, 4, 8, 16)
+_KIMI_LATENT_WIDTH = 3584
+_KIMI_ROUTER_WIDTH = 896
+_KIMI_ROUTER_TOPK = 16
 _DCP_A2A_GRAPH_BUFFERS: dict[
     tuple[tuple[int, ...], torch.device, torch.dtype],
     tuple[torch.Tensor, torch.Tensor],
@@ -548,6 +551,85 @@ def dcp_b12x_all_gather_pair(
         cp_group.all_gather(local_first, dim=-1),
         cp_group.all_gather(local_second, dim=-1),
     )
+
+
+def try_dcp_b12x_all_gather_pair_kimi_topk(
+    local_down: torch.Tensor,
+    local_router: torch.Tensor,
+    correction_bias: torch.Tensor,
+    cp_group: GroupCoordinator,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Gather Kimi projections and select routed experts in one operation.
+
+    The returned routing payload has contiguous FP32 weight and int32 expert-ID
+    planes, each shaped ``[1, 16]``. The expert-ID plane is an integer view of
+    the second FP32 row, which gives graph callers one allocation to retain.
+
+    This binding has no collective fallback because the ordinary paired gather
+    and router are model-level operations. Callers must use those operations
+    when this function returns ``None``.
+    """
+    world_size = cp_group.world_size
+    if world_size not in _B12X_DCP_WORLD_SIZES:
+        return None
+    local_down_width = _KIMI_LATENT_WIDTH // world_size
+    local_router_width = _KIMI_ROUTER_WIDTH // world_size
+    if (
+        not envs.VLLM_USE_B12X_DCP_A2A
+        or local_down.shape != (1, local_down_width)
+        or local_down.dtype != torch.bfloat16
+        or local_router.shape != (1, local_router_width)
+        or local_router.dtype != torch.float32
+        or correction_bias.shape != (_KIMI_ROUTER_WIDTH,)
+        or correction_bias.dtype != torch.float32
+        or not local_down.is_cuda
+        or not local_router.is_cuda
+        or not correction_bias.is_cuda
+        or local_down.device != local_router.device
+        or local_down.device != correction_bias.device
+        or not local_down.is_contiguous()
+        or not local_router.is_contiguous()
+        or not correction_bias.is_contiguous()
+    ):
+        return None
+
+    combined_row_bytes = (
+        local_down_width * local_down.element_size()
+        + local_router_width * local_router.element_size()
+    )
+    pool = _get_b12x_dcp_a2a_pool(
+        cp_group,
+        device=local_down.device,
+        total_heads=world_size,
+        head_dim=combined_row_bytes,
+        query_head_dim=combined_row_bytes,
+        max_batch_size=1,
+    )
+    if pool is None or not hasattr(pool, "all_gather_pair_kimi_topk"):
+        return None
+
+    gathered_down = torch.empty(
+        (1, _KIMI_LATENT_WIDTH),
+        device=local_down.device,
+        dtype=torch.bfloat16,
+    )
+    routing_payload = torch.empty(
+        (2, _KIMI_ROUTER_TOPK),
+        device=local_down.device,
+        dtype=torch.float32,
+    )
+    topk_weights = routing_payload[:1]
+    topk_ids = routing_payload[1:].view(torch.int32)
+    pool.all_gather_pair_kimi_topk(
+        local_down,
+        local_router,
+        correction_bias,
+        gathered_down,
+        topk_weights,
+        topk_ids,
+        channel_id=_b12x_dcp_channel_id(cp_group),
+    )
+    return gathered_down, routing_payload
 
 
 def warmup_b12x_dcp_a2a(
