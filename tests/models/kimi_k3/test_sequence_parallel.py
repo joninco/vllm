@@ -529,6 +529,110 @@ def test_kimi_router_uses_standard_routing_for_non_payload(monkeypatch):
     assert received["input_ids"] is input_ids
 
 
+def _make_paired_projection_moe():
+    moe = object.__new__(kimi_model.KimiMoE)
+    nn.Module.__init__(moe)
+    moe.use_mega_moe = False
+    moe.gate = object.__new__(kimi_model.KimiColumnParallelGate)
+    nn.Module.__init__(moe.gate)
+    moe.gate.logical_output_size = 5
+    moe.gate.e_score_correction_bias = nn.Parameter(torch.zeros(5))
+    moe.routed_expert_down_proj = object.__new__(
+        kimi_model.KimiPaddedColumnParallelLinear
+    )
+    nn.Module.__init__(moe.routed_expert_down_proj)
+    moe.routed_expert_down_proj.logical_output_size = 3
+    moe._down_proj_events = (None, None)
+    moe._down_proj_stream = None
+    return moe
+
+
+def test_kimi_moe_uses_fused_projection_routing_payload(monkeypatch):
+    moe = _make_paired_projection_moe()
+    hidden_states = torch.empty(1, 4)
+    local_router = torch.empty(1, 3)
+    local_down = torch.empty(1, 2)
+    gathered_down = torch.empty(1, 3)
+    routing_payload = torch.empty(2, 16)
+    monkeypatch.setattr(
+        kimi_model.KimiColumnParallelGate,
+        "forward_local",
+        lambda _self, _hidden: (local_router, None),
+    )
+    monkeypatch.setattr(
+        kimi_model.KimiPaddedColumnParallelLinear,
+        "forward_local",
+        lambda _self, _hidden: (local_down, None),
+    )
+    monkeypatch.setattr(
+        kimi_model,
+        "maybe_execute_in_parallel",
+        lambda first, second, *_args: (first(), second()),
+    )
+    monkeypatch.setattr(
+        kimi_model,
+        "try_gather_kimi_sharded_projection_pair_topk",
+        lambda down, router, bias: (gathered_down, routing_payload),
+    )
+    monkeypatch.setattr(
+        kimi_model,
+        "gather_kimi_sharded_projection_pair",
+        lambda *_args: pytest.fail("the fused result must skip paired gather"),
+    )
+
+    routed_hidden, router_output, topk_ids = moe._maybe_overlap_router_and_down_proj(
+        hidden_states
+    )
+
+    assert routed_hidden is gathered_down
+    assert router_output is routing_payload
+    assert topk_ids is None
+
+
+def test_kimi_moe_paired_projection_uses_exact_router_fallback(monkeypatch):
+    moe = _make_paired_projection_moe()
+    hidden_states = torch.empty(2, 4)
+    local_router = torch.empty(2, 3)
+    local_down = torch.empty(2, 2)
+    gathered_router = torch.arange(12, dtype=torch.float32).view(2, 6)
+    gathered_down = torch.arange(8, dtype=torch.float32).view(2, 4)
+    monkeypatch.setattr(
+        kimi_model.KimiColumnParallelGate,
+        "forward_local",
+        lambda _self, _hidden: (local_router, None),
+    )
+    monkeypatch.setattr(
+        kimi_model.KimiPaddedColumnParallelLinear,
+        "forward_local",
+        lambda _self, _hidden: (local_down, None),
+    )
+    monkeypatch.setattr(
+        kimi_model,
+        "maybe_execute_in_parallel",
+        lambda first, second, *_args: (first(), second()),
+    )
+    monkeypatch.setattr(
+        kimi_model,
+        "try_gather_kimi_sharded_projection_pair_topk",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        kimi_model,
+        "gather_kimi_sharded_projection_pair",
+        lambda down, router: (gathered_down, gathered_router),
+    )
+
+    routed_hidden, router_output, topk_ids = moe._maybe_overlap_router_and_down_proj(
+        hidden_states
+    )
+
+    torch.testing.assert_close(routed_hidden, gathered_down[:, :3])
+    torch.testing.assert_close(router_output, gathered_router[:, :5])
+    assert routed_hidden.is_contiguous()
+    assert router_output.is_contiguous()
+    assert topk_ids is None
+
+
 def test_kimi_merged_projection_restores_logical_output_order(monkeypatch):
     layer = object.__new__(kimi_mla.KimiShardedMergedColumnParallelLinear)
     nn.Module.__init__(layer)
