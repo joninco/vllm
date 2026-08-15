@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     VLLM_NVFP4_MLA_SCALES_FILE: str = ""
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
+    VLLM_K3_KV_GROUP_SIZE: int = 0
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_NF3_GRID188_DECODE: bool = True
@@ -1138,6 +1139,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_FP8_DRAFT_HEAD": lambda: bool(
         int(os.getenv("VLLM_DSPARK_FP8_DRAFT_HEAD", "0"))
     ),
+    # Bound the number of physical Kimi-K3 layers sharing each hybrid-cache
+    # block table. Zero preserves the general grouping heuristic.
+    "VLLM_K3_KV_GROUP_SIZE": lambda: int(os.getenv("VLLM_K3_KV_GROUP_SIZE", "0")),
     # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
     # This is separate from the generic FP8 linear switch for perf isolation.
     "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(

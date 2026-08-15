@@ -2867,6 +2867,74 @@ def test_group_and_unify_kv_cache_specs_defers_recurrent_state():
     assert group_and_unify_kv_cache_specs(specs) is None
 
 
+def _k3_hybrid_cache_specs() -> dict[str, KVCacheSpec]:
+    recurrent = MambaSpec(
+        block_size=16,
+        shapes=((9216,),),
+        dtypes=(torch.bfloat16,),
+    )
+    draft = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+        sliding_window=32768,
+        non_causal_multi_token_decode=True,
+    )
+    assert recurrent.page_size_bytes == draft.page_size_bytes
+    return {
+        **{f"state.{index}": recurrent for index in range(8)},
+        **{f"draft.{index}": draft for index in range(6)},
+    }
+
+
+def test_uniform_page_group_size_override_is_explicit():
+    specs = _k3_hybrid_cache_specs()
+
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(
+        specs,
+        group_size_override=2,
+    )
+
+    assert len(groups) == 7
+    assert all(len(group.layer_names) == 2 for group in groups)
+    with pytest.raises(ValueError, match="must be positive"):
+        kv_cache_utils._get_kv_cache_groups_uniform_page_size(
+            specs,
+            group_size_override=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected_groups"), [("kimi_k3", 7), ("other", 2)]
+)
+def test_k3_hybrid_group_size_is_model_and_cache_specific(
+    monkeypatch: pytest.MonkeyPatch,
+    model_type: str,
+    expected_groups: int,
+):
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type=model_type),
+        ),
+    )
+    monkeypatch.setenv("VLLM_K3_KV_GROUP_SIZE", "2")
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "group_and_unify_kv_cache_specs",
+        lambda *args, **kwargs: None,
+    )
+
+    groups = get_kv_cache_groups(config, _k3_hybrid_cache_specs())
+
+    assert len(groups) == expected_groups
+
+
 def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     # DeepseekV4-style: differing page sizes across MLA and sliding-window MLA
     # layers do require tuple packing, so grouping must still be produced.
