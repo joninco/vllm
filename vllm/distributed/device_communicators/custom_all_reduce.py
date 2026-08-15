@@ -1380,3 +1380,23 @@ def get_b12x_pcie_allreduce() -> CustomAllreduce | None:
     ):
         return custom_allreduce
     return None
+
+
+def get_active_b12x_pcie_allreduce() -> CustomAllreduce | None:
+    """Return the active TP B12X runtime for any supported algorithm."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        device_communicator = get_tp_group().device_communicator
+    except (AssertionError, RuntimeError):
+        return None
+    if device_communicator is None:
+        return None
+    custom_allreduce = getattr(device_communicator, "ca_comm", None)
+    if (
+        isinstance(custom_allreduce, CustomAllreduce)
+        and not custom_allreduce.disabled
+        and custom_allreduce._pcie_runtime is not None
+    ):
+        return custom_allreduce
+    return None
