@@ -53,6 +53,7 @@ def test_instanttensor_copy_contract(
         raise AssertionError
 
     monkeypatch.setenv("INSTANTTENSOR_COPY", setting)
+    monkeypatch.delenv("INSTANTTENSOR_BUFFER_SIZE", raising=False)
     monkeypatch.setattr(
         weight_utils,
         "current_platform",
@@ -136,7 +137,7 @@ def test_instanttensor_restricts_io_to_indexed_shards(tmp_path):
         "model.expert.weight": str(overlay_shard.resolve()),
     }
 
-    weight_utils._restrict_instanttensor_to_selected_ranges(
+    cpu_fallback = weight_utils._restrict_instanttensor_to_selected_ranges(
         instant_open,
         indexed_tensor_files=indexed_tensor_files,
         weight_name_prefixes=None,
@@ -160,6 +161,77 @@ def test_instanttensor_restricts_io_to_indexed_shards(tmp_path):
         "model.expert.weight": 1,
     }
     assert buffer_sizes == [None]
+    assert cpu_fallback == []
+
+
+def test_instanttensor_routes_oversized_selected_tensors_to_cpu(tmp_path):
+    shard = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "model.large.weight": torch.arange(8, dtype=torch.float32),
+            "model.small.weight": torch.arange(2, dtype=torch.float32),
+        },
+        shard,
+    )
+    with weight_utils.safe_open(shard, framework="pt") as physical_file:
+        physical_names = list(physical_file.offset_keys())
+    metadata_by_name = {
+        "model.large.weight": {"data_offsets": [0, 32]},
+        "model.small.weight": {"data_offsets": [32, 40]},
+    }
+    offsets_by_name = {
+        "model.large.weight": (0, 32),
+        "model.small.weight": (32, 40),
+    }
+    metadata = [(name, metadata_by_name[name]) for name in physical_names]
+    offsets = [(0, offsets_by_name[physical_names[0]][0])]
+    offsets.extend((0, offsets_by_name[name][1]) for name in physical_names)
+    buffer_sizes = []
+    instant_open = SimpleNamespace(
+        filename=[str(shard)],
+        ordered_tensor_metadatas=metadata,
+        tensor_offsets=offsets,
+        tensor_sizes=[32, 8],
+        total_tensor_size=40,
+        tensor_name_to_index={},
+        loader_handle=None,
+        _determine_buffer_size=lambda requested: buffer_sizes.append(requested),
+    )
+
+    cpu_fallback = weight_utils._restrict_instanttensor_to_selected_ranges(
+        instant_open,
+        indexed_tensor_files=None,
+        weight_name_prefixes=None,
+        max_tensor_size=16,
+    )
+
+    assert [name for name, _ in instant_open.ordered_tensor_metadatas] == [
+        "model.small.weight"
+    ]
+    assert cpu_fallback == [("model.large.weight", str(shard))]
+    assert instant_open.total_tensor_size == 8
+    assert buffer_sizes == [None]
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="InstantTensor requires NVIDIA GPUs",
+)
+def test_instanttensor_loads_tensor_larger_than_staging_buffer(tmp_path, monkeypatch):
+    shard = tmp_path / "model.safetensors"
+    small = torch.arange(256 * 1024, dtype=torch.float32)
+    large = torch.arange(9 * 256 * 1024, dtype=torch.float32)
+    save_file({"model.small": small, "model.large": large}, shard)
+    monkeypatch.setenv("INSTANTTENSOR_BUFFER_SIZE", str(8 * 1024 * 1024))
+    monkeypatch.setenv("INSTANTTENSOR_COPY", "1")
+
+    loaded = list(instanttensor_weights_iterator([str(shard)], use_tqdm_on_load=False))
+    devices = {name: tensor.device.type for name, tensor in loaded}
+    weights = {name: tensor.cpu() for name, tensor in loaded}
+
+    assert devices == {"model.small": "cuda", "model.large": "cpu"}
+    torch.testing.assert_close(weights["model.small"], small)
+    torch.testing.assert_close(weights["model.large"], large)
 
 
 @pytest.mark.skipif(
