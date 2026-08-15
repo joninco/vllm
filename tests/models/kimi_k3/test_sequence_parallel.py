@@ -330,6 +330,32 @@ def test_auxiliary_projection_sharding_requires_shared_token_rows(
     assert kimi_model.shard_auxiliary_projections(use_sequence_parallel) is expected
 
 
+@pytest.mark.parametrize(
+    ("quantization", "moe_backend", "b12x_env", "expected"),
+    [
+        ("mxfp4", "b12x", False, True),
+        ("mxfp4", "auto", True, True),
+        ("mxfp4", "auto", False, False),
+        ("mxfp4", "flashinfer_cutlass", True, False),
+        (None, "b12x", True, False),
+    ],
+)
+def test_native_mxfp4_moe_shard_requires_b12x_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    quantization: str | None,
+    moe_backend: str,
+    b12x_env: bool,
+    expected: bool,
+):
+    monkeypatch.setattr(kimi_model.envs, "VLLM_USE_B12X_MOE", b12x_env)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(quantization=quantization),
+        kernel_config=SimpleNamespace(moe_backend=moe_backend),
+    )
+
+    assert kimi_model._uses_native_b12x_mxfp4_intermediate_size(vllm_config) is expected
+
+
 def test_partial_routed_output_transform_adds_partial_residual(monkeypatch):
     monkeypatch.delenv("VLLM_KQUANT_CAPTURE_DIR", raising=False)
     weight = torch.arange(12, dtype=torch.float32).view(4, 3)
