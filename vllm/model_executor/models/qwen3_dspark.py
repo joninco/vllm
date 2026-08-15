@@ -20,6 +20,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -27,6 +28,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    VocabParallelEmbedding,
 )
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
@@ -43,9 +45,8 @@ class DSparkMarkovHead(nn.Module):
     (``draft_vocab_size``) added to the base draft logits. The two sizes
     coincide for full-vocab drafts.
 
-    Both weights are replicated because the head runs sequentially for every
-    draft position. Sharding them would add an all-reduce and a full-vocab
-    gather to each position.
+    Both weights are replicated by default. The TP-sharded layout reduces
+    persistent draft memory and retains the ordinary exact gathered-logit path.
     """
 
     def __init__(
@@ -57,6 +58,31 @@ class DSparkMarkovHead(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
+        self.shard_across_tp = envs.VLLM_DSPARK_SHARD_MARKOV_HEAD
+        self.replicate_w1 = envs.VLLM_DSPARK_REPLICATE_MARKOV_W1
+        if self.replicate_w1 and not self.shard_across_tp:
+            raise ValueError(
+                "VLLM_DSPARK_REPLICATE_MARKOV_W1 requires "
+                "VLLM_DSPARK_SHARD_MARKOV_HEAD=1."
+            )
+        if self.shard_across_tp:
+            self.markov_w1 = (
+                nn.Embedding(vocab_size, markov_rank)
+                if self.replicate_w1
+                else VocabParallelEmbedding(
+                    vocab_size,
+                    markov_rank,
+                    prefix=maybe_prefix(prefix, "markov_w1"),
+                )
+            )
+            self.markov_w2 = ParallelLMHead(
+                draft_vocab_size,
+                markov_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "markov_w2"),
+            )
+            return
         self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
         self.markov_w2 = ParallelLMHead(
             draft_vocab_size,
@@ -78,6 +104,16 @@ class DSparkMarkovHead(nn.Module):
     ) -> torch.Tensor:
         """Vocab-size transition bias from a Markov embedding ([B, r] -> [B, V])."""
         return logits_processor(self.markov_w2, markov_embed)
+
+    def local_bias(
+        self,
+        markov_embed: torch.Tensor,
+        logits_processor: LogitsProcessor,
+    ) -> torch.Tensor:
+        """Return the unprocessed transition-bias shard owned by this TP rank."""
+        if not self.shard_across_tp:
+            raise RuntimeError("Local Markov bias requires a TP-sharded head.")
+        return logits_processor._apply_head(self.markov_w2, markov_embed, None)
 
     def apply_bias_gathered(
         self,

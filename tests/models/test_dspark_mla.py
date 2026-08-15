@@ -83,6 +83,8 @@ def test_dspark_markov_head_is_replicated(
         "get_current_vllm_config",
         lambda: SimpleNamespace(model_config=None),
     )
+    monkeypatch.delenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", raising=False)
+    monkeypatch.delenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", raising=False)
 
     head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
     assert head.markov_w2.tp_size == 1
@@ -104,6 +106,65 @@ def test_dspark_markov_head_is_replicated(
     bias = head.bias(markov_embed, logits_processor)
     assert markov_embed.shape == (2, 8)
     assert bias.shape == (2, 128)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("replicate_w1", [False, True])
+def test_dspark_markov_head_shards_vocabulary_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    replicate_w1: bool,
+) -> None:
+    from vllm.model_executor.layers import logits_processor, vocab_parallel_embedding
+
+    monkeypatch.setenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "1")
+    monkeypatch.setenv(
+        "VLLM_DSPARK_REPLICATE_MARKOV_W1",
+        "1" if replicate_w1 else "0",
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 3
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding,
+        "get_tensor_model_parallel_world_size",
+        lambda: 8,
+    )
+    monkeypatch.setattr(
+        logits_processor,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=None),
+    )
+
+    head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
+
+    assert head.shard_across_tp
+    assert head.replicate_w1 is replicate_w1
+    assert head.markov_w2.tp_size == 8
+    assert head.markov_w2.weight.shape == (16, 8)
+    if replicate_w1:
+        assert isinstance(head.markov_w1, nn.Embedding)
+        assert head.markov_w1.weight.shape == (128, 8)
+    else:
+        assert isinstance(
+            head.markov_w1,
+            vocab_parallel_embedding.VocabParallelEmbedding,
+        )
+        assert head.markov_w1.weight.shape == (16, 8)
+
+    processor = LogitsProcessor(128)
+    local_bias = head.local_bias(torch.ones((2, 8)), processor)
+    assert local_bias.shape == (2, 16)
+
+
+@pytest.mark.cpu_test
+def test_replicated_markov_w1_requires_sharded_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", raising=False)
+    monkeypatch.setenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "1")
+
+    with pytest.raises(ValueError, match="requires VLLM_DSPARK_SHARD_MARKOV_HEAD"):
+        DSparkMarkovHead(128, 128, 8, prefix="markov_head")
 
 
 @pytest.mark.cpu_test
