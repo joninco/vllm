@@ -262,3 +262,70 @@ def test_projection_pair_uses_exact_separate_fallback(monkeypatch):
     assert actual[1] is gathered_second
     assert calls[0] is first
     assert calls[1] is second
+
+
+def test_projection_pair_topk_uses_available_b12x_binding(monkeypatch):
+    local_down = torch.empty(1, 448)
+    local_router = torch.empty(1, 112)
+    correction_bias = torch.empty(896)
+    group = SimpleNamespace(world_size=8, ranks=list(range(8)))
+    expected = (torch.empty(1, 3584), torch.empty(2, 16))
+    received: dict[str, object] = {}
+    monkeypatch.setattr(
+        tp_projection, "get_tensor_model_parallel_world_size", lambda: 8
+    )
+    monkeypatch.setattr(tp_projection, "_get_kimi_projection_group", lambda: group)
+
+    def pair_topk(local_down_arg, local_router_arg, bias_arg, group_arg):
+        received.update(
+            local_down=local_down_arg,
+            local_router=local_router_arg,
+            correction_bias=bias_arg,
+            group=group_arg,
+        )
+        return expected
+
+    monkeypatch.setattr(
+        tp_projection.dcp_alltoall,
+        "try_dcp_b12x_all_gather_pair_kimi_topk",
+        pair_topk,
+        raising=False,
+    )
+
+    actual = tp_projection.try_gather_kimi_sharded_projection_pair_topk(
+        local_down,
+        local_router,
+        correction_bias,
+    )
+
+    assert actual is expected
+    assert received == {
+        "local_down": local_down,
+        "local_router": local_router,
+        "correction_bias": correction_bias,
+        "group": group,
+    }
+
+
+def test_projection_pair_topk_returns_none_without_b12x_binding(monkeypatch):
+    monkeypatch.setattr(
+        tp_projection, "get_tensor_model_parallel_world_size", lambda: 8
+    )
+    monkeypatch.delattr(
+        tp_projection.dcp_alltoall,
+        "try_dcp_b12x_all_gather_pair_kimi_topk",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        tp_projection,
+        "_get_kimi_projection_group",
+        lambda: pytest.fail("an unavailable binding must not resolve a group"),
+    )
+
+    actual = tp_projection.try_gather_kimi_sharded_projection_pair_topk(
+        torch.empty(1, 448),
+        torch.empty(1, 112),
+        torch.empty(896),
+    )
+
+    assert actual is None

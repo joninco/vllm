@@ -11,6 +11,7 @@ from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_gather,
 )
+from vllm.v1.attention.ops import dcp_alltoall
 from vllm.v1.attention.ops.dcp_alltoall import (
     dcp_b12x_all_gather_heads,
     dcp_b12x_all_gather_pair,
@@ -137,4 +138,31 @@ def gather_kimi_sharded_projection_pair(
     return (
         gather_kimi_sharded_projection(local_first),
         gather_kimi_sharded_projection(local_second),
+    )
+
+
+def try_gather_kimi_sharded_projection_pair_topk(
+    local_down: torch.Tensor,
+    local_router: torch.Tensor,
+    correction_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Use B12X fused Kimi projection transport and expert selection.
+
+    A missing or ineligible fused binding returns ``None``. The model caller
+    must then use the exact paired gather and ordinary router operations.
+    """
+    if get_tensor_model_parallel_world_size() <= 1:
+        return None
+    pair_topk = getattr(
+        dcp_alltoall,
+        "try_dcp_b12x_all_gather_pair_kimi_topk",
+        None,
+    )
+    if pair_topk is None:
+        return None
+    return pair_topk(
+        local_down,
+        local_router,
+        correction_bias,
+        _get_kimi_projection_group(),
     )
