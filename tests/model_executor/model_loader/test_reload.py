@@ -138,6 +138,47 @@ class _ReloadableAttentionLayer(
         self.post_load_called = True
 
 
+class _SourceLifetimeQuantMethod(QuantizeMethodBase):
+    """Observes checkpoint-source ownership when online processing starts."""
+
+    uses_meta_device = True
+
+    def __init__(self, source_refs):
+        self.source_refs = source_refs
+        self.sources_alive_at_process = None
+
+    def create_weights(self, layer, *weight_args, **extra_weight_attrs):
+        pass
+
+    def apply(self, layer, *args, **kwargs):
+        raise NotImplementedError
+
+    def process_weights_after_loading(self, layer):
+        gc.collect()
+        self.sources_alive_at_process = [
+            source_ref() is not None for source_ref in self.source_refs
+        ]
+
+
+class _DeferredOnlineQuantAttention(_ReloadableAttentionLayer):
+    """Attention layer whose checkpoint tensor is processed after loading."""
+
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+        self.source_refs = []
+        self.quant_method = _SourceLifetimeQuantMethod(self.source_refs)
+
+        def tracking_weight_loader(param, loaded_weight):
+            self.source_refs.append(ref(loaded_weight))
+            default_weight_loader(param, loaded_weight)
+
+        weight = torch.nn.Parameter(torch.empty(2, 2, device="meta"))
+        weight.weight_loader = tracking_weight_loader
+        self.register_parameter("weight", weight)
+        self.post_load_called = False
+        initialize_online_processing(self)
+
+
 def test_move_metatensors():
     tensor = torch.empty((1, 2, 3))
     meta_tensor = to_meta_tensor(tensor)
@@ -191,6 +232,24 @@ def test_attention_first_load_processes_weights(default_vllm_config, layer_cls):
 
     assert layer.post_load_called
     assert torch.equal(layer.weight, loaded_weight)
+
+
+def test_attention_first_load_releases_sources_before_online_quantization(
+    default_vllm_config,
+):
+    default_vllm_config.model_config = ModelConfig()
+    layer = _DeferredOnlineQuantAttention()
+    model = torch.nn.Sequential(layer)
+
+    layer.weight.weight_loader(layer.weight, torch.full((2, 2), 7.0))
+
+    assert layer.source_refs[0]() is not None
+    finalize_layerwise_reload(model, default_vllm_config.model_config)
+
+    assert layer.quant_method.sources_alive_at_process
+    assert not any(layer.quant_method.sources_alive_at_process)
+    assert layer.post_load_called
+    assert torch.equal(layer.weight, torch.full((2, 2), 7.0))
 
 
 def test_reload_lifecycle():

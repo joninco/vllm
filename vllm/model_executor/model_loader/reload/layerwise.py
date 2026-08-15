@@ -435,10 +435,19 @@ def _layerwise_process(layer: torch.nn.Module, info: LayerReloadingInfo):
         param.weight_loader = _get_original_loader(param)
 
     # Load all buffered weights into materialized layer (using original loaders)
-    for name, args in info.loaded_weights:
+    loaded_args = None
+    for name, loaded_args in info.loaded_weights:
         param = getattr(layer, name)
-        args.arguments["param"] = param
-        param.weight_loader(*args.args, **args.kwargs)
+        loaded_args.arguments["param"] = param
+        param.weight_loader(*loaded_args.args, **loaded_args.kwargs)
+
+    if info.kernel_tensors is None:
+        # Initial online quantization no longer needs checkpoint tensors after
+        # their values have reached the materialized parameters. Release the
+        # buffered sources before quantization and kernel repacking allocate
+        # their transient workspaces.
+        info.loaded_weights.clear()
+        loaded_args = None
 
     _zero_online_processing_unloaded(layer)
 
