@@ -218,13 +218,23 @@ def test_b12x_oneshot_defaults_to_stream_isolation(
     assert not envs.environment_variables["VLLM_PCIE_ONESHOT_SINGLE_CHANNEL"]()
 
 
-def test_b12x_pool_prepares_single_stable_eager_owner(
+@pytest.mark.parametrize(
+    ("world_size", "algorithm", "supports_all_peer_auxiliary"),
+    [(2, "oneshot", True), (16, "hierarchical", False)],
+)
+def test_b12x_dispatcher_prepares_single_stable_eager_owner(
     monkeypatch: pytest.MonkeyPatch,
+    world_size: int,
+    algorithm: str,
+    supports_all_peer_auxiliary: bool,
 ) -> None:
     captured = {}
     runtime = MagicMock()
+    runtime.algorithm = algorithm
+    runtime.supports_all_peer_auxiliary = supports_all_peer_auxiliary
+    dma_min_bytes = MagicMock(return_value=None)
 
-    class FakePool:
+    class FakeDispatcher:
         @classmethod
         def from_exchange_group(cls, **kwargs):
             captured.update(kwargs)
@@ -243,10 +253,14 @@ def test_b12x_pool_prepares_single_stable_eager_owner(
     monkeypatch.setattr(
         custom_all_reduce,
         "in_the_same_node_as",
-        lambda group, source_rank=0: [True, True],
+        lambda group, source_rank=0: [True] * world_size,
     )
     monkeypatch.setattr(custom_all_reduce.dist, "get_rank", lambda group=None: 0)
-    monkeypatch.setattr(custom_all_reduce.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(
+        custom_all_reduce.dist,
+        "get_world_size",
+        lambda group=None: world_size,
+    )
     monkeypatch.setattr(custom_all_reduce.dist, "all_gather", fake_all_gather)
     monkeypatch.setattr(
         custom_all_reduce.dist, "all_reduce", lambda *args, **kwargs: None
@@ -264,13 +278,13 @@ def test_b12x_pool_prepares_single_stable_eager_owner(
     )
     monkeypatch.setattr(
         custom_all_reduce,
-        "_load_b12x_pcie_oneshot_pool",
-        lambda: FakePool,
+        "_load_b12x_pcie_allreduce",
+        lambda: FakeDispatcher,
     )
     monkeypatch.setattr(
         custom_all_reduce,
         "_b12x_pcie_dma_min_bytes",
-        lambda: None,
+        dma_min_bytes,
     )
     monkeypatch.setattr(
         custom_all_reduce.current_platform,
@@ -331,6 +345,10 @@ def test_b12x_pool_prepares_single_stable_eager_owner(
     assert captured["max_concurrent_channels"] == 2
     runtime.prepare_channels.assert_called_once_with(("vllm:eager:allreduce",))
     runtime.for_stream.assert_called_once_with(channel_id="vllm:eager:allreduce")
+    assert built.backend_name() == (
+        "B12X_PCIE_ONESHOT" if algorithm == "oneshot" else "B12X_PCIE_HIERARCHICAL"
+    )
+    assert dma_min_bytes.call_count == int(supports_all_peer_auxiliary)
 
 
 def test_b12x_channel_checkpoint_delegates_to_runtime() -> None:

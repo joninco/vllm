@@ -118,14 +118,12 @@ def _b12x_pcie_dma_min_bytes() -> int | None:
 
 
 @lru_cache(maxsize=1)
-def _load_b12x_pcie_oneshot_pool() -> Any | None:
+def _load_b12x_pcie_allreduce() -> Any | None:
     try:
-        from b12x.comm.pcie import (
-            OneshotAllReducePool as PCIeOneshotAllReducePool,
-        )
+        from b12x.comm.pcie import AllReduce as PCIeAllReduce
     except Exception:
         return None
-    return PCIeOneshotAllReducePool
+    return PCIeAllReduce
 
 
 @lru_cache(maxsize=1)
@@ -515,12 +513,12 @@ class CustomAllreduce:
                     physical_device_ids,
                 )
                 return
-            pool_cls = (
-                _load_b12x_pcie_oneshot_pool()
+            runtime_cls = (
+                _load_b12x_pcie_allreduce()
                 if pcie_backend == "b12x"
                 else _load_flashinfer_pcie_oneshot_pool()
             )
-            if pool_cls is None:
+            if runtime_cls is None:
                 logger.warning(
                     "%s PCIe custom allreduce was requested, but its runtime "
                     "is unavailable.",
@@ -568,7 +566,7 @@ class CustomAllreduce:
             pcie_runtime = None
             pcie_init_error: Exception | None = None
             try:
-                pcie_runtime = pool_cls.from_exchange_group(
+                pcie_runtime = runtime_cls.from_exchange_group(
                     exchange_group=self.nccl_group,
                     device=self.device,
                     eager_buffer_bytes=pcie_oneshot_buffer_size,
@@ -614,14 +612,25 @@ class CustomAllreduce:
             # Prefill-size DMA allreduce alongside the oneshot. A deployment
             # preflight can tune its crossover or disable it when lossless DMA
             # never beats NCCL on the selected PCIe topology.
+            supports_all_peer_auxiliary = bool(
+                getattr(pcie_runtime, "supports_all_peer_auxiliary", True)
+            )
             dma_min_bytes = (
-                _b12x_pcie_dma_min_bytes() if pcie_backend == "b12x" else None
+                _b12x_pcie_dma_min_bytes()
+                if pcie_backend == "b12x" and supports_all_peer_auxiliary
+                else None
             )
             dma_cls = None if dma_min_bytes is None else _load_b12x_pcie_dma()
             if pcie_backend != "b12x":
                 logger.info(
                     "FlashInfer PCIe IPC handles only tuned one-shot shapes; "
                     "larger allreduces stay on PyNCCL."
+                )
+            elif not supports_all_peer_auxiliary:
+                logger.info(
+                    "B12X PCIe %s all-reduce does not expose the all-peer "
+                    "topology required by DMA; larger tensors use PyNCCL.",
+                    getattr(pcie_runtime, "algorithm", "bounded-degree"),
                 )
             elif dma_min_bytes is None:
                 logger.info(
@@ -678,8 +687,9 @@ class CustomAllreduce:
             if rank == 0:
                 logger.info(
                     "Configured %s PCIe crossovers: "
-                    "oneshot max=%d, fused max=%d, DMA min=%s.",
+                    "algorithm=%s, allreduce max=%d, fused max=%d, DMA min=%s.",
                     pcie_backend,
+                    getattr(pcie_runtime, "algorithm", "oneshot"),
                     self._pcie_allreduce_max_size,
                     self._pcie_fused_add_rms_norm_max_size,
                     dma_min_bytes if dma_min_bytes is not None else "off",
@@ -1017,6 +1027,8 @@ class CustomAllreduce:
         if self._pcie_runtime is not None:
             if self._pcie_backend_name == "flashinfer-ipc":
                 return "FLASHINFER_PCIE_IPC"
+            if getattr(self._pcie_runtime, "algorithm", "oneshot") != "oneshot":
+                return "B12X_PCIE_HIERARCHICAL"
             if self._pcie_dma is not None:
                 return "B12X_PCIE_ONESHOT_DMA"
             return "B12X_PCIE_ONESHOT"
