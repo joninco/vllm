@@ -402,8 +402,8 @@ def test_kimi_merged_projection_restores_logical_output_order(monkeypatch):
     )
     monkeypatch.setattr(
         kimi_mla,
-        "tensor_model_parallel_all_gather",
-        lambda output, dim: rank_major_output,
+        "gather_kimi_sharded_projection",
+        lambda output: rank_major_output,
     )
 
     output, bias = layer(torch.empty(1, 1))

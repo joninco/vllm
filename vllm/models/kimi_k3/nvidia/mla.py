@@ -44,7 +44,6 @@ from vllm.config import (
 )
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -73,6 +72,9 @@ from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_key_concat_ds_mla_insert,
     fused_mla_key_concat_kv_cache_insert,
     fused_mla_qkv_quant_kv_cache_fp8_insert,
+)
+from vllm.models.kimi_k3.nvidia.tp_projection import (
+    gather_kimi_sharded_projection,
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -161,7 +163,7 @@ class KimiShardedMergedColumnParallelLinear(MergedColumnParallelLinear):
         output_parallel, output_bias = super().forward(x)
         if self.tp_size == 1:
             return output_parallel, output_bias
-        rank_major_output = tensor_model_parallel_all_gather(output_parallel, dim=-1)
+        rank_major_output = gather_kimi_sharded_projection(output_parallel)
         output = _restore_merged_output_order(
             rank_major_output,
             self.output_sizes,
