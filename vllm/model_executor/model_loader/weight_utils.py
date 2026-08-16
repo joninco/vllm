@@ -1467,9 +1467,8 @@ def _restrict_instanttensor_to_selected_ranges(
                 name, weight_name_prefixes
             )
             selected_here = indexed_here and prefix_matches
-            tensor_size = int(file_offsets[item_index + 1][1]) - int(
-                file_offsets[item_index][1]
-            )
+            item_data_offsets = file_metadata[item_index][1]["data_offsets"]
+            tensor_size = int(item_data_offsets[1]) - int(item_data_offsets[0])
             use_cpu_fallback = (
                 selected_here
                 and max_tensor_size is not None

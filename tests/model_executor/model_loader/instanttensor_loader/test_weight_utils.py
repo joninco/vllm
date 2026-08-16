@@ -3,6 +3,8 @@
 
 import glob
 import inspect
+import json
+import struct
 import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -23,26 +25,32 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.platforms import current_platform
 
 
+def _safetensors_tensor_metadata(filename):
+    with open(filename, "rb") as checkpoint:
+        header_size = struct.unpack("<Q", checkpoint.read(8))[0]
+        header = json.loads(checkpoint.read(header_size))
+    return {name: item for name, item in header.items() if name != "__metadata__"}
+
+
 class _FakeInstantOpen:
     def __init__(self, filename, tensors):
         self.filename = [str(filename)]
         self._tensors = tensors
         with weight_utils.safe_open(filename, framework="pt") as physical_file:
             names = list(physical_file.offset_keys())
+        metadata = _safetensors_tensor_metadata(filename)
         self.original_names = names
-        self.ordered_tensor_metadatas = []
-        self.tensor_offsets = [(0, 0)]
-        self.tensor_sizes = []
-        offset = 0
-        for name in names:
-            tensor_size = tensors[name].numel() * tensors[name].element_size()
-            self.ordered_tensor_metadatas.append(
-                (name, {"data_offsets": [offset, offset + tensor_size]})
-            )
-            offset += tensor_size
-            self.tensor_offsets.append((0, offset))
-            self.tensor_sizes.append(tensor_size)
-        self.total_tensor_size = offset
+        self.ordered_tensor_metadatas = [(name, metadata[name]) for name in names]
+        first_offset = metadata[names[0]]["data_offsets"][0]
+        self.tensor_offsets = [(0, first_offset)]
+        self.tensor_offsets.extend(
+            (0, metadata[name]["data_offsets"][1]) for name in names
+        )
+        self.tensor_sizes = [
+            item["data_offsets"][1] - item["data_offsets"][0]
+            for _, item in self.ordered_tensor_metadatas
+        ]
+        self.total_tensor_size = sum(self.tensor_sizes)
         self.tensor_name_to_index = {name: index for index, name in enumerate(names)}
         self.loader_handle = None
         self.buffer_size_requests = []
@@ -221,17 +229,12 @@ def test_instanttensor_routes_oversized_selected_tensors_to_cpu(tmp_path):
     )
     with weight_utils.safe_open(shard, framework="pt") as physical_file:
         physical_names = list(physical_file.offset_keys())
-    metadata_by_name = {
-        "model.large.weight": {"data_offsets": [0, 32]},
-        "model.small.weight": {"data_offsets": [32, 40]},
-    }
-    offsets_by_name = {
-        "model.large.weight": (0, 32),
-        "model.small.weight": (32, 40),
-    }
+    metadata_by_name = _safetensors_tensor_metadata(shard)
     metadata = [(name, metadata_by_name[name]) for name in physical_names]
-    offsets = [(0, offsets_by_name[physical_names[0]][0])]
-    offsets.extend((0, offsets_by_name[name][1]) for name in physical_names)
+    offsets = [(0, metadata_by_name[physical_names[0]]["data_offsets"][0])]
+    offsets.extend(
+        (0, metadata_by_name[name]["data_offsets"][1]) for name in physical_names
+    )
     buffer_sizes = []
     instant_open = SimpleNamespace(
         filename=[str(shard)],
@@ -387,6 +390,7 @@ def test_instanttensor_deferred_tensors_survive_ring_reuse(tmp_path, monkeypatch
     for name, tensor in instanttensor_weights_iterator(
         [str(shard)], use_tqdm_on_load=False
     ):
+        assert getattr(tensor, "_vllm_instanttensor_borrowed", False)
         bound_args = signature.bind(None, tensor)
         _own_deferred_accelerator_tensors(bound_args)
         retained[name] = bound_args.arguments["loaded_weight"]
