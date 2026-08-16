@@ -319,6 +319,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    get_kv_cache_dcp_shard_count,
     get_kv_quant_mode,
 )
 
@@ -326,6 +327,19 @@ logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
 _B12X_ABSORB_BMM_MAX_M = 32
+
+
+def _get_mla_kv_dcp_world_size(
+    kv_cache_spec: KVCacheSpec, configured_dcp_world_size: int
+) -> int:
+    """Return the DCP group size that owns distinct KV position shards."""
+    shard_count = get_kv_cache_dcp_shard_count(kv_cache_spec, configured_dcp_world_size)
+    if shard_count not in (1, configured_dcp_world_size):
+        raise NotImplementedError(
+            "MLA metadata supports fully sharded or replicated DCP KV groups; "
+            "partial DCP KV sharding requires a matching subgroup"
+        )
+    return shard_count
 
 
 def _run_mla_query_bmm(
@@ -3159,10 +3173,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         attention_layer = self.compilation_config.static_forward_context[layer_names[0]]
 
         try:
-            self.dcp_world_size = get_dcp_group().world_size
+            configured_dcp_world_size = int(get_dcp_group().world_size)
         except AssertionError:
             # DCP might not be initialized in testing
-            self.dcp_world_size = 1
+            configured_dcp_world_size = 1
+        self.dcp_world_size = _get_mla_kv_dcp_world_size(
+            kv_cache_spec, configured_dcp_world_size
+        )
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size

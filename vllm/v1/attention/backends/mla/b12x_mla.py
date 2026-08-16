@@ -149,6 +149,7 @@ def _create_dense_mla_plan(
     num_q_heads: int,
     max_total_q: int | None = None,
     dcp_size: int | None = None,
+    max_cache_tokens: int | None = None,
 ) -> Any:
     dense_mla = _load_dense_mla()
     max_total_q = int(
@@ -156,7 +157,11 @@ def _create_dense_mla_plan(
         if max_total_q is not None
         else vllm_config.scheduler_config.max_num_seqs
     )
-    max_cache_tokens = _max_dcp_local_cache_tokens(vllm_config, dcp_size=dcp_size)
+    max_cache_tokens = int(
+        max_cache_tokens
+        if max_cache_tokens is not None
+        else _max_dcp_local_cache_tokens(vllm_config, dcp_size=dcp_size)
+    )
     if max_total_q > _MAX_B12X_QUERY_ROWS:
         raise ValueError(
             "B12X_MLA supports at most "
@@ -196,6 +201,7 @@ class B12xMLAMetadata(MLACommonMetadata):
     dense_mla_flat_block_table: torch.Tensor | None = None
     dense_mla_flat_seq_lens: torch.Tensor | None = None
     dense_mla_flat_query_start_loc: torch.Tensor | None = None
+    dense_mla_dcp_world_size: int = 1
 
 
 class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
@@ -233,6 +239,12 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         self._max_dense_mla_rows = max_dense_mla_rows
         self._effective_heads = self.num_heads * self.dcp_world_size
         self._kernel_heads = _kernel_query_heads(self.num_heads, self.dcp_world_size)
+        max_cache_tokens = _max_dcp_local_cache_tokens(
+            vllm_config, dcp_size=self.dcp_world_size
+        )
+        sliding_window = getattr(kv_cache_spec, "sliding_window", None)
+        if sliding_window is not None:
+            max_cache_tokens = min(max_cache_tokens, int(sliding_window))
         self._dense_mla_plan = _create_dense_mla_plan(
             vllm_config,
             device,
@@ -240,6 +252,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             num_q_heads=self._kernel_heads,
             max_total_q=max_dense_mla_rows,
             dcp_size=self.dcp_world_size,
+            max_cache_tokens=max_cache_tokens,
         )
         self._workspace_specs = self._dense_mla_plan.shapes_and_dtypes()
         if len(self._workspace_specs) != 1:
@@ -316,7 +329,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             self._kernel_heads,
             self.page_size,
             max_dense_mla_rows,
-            _max_dcp_local_cache_tokens(vllm_config, dcp_size=self.dcp_world_size),
+            max_cache_tokens,
             self._dense_mla_plan.num_splits,
         )
 
@@ -338,6 +351,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         metadata.dense_mla_scratch = self._dense_mla_scratch
         metadata.dense_mla_padded_q = self._dense_mla_padded_q
         metadata.dense_mla_padded_output = self._dense_mla_padded_output
+        metadata.dense_mla_dcp_world_size = self.dcp_world_size
         decode_metadata = metadata.decode
         flatten_decode = False
         if decode_metadata is not None and metadata.num_decodes > 0:
@@ -622,8 +636,6 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 "B12xMLAImpl does not support prefill context parallelism."
             )
         self._dense_mla = _load_dense_mla()
-        self._effective_heads = num_heads * self.dcp_world_size
-        self._kernel_heads = _kernel_query_heads(num_heads, self.dcp_world_size)
         self._dcp_comm_backend = vllm_config.parallel_config.dcp_comm_backend
         self._dcp_max_batch_size = vllm_config.scheduler_config.max_num_batched_tokens
         self._compiled_bindings: set[tuple[object, ...]] = set()
@@ -675,8 +687,19 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 f"B12X_MLA expected {self.num_heads} query heads, got {q.shape[1]}."
             )
 
+        metadata_dcp_world_size = int(
+            getattr(attn_metadata, "dense_mla_dcp_world_size", self.dcp_world_size)
+        )
+        if metadata_dcp_world_size not in (1, self.dcp_world_size):
+            raise ValueError(
+                "B12X_MLA metadata uses an unsupported DCP KV shard count: "
+                f"metadata={metadata_dcp_world_size}, runtime={self.dcp_world_size}."
+            )
+        effective_heads = self.num_heads * metadata_dcp_world_size
+        kernel_heads = _kernel_query_heads(self.num_heads, metadata_dcp_world_size)
+
         dcp_group = None
-        if self.dcp_world_size > 1:
+        if metadata_dcp_world_size > 1:
             dcp_group = get_dcp_group()
             gathered_q = getattr(attn_metadata, "dense_mla_padded_q", None)
             if gathered_q is None:
@@ -693,7 +716,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                     "B12X_MLA DCP query storage does not match the live query: "
                     f"buffer={gathered_q.dtype}, query={q.dtype}."
                 )
-            gathered_q = gathered_q[:total_q, : self._effective_heads]
+            gathered_q = gathered_q[:total_q, :effective_heads]
             q = dcp_b12x_all_gather_heads(
                 q,
                 dcp_group,
@@ -702,13 +725,13 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                 out=gathered_q,
             )
 
-        effective_heads = int(q.shape[1])
-        if effective_heads != self._effective_heads:
+        actual_heads = int(q.shape[1])
+        if actual_heads != effective_heads:
             raise ValueError(
                 "B12X_MLA gathered an unexpected query-head count: "
-                f"expected {self._effective_heads}, got {effective_heads}."
+                f"expected {effective_heads}, got {actual_heads}."
             )
-        if self._kernel_heads == effective_heads and self.dcp_world_size == 1:
+        if kernel_heads == effective_heads and metadata_dcp_world_size == 1:
             output = torch.empty(
                 (total_q, effective_heads, self.kv_lora_rank),
                 dtype=torch.bfloat16,
@@ -717,9 +740,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         else:
             padded_q = getattr(attn_metadata, "dense_mla_padded_q", None)
             output = getattr(attn_metadata, "dense_mla_padded_output", None)
-            if output is None or (
-                self._kernel_heads != effective_heads and padded_q is None
-            ):
+            if output is None or (kernel_heads != effective_heads and padded_q is None):
                 raise RuntimeError(
                     "B12X_MLA metadata is missing caller-owned padded query buffers."
                 )
@@ -733,7 +754,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                     f"required={total_q}."
                 )
             output = output[:total_q]
-            if self._kernel_heads != effective_heads:
+            if kernel_heads != effective_heads:
                 assert padded_q is not None
                 padded_q = padded_q[:total_q]
                 if padded_q.dtype != q.dtype:
@@ -793,8 +814,8 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             self._compiled_bindings.add(compile_key)
 
         output, lse = self._dense_mla.run(binding=binding)
-        output = output[:, : self._effective_heads]
-        lse = lse[:, : self._effective_heads]
+        output = output[:, :effective_heads]
+        lse = lse[:, :effective_heads]
         if dcp_group is None:
             return output, lse
         if self._dcp_comm_backend == "a2a":
