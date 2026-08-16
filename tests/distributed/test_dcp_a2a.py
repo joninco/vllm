@@ -2088,9 +2088,6 @@ def test_distributed_packed_a2a_with_workspace_matches_reference():
     reason="Need two GPUs and b12x.",
 )
 def test_distributed_b12x_a2a_eager_and_graph_matches_reference():
-    from b12x.comm.pcie.pcie_dcp_a2a import _load_extension
-
-    _load_extension()
     _distributed_run(
         _distributed_b12x_a2a_worker,
         world_size=2,
