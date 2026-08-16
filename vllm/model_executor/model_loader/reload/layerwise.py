@@ -95,6 +95,11 @@ def _online_processing_load_numel_total(layer: torch.nn.Module) -> int:
 
 
 def _zero_online_processing_unloaded(layer: torch.nn.Module) -> None:
+    """Zero checkpoint-omitted parameter tails before online processing.
+
+    Args:
+        layer: Materialized layer with unloaded-tail annotations.
+    """
     unloaded = getattr(layer, _ONLINE_PROCESSING_UNLOADED_ATTR, {})
     for name, numel in unloaded.items():
         if numel:

@@ -23,6 +23,46 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.platforms import current_platform
 
 
+class _FakeInstantOpen:
+    def __init__(self, filename, tensors):
+        self.filename = [str(filename)]
+        self._tensors = tensors
+        with weight_utils.safe_open(filename, framework="pt") as physical_file:
+            names = list(physical_file.offset_keys())
+        self.original_names = names
+        self.ordered_tensor_metadatas = []
+        self.tensor_offsets = [(0, 0)]
+        self.tensor_sizes = []
+        offset = 0
+        for name in names:
+            tensor_size = tensors[name].numel() * tensors[name].element_size()
+            self.ordered_tensor_metadatas.append(
+                (name, {"data_offsets": [offset, offset + tensor_size]})
+            )
+            offset += tensor_size
+            self.tensor_offsets.append((0, offset))
+            self.tensor_sizes.append(tensor_size)
+        self.total_tensor_size = offset
+        self.tensor_name_to_index = {name: index for index, name in enumerate(names)}
+        self.loader_handle = None
+        self.buffer_size_requests = []
+        self.enter_count = 0
+
+    def _determine_buffer_size(self, requested):
+        self.buffer_size_requests.append(requested)
+
+    def __enter__(self):
+        self.enter_count += 1
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def tensors(self):
+        for name, _ in self.ordered_tensor_metadatas:
+            yield name, self._tensors[name]
+
+
 @pytest.mark.parametrize(
     ("setting", "expected_copy", "expected_borrowed"),
     [("0", False, True), ("1", True, False)],
@@ -141,7 +181,7 @@ def test_instanttensor_restricts_io_to_indexed_shards(tmp_path):
         "model.expert.weight": str(overlay_shard.resolve()),
     }
 
-    cpu_fallback = weight_utils._restrict_instanttensor_to_selected_ranges(
+    selection = weight_utils._restrict_instanttensor_to_selected_ranges(
         instant_open,
         indexed_tensor_files=indexed_tensor_files,
         weight_name_prefixes=None,
@@ -165,7 +205,9 @@ def test_instanttensor_restricts_io_to_indexed_shards(tmp_path):
         "model.expert.weight": 1,
     }
     assert buffer_sizes == [None]
-    assert cpu_fallback == []
+    assert selection.gpu_tensor_count == 2
+    assert selection.selected_tensor_count == 2
+    assert selection.cpu_fallbacks == ()
 
 
 def test_instanttensor_routes_oversized_selected_tensors_to_cpu(tmp_path):
@@ -202,7 +244,7 @@ def test_instanttensor_routes_oversized_selected_tensors_to_cpu(tmp_path):
         _determine_buffer_size=lambda requested: buffer_sizes.append(requested),
     )
 
-    cpu_fallback = weight_utils._restrict_instanttensor_to_selected_ranges(
+    selection = weight_utils._restrict_instanttensor_to_selected_ranges(
         instant_open,
         indexed_tensor_files=None,
         weight_name_prefixes=None,
@@ -212,9 +254,58 @@ def test_instanttensor_routes_oversized_selected_tensors_to_cpu(tmp_path):
     assert [name for name, _ in instant_open.ordered_tensor_metadatas] == [
         "model.small.weight"
     ]
-    assert cpu_fallback == [("model.large.weight", str(shard))]
+    assert selection.gpu_tensor_count == 1
+    assert selection.selected_tensor_count == 2
+    assert [
+        (fallback.position, fallback.name, fallback.filename)
+        for fallback in selection.cpu_fallbacks
+    ] == [(0, "model.large.weight", str(shard))]
     assert instant_open.total_tensor_size == 8
     assert buffer_sizes == [None]
+
+
+@pytest.mark.parametrize(
+    ("buffer_size", "expected_gpu_opens", "expected_buffer_requests"),
+    [(16, 1, [None]), (1, 0, [])],
+)
+def test_instanttensor_emits_cpu_fallbacks_in_checkpoint_order(
+    tmp_path,
+    monkeypatch,
+    buffer_size,
+    expected_gpu_opens,
+    expected_buffer_requests,
+):
+    shard = tmp_path / "model.safetensors"
+    source = {
+        "a_small": torch.arange(2, dtype=torch.float32),
+        "b_large": torch.arange(8, dtype=torch.float32),
+        "c_small": torch.arange(2, dtype=torch.float32),
+    }
+    save_file(source, shard)
+    instant_open = _FakeInstantOpen(shard, source)
+
+    def no_world_group():
+        raise AssertionError
+
+    monkeypatch.setenv("INSTANTTENSOR_BUFFER_SIZE", str(buffer_size))
+    monkeypatch.setenv("INSTANTTENSOR_COPY", "1")
+    monkeypatch.setattr(
+        weight_utils,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: True, current_device=lambda: 0),
+    )
+    monkeypatch.setattr(weight_utils, "get_world_group", no_world_group)
+    monkeypatch.setitem(
+        sys.modules,
+        "instanttensor",
+        SimpleNamespace(safe_open=lambda *args, **kwargs: instant_open),
+    )
+
+    loaded = list(instanttensor_weights_iterator([str(shard)], False))
+
+    assert [name for name, _ in loaded] == instant_open.original_names
+    assert instant_open.enter_count == expected_gpu_opens
+    assert instant_open.buffer_size_requests == expected_buffer_requests
 
 
 @pytest.mark.skipif(
