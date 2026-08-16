@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import builtins
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -32,6 +33,7 @@ from vllm.distributed.device_communicators.custom_all_reduce import (
     _b12x_pcie_allreduce_max_size,
     _b12x_pcie_dma_min_bytes,
     _b12x_pcie_oneshot_limits,
+    _load_b12x_pcie_recommended_max_bytes,
     get_b12x_pcie_allreduce,
 )
 from vllm.distributed.parallel_state import get_tp_group, graph_capture
@@ -479,6 +481,39 @@ def test_b12x_allreduce_limit_uses_vllm_default_without_b12x_policy(
     )
 
     assert _b12x_pcie_allreduce_max_size(16) == 84 * 1024
+
+
+def test_b12x_policy_loader_accepts_absent_optional_package(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_import = builtins.__import__
+
+    def import_without_b12x(name, *args, **kwargs):
+        if name == "b12x.comm.pcie.pcie_allreduce":
+            raise ModuleNotFoundError("No module named 'b12x'", name="b12x")
+        return original_import(name, *args, **kwargs)
+
+    _load_b12x_pcie_recommended_max_bytes.cache_clear()
+    monkeypatch.setattr(builtins, "__import__", import_without_b12x)
+    assert _load_b12x_pcie_recommended_max_bytes() is None
+    _load_b12x_pcie_recommended_max_bytes.cache_clear()
+
+
+def test_b12x_policy_loader_surfaces_broken_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_import = builtins.__import__
+
+    def import_with_broken_dependency(name, *args, **kwargs):
+        if name == "b12x.comm.pcie.pcie_allreduce":
+            raise ModuleNotFoundError("No module named 'cutlass'", name="cutlass")
+        return original_import(name, *args, **kwargs)
+
+    _load_b12x_pcie_recommended_max_bytes.cache_clear()
+    monkeypatch.setattr(builtins, "__import__", import_with_broken_dependency)
+    with pytest.raises(ModuleNotFoundError, match="cutlass"):
+        _load_b12x_pcie_recommended_max_bytes()
+    _load_b12x_pcie_recommended_max_bytes.cache_clear()
 
 
 def test_b12x_dma_min_bytes_is_configurable(

@@ -100,7 +100,9 @@ def _parse_byte_size(value: str) -> int:
 def _load_b12x_pcie_recommended_max_bytes() -> Any | None:
     try:
         from b12x.comm.pcie.pcie_allreduce import recommended_max_bytes
-    except Exception:
+    except ModuleNotFoundError as exc:
+        if exc.name != "b12x":
+            raise
         return None
     return recommended_max_bytes
 
@@ -111,6 +113,12 @@ def _b12x_pcie_allreduce_max_size(world_size: int) -> int:
     An explicitly configured vLLM limit has priority. Otherwise B12X may
     enlarge the vLLM default only for tensor-parallel sizes with a qualified
     implementation for the additional message-size band.
+
+    Args:
+        world_size: Active tensor-parallel world size.
+
+    Returns:
+        Resolved maximum all-reduce size in bytes.
     """
 
     configured = os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE")
