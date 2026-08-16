@@ -1800,6 +1800,65 @@ def test_b12x_kimi_batched_topk_requires_batched_router_binding(monkeypatch):
     assert result is None
 
 
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_kimi_router_topk_is_stateless(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "1")
+    router_logits = torch.zeros(8, 896, dtype=torch.float32, device="cuda")
+    correction_bias = torch.zeros(896, dtype=torch.float32, device="cuda")
+    received: dict[str, Any] = {}
+
+    def kimi_topk16(router, bias, weights, ids):
+        received.update(
+            router=router,
+            bias=bias,
+            weights=weights,
+            ids=ids,
+        )
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_load_b12x_kimi_topk16",
+        lambda: kimi_topk16,
+    )
+
+    actual = dcp_alltoall.try_b12x_kimi_topk16(
+        router_logits,
+        correction_bias,
+    )
+
+    assert actual is not None
+    weights, ids = actual
+    assert weights.shape == ids.shape == (8, 16)
+    assert weights.dtype == torch.float32
+    assert ids.dtype == torch.int32
+    assert received.pop("router") is router_logits
+    assert received.pop("bias") is correction_bias
+    assert received.pop("weights") is weights
+    assert received.pop("ids") is ids
+    assert received == {}
+
+
+def test_b12x_kimi_router_topk_requires_b12x_transport(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.delenv("VLLM_USE_B12X_DCP_A2A", raising=False)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_load_b12x_kimi_topk16",
+        lambda: pytest.fail("disabled routing must not load B12X"),
+    )
+
+    result = dcp_alltoall.try_b12x_kimi_topk16(
+        torch.zeros(8, 896),
+        torch.zeros(896),
+    )
+
+    assert result is None
+
+
 def test_kimi_projection_warmup_respects_transport_token_cap(monkeypatch):
     from vllm.v1.attention.ops import dcp_alltoall
 

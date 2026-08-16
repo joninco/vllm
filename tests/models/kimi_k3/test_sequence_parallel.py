@@ -525,6 +525,43 @@ def test_kimi_router_marks_precomputed_padding_routes_inactive(monkeypatch):
     torch.testing.assert_close(ids[2], expected_ids[2])
 
 
+def test_kimi_router_selects_experts_with_b12x_for_full_logits(monkeypatch):
+    correction_bias = nn.Parameter(torch.zeros(896))
+    router = kimi_model.KimiK3PrecomputedTopKRouter(
+        top_k=16,
+        global_num_experts=896,
+        e_score_correction_bias=correction_bias,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        scoring_func="sigmoid",
+    )
+    hidden_states = torch.empty(8, 4)
+    router_logits = torch.empty(8, 896, dtype=torch.float32)
+    expected = (torch.empty(8, 16), torch.empty(8, 16, dtype=torch.int32))
+    received: dict[str, torch.Tensor] = {}
+
+    def select_experts(logits: torch.Tensor, bias: torch.Tensor):
+        received.update(logits=logits, bias=bias)
+        return expected
+
+    monkeypatch.setattr(
+        kimi_model,
+        "try_select_kimi_routed_experts",
+        select_experts,
+    )
+
+    actual = router._compute_routing(
+        hidden_states,
+        router_logits,
+        torch.int32,
+    )
+
+    assert actual is expected
+    assert received.pop("logits") is router_logits
+    assert received.pop("bias").data_ptr() == correction_bias.data.data_ptr()
+    assert received == {}
+
+
 def test_kimi_router_uses_standard_routing_for_non_payload(monkeypatch):
     router = kimi_model.KimiK3PrecomputedTopKRouter(
         top_k=16,

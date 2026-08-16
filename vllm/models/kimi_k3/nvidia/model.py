@@ -113,6 +113,7 @@ from vllm.models.kimi_k3.nvidia.tp_projection import (
     gather_kimi_sharded_projection,
     gather_kimi_sharded_projection_pair,
     try_gather_kimi_sharded_projection_pair_topk,
+    try_select_kimi_routed_experts,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import NestedTensors
@@ -645,6 +646,26 @@ class KimiK3PrecomputedTopKRouter(FusedTopKBiasRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = hidden_states.shape[0]
+        if (
+            self.top_k == 16
+            and self.global_num_experts == 896
+            and self.scoring_func == "sigmoid"
+            and self.renormalize
+            and self.routed_scaling_factor == 1.0
+            and indices_type in (None, torch.int32)
+            and input_ids is None
+            and self.e_score_correction_bias is not None
+            and router_logits.shape == (num_tokens, 896)
+            and router_logits.dtype == torch.float32
+            and router_logits.device == hidden_states.device
+            and router_logits.is_contiguous()
+        ):
+            selected = try_select_kimi_routed_experts(
+                router_logits,
+                self.e_score_correction_bias.data,
+            )
+            if selected is not None:
+                return selected
         if (
             self.top_k == 16
             and self.global_num_experts == 896

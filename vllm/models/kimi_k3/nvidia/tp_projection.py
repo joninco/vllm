@@ -166,3 +166,17 @@ def try_gather_kimi_sharded_projection_pair_topk(
         correction_bias,
         _get_kimi_projection_group(),
     )
+
+
+def try_select_kimi_routed_experts(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Use B12X CuTeDSL expert selection for assembled Kimi router logits."""
+    select_topk = getattr(dcp_alltoall, "try_b12x_kimi_topk16", None)
+    if select_topk is None:
+        return None
+    return select_topk(
+        router_logits,
+        correction_bias,
+    )

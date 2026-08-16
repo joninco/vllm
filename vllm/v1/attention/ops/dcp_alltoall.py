@@ -89,6 +89,15 @@ def _load_b12x_dcp_a2a_pool() -> Any | None:
     return PCIeDCPA2APool
 
 
+@lru_cache(maxsize=1)
+def _load_b12x_kimi_topk16() -> Any | None:
+    try:
+        from b12x.comm.pcie import kimi_topk16
+    except (AttributeError, ImportError):
+        return None
+    return kimi_topk16
+
+
 def _b12x_dcp_init_failed(
     cp_group: GroupCoordinator,
     device: torch.device,
@@ -670,6 +679,57 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
     return gathered_down, routing_payload
 
 
+def try_b12x_kimi_topk16(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Select Kimi-K3 experts after router-logit assembly.
+
+    This stateless CuTeDSL operation is local to each rank and does not create
+    PCIe communication channels. Unsupported inputs return ``None`` so the
+    caller can use the vLLM router.
+    """
+    if not envs.VLLM_USE_B12X_DCP_A2A or router_logits.ndim != 2:
+        return None
+    rows = int(router_logits.shape[0])
+    if (
+        rows < 1
+        or rows > _KIMI_PAIRED_MAX_BATCH_SIZE
+        or router_logits.shape != (rows, _KIMI_ROUTER_WIDTH)
+        or router_logits.dtype != torch.float32
+        or correction_bias.shape != (_KIMI_ROUTER_WIDTH,)
+        or correction_bias.dtype != torch.float32
+        or not router_logits.is_cuda
+        or not correction_bias.is_cuda
+        or router_logits.device != correction_bias.device
+        or not router_logits.is_contiguous()
+        or not correction_bias.is_contiguous()
+    ):
+        return None
+
+    kimi_topk16 = _load_b12x_kimi_topk16()
+    if kimi_topk16 is None:
+        return None
+
+    topk_weights = torch.empty(
+        (rows, _KIMI_ROUTER_TOPK),
+        device=router_logits.device,
+        dtype=torch.float32,
+    )
+    topk_ids = torch.empty(
+        (rows, _KIMI_ROUTER_TOPK),
+        device=router_logits.device,
+        dtype=torch.int32,
+    )
+    kimi_topk16(
+        router_logits,
+        correction_bias,
+        topk_weights,
+        topk_ids,
+    )
+    return topk_weights, topk_ids
+
+
 def warmup_b12x_kimi_projection_gathers(
     projection_group: GroupCoordinator,
     *,
@@ -730,6 +790,17 @@ def warmup_b12x_kimi_projection_gathers(
         )
         if batched is not None:
             warmed += 1
+    router_logits = torch.zeros(
+        (_KIMI_PAIRED_MAX_BATCH_SIZE, _KIMI_ROUTER_WIDTH),
+        device=device,
+        dtype=torch.float32,
+    )
+    selected = try_b12x_kimi_topk16(
+        router_logits,
+        correction_bias,
+    )
+    if selected is not None:
+        warmed += 1
     return warmed
 
 
