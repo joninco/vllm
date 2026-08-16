@@ -2085,7 +2085,9 @@ def get_kv_cache_groups(
         if fallback_groups is None:
             raise
         return fallback_groups
-    model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    model_type = getattr(hf_config, "model_type", None)
     k3_group_size = envs.VLLM_K3_KV_GROUP_SIZE
     use_k3_group_size_override = (
         k3_group_size > 0
