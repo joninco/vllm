@@ -819,13 +819,15 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
         if dcp_group is None:
             return output, lse
         if self._dcp_comm_backend == "a2a":
+            # B12X dense MLA writes -inf LSE for rows with no visible local KV
+            # chunks. The B12X DCP reduction converts every non-finite LSE to
+            # zero weight before reading its payload, so empty rows already
+            # contribute the exact neutral value without a sanitization pass.
             reduced = dcp_a2a_lse_reduce(
                 output,
                 lse,
                 dcp_group,
                 is_lse_base_on_e=True,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc[: batch + 1],
                 use_b12x=True,
                 b12x_max_batch_size=self._dcp_max_batch_size,
                 b12x_query_head_dim=_K3_ABSORBED_HEAD_DIM,

@@ -563,8 +563,8 @@ def test_b12x_mla_adapter_gathers_and_combines_dcp(monkeypatch) -> None:
         assert actual_group is group
         assert output.shape == (batch, 48, 512)
         assert lse.shape == (batch, 48)
-        assert kwargs["seq_lens"].tolist() == [17, 31]
-        assert kwargs["query_start_loc"].tolist() == [0, 1, 2]
+        assert "seq_lens" not in kwargs
+        assert "query_start_loc" not in kwargs
         assert kwargs["b12x_query_head_dim"] == 576
         calls.append("reduce")
         return output[:, :6].add(1)
