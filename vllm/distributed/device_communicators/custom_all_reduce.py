@@ -96,8 +96,44 @@ def _parse_byte_size(value: str) -> int:
     return int(value)
 
 
-def _b12x_pcie_oneshot_limits() -> tuple[int, int, int]:
-    allreduce_max_size = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+@lru_cache(maxsize=1)
+def _load_b12x_pcie_recommended_max_bytes() -> Any | None:
+    try:
+        from b12x.comm.pcie.pcie_allreduce import recommended_max_bytes
+    except Exception:
+        return None
+    return recommended_max_bytes
+
+
+def _b12x_pcie_allreduce_max_size(world_size: int) -> int:
+    """Resolve the custom all-reduce limit from operator and B12X policy.
+
+    An explicitly configured vLLM limit has priority. Otherwise B12X may
+    enlarge the vLLM default only for tensor-parallel sizes with a qualified
+    implementation for the additional message-size band.
+    """
+
+    configured = os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE")
+    if configured is not None:
+        return _parse_byte_size(configured)
+    default = _parse_byte_size(envs.VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE)
+    recommended_max_bytes = _load_b12x_pcie_recommended_max_bytes()
+    if recommended_max_bytes is None:
+        return default
+    resolved = int(recommended_max_bytes(world_size, default=default))
+    if resolved != default:
+        logger.info(
+            "B12X selected a %d-byte PCIe all-reduce limit for TP%d; "
+            "the vLLM default is %d bytes.",
+            resolved,
+            world_size,
+            default,
+        )
+    return resolved
+
+
+def _b12x_pcie_oneshot_limits(world_size: int) -> tuple[int, int, int]:
+    allreduce_max_size = _b12x_pcie_allreduce_max_size(world_size)
     fused_max_size = _parse_byte_size(
         envs.VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE
     )
@@ -554,7 +590,7 @@ class CustomAllreduce:
                 self._pcie_allreduce_max_size,
                 self._pcie_fused_add_rms_norm_max_size,
                 pcie_oneshot_buffer_size,
-            ) = _b12x_pcie_oneshot_limits()
+            ) = _b12x_pcie_oneshot_limits(world_size)
             if self.nccl_group is None:
                 logger.warning(
                     "Custom allreduce is disabled because %s PCIe oneshot "

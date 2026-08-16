@@ -29,6 +29,7 @@ from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.device_communicators import custom_all_reduce
 from vllm.distributed.device_communicators.custom_all_reduce import (
     CustomAllreduce,
+    _b12x_pcie_allreduce_max_size,
     _b12x_pcie_dma_min_bytes,
     _b12x_pcie_oneshot_limits,
     get_b12x_pcie_allreduce,
@@ -425,11 +426,59 @@ def test_b12x_oneshot_buffer_tracks_dispatch_limits(
         "84KB",
     )
 
-    assert _b12x_pcie_oneshot_limits() == (
+    assert _b12x_pcie_oneshot_limits(16) == (
         64 * 1024,
         84 * 1024,
         84 * 1024,
     )
+
+
+def test_b12x_allreduce_limit_uses_world_size_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", raising=False)
+    recommender = MagicMock(return_value=160 * 1024)
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "_load_b12x_pcie_recommended_max_bytes",
+        lambda: recommender,
+    )
+
+    assert _b12x_pcie_allreduce_max_size(16) == 160 * 1024
+    assert _b12x_pcie_oneshot_limits(16) == (
+        160 * 1024,
+        84 * 1024,
+        160 * 1024,
+    )
+    recommender.assert_called_with(16, default=84 * 1024)
+
+
+def test_b12x_allreduce_limit_preserves_explicit_operator_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB")
+    recommender = MagicMock(return_value=160 * 1024)
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "_load_b12x_pcie_recommended_max_bytes",
+        lambda: recommender,
+    )
+
+    assert _b12x_pcie_allreduce_max_size(16) == 64 * 1024
+    recommender.assert_not_called()
+
+
+def test_b12x_allreduce_limit_uses_vllm_default_without_b12x_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", raising=False)
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "_load_b12x_pcie_recommended_max_bytes",
+        lambda: None,
+    )
+
+    assert _b12x_pcie_allreduce_max_size(16) == 84 * 1024
 
 
 def test_b12x_dma_min_bytes_is_configurable(
