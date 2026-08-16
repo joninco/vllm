@@ -41,6 +41,9 @@ logger = init_logger(__name__)
 # fails closed if the same logical owner is rebound to a second eager stream.
 _B12X_PCIE_EAGER_CHANNEL_ID = "vllm:eager:allreduce"
 _B12X_PCIE_MAX_CONCURRENT_CHANNELS = 2
+# B12X TP12/TP16 uses one ordered bounded-degree channel. Distinct graph
+# owners serialize their collectives through that channel.
+_B12X_PCIE_SINGLE_CHANNEL_WORLD_SIZES = frozenset((12, 16))
 
 
 def _get_pcie_allreduce_backend() -> str:
@@ -572,7 +575,15 @@ class CustomAllreduce:
                     eager_buffer_bytes=pcie_oneshot_buffer_size,
                     max_size=pcie_oneshot_buffer_size,
                     single_channel=pcie_single_channel,
-                    max_concurrent_channels=_B12X_PCIE_MAX_CONCURRENT_CHANNELS,
+                    max_concurrent_channels=(
+                        1
+                        if pcie_single_channel
+                        or (
+                            pcie_backend == "b12x"
+                            and world_size in _B12X_PCIE_SINGLE_CHANNEL_WORLD_SIZES
+                        )
+                        else _B12X_PCIE_MAX_CONCURRENT_CHANNELS
+                    ),
                 )
                 if not pcie_single_channel:
                     pcie_runtime.prepare_channels((_B12X_PCIE_EAGER_CHANNEL_ID,))

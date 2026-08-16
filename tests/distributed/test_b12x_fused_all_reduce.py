@@ -219,14 +219,26 @@ def test_b12x_oneshot_defaults_to_stream_isolation(
 
 
 @pytest.mark.parametrize(
-    ("world_size", "algorithm", "supports_all_peer_auxiliary"),
-    [(2, "oneshot", True), (16, "hierarchical", False)],
+    (
+        "world_size",
+        "algorithm",
+        "supports_all_peer_auxiliary",
+        "single_channel",
+        "expected_channel_capacity",
+    ),
+    [
+        (2, "oneshot", True, False, 2),
+        (16, "hierarchical", False, False, 1),
+        (16, "hierarchical", False, True, 1),
+    ],
 )
 def test_b12x_dispatcher_prepares_single_stable_eager_owner(
     monkeypatch: pytest.MonkeyPatch,
     world_size: int,
     algorithm: str,
     supports_all_peer_auxiliary: bool,
+    single_channel: bool,
+    expected_channel_capacity: int,
 ) -> None:
     captured = {}
     runtime = MagicMock()
@@ -324,7 +336,7 @@ def test_b12x_dispatcher_prepares_single_stable_eager_owner(
     monkeypatch.setattr(
         custom_all_reduce.envs,
         "VLLM_PCIE_ONESHOT_SINGLE_CHANNEL",
-        False,
+        single_channel,
         raising=False,
     )
     monkeypatch.setattr(
@@ -341,10 +353,14 @@ def test_b12x_dispatcher_prepares_single_stable_eager_owner(
     )
 
     assert not built.disabled
-    assert captured["single_channel"] is False
-    assert captured["max_concurrent_channels"] == 2
-    runtime.prepare_channels.assert_called_once_with(("vllm:eager:allreduce",))
-    runtime.for_stream.assert_called_once_with(channel_id="vllm:eager:allreduce")
+    assert captured["single_channel"] is single_channel
+    assert captured["max_concurrent_channels"] == expected_channel_capacity
+    if single_channel:
+        runtime.prepare_channels.assert_not_called()
+        runtime.for_stream.assert_called_once_with(channel_id=None)
+    else:
+        runtime.prepare_channels.assert_called_once_with(("vllm:eager:allreduce",))
+        runtime.for_stream.assert_called_once_with(channel_id="vllm:eager:allreduce")
     assert built.backend_name() == (
         "B12X_PCIE_ONESHOT" if algorithm == "oneshot" else "B12X_PCIE_HIERARCHICAL"
     )
