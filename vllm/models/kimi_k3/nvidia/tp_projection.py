@@ -146,10 +146,10 @@ def try_gather_kimi_sharded_projection_pair_topk(
     local_router: torch.Tensor,
     correction_bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Use B12X fused Kimi projection transport and expert selection.
+    """Use B12X Kimi projection transport and precomputed expert selection.
 
-    A missing or ineligible fused binding returns ``None``. The model caller
-    must then use the exact paired gather and ordinary router operations.
+    A missing or ineligible binding returns ``None``. The model caller must
+    then use the exact paired gather and ordinary router operations.
     """
     if get_tensor_model_parallel_world_size() <= 1:
         return None

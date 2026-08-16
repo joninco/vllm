@@ -547,13 +547,16 @@ def _make_paired_projection_moe():
     return moe
 
 
-def test_kimi_moe_uses_fused_projection_routing_payload(monkeypatch):
+@pytest.mark.parametrize("num_tokens", [1, 8])
+def test_kimi_moe_uses_precomputed_projection_routing_payload(
+    monkeypatch, num_tokens: int
+):
     moe = _make_paired_projection_moe()
-    hidden_states = torch.empty(1, 4)
-    local_router = torch.empty(1, 3)
-    local_down = torch.empty(1, 2)
-    gathered_down = torch.empty(1, 3)
-    routing_payload = torch.empty(2, 16)
+    hidden_states = torch.empty(num_tokens, 4)
+    local_router = torch.empty(num_tokens, 3)
+    local_down = torch.empty(num_tokens, 2)
+    gathered_down = torch.empty(num_tokens, 3)
+    routing_payload = torch.empty(num_tokens * 2, 16)
     monkeypatch.setattr(
         kimi_model.KimiColumnParallelGate,
         "forward_local",
@@ -577,7 +580,9 @@ def test_kimi_moe_uses_fused_projection_routing_payload(monkeypatch):
     monkeypatch.setattr(
         kimi_model,
         "gather_kimi_sharded_projection_pair",
-        lambda *_args: pytest.fail("the fused result must skip paired gather"),
+        lambda *_args: pytest.fail(
+            "precomputed routing must skip the model-level paired gather"
+        ),
     )
 
     routed_hidden, router_output, topk_ids = moe._maybe_overlap_router_and_down_proj(
