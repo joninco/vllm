@@ -706,13 +706,21 @@ class K3DSparkForCausalLM(nn.Module):
             return False
         if self.lm_head.shard_indices != markov_w2.shard_indices:
             return False
-        # B12X maps every local row to a global token. Restrict its fast path
-        # to a dense vocabulary so a zero-filled padding row cannot win.
-        if self.lm_head.num_embeddings_padded != self.lm_head.org_vocab_size:
+        # Rank-major base-vocabulary padding preserves B12X's global token
+        # mapping. Added-vocabulary shards interleave padding and require a
+        # different local-index mapping.
+        if self.lm_head.num_embeddings != self.lm_head.org_vocab_size:
             return False
         if self.logits_processor.soft_cap is not None:
             return False
         return self.logits_processor.scale > 0.0
+
+    def _mask_local_draft_padding(self, logits: torch.Tensor) -> None:
+        """Exclude this rank's padded vocabulary tail from token selection."""
+        assert isinstance(self.lm_head, VocabParallelEmbedding)
+        valid_rows = self.lm_head.shard_indices.num_org_elements
+        if valid_rows < logits.shape[-1]:
+            logits[..., valid_rows:].fill_(float("-inf"))
 
     def compute_local_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project target hidden states into this rank's vocabulary shard."""
@@ -733,6 +741,8 @@ class K3DSparkForCausalLM(nn.Module):
         return logits[..., : self.logits_processor.org_vocab_size]
 
     def _get_b12x_dspark_argmax(self, base_logits: torch.Tensor) -> Any | None:
+        lm_head = self.lm_head
+        assert isinstance(lm_head, VocabParallelEmbedding)
         runtime = self._b12x_dspark_argmax_runtime
         if runtime is not None:
             return runtime
@@ -757,7 +767,7 @@ class K3DSparkForCausalLM(nn.Module):
         logger.info_once(
             "Kimi-K3 DSpark uses B12X TP%d fused BF16 add and global argmax "
             "for up to %d requests.",
-            self.lm_head.tp_size,
+            lm_head.tp_size,
             self._b12x_dspark_argmax_max_batch,
         )
         return runtime
@@ -769,6 +779,8 @@ class K3DSparkForCausalLM(nn.Module):
     ) -> torch.Tensor:
         """Return exact greedy tokens through B12X or the full-logit fallback."""
         assert isinstance(self.lm_head, VocabParallelEmbedding)
+        self._mask_local_draft_padding(base_logits)
+        self._mask_local_draft_padding(markov_bias)
         batch_size = int(base_logits.shape[0])
         if (
             self._b12x_dspark_argmax_enabled

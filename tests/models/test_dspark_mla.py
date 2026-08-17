@@ -342,18 +342,24 @@ def test_kda_warmup_ignores_cacheless_dspark_layers(
 
 def _make_local_argmax_model(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    tp_size: int = 8,
+    tp_rank: int = 0,
+    vocab_size: int = 128,
 ) -> K3DSparkForCausalLM:
     from vllm.model_executor.layers import logits_processor, vocab_parallel_embedding
 
     monkeypatch.setenv("VLLM_DSPARK_SHARD_MARKOV_HEAD", "1")
     monkeypatch.delenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", raising=False)
     monkeypatch.setattr(
-        vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 0
+        vocab_parallel_embedding,
+        "get_tensor_model_parallel_rank",
+        lambda: tp_rank,
     )
     monkeypatch.setattr(
         vocab_parallel_embedding,
         "get_tensor_model_parallel_world_size",
-        lambda: 8,
+        lambda: tp_size,
     )
     monkeypatch.setattr(
         logits_processor,
@@ -363,10 +369,12 @@ def _make_local_argmax_model(
 
     model = object.__new__(K3DSparkForCausalLM)
     nn.Module.__init__(model)
-    model.lm_head = ParallelLMHead(128, 8, prefix="lm_head")
+    model.lm_head = ParallelLMHead(vocab_size, 8, prefix="lm_head")
     model.model = nn.Module()
-    model.model.markov_head = DSparkMarkovHead(128, 128, 8, prefix="markov_head")
-    model.logits_processor = LogitsProcessor(128)
+    model.model.markov_head = DSparkMarkovHead(
+        vocab_size, vocab_size, 8, prefix="markov_head"
+    )
+    model.logits_processor = LogitsProcessor(vocab_size)
     model._b12x_dspark_argmax_enabled = False
     model._b12x_dspark_argmax_cls = None
     model._b12x_dspark_argmax_runtime = None
@@ -376,7 +384,7 @@ def _make_local_argmax_model(
 
 
 @pytest.mark.cpu_test
-def test_k3_dspark_local_argmax_requires_matching_unpadded_shards(
+def test_k3_dspark_local_argmax_requires_matching_shards(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _make_local_argmax_model(monkeypatch)
@@ -387,20 +395,63 @@ def test_k3_dspark_local_argmax_requires_matching_unpadded_shards(
 
 
 @pytest.mark.cpu_test
-def test_k3_dspark_cutedsl_argmax_uses_tp8_runtime(
+def test_k3_dspark_cutedsl_argmax_masks_tp12_vocab_padding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = _make_local_argmax_model(monkeypatch)
-    calls = []
+    model = _make_local_argmax_model(
+        monkeypatch,
+        tp_size=12,
+        tp_rank=11,
+        vocab_size=190,
+    )
+    assert model.lm_head.num_embeddings_padded == 192
+    assert model.supports_local_draft_argmax()
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     class FakeArgmax:
         @classmethod
         def from_exchange_group(cls, **kwargs):
-            calls.append(("construct", kwargs))
             return cls()
 
         def fused_add_argmax(self, base, bias, out):
-            calls.append(("sample", base.clone(), bias.clone(), out))
+            calls.append((base.clone(), bias.clone()))
+            return out.fill_(7)
+
+    monkeypatch.setattr(
+        dspark_mla,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group="tp-metadata-group"),
+    )
+    model._b12x_dspark_argmax_cls = FakeArgmax
+    model._b12x_dspark_argmax_enabled = True
+    base = torch.zeros((1, 16), dtype=torch.bfloat16)
+    bias = torch.zeros_like(base)
+    base[:, -2:] = 1000
+    bias[:, -2:] = 1000
+
+    sampled = model.sample_local_draft_logits(base, bias)
+
+    assert sampled.tolist() == [7]
+    assert torch.isneginf(calls[0][0][:, -2:]).all()
+    assert torch.isneginf(calls[0][1][:, -2:]).all()
+
+
+@pytest.mark.cpu_test
+def test_k3_dspark_cutedsl_argmax_uses_tp8_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _make_local_argmax_model(monkeypatch)
+    construct_calls: list[dict[str, object]] = []
+    sample_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    class FakeArgmax:
+        @classmethod
+        def from_exchange_group(cls, **kwargs):
+            construct_calls.append(kwargs)
+            return cls()
+
+        def fused_add_argmax(self, base, bias, out):
+            sample_calls.append((base.clone(), bias.clone(), out))
             return out.fill_(7)
 
     monkeypatch.setattr(
@@ -416,17 +467,13 @@ def test_k3_dspark_cutedsl_argmax_uses_tp8_runtime(
     sampled = model.sample_local_draft_logits(base, bias)
 
     assert sampled.tolist() == [7, 7, 7]
-    assert calls[0] == (
-        "construct",
-        {
-            "exchange_group": "tp-metadata-group",
-            "device": torch.device("cpu"),
-            "local_vocab_size": 16,
-            "max_batch_size": 8,
-        },
-    )
-    assert calls[1][0] == "sample"
-    assert calls[1][3].shape == (3,)
+    assert construct_calls[0] == {
+        "exchange_group": "tp-metadata-group",
+        "device": torch.device("cpu"),
+        "local_vocab_size": 16,
+        "max_batch_size": 8,
+    }
+    assert sample_calls[0][2].shape == (3,)
 
 
 @pytest.mark.cpu_test
