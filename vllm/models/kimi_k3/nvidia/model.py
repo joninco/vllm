@@ -659,6 +659,10 @@ class KimiK3PrecomputedTopKRouter(FusedTopKBiasRouter):
         ):
             topk_weights = router_logits[:num_tokens]
             topk_ids = router_logits[num_tokens:].view(torch.int32)
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                is_padding = get_forward_context().is_padding
+                if is_padding is not None:
+                    topk_ids.masked_fill_(is_padding[:num_tokens, None], -1)
             return topk_weights, topk_ids
         return super()._compute_routing(
             hidden_states,

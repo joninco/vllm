@@ -478,6 +478,42 @@ def test_kimi_router_decodes_precomputed_topk_payload_without_copy():
     torch.testing.assert_close(ids, expected_ids)
 
 
+def test_kimi_router_marks_precomputed_padding_routes_inactive(monkeypatch):
+    router = kimi_model.KimiK3PrecomputedTopKRouter(
+        top_k=16,
+        global_num_experts=896,
+        e_score_correction_bias=nn.Parameter(torch.zeros(896)),
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        scoring_func="sigmoid",
+    )
+    num_tokens = 3
+    hidden_states = torch.empty(num_tokens, 4)
+    payload = torch.empty(num_tokens * 2, 16, dtype=torch.float32)
+    expected_weights = torch.arange(num_tokens * 16, dtype=torch.float32).view(
+        num_tokens, 16
+    )
+    expected_ids = torch.arange(num_tokens * 16, dtype=torch.int32).view(num_tokens, 16)
+    payload[:num_tokens].copy_(expected_weights)
+    payload[num_tokens:].view(torch.int32).copy_(expected_ids)
+    monkeypatch.setattr(kimi_model.envs, "VLLM_MOE_SKIP_PADDING", True)
+    monkeypatch.setattr(kimi_model, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        kimi_model,
+        "get_forward_context",
+        lambda: SimpleNamespace(is_padding=torch.tensor([False, True, False])),
+    )
+
+    weights, ids = router._compute_routing(hidden_states, payload, torch.int32)
+
+    assert weights.data_ptr() == payload.data_ptr()
+    assert ids.data_ptr() == payload[num_tokens:].data_ptr()
+    torch.testing.assert_close(weights, expected_weights)
+    torch.testing.assert_close(ids[0], expected_ids[0])
+    torch.testing.assert_close(ids[1], torch.full((16,), -1, dtype=torch.int32))
+    torch.testing.assert_close(ids[2], expected_ids[2])
+
+
 def test_kimi_router_uses_standard_routing_for_non_payload(monkeypatch):
     router = kimi_model.KimiK3PrecomputedTopKRouter(
         top_k=16,

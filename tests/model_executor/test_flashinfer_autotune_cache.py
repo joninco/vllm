@@ -262,10 +262,15 @@ def test_b12x_projection_warmup_uses_complete_projection_group(monkeypatch) -> N
     calls = []
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: dcp_group)
+
+    def warmup(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 2
+
     monkeypatch.setattr(
         dcp_alltoall,
         "warmup_b12x_kimi_projection_gathers",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or 2,
+        warmup,
     )
 
     warmed = kernel_warmup._warmup_b12x_kimi_projection_gathers(worker)

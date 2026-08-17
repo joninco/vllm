@@ -1014,10 +1014,15 @@ def test_profile_channel_checkpoint_deduplicates_shared_b12x_pool(monkeypatch):
     monkeypatch.setattr(parallel_state, "_TP", tp_group)
     monkeypatch.setattr(parallel_state, "_PP", None)
     monkeypatch.setattr(parallel_state, "_DCP", dcp_group)
+
+    def checkpoint(group: _FakeGroup) -> str:
+        events.append(group.name)
+        return group.name
+
     monkeypatch.setattr(
         dcp_alltoall,
         "checkpoint_b12x_dcp_a2a_channels",
-        lambda group: events.append(group.name) or group.name,
+        checkpoint,
     )
 
     parallel_state.checkpoint_b12x_graph_channels()
