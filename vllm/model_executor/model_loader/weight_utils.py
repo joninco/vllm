@@ -1233,8 +1233,7 @@ def instanttensor_weights_iterator(
         raise ValueError("InstantTensor requires NVIDIA GPUs")
 
     if small_checkpoint_max_bytes is not None and (
-        isinstance(small_checkpoint_max_bytes, bool)
-        or small_checkpoint_max_bytes <= 0
+        isinstance(small_checkpoint_max_bytes, bool) or small_checkpoint_max_bytes <= 0
     ):
         raise ValueError(
             "InstantTensor small-checkpoint threshold must be a positive integer"
@@ -1249,6 +1248,7 @@ def instanttensor_weights_iterator(
                 "InstantTensor priority weight prefixes must be non-empty strings"
             )
         priority_names_by_file: dict[str, set[str]] = defaultdict(set)
+        tensor_files: Iterable[tuple[str, str]]
         if indexed_tensor_files is not None:
             tensor_files = indexed_tensor_files.items()
         else:
@@ -1318,26 +1318,26 @@ def instanttensor_weights_iterator(
     else:
         priority_names = set()
 
-    checkpoint_size = _get_checkpoints_size_bytes(hf_weights_files)
     if (
         small_checkpoint_max_bytes is not None
         and indexed_tensor_files is None
         and not priority_names
-        and checkpoint_size <= small_checkpoint_max_bytes
     ):
-        logger.info_once(
-            "Loading the %.2f GiB unindexed checkpoint through CPU "
-            "safetensors because it does not exceed the configured %.2f GiB "
-            "InstantTensor small-checkpoint threshold.",
-            checkpoint_size / 1024**3,
-            small_checkpoint_max_bytes / 1024**3,
-        )
-        yield from safetensors_weights_iterator(
-            hf_weights_files,
-            use_tqdm_on_load,
-            weight_name_prefixes=weight_name_prefixes,
-        )
-        return
+        checkpoint_size = _get_checkpoints_size_bytes(hf_weights_files)
+        if checkpoint_size <= small_checkpoint_max_bytes:
+            logger.info_once(
+                "Loading the %.2f GiB unindexed checkpoint through CPU "
+                "safetensors because it does not exceed the configured %.2f GiB "
+                "InstantTensor small-checkpoint threshold.",
+                checkpoint_size / 1024**3,
+                small_checkpoint_max_bytes / 1024**3,
+            )
+            yield from safetensors_weights_iterator(
+                hf_weights_files,
+                use_tqdm_on_load,
+                weight_name_prefixes=weight_name_prefixes,
+            )
+            return
 
     try:
         world_group = get_world_group()
@@ -1394,6 +1394,8 @@ def instanttensor_weights_iterator(
             max_tensor_size=max_gpu_tensor_size,
             excluded_tensor_names=priority_names,
         )
+        if selection.selected_tensor_count == 0:
+            return
 
     cpu_fallbacks = selection.cpu_fallbacks if selection is not None else ()
     if not cpu_fallbacks:
@@ -1441,10 +1443,10 @@ def instanttensor_weights_iterator(
     fallback_by_position = {fallback.position: fallback for fallback in cpu_fallbacks}
     with ExitStack() as stack:
         fallback_readers: dict[str, Any] = {}
-        for fallback in cpu_fallbacks:
-            if fallback.filename not in fallback_readers:
-                fallback_readers[fallback.filename] = stack.enter_context(
-                    safe_open(fallback.filename, framework="pt", device="cpu")
+        for cpu_fallback in cpu_fallbacks:
+            if cpu_fallback.filename not in fallback_readers:
+                fallback_readers[cpu_fallback.filename] = stack.enter_context(
+                    safe_open(cpu_fallback.filename, framework="pt", device="cpu")
                 )
 
         pbar = None
@@ -1465,34 +1467,36 @@ def instanttensor_weights_iterator(
             gpu_tensors = iter(instant_reader.tensors())
 
         try:
-            tensor: torch.Tensor | None = None
+            gpu_tensor: torch.Tensor | None = None
             for position in range(selection.selected_tensor_count):
-                fallback = fallback_by_position.get(position)
-                if fallback is not None:
+                scheduled_fallback = fallback_by_position.get(position)
+                if scheduled_fallback is not None:
                     yield (
-                        fallback.name,
-                        fallback_readers[fallback.filename].get_tensor(fallback.name),
+                        scheduled_fallback.name,
+                        fallback_readers[scheduled_fallback.filename].get_tensor(
+                            scheduled_fallback.name
+                        ),
                     )
                     continue
                 try:
-                    name, tensor = next(gpu_tensors)
+                    name, gpu_tensor = next(gpu_tensors)
                 except StopIteration as e:
                     raise RuntimeError(
                         "InstantTensor produced fewer tensors than the selected "
                         "checkpoint schedule"
                     ) from e
                 if pbar is not None:
-                    pbar.update(tensor.numel() * tensor.element_size())
+                    pbar.update(gpu_tensor.numel() * gpu_tensor.element_size())
                 if not copy_tensors:
-                    tensor._vllm_instanttensor_borrowed = True
-                yield name, tensor
+                    gpu_tensor._vllm_instanttensor_borrowed = True
+                yield name, gpu_tensor
 
             if next(gpu_tensors, None) is not None:
                 raise RuntimeError(
                     "InstantTensor produced more tensors than the selected "
                     "checkpoint schedule"
                 )
-            tensor = None
+            gpu_tensor = None
         finally:
             if pbar is not None:
                 pbar.close()
@@ -1552,6 +1556,7 @@ def _restrict_instanttensor_to_selected_ranges(
     selected_offsets: list[tuple[int, int]] = []
     cpu_fallbacks: list[_InstantTensorCpuFallback] = []
     selected_position = 0
+    excluded_selected_count = 0
     metadata_pos = 0
     offset_pos = 0
 
@@ -1581,14 +1586,14 @@ def _restrict_instanttensor_to_selected_ranges(
             prefix_matches = not weight_name_prefixes or _matches_weight_name_prefixes(
                 name, weight_name_prefixes
             )
-            selected_here = (
-                indexed_here
-                and prefix_matches
-                and (
-                    excluded_tensor_names is None
-                    or name not in excluded_tensor_names
-                )
+            otherwise_selected = indexed_here and prefix_matches
+            excluded_here = (
+                otherwise_selected
+                and excluded_tensor_names is not None
+                and name in excluded_tensor_names
             )
+            excluded_selected_count += int(excluded_here)
+            selected_here = otherwise_selected and not excluded_here
             item_data_offsets = file_metadata[item_index][1]["data_offsets"]
             tensor_size = int(item_data_offsets[1]) - int(item_data_offsets[0])
             use_cpu_fallback = (
@@ -1635,7 +1640,7 @@ def _restrict_instanttensor_to_selected_ranges(
         raise RuntimeError(
             "InstantTensor layout contains unaccounted metadata or offsets"
         )
-    if not selected_metadata and not cpu_fallbacks:
+    if not selected_metadata and not cpu_fallbacks and excluded_selected_count == 0:
         raise RuntimeError("InstantTensor index/prefix selection matched no tensors")
 
     selected_names = [name for name, _ in selected_metadata]

@@ -267,6 +267,24 @@ def test_instanttensor_routes_oversized_selected_tensors_to_cpu(tmp_path):
     assert buffer_sizes == [None]
 
 
+def test_instanttensor_rejects_no_match_with_irrelevant_exclusion(tmp_path):
+    shard = tmp_path / "model.safetensors"
+    source = {"model.weight": torch.tensor([1.0])}
+    save_file(source, shard)
+    instant_open = _FakeInstantOpen(shard, source)
+
+    with pytest.raises(
+        RuntimeError,
+        match="InstantTensor index/prefix selection matched no tensors",
+    ):
+        weight_utils._restrict_instanttensor_to_selected_ranges(
+            instant_open,
+            indexed_tensor_files=None,
+            weight_name_prefixes=["vision_tower"],
+            excluded_tensor_names={"model.weight"},
+        )
+
+
 @pytest.mark.parametrize("use_index", [False, True])
 def test_instanttensor_emits_priority_tensors_before_gpu_staging(
     tmp_path, monkeypatch, use_index
@@ -284,24 +302,25 @@ def test_instanttensor_emits_priority_tensors_before_gpu_staging(
     ]
 
     class FakeReader:
-        filename = [str(regular_shard), str(priority_shard)]
-        ordered_tensor_metadatas = [
-            ("model.weight", regular_metadata),
-            ("vision_tower.weight", priority_metadata),
-        ]
-        tensor_offsets = [
-            (0, regular_metadata["data_offsets"][0]),
-            (0, regular_metadata["data_offsets"][1]),
-            (1, priority_metadata["data_offsets"][0]),
-            (1, priority_metadata["data_offsets"][1]),
-        ]
-        tensor_sizes = [
-            regular_tensor.numel() * regular_tensor.element_size(),
-            priority_tensor.numel() * priority_tensor.element_size(),
-        ]
-        total_tensor_size = sum(tensor_sizes)
-        tensor_name_to_index = {}
-        loader_handle = None
+        def __init__(self):
+            self.filename = [str(regular_shard), str(priority_shard)]
+            self.ordered_tensor_metadatas = [
+                ("model.weight", regular_metadata),
+                ("vision_tower.weight", priority_metadata),
+            ]
+            self.tensor_offsets = [
+                (0, regular_metadata["data_offsets"][0]),
+                (0, regular_metadata["data_offsets"][1]),
+                (1, priority_metadata["data_offsets"][0]),
+                (1, priority_metadata["data_offsets"][1]),
+            ]
+            self.tensor_sizes = [
+                regular_tensor.numel() * regular_tensor.element_size(),
+                priority_tensor.numel() * priority_tensor.element_size(),
+            ]
+            self.total_tensor_size = sum(self.tensor_sizes)
+            self.tensor_name_to_index = {}
+            self.loader_handle = None
 
         def _determine_buffer_size(self, requested):
             pass
@@ -364,25 +383,64 @@ def test_instanttensor_emits_priority_tensors_before_gpu_staging(
     assert observed_files == [str(regular_shard), str(priority_shard)]
 
 
-def test_instanttensor_ignores_source_without_priority_tensors(
+def test_instanttensor_priority_only_checkpoint_skips_gpu_staging(
     tmp_path, monkeypatch
 ):
+    shard = tmp_path / "model.safetensors"
+    priority_tensor = torch.tensor([1.0, 2.0])
+    save_file({"vision_tower.weight": priority_tensor}, shard)
+    instant_open = _FakeInstantOpen(shard, {"vision_tower.weight": priority_tensor})
+
+    def no_world_group():
+        raise AssertionError
+
+    monkeypatch.delenv("INSTANTTENSOR_BUFFER_SIZE", raising=False)
+    monkeypatch.setenv("INSTANTTENSOR_COPY", "1")
+    monkeypatch.setattr(
+        weight_utils,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: True, current_device=lambda: 0),
+    )
+    monkeypatch.setattr(weight_utils, "get_world_group", no_world_group)
+    monkeypatch.setitem(
+        sys.modules,
+        "instanttensor",
+        SimpleNamespace(safe_open=lambda *args, **kwargs: instant_open),
+    )
+
+    loaded = list(
+        instanttensor_weights_iterator(
+            [str(shard)],
+            use_tqdm_on_load=False,
+            indexed_tensor_files={"vision_tower.weight": str(shard.resolve())},
+            priority_weight_name_prefixes=["vision_tower"],
+        )
+    )
+
+    assert [name for name, _ in loaded] == ["vision_tower.weight"]
+    assert torch.equal(loaded[0][1], priority_tensor)
+    assert instant_open.enter_count == 0
+    assert instant_open.buffer_size_requests == []
+
+
+def test_instanttensor_ignores_source_without_priority_tensors(tmp_path, monkeypatch):
     shard = tmp_path / "draft.safetensors"
     draft_tensor = torch.tensor([1.0, 2.0])
     save_file({"draft.weight": draft_tensor}, shard)
     metadata = _safetensors_tensor_metadata(shard)["draft.weight"]
 
     class FakeReader:
-        filename = [str(shard)]
-        ordered_tensor_metadatas = [("draft.weight", metadata)]
-        tensor_offsets = [
-            (0, metadata["data_offsets"][0]),
-            (0, metadata["data_offsets"][1]),
-        ]
-        tensor_sizes = [draft_tensor.numel() * draft_tensor.element_size()]
-        total_tensor_size = tensor_sizes[0]
-        tensor_name_to_index = {}
-        loader_handle = None
+        def __init__(self):
+            self.filename = [str(shard)]
+            self.ordered_tensor_metadatas = [("draft.weight", metadata)]
+            self.tensor_offsets = [
+                (0, metadata["data_offsets"][0]),
+                (0, metadata["data_offsets"][1]),
+            ]
+            self.tensor_sizes = [draft_tensor.numel() * draft_tensor.element_size()]
+            self.total_tensor_size = self.tensor_sizes[0]
+            self.tensor_name_to_index = {}
+            self.loader_handle = None
 
         def _determine_buffer_size(self, requested):
             pass
@@ -588,7 +646,7 @@ def test_instanttensor_deferred_tensors_survive_ring_reuse(tmp_path, monkeypatch
         bound_args = signature.bind(None, tensor)
         _own_deferred_accelerator_tensors(bound_args)
         retained[name] = bound_args.arguments["loaded_weight"]
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     for name, expected in source.items():
         assert torch.equal(retained[name].cpu(), expected)
