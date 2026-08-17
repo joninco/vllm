@@ -1899,6 +1899,33 @@ def test_kimi_projection_warmup_respects_transport_token_cap(monkeypatch):
     ]
 
 
+def test_kimi_router_topk_warmup_is_independent_of_dcp_world_size(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    group = _FakeCPGroup(12, object())  # type: ignore[arg-type]
+    calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    def topk(router_logits, correction_bias):
+        calls.append((tuple(router_logits.shape), tuple(correction_bias.shape)))
+        return torch.empty(8, 16), torch.empty(8, 16, dtype=torch.int32)
+
+    monkeypatch.setattr(dcp_alltoall, "try_b12x_kimi_topk16", topk)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_try_b12x_dcp_all_gather_pair",
+        lambda *args, **kwargs: pytest.fail("TP12 has no DCP gather runtime"),
+    )
+
+    warmed = dcp_alltoall.warmup_b12x_kimi_projection_gathers(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+    )
+
+    assert warmed == 1
+    assert calls == [((8, 896), (896,))]
+
+
 def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
 

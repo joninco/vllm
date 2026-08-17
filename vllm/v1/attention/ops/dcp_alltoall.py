@@ -735,10 +735,28 @@ def warmup_b12x_kimi_projection_gathers(
     *,
     device: torch.device,
 ) -> int:
-    """Compile B12X Kimi paired-projection graph operations eagerly."""
+    """Compile B12X Kimi projection and routing graph operations eagerly."""
     world_size = projection_group.world_size
-    if not envs.VLLM_USE_B12X_DCP_A2A or world_size not in _B12X_DCP_WORLD_SIZES:
+    if not envs.VLLM_USE_B12X_DCP_A2A:
         return 0
+
+    correction_bias = torch.zeros(
+        (_KIMI_ROUTER_WIDTH,),
+        device=device,
+        dtype=torch.float32,
+    )
+    router_logits = torch.zeros(
+        (_KIMI_PAIRED_MAX_BATCH_SIZE, _KIMI_ROUTER_WIDTH),
+        device=device,
+        dtype=torch.float32,
+    )
+    selected = try_b12x_kimi_topk16(
+        router_logits,
+        correction_bias,
+    )
+    warmed = int(selected is not None)
+    if world_size not in _B12X_DCP_WORLD_SIZES:
+        return warmed
 
     token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
     pair_batch = (
@@ -758,7 +776,6 @@ def warmup_b12x_kimi_projection_gathers(
         device=device,
         dtype=torch.float32,
     )
-    warmed = 0
     paired = _try_b12x_dcp_all_gather_pair(
         local_down,
         local_router,
@@ -768,11 +785,6 @@ def warmup_b12x_kimi_projection_gathers(
     if paired is not None:
         warmed += 1
 
-    correction_bias = torch.zeros(
-        (_KIMI_ROUTER_WIDTH,),
-        device=device,
-        dtype=torch.float32,
-    )
     fused = try_dcp_b12x_all_gather_pair_kimi_topk(
         local_down[:1],
         local_router[:1],
@@ -790,17 +802,6 @@ def warmup_b12x_kimi_projection_gathers(
         )
         if batched is not None:
             warmed += 1
-    router_logits = torch.zeros(
-        (_KIMI_PAIRED_MAX_BATCH_SIZE, _KIMI_ROUTER_WIDTH),
-        device=device,
-        dtype=torch.float32,
-    )
-    selected = try_b12x_kimi_topk16(
-        router_logits,
-        correction_bias,
-    )
-    if selected is not None:
-        warmed += 1
     return warmed
 
 
