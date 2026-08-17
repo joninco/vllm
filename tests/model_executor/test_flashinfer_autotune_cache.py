@@ -6,6 +6,7 @@ from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.model_executor.warmup import flashinfer_autotune_cache, kernel_warmup
@@ -284,7 +285,13 @@ def test_b12x_projection_warmup_uses_complete_projection_group(monkeypatch) -> N
     ]
 
 
-def test_b12x_dcp_warmup_finds_kimi_dense_mla_attention(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("dcp_world_size", "num_local_heads"),
+    ((12, 8), (16, 6)),
+)
+def test_b12x_dcp_warmup_finds_kimi_dense_mla_attention(
+    monkeypatch, dcp_world_size: int, num_local_heads: int
+) -> None:
     from vllm.distributed import parallel_state
     from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
     from vllm.v1.attention.ops import dcp_alltoall
@@ -297,8 +304,8 @@ def test_b12x_dcp_warmup_finds_kimi_dense_mla_attention(monkeypatch) -> None:
         torch.nn.Parameter(torch.empty(1)),
     )
     attention.attn_backend = SimpleNamespace(get_name=lambda: "B12X_MLA")
-    attention.impl = SimpleNamespace(dcp_world_size=16)
-    attention.num_local_heads = 6
+    attention.impl = SimpleNamespace(dcp_world_size=dcp_world_size)
+    attention.num_local_heads = num_local_heads
     attention.head_size = 576
     attention.kv_lora_rank = 512
 
@@ -311,7 +318,7 @@ def test_b12x_dcp_warmup_finds_kimi_dense_mla_attention(monkeypatch) -> None:
         scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(
-                decode_context_parallel_size=16,
+                decode_context_parallel_size=dcp_world_size,
                 dcp_comm_backend="a2a",
             ),
             compilation_config=SimpleNamespace(

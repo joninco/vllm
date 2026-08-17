@@ -46,6 +46,8 @@ def test_b12x_mla_pads_query_heads_to_kernel_tile(
 def test_b12x_mla_uses_gathered_dcp_head_geometry() -> None:
     assert b12x_mla._kernel_query_heads(6, 8) == 48
     assert b12x_mla._kernel_query_heads(12, 8) == 96
+    assert b12x_mla._kernel_query_heads(8, 12) == 96
+    assert b12x_mla._kernel_query_heads(6, 16) == 96
     with pytest.raises(ValueError, match="multiple of eight"):
         b12x_mla._kernel_query_heads(6, 2)
 
@@ -88,7 +90,9 @@ def test_mla_rejects_partial_dcp_cache_without_matching_subgroup() -> None:
         mla_attention._get_mla_kv_dcp_world_size(partial, 16)
 
 
-def _support_reason(monkeypatch, *, dcp_size: int, pcp_size: int = 1) -> str | None:
+def _support_reason(
+    monkeypatch, *, dcp_size: int, local_heads: int = 6, pcp_size: int = 1
+) -> str | None:
     parallel_config = SimpleNamespace(
         decode_context_parallel_size=dcp_size,
         prefill_context_parallel_size=pcp_size,
@@ -103,7 +107,7 @@ def _support_reason(monkeypatch, *, dcp_size: int, pcp_size: int = 1) -> str | N
             v_head_dim=128,
         ),
         max_model_len=1_048_576,
-        get_num_attention_heads=lambda _: 6,
+        get_num_attention_heads=lambda _: local_heads,
     )
     config = SimpleNamespace(
         parallel_config=parallel_config,
@@ -125,16 +129,31 @@ def _support_reason(monkeypatch, *, dcp_size: int, pcp_size: int = 1) -> str | N
     )
 
 
-def test_b12x_mla_selects_supported_native_dcp_geometry(monkeypatch) -> None:
-    assert _support_reason(monkeypatch, dcp_size=8) is None
-    assert _support_reason(monkeypatch, dcp_size=16) is None
+@pytest.mark.parametrize(
+    ("dcp_size", "local_heads"),
+    ((8, 12), (12, 8), (16, 6)),
+)
+def test_b12x_mla_selects_supported_native_dcp_geometry(
+    monkeypatch, dcp_size: int, local_heads: int
+) -> None:
+    assert (
+        _support_reason(
+            monkeypatch,
+            dcp_size=dcp_size,
+            local_heads=local_heads,
+        )
+        is None
+    )
 
 
 def test_b12x_mla_rejects_unsupported_parallel_geometry(monkeypatch) -> None:
-    assert "multiple of eight" in _support_reason(monkeypatch, dcp_size=2)
-    assert "prefill context parallelism" in _support_reason(
-        monkeypatch, dcp_size=8, pcp_size=2
-    )
+    dcp_reason = _support_reason(monkeypatch, dcp_size=2)
+    pcp_reason = _support_reason(monkeypatch, dcp_size=8, pcp_size=2)
+
+    assert dcp_reason is not None
+    assert "multiple of eight" in dcp_reason
+    assert pcp_reason is not None
+    assert "prefill context parallelism" in pcp_reason
 
 
 class _FakePlan:
