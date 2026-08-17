@@ -99,7 +99,9 @@ def test_b12x_projection_gather_removes_each_rank_padding(monkeypatch):
     torch.testing.assert_close(actual, expected)
     assert received["projection_group"] is group
     assert received["max_batch_size"] == 1
-    assert received["transport"].shape == (1, 1, 136)
+    transport = received["transport"]
+    assert isinstance(transport, torch.Tensor)
+    assert transport.shape == (1, 1, 136)
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
@@ -132,8 +134,10 @@ def test_b12x_projection_gather_preserves_fp32_payload_bits(monkeypatch):
 
     torch.testing.assert_close(actual, torch.cat((local, other), dim=-1))
     assert actual.dtype == torch.float32
-    assert received["transport"].dtype == torch.float8_e4m3fn
-    assert received["transport"].shape == (1, 1, 8)
+    transport = received["transport"]
+    assert isinstance(transport, torch.Tensor)
+    assert transport.dtype == torch.float8_e4m3fn
+    assert transport.shape == (1, 1, 8)
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")

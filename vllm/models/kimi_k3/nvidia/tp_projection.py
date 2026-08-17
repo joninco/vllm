@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tensor-parallel collectives for Kimi-K3 projection outputs."""
 
 import torch
