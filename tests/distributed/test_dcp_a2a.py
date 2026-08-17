@@ -766,6 +766,45 @@ def test_b12x_dcp_capture_selects_only_current_group_pools(monkeypatch):
     ]
 
 
+def test_b12x_dcp_capture_reuses_nested_shared_group_scope(monkeypatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    events: list[str] = []
+
+    class _FakePool:
+        @contextmanager
+        def capture(self, *, stream, channel_id):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+    device_group = object()
+    tp_group = _FakeCPGroup(16, device_group)  # type: ignore[arg-type]
+    dcp_group = _FakeCPGroup(16, device_group)  # type: ignore[arg-type]
+    stream = object()
+    key = (id(device_group), 0, 64, 512, 576, 64)
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_A2A_POOLS", {key: _FakePool()})
+    monkeypatch.setattr(dcp_alltoall, "_B12X_DCP_ACTIVE_CAPTURE", {})
+
+    with (
+        dcp_alltoall.capture_b12x_dcp_a2a(
+            tp_group,  # type: ignore[arg-type]
+            stream,
+            channel_id="vllm:target:decode",
+        ),
+        dcp_alltoall.capture_b12x_dcp_a2a(
+            dcp_group,  # type: ignore[arg-type]
+            stream,
+            channel_id="vllm:target:decode",
+        ),
+    ):
+        events.append("body")
+
+    assert events == ["enter", "body", "exit"]
+
+
 def test_b12x_dcp_capture_rejects_missing_semantic_id(monkeypatch):
     from vllm.v1.attention.ops import dcp_alltoall
 

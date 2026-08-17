@@ -226,7 +226,17 @@ def capture_b12x_dcp_a2a(
         yield
         return
 
-    previous_active = _B12X_DCP_ACTIVE_CAPTURE.get(group_id)
+    active = _B12X_DCP_ACTIVE_CAPTURE.get(group_id)
+    if active is not None:
+        active_channel_id, active_stream, _ = active
+        if channel_id != active_channel_id or stream is not active_stream:
+            raise RuntimeError(
+                "nested PCIe DCP graph capture must reuse the active "
+                "channel_id and stream"
+            )
+        yield
+        return
+
     try:
         with ExitStack() as stack:
             _B12X_DCP_ACTIVE_CAPTURE[group_id] = (channel_id, stream, stack)
@@ -234,10 +244,7 @@ def capture_b12x_dcp_a2a(
                 stack.enter_context(pool.capture(stream=stream, channel_id=channel_id))
             yield
     finally:
-        if previous_active is None:
-            _B12X_DCP_ACTIVE_CAPTURE.pop(group_id, None)
-        else:
-            _B12X_DCP_ACTIVE_CAPTURE[group_id] = previous_active
+        _B12X_DCP_ACTIVE_CAPTURE.pop(group_id, None)
 
 
 def checkpoint_b12x_dcp_a2a_channels(
