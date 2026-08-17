@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.attention.mla_attention import (
+    MLAAttention,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
     QueryLenSupport,
@@ -147,3 +148,20 @@ def test_sliding_mla_cache_marker_is_a_group_invariant():
     assert not merged.is_uniform_with_collection({"first": marked, "second": unmarked})
     with pytest.raises(AssertionError, match="causal mode"):
         SlidingWindowMLASpec.merge([marked, unmarked])
+
+
+def test_sliding_mla_cache_spec_preserves_noncausal_marker():
+    layer = SimpleNamespace(
+        kv_cache_dtype="auto",
+        head_size=576,
+        non_causal_multi_token_decode=True,
+        sliding_window=32768,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=64), model_config=None
+    )
+
+    spec = MLAAttention.get_kv_cache_spec(layer, vllm_config)
+
+    assert isinstance(spec, SlidingWindowMLASpec)
+    assert spec.non_causal_multi_token_decode
