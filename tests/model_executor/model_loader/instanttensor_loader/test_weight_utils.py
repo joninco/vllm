@@ -267,6 +267,200 @@ def test_instanttensor_routes_oversized_selected_tensors_to_cpu(tmp_path):
     assert buffer_sizes == [None]
 
 
+@pytest.mark.parametrize("use_index", [False, True])
+def test_instanttensor_emits_priority_tensors_before_gpu_staging(
+    tmp_path, monkeypatch, use_index
+):
+    regular_shard = tmp_path / "model-00001-of-00002.safetensors"
+    priority_shard = tmp_path / "model-00002-of-00002.safetensors"
+    regular_tensor = torch.tensor([1.0, 2.0])
+    priority_tensor = torch.tensor([3.0, 4.0])
+    save_file({"model.weight": regular_tensor}, regular_shard)
+    save_file({"vision_tower.weight": priority_tensor}, priority_shard)
+
+    regular_metadata = _safetensors_tensor_metadata(regular_shard)["model.weight"]
+    priority_metadata = _safetensors_tensor_metadata(priority_shard)[
+        "vision_tower.weight"
+    ]
+
+    class FakeReader:
+        filename = [str(regular_shard), str(priority_shard)]
+        ordered_tensor_metadatas = [
+            ("model.weight", regular_metadata),
+            ("vision_tower.weight", priority_metadata),
+        ]
+        tensor_offsets = [
+            (0, regular_metadata["data_offsets"][0]),
+            (0, regular_metadata["data_offsets"][1]),
+            (1, priority_metadata["data_offsets"][0]),
+            (1, priority_metadata["data_offsets"][1]),
+        ]
+        tensor_sizes = [
+            regular_tensor.numel() * regular_tensor.element_size(),
+            priority_tensor.numel() * priority_tensor.element_size(),
+        ]
+        total_tensor_size = sum(tensor_sizes)
+        tensor_name_to_index = {}
+        loader_handle = None
+
+        def _determine_buffer_size(self, requested):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def tensors(self):
+            tensors = {
+                "model.weight": regular_tensor,
+                "vision_tower.weight": priority_tensor,
+            }
+            for name, _ in self.ordered_tensor_metadatas:
+                yield name, tensors[name]
+
+    observed_files = []
+
+    def fake_instant_open(files, **kwargs):
+        observed_files.extend(files)
+        return FakeReader()
+
+    def no_world_group():
+        raise AssertionError
+
+    monkeypatch.delenv("INSTANTTENSOR_BUFFER_SIZE", raising=False)
+    monkeypatch.setenv("INSTANTTENSOR_COPY", "1")
+    monkeypatch.setattr(
+        weight_utils,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: True, current_device=lambda: 0),
+    )
+    monkeypatch.setattr(weight_utils, "get_world_group", no_world_group)
+    monkeypatch.setitem(
+        sys.modules,
+        "instanttensor",
+        SimpleNamespace(safe_open=fake_instant_open),
+    )
+
+    loaded = list(
+        instanttensor_weights_iterator(
+            [str(regular_shard), str(priority_shard)],
+            use_tqdm_on_load=False,
+            indexed_tensor_files=(
+                {
+                    "model.weight": str(regular_shard.resolve()),
+                    "vision_tower.weight": str(priority_shard.resolve()),
+                }
+                if use_index
+                else None
+            ),
+            priority_weight_name_prefixes=["vision_tower"],
+        )
+    )
+
+    assert [name for name, _ in loaded] == ["vision_tower.weight", "model.weight"]
+    assert torch.equal(loaded[0][1], priority_tensor)
+    assert observed_files == [str(regular_shard), str(priority_shard)]
+
+
+def test_instanttensor_ignores_source_without_priority_tensors(
+    tmp_path, monkeypatch
+):
+    shard = tmp_path / "draft.safetensors"
+    draft_tensor = torch.tensor([1.0, 2.0])
+    save_file({"draft.weight": draft_tensor}, shard)
+    metadata = _safetensors_tensor_metadata(shard)["draft.weight"]
+
+    class FakeReader:
+        filename = [str(shard)]
+        ordered_tensor_metadatas = [("draft.weight", metadata)]
+        tensor_offsets = [
+            (0, metadata["data_offsets"][0]),
+            (0, metadata["data_offsets"][1]),
+        ]
+        tensor_sizes = [draft_tensor.numel() * draft_tensor.element_size()]
+        total_tensor_size = tensor_sizes[0]
+        tensor_name_to_index = {}
+        loader_handle = None
+
+        def _determine_buffer_size(self, requested):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def tensors(self):
+            yield "draft.weight", draft_tensor
+
+    def no_world_group():
+        raise AssertionError
+
+    monkeypatch.delenv("INSTANTTENSOR_BUFFER_SIZE", raising=False)
+    monkeypatch.setenv("INSTANTTENSOR_COPY", "1")
+    monkeypatch.setattr(
+        weight_utils,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: True, current_device=lambda: 0),
+    )
+    monkeypatch.setattr(weight_utils, "get_world_group", no_world_group)
+    monkeypatch.setitem(
+        sys.modules,
+        "instanttensor",
+        SimpleNamespace(safe_open=lambda files, **kwargs: FakeReader()),
+    )
+
+    loaded = list(
+        instanttensor_weights_iterator(
+            [str(shard)],
+            use_tqdm_on_load=False,
+            indexed_tensor_files=None,
+            priority_weight_name_prefixes=["vision_tower"],
+        )
+    )
+
+    assert [name for name, _ in loaded] == ["draft.weight"]
+    assert torch.equal(loaded[0][1], draft_tensor)
+
+
+def test_instanttensor_uses_cpu_safetensors_for_small_unindexed_source(
+    tmp_path, monkeypatch
+):
+    shard = tmp_path / "draft.safetensors"
+    draft_tensor = torch.tensor([1.0, 2.0])
+    save_file({"draft.weight": draft_tensor}, shard)
+
+    def fail_if_opened(*args, **kwargs):
+        raise AssertionError("InstantTensor must not open a small draft checkpoint")
+
+    monkeypatch.setattr(
+        weight_utils,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: True, current_device=lambda: 0),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "instanttensor",
+        SimpleNamespace(safe_open=fail_if_opened),
+    )
+
+    loaded = list(
+        instanttensor_weights_iterator(
+            [str(shard)],
+            use_tqdm_on_load=False,
+            indexed_tensor_files=None,
+            priority_weight_name_prefixes=["vision_tower"],
+            small_checkpoint_max_bytes=shard.stat().st_size,
+        )
+    )
+
+    assert [name for name, _ in loaded] == ["draft.weight"]
+    assert torch.equal(loaded[0][1], draft_tensor)
+
+
 @pytest.mark.parametrize(
     ("buffer_size", "expected_gpu_opens", "expected_buffer_requests"),
     [(16, 1, [None]), (1, 0, [])],

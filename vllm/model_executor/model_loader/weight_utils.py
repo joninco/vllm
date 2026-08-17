@@ -1213,6 +1213,8 @@ def instanttensor_weights_iterator(
     weight_name_prefixes: Sequence[str] | None = None,
     *,
     indexed_tensor_files: dict[str, str] | None = None,
+    priority_weight_name_prefixes: Sequence[str] | None = None,
+    small_checkpoint_max_bytes: int | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over weights in model safetensor files with InstantTensor.
 
@@ -1229,6 +1231,113 @@ def instanttensor_weights_iterator(
 
     if not current_platform.is_cuda():
         raise ValueError("InstantTensor requires NVIDIA GPUs")
+
+    if small_checkpoint_max_bytes is not None and (
+        isinstance(small_checkpoint_max_bytes, bool)
+        or small_checkpoint_max_bytes <= 0
+    ):
+        raise ValueError(
+            "InstantTensor small-checkpoint threshold must be a positive integer"
+        )
+
+    if priority_weight_name_prefixes:
+        if not all(
+            isinstance(prefix, str) and prefix
+            for prefix in priority_weight_name_prefixes
+        ):
+            raise ValueError(
+                "InstantTensor priority weight prefixes must be non-empty strings"
+            )
+        priority_names_by_file: dict[str, set[str]] = defaultdict(set)
+        if indexed_tensor_files is not None:
+            tensor_files = indexed_tensor_files.items()
+        else:
+            # The target and every speculative-model source share one loader
+            # configuration. Header discovery lets an unindexed draft ignore
+            # target-only priorities without disabling them for the target.
+            discovered_tensor_files: list[tuple[str, str]] = []
+            for filename in hf_weights_files:
+                absolute_filename = os.path.abspath(filename)
+                with safe_open(filename, framework="pt", device="cpu") as reader:
+                    discovered_tensor_files.extend(
+                        (name, absolute_filename) for name in reader.offset_keys()
+                    )
+            tensor_files = discovered_tensor_files
+
+        for name, filename in tensor_files:
+            if not name.startswith(tuple(priority_weight_name_prefixes)):
+                continue
+            if weight_name_prefixes and not _matches_weight_name_prefixes(
+                name, weight_name_prefixes
+            ):
+                continue
+            priority_names_by_file[os.path.abspath(filename)].add(name)
+        if not priority_names_by_file:
+            logger.info_once(
+                "InstantTensor priority prefixes %s match no tensors in this "
+                "checkpoint source; all selected tensors use the normal "
+                "loading schedule.",
+                tuple(priority_weight_name_prefixes),
+            )
+        else:
+            logger.info_once(
+                "InstantTensor loads %d tensors from %d/%d checkpoint shards "
+                "through CPU safetensors before GPU staging because they match "
+                "priority prefixes %s.",
+                sum(len(names) for names in priority_names_by_file.values()),
+                len(priority_names_by_file),
+                len(hf_weights_files),
+                tuple(priority_weight_name_prefixes),
+            )
+        priority_names: set[str] = set()
+        for filename in hf_weights_files:
+            names = priority_names_by_file.get(os.path.abspath(filename))
+            if not names:
+                continue
+            with safe_open(filename, framework="pt", device="cpu") as reader:
+                physical_names = list(reader.offset_keys())
+                missing_names = names.difference(physical_names)
+                if missing_names:
+                    raise RuntimeError(
+                        "Safetensors index maps priority tensors to a shard "
+                        "that does not contain them: "
+                        f"{sorted(missing_names)[:3]} in {filename}"
+                    )
+                for name in physical_names:
+                    if name not in names:
+                        continue
+                    priority_names.add(name)
+                    yield name, reader.get_tensor(name)
+        expected_priority_names = set().union(*priority_names_by_file.values())
+        if priority_names != expected_priority_names:
+            missing_names = expected_priority_names.difference(priority_names)
+            raise RuntimeError(
+                "InstantTensor priority tensors reference checkpoint shards "
+                f"outside the selected file set: {sorted(missing_names)[:3]}"
+            )
+    else:
+        priority_names = set()
+
+    checkpoint_size = _get_checkpoints_size_bytes(hf_weights_files)
+    if (
+        small_checkpoint_max_bytes is not None
+        and indexed_tensor_files is None
+        and not priority_names
+        and checkpoint_size <= small_checkpoint_max_bytes
+    ):
+        logger.info_once(
+            "Loading the %.2f GiB unindexed checkpoint through CPU "
+            "safetensors because it does not exceed the configured %.2f GiB "
+            "InstantTensor small-checkpoint threshold.",
+            checkpoint_size / 1024**3,
+            small_checkpoint_max_bytes / 1024**3,
+        )
+        yield from safetensors_weights_iterator(
+            hf_weights_files,
+            use_tqdm_on_load,
+            weight_name_prefixes=weight_name_prefixes,
+        )
+        return
 
     try:
         world_group = get_world_group()
@@ -1260,6 +1369,7 @@ def instanttensor_weights_iterator(
         indexed_tensor_files is not None
         or bool(weight_name_prefixes)
         or max_gpu_tensor_size is not None
+        or bool(priority_names)
     )
     open_kwargs: dict[str, Any] = {}
     if restrict_before_io:
@@ -1282,6 +1392,7 @@ def instanttensor_weights_iterator(
             indexed_tensor_files=indexed_tensor_files,
             weight_name_prefixes=weight_name_prefixes,
             max_tensor_size=max_gpu_tensor_size,
+            excluded_tensor_names=priority_names,
         )
 
     cpu_fallbacks = selection.cpu_fallbacks if selection is not None else ()
@@ -1393,6 +1504,7 @@ def _restrict_instanttensor_to_selected_ranges(
     indexed_tensor_files: dict[str, str] | None,
     weight_name_prefixes: Sequence[str] | None,
     max_tensor_size: int | None = None,
+    excluded_tensor_names: set[str] | None = None,
 ) -> _InstantTensorSelection:
     """Restrict an InstantTensor loader to requested checkpoint ranges.
 
@@ -1405,6 +1517,9 @@ def _restrict_instanttensor_to_selected_ranges(
             ``None`` or an empty sequence accepts every prefix.
         max_tensor_size: Largest tensor payload, in bytes, retained in the GPU
             staging path. Larger selected tensors are assigned to CPU loading.
+        excluded_tensor_names: Tensor names already emitted by an earlier
+            loading pass. Excluded names are removed before InstantTensor opens
+            its GPU staging context.
 
     Returns:
         Selected GPU tensor count, total selected tensor count, and CPU
@@ -1466,7 +1581,14 @@ def _restrict_instanttensor_to_selected_ranges(
             prefix_matches = not weight_name_prefixes or _matches_weight_name_prefixes(
                 name, weight_name_prefixes
             )
-            selected_here = indexed_here and prefix_matches
+            selected_here = (
+                indexed_here
+                and prefix_matches
+                and (
+                    excluded_tensor_names is None
+                    or name not in excluded_tensor_names
+                )
+            )
             item_data_offsets = file_metadata[item_index][1]["data_offsets"]
             tensor_size = int(item_data_offsets[1]) - int(item_data_offsets[0])
             use_cpu_fallback = (
