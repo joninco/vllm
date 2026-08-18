@@ -70,10 +70,13 @@ def _retain_dflash_weight(weight: torch.Tensor) -> torch.Tensor:
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
-    """``dflash_config.causal`` overrides all layers; else only SWA layers causal."""
+    """Resolve explicit causality before falling back to legacy layer defaults."""
+    is_causal = getattr(config, "is_causal", None)
+    if is_causal is not None:
+        return bool(is_causal)
     override = (getattr(config, "dflash_config", None) or {}).get("causal")
     if override is not None:
-        return override
+        return bool(override)
     layer_types = getattr(config, "layer_types", None)
     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
 
@@ -395,6 +398,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
 
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
+    decoder_layer_cls = DFlashQwen3DecoderLayer
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={"midlayer.": "layers.0."},
         orig_to_new_stacked={
@@ -454,7 +459,7 @@ class DFlashQwen3Model(nn.Module):
         ]
         self.layers = nn.ModuleList(
             [
-                DFlashQwen3DecoderLayer(
+                self.decoder_layer_cls(
                     current_vllm_config,
                     config=self.config,
                     layer_idx=layer_idx,
@@ -734,6 +739,8 @@ class DFlashQwen3Model(nn.Module):
 
 
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+    model_cls = DFlashQwen3Model
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
@@ -743,7 +750,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.model = DFlashQwen3Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config,
             # Keep draft Attention layer names out of the target model's
             # `model.layers.*` namespace. The Python module hierarchy remains
