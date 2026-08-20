@@ -154,6 +154,7 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         layer_idx: int,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        layer_type: str = "full_attention",
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -162,6 +163,7 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             layer_idx=layer_idx,
             cache_config=cache_config,
             quant_config=quant_config,
+            layer_type=layer_type,
             prefix=prefix,
         )
         draft_config = config.dflash_config

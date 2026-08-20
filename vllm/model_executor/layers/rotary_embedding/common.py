@@ -136,11 +136,16 @@ class ApplyRotaryEmb(CustomOp):
         self.enable_fp32_compute = enable_fp32_compute
 
         self.apply_rotary_emb_flash_attn = None
+        self.apply_rotary_emb_vllm_flash_attn = None
         if not current_platform.is_cpu():
             with suppress(ModuleNotFoundError):
                 self.apply_rotary_emb_flash_attn = import_module(
                     "flash_attn.ops.triton.rotary"
                 ).apply_rotary
+            with suppress(ModuleNotFoundError):
+                self.apply_rotary_emb_vllm_flash_attn = import_module(
+                    "vllm.vllm_flash_attn.layers.rotary"
+                ).apply_rotary_emb
 
     @staticmethod
     def forward_static(
@@ -232,7 +237,11 @@ class ApplyRotaryEmb(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        apply_rotary_emb = self.apply_rotary_emb_vllm_flash_attn
+        if apply_rotary_emb is None:
+            # Builds that vendor vllm_flash_attn without its Python layers
+            # (e.g. MLA-only images) fall back to the native implementation.
+            return self.forward_native(x, cos, sin)
 
         x, cos, sin, origin_shape, origin_dtype = self._pre_process(x, cos, sin)
 
