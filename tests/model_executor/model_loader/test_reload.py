@@ -165,7 +165,7 @@ class _DeferredOnlineQuantAttention(_ReloadableAttentionLayer):
 
     def __init__(self):
         torch.nn.Module.__init__(self)
-        self.source_refs = []
+        self.source_refs: list[ref] = []
         self.quant_method = _SourceLifetimeQuantMethod(self.source_refs)
 
         def tracking_weight_loader(param, loaded_weight):
@@ -803,6 +803,19 @@ def test_online_processing_finalizes_checkpoint_omitted_padding():
     expected = torch.cat((first, second, torch.zeros(2, 2)))
     assert torch.equal(quant_method.weight_at_process, expected)
     assert not get_layerwise_info(layer).can_load()
+
+
+def test_online_processing_owns_deferred_instanttensor_weight():
+    quant_method = _RecordingQuantMethod()
+    layer = _LateBiasLayer(quant_method)
+    loaded_weight = torch.full((4, 2), 2.0)
+    loaded_weight._vllm_instanttensor_borrowed = True
+
+    layer.weight.weight_loader(layer.weight, loaded_weight)
+    loaded_weight.fill_(9.0)
+    layer.bias.weight_loader(layer.bias, torch.zeros(4))
+
+    assert torch.equal(layer.weight, torch.full((4, 2), 2.0))
 
 
 def test_layerwise_reload_skips_non_persistent_parameter_alias_buffers(monkeypatch):
