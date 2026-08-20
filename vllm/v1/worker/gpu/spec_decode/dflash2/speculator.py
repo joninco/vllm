@@ -22,6 +22,7 @@ def _selector_walk_kernel(
     seeds_ptr,
     tokens_ptr,
     realized_scores_ptr,
+    tokens_stride,
     num_steps: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -73,7 +74,7 @@ def _selector_walk_kernel(
             mask=mask & valid,
         )
         token = tl.load(candidate_ptr + candidate_base + index, mask=valid, other=0)
-        tl.store(tokens_ptr + flat, token, mask=valid)
+        tl.store(tokens_ptr + row * tokens_stride + step, token, mask=valid)
         previous = index
 
 
@@ -87,6 +88,7 @@ def _cache_draft_logits_kernel(
     draft_logits_stride_0,
     draft_logits_stride_1,
     num_steps: tl.constexpr,
+    cache_num_steps: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -96,7 +98,9 @@ def _cache_draft_logits_kernel(
     offsets = tl.arange(0, BLOCK_K)
     mask = (req_state >= 0) & (offsets < top_k)
     candidate_base = flat * top_k
-    cache_base = (req_state * num_steps + step) * top_k
+    # The candidate cache keeps the full-width layout so entries stay
+    # addressable when the active speculation width varies between steps.
+    cache_base = (req_state * cache_num_steps + step) * top_k
     old_token_ids = tl.load(cached_candidate_ptr + cache_base + offsets, mask=mask)
     logits_base = (
         draft_logits_ptr
@@ -117,9 +121,8 @@ class DFlash2Speculator(DFlashSpeculator):
         super().__init__(vllm_config, device)
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
-        self._anchor_indices = (
-            torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
-            * self.num_query_per_req
+        self._req_indices = torch.arange(
+            self.max_num_reqs, dtype=torch.int64, device=device
         )
         self._selector_scores = torch.empty(
             self.max_num_reqs,
@@ -151,6 +154,7 @@ class DFlash2Speculator(DFlashSpeculator):
         candidate_ids: torch.Tensor,
         scores: torch.Tensor,
         num_reqs: int,
+        num_speculative_steps: int,
     ) -> None:
         block_k = triton.next_power_of_2(self.selector_top_k)
         _selector_walk_kernel[(num_reqs,)](
@@ -162,7 +166,8 @@ class DFlash2Speculator(DFlashSpeculator):
             self.seeds,
             self.draft_tokens,
             self._selector_scores,
-            num_steps=self.num_speculative_steps,
+            self.draft_tokens.stride(0),
+            num_steps=num_speculative_steps,
             top_k=self.selector_top_k,
             BLOCK_K=block_k,
             SAMPLE_PROBABILISTIC=self.draft_logits is not None,
@@ -170,7 +175,12 @@ class DFlash2Speculator(DFlashSpeculator):
             num_warps=1,
         )
 
-    def _cache_draft_logits(self, candidate_ids: torch.Tensor, num_sample: int) -> None:
+    def _cache_draft_logits(
+        self,
+        candidate_ids: torch.Tensor,
+        num_sample: int,
+        num_speculative_steps: int,
+    ) -> None:
         draft_logits = self.draft_logits
         assert draft_logits is not None
         block_k = triton.next_power_of_2(self.selector_top_k)
@@ -182,7 +192,8 @@ class DFlash2Speculator(DFlashSpeculator):
             self.sample_idx_mapping,
             draft_logits.stride(0),
             draft_logits.stride(1),
-            num_steps=self.num_speculative_steps,
+            num_steps=num_speculative_steps,
+            cache_num_steps=self.num_speculative_steps,
             top_k=self.selector_top_k,
             BLOCK_K=block_k,
             num_warps=1,
@@ -196,7 +207,17 @@ class DFlash2Speculator(DFlashSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        is_profile: bool = False,
+        num_query_per_req: int | None = None,
+        capture_only: bool = False,
     ) -> None:
+        if num_query_per_req is None:
+            num_query_per_req = self.num_query_per_req
+            num_speculative_steps = self.num_speculative_steps
+        else:
+            num_speculative_steps = self._speculative_steps_for_query_len(
+                num_query_per_req
+            )
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -204,24 +225,27 @@ class DFlash2Speculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        num_sample = num_reqs * self.num_speculative_steps
+        if torch.cuda.is_current_stream_capturing():
+            self._captured_backbone_outputs.append(last_hidden_states)
+        num_sample = num_reqs * num_speculative_steps
         hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
-            num_reqs, self.num_speculative_steps, -1
+            num_reqs, num_speculative_steps, -1
         )
         candidate_ids, unary_logits = self.model.compute_candidates(
             hidden_states.flatten(0, 1)
         )
         candidate_ids = candidate_ids.view(
-            num_reqs, self.num_speculative_steps, self.selector_top_k
+            num_reqs, num_speculative_steps, self.selector_top_k
         )
         unary_logits = unary_logits.view_as(candidate_ids)
-        anchor_token_ids = self.input_buffers.input_ids[self._anchor_indices[:num_reqs]]
+        anchor_indices = self._req_indices[:num_reqs] * num_query_per_req
+        anchor_token_ids = self.input_buffers.input_ids[anchor_indices]
         scores = self.model.model.candidate_selector(
             candidate_ids,
             unary_logits,
             hidden_states,
             anchor_token_ids,
         )
-        self._sample_path(candidate_ids, scores, num_reqs)
+        self._sample_path(candidate_ids, scores, num_reqs, num_speculative_steps)
         if self.draft_logits is not None:
-            self._cache_draft_logits(candidate_ids, num_sample)
+            self._cache_draft_logits(candidate_ids, num_sample, num_speculative_steps)
