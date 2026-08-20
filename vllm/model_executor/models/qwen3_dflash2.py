@@ -21,6 +21,9 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsLinearMethod,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
@@ -328,13 +331,21 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # CompressedTensors heads are admitted because the candidate logits
+        # below route through the same quantized apply() the target's verifier
+        # logits use, so ranking and verification stay numerically consistent.
         if not isinstance(
             self.lm_head.quant_method,
-            (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+            (
+                UnquantizedEmbeddingMethod,
+                UnquantizedLinearMethod,
+                CompressedTensorsLinearMethod,
+            ),
         ):
             raise ValueError(
-                "DFlash2 requires an unquantized target LM head for candidate TopK; "
-                f"got {type(self.lm_head.quant_method).__name__}."
+                "DFlash2 requires an unquantized or compressed-tensors target "
+                f"LM head for candidate TopK; got "
+                f"{type(self.lm_head.quant_method).__name__}."
             )
 
         selector = self.model.candidate_selector
