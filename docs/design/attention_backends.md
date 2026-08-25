@@ -131,7 +131,10 @@ Priority is **1 = highest** (tried first).
 ### b12x
 
 The optional [b12x](https://pypi.org/project/b12x/) backend supports causal
-decoder attention on NVIDIA SM120 and SM121 GPUs. Install and select it with:
+decoder attention and compatible sparse MLA models on NVIDIA SM120 and SM121
+GPUs. The `B12X` selector chooses the implementation for the model's attention
+contract, including non-compressed DSA models and DeepSeek V4's compressed
+sparse MLA path. Install and select it with:
 
 ```bash
 uv pip install "vllm[b12x]"
@@ -182,5 +185,7 @@ DeepSeek V4 sparse MLA uses its own decode backends, selected via
 pipeline (compressor + SWA + indexer, 256-token blocks, head 512);
 default on NVIDIA is `FLASHINFER_MLA_SPARSE_DSV4` on SM12x and
 `FLASHMLA_SPARSE_DSV4` on other supported CUDA architectures.
+On SM120 and SM121, `B12X` selects the optional `b12x` DSA indexer, compressed
+sparse MLA, fused output projection, and mHC residual kernels.
 
 --8<-- "gen:table-mla-v4-decode"

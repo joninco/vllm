@@ -480,33 +480,48 @@ def test_deepseek_v4_mega_moe_stages_shared_scale_tma_layout(shared_block_m):
 
 def test_deepseek_v4_pwal_hook_finalizes_mega_moe_and_mhc_broadcast():
     """The loader invokes the model-level PWAL hook for every load format,
-    so it must finalize megamoe + mhc broadcast weights to cover dummy
-    load, which skips load_weights()."""
+    so it must finalize derived MegaMoE, mHC, and B12x weights."""
     calls = []
     stub = SimpleNamespace(
         model=SimpleNamespace(
             finalize_mega_moe_weights=lambda: calls.append("mega_moe"),
             finalize_mhc_broadcast_weights=lambda: calls.append("mhc"),
+            process_b12x_weights_after_loading=lambda: calls.append("b12x"),
         )
     )
 
     DeepseekV4ForCausalLM.process_weights_after_loading(stub)
 
-    assert calls == ["mega_moe", "mhc"]
+    assert calls == ["mega_moe", "mhc", "b12x"]
 
 
 def test_deepseek_v4_drafter_pwal_hooks_finalize_mega_moe():
-    """MTP/DSpark drafters load as their own top-level models, so each needs
-    its own PWAL hook now that the megamoe forward no longer finalizes
-    weights lazily on first use."""
+    """MTP and DSpark top-level loaders finalize derived backend weights."""
     calls = []
-    mtp = SimpleNamespace(finalize_mega_moe_weights=lambda: calls.append("mtp"))
+    mtp_block = SimpleNamespace(
+        process_b12x_weights_after_loading=lambda: calls.append("mtp_b12x")
+    )
+    mtp = SimpleNamespace(
+        finalize_mega_moe_weights=lambda: calls.append("mtp"),
+        model=SimpleNamespace(layers={0: SimpleNamespace(mtp_block=mtp_block)}),
+    )
     DeepSeekV4MTP.process_weights_after_loading(mtp)
 
-    dspark = SimpleNamespace(_finalize_moe=lambda: calls.append("dspark"))
+    dspark = SimpleNamespace(
+        _finalize_moe=lambda: calls.append("dspark"),
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    process_b12x_weights_after_loading=lambda: calls.append(
+                        "dspark_b12x"
+                    )
+                )
+            ]
+        ),
+    )
     DSparkDeepseekV4ForCausalLM.process_weights_after_loading(dspark)
 
-    assert calls == ["mtp", "dspark"]
+    assert calls == ["mtp", "mtp_b12x", "dspark", "dspark_b12x"]
 
 
 @pytest.mark.skipif(
