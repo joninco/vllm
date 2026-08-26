@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for GDNAttentionMetadataBuilder.build() — specifically the
-reclassification of non-spec decodes as prefills when spec decodes exist.
-Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
-"""
+"""Tests for mixed speculative and non-speculative GDN metadata."""
 
 from dataclasses import dataclass
 
@@ -155,9 +152,13 @@ def _build(
     builder: GDNAttentionMetadataBuilder,
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
+    is_prefilling: list[bool] | None = None,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
+    if is_prefilling is None:
+        is_prefilling = [False] * batch_spec.batch_size
+    common = common.replace(is_prefilling=torch.tensor(is_prefilling))
     kwargs: dict = {}
     if num_decode_draft_tokens is not None:
         kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(
@@ -182,6 +183,36 @@ def test_gdn_build_classification(test_case: GDNBuildTestCase):
     assert meta.num_prefills == test_case.expected_num_prefills
     assert meta.num_prefill_tokens == test_case.expected_num_prefill_tokens
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
+
+
+def test_fresh_single_token_prompt_uses_prefill_state_initialization() -> None:
+    builder = _create_gdn_builder()
+    batch = BatchSpec(seq_lens=[1], query_lens=[1])
+
+    meta = _build(builder, batch, is_prefilling=[True])
+
+    assert meta.num_decodes == 0
+    assert meta.num_prefills == 1
+    assert meta.num_prefill_tokens == 1
+    assert meta.has_initial_state is not None
+    assert meta.has_initial_state.tolist() == [False]
+    assert meta.prefill_query_start_loc is not None
+    assert meta.prefill_query_start_loc.tolist() == [0, 1]
+
+
+def test_fresh_two_token_prompt_uses_prefill_state_initialization() -> None:
+    builder = _create_gdn_builder()
+    batch = BatchSpec(seq_lens=[2], query_lens=[2])
+
+    meta = _build(builder, batch, is_prefilling=[True])
+
+    assert meta.num_decodes == 0
+    assert meta.num_prefills == 1
+    assert meta.num_prefill_tokens == 2
+    assert meta.has_initial_state is not None
+    assert meta.has_initial_state.tolist() == [False]
+    assert meta.prefill_query_start_loc is not None
+    assert meta.prefill_query_start_loc.tolist() == [0, 2]
 
 
 def test_has_initial_state_after_reclassification():
