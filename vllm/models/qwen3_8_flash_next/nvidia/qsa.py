@@ -1139,7 +1139,6 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
                 ),
                 rms_norm_eps=float(self.indexer.q_layernorm.variance_epsilon),
                 dtype=torch.bfloat16,
-                use_cuda_graph=True,
             )
         )
         scratch_spec = plan.scratch_specs()[0]
