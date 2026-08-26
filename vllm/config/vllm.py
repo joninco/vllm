@@ -78,6 +78,10 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "KimiK3ForConditionalGeneration",
         "LongcatFlashNgramForCausalLM",
         "Qwen2MoeForCausalLM",
+        "Qwen3_8FlashNextForCausalLM",
+        "Qwen3_8FlashNextForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
     }
 )
 

@@ -111,6 +111,14 @@ _TEXT_GENERATION_MODELS = {
     "Gemma3nForCausalLM": ("gemma3n", "Gemma3nForCausalLM"),
     "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
     "Qwen3NextForCausalLM": ("qwen3_next", "Qwen3NextForCausalLM"),
+    "Qwen3_8FlashNextForCausalLM": (
+        "vllm.models.qwen3_8_flash_next",
+        "Qwen3_8FlashNextForCausalLM",
+    ),
+    "Qwen4ExpForCausalLM": (
+        "vllm.models.qwen3_8_flash_next",
+        "Qwen3_8FlashNextForCausalLM",
+    ),
     "GlmForCausalLM": ("glm", "GlmForCausalLM"),
     "Glm4ForCausalLM": ("glm4", "Glm4ForCausalLM"),
     "Glm4MoeForCausalLM": ("glm4_moe", "Glm4MoeForCausalLM"),
@@ -572,6 +580,14 @@ _MULTIMODAL_MODELS = {
         "qwen3_5",
         "Qwen3_5MoeForConditionalGeneration",
     ),
+    "Qwen3_8FlashNextForConditionalGeneration": (
+        "vllm.models.qwen3_8_flash_next",
+        "Qwen3_8FlashNextForConditionalGeneration",
+    ),
+    "Qwen4ExpForConditionalGeneration": (
+        "vllm.models.qwen3_8_flash_next",
+        "Qwen3_8FlashNextForConditionalGeneration",
+    ),
     "RForConditionalGeneration": ("rvl", "RForConditionalGeneration"),
     "SkyworkR1VChatModel": ("skyworkr1v", "SkyworkR1VChatModel"),
     "SmolVLMForConditionalGeneration": ("smolvlm", "SmolVLMForConditionalGeneration"),
@@ -658,6 +674,10 @@ _SPECULATIVE_DECODING_MODELS = {
     "MedusaModel": ("medusa", "Medusa"),
     "OpenPanguMTPModel": ("openpangu_mtp", "OpenPanguMTP"),
     "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),
+    "Qwen3_8FlashNextMTP": (
+        "vllm.models.qwen3_8_flash_next",
+        "Qwen3_8FlashNextMTP",
+    ),
     "Step3p5MTP": ("step3p5_mtp", "Step3p5MTP"),
     "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),
     "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),

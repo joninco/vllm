@@ -829,6 +829,102 @@ class Qwen3_5ForCausalLMConfig(Qwen3_5ForConditionalGenerationConfig):
             rope_parameters.pop("mrope_interleaved", None)
 
 
+def _strip_qwen3_8_flash_next_mrope(model_config: "ModelConfig") -> None:
+    configs = {
+        id(config): config
+        for config in (
+            getattr(model_config, "hf_config", None),
+            model_config.hf_text_config,
+        )
+        if config is not None
+    }
+    for config in configs.values():
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_parameters.pop("mrope_section", None)
+            rope_parameters.pop("mrope_interleaved", None)
+
+
+def _strip_qwen3_8_flash_next_target_and_draft_mrope(
+    vllm_config: "VllmConfig",
+) -> None:
+    """Keep a text target and its native draft on the same position contract."""
+    model_config = vllm_config.model_config
+    _strip_qwen3_8_flash_next_mrope(model_config)
+
+    spec_config = vllm_config.speculative_config
+    draft_model_config = (
+        getattr(spec_config, "draft_model_config", None)
+        if spec_config is not None
+        else None
+    )
+    if draft_model_config is None or draft_model_config is model_config:
+        return
+    _strip_qwen3_8_flash_next_mrope(draft_model_config)
+    draft_model_config.model_arch_config = draft_model_config.get_model_arch_config()
+
+
+class Qwen3_8FlashNextForConditionalGenerationConfig(
+    Qwen3_5ForConditionalGenerationConfig
+):
+    """Apply the Qwen3.5 hybrid-state contract and QSA feature guards."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        text_config = vllm_config.model_config.hf_text_config
+        if text_config.hc_count <= 1:
+            raise ValueError("Qwen3.8-Flash-Next requires hc_count > 1")
+
+        uses_ple_or_qsa = bool(text_config.ple_layer_ids) or (
+            getattr(text_config, "indexer_n_heads", None) is not None
+        )
+        parallel_config = vllm_config.parallel_config
+        if uses_ple_or_qsa and (
+            parallel_config.enable_dbo or parallel_config.ubatch_size > 1
+        ):
+            raise NotImplementedError(
+                "Qwen3.8-Flash-Next PLE/QSA does not support dual-batch overlap "
+                "or microbatching"
+            )
+
+        multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is not None and multimodal_config.language_model_only:
+            _strip_qwen3_8_flash_next_target_and_draft_mrope(vllm_config)
+
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.method not in {
+            "mtp",
+            "ngram",
+            "ngram_gpu",
+        }:
+            raise NotImplementedError(
+                "Qwen3.8-Flash-Next speculative decoding supports only its native "
+                "MTP checkpoint and linear n-gram proposers"
+            )
+
+
+class Qwen3_8FlashNextForCausalLMConfig(Qwen3_8FlashNextForConditionalGenerationConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen3_8FlashNextForConditionalGenerationConfig.verify_and_update_config(
+            vllm_config
+        )
+        _strip_qwen3_8_flash_next_target_and_draft_mrope(vllm_config)
+
+
+class Qwen3_8FlashNextMTPConfig(Qwen3_8FlashNextForConditionalGenerationConfig):
+    """Preserve M-RoPE for a VL target and use 1D RoPE for a text target."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen3_8FlashNextForConditionalGenerationConfig.verify_and_update_config(
+            vllm_config
+        )
+        if not hasattr(vllm_config.model_config.hf_config, "vision_config"):
+            _strip_qwen3_8_flash_next_mrope(vllm_config.model_config)
+
+
 class ColQwen3_5Config(Qwen3_5ForConditionalGenerationConfig):
     """Apply the attention contract declared by a ColQwen3.5 checkpoint."""
 
@@ -953,6 +1049,15 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "Qwen3_5MoeForCausalLM": Qwen3_5ForCausalLMConfig,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
+    "Qwen3_8FlashNextForCausalLM": Qwen3_8FlashNextForCausalLMConfig,
+    "Qwen3_8FlashNextForConditionalGeneration": (
+        Qwen3_8FlashNextForConditionalGenerationConfig
+    ),
+    "Qwen3_8FlashNextMTP": Qwen3_8FlashNextMTPConfig,
+    "Qwen4ExpForCausalLM": Qwen3_8FlashNextForCausalLMConfig,
+    "Qwen4ExpForConditionalGeneration": (
+        Qwen3_8FlashNextForConditionalGenerationConfig
+    ),
     "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,

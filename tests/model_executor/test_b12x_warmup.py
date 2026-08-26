@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.utils.b12x as b12x_utils
 from vllm.model_executor.kernels.linear import (
     B12xFp8BlockScaledMMKernel,
     B12xMxFp4LinearKernel,
@@ -16,6 +17,27 @@ from vllm.model_executor.kernels.linear import (
 )
 from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.utils.b12x import B12xWarmupUnit, b12x_warmup_token_counts
+
+
+@pytest.mark.parametrize(
+    ("getter_name", "module_name"),
+    [
+        ("get_b12x_qsa", "b12x.attention.qsa"),
+        ("get_b12x_hyperconnection", "b12x.norm.hyperconnection"),
+        ("get_b12x_gdn_decode", "b12x.sequence.gdn_decode"),
+        ("get_b12x_mtp_feedback", "b12x.sequence.mtp_feedback"),
+        ("get_b12x_ple", "b12x.sequence.ple"),
+        ("get_b12x_ple_embedding", "b12x.sequence.ple_embedding"),
+        ("get_b12x_ple_hash", "b12x.sequence.ple_hash"),
+    ],
+)
+def test_b12x_model_component_accessors(
+    monkeypatch, getter_name: str, module_name: str
+) -> None:
+    sentinel = object()
+    monkeypatch.setitem(b12x_utils._B12X_SUBMODULES, module_name, sentinel)
+
+    assert getattr(b12x_utils, getter_name)() is sentinel
 
 
 def test_b12x_warmup_token_counts_cover_serving_regimes() -> None:

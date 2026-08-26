@@ -38,6 +38,7 @@ _B12X_SUBMODULES = {
         "b12x.attention.sparse_mla",
         "b12x.attention.compressed_sparse_mla",
         "b12x.attention.dsa_indexer",
+        "b12x.attention.qsa",
         "b12x.gemm.blockscaled",
         "b12x.gemm.wo_projection",
         "b12x.norm.mhc",
@@ -46,6 +47,12 @@ _B12X_SUBMODULES = {
         "b12x.gemm.mxfp8_linear",
         "b12x.gemm.tensor_fp8_linear",
         "b12x.moe.fused_moe",
+        "b12x.norm.hyperconnection",
+        "b12x.sequence.gdn_decode",
+        "b12x.sequence.mtp_feedback",
+        "b12x.sequence.ple",
+        "b12x.sequence.ple_embedding",
+        "b12x.sequence.ple_hash",
     )
 }
 
@@ -101,6 +108,34 @@ def get_b12x_fused_moe() -> ModuleType | None:
 
 def get_b12x_paged_attention() -> ModuleType | None:
     return _get_submodule("b12x.attention.paged")
+
+
+def get_b12x_qsa() -> ModuleType | None:
+    return _get_submodule("b12x.attention.qsa")
+
+
+def get_b12x_hyperconnection() -> ModuleType | None:
+    return _get_submodule("b12x.norm.hyperconnection")
+
+
+def get_b12x_gdn_decode() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.gdn_decode")
+
+
+def get_b12x_mtp_feedback() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.mtp_feedback")
+
+
+def get_b12x_ple() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.ple")
+
+
+def get_b12x_ple_embedding() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.ple_embedding")
+
+
+def get_b12x_ple_hash() -> ModuleType | None:
+    return _get_submodule("b12x.sequence.ple_hash")
 
 
 def b12x_warmup_token_counts(

@@ -32,6 +32,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionImpl,
+    AttentionImplBase,
     AttentionLayer,
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -175,7 +176,7 @@ class B12xPagedAttentionBackend(AttentionBackend):
         return "B12X"
 
     @classmethod
-    def get_impl_cls(cls) -> type[B12xPagedAttentionImpl]:
+    def get_impl_cls(cls) -> type[AttentionImplBase]:
         return B12xPagedAttentionImpl
 
     @staticmethod
