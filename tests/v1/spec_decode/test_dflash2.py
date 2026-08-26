@@ -11,6 +11,31 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
 
+def test_dflash_reset_attn_releases_cache_layout_state():
+    speculator = object.__new__(DFlashSpeculator)
+    cache_derived_fields = (
+        "model_state",
+        "kv_cache_config",
+        "attn_groups",
+        "attn_cg_support",
+        "block_tables",
+        "target_attn_groups",
+        "draft_kv_cache_group_ids",
+        "draft_kv_cache_group_id",
+        "_context_slot_mappings",
+        "_layer_group_idx",
+        "_group_causal",
+    )
+    for name in cache_derived_fields:
+        setattr(speculator, name, object())
+    speculator.query_cudagraph_manager = object()
+
+    speculator.reset_attn()
+
+    assert all(not hasattr(speculator, name) for name in cache_derived_fields)
+    assert speculator.query_cudagraph_manager is None
+
+
 @pytest.mark.parametrize("block_size", [5, 8])
 def test_grouped_conv_matches_reference(block_size: int):
     torch.manual_seed(0)

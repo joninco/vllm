@@ -3,6 +3,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -20,11 +21,17 @@ from vllm.model_executor.models.mistral_large_3_eagle import (
 from vllm.v1.attention.backends import flash_attn as flash_attn_module
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
+    compact_mrope_positions,
+    prepare_decode_inputs,
+    prepare_prefill_inputs,
+    update_draft_inputs,
 )
+from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
 )
@@ -40,8 +47,10 @@ class _DraftModel(torch.nn.Module):
     def __init__(self, output: torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
         super().__init__()
         self.output = output
+        self.last_kwargs: dict[str, Any] | None = None
 
     def forward(self, **kwargs):
+        self.last_kwargs = kwargs
         return self.output
 
 
@@ -69,6 +78,30 @@ class _TextOnlyDraftModel(torch.nn.Module):
         raise AssertionError("embed_input_ids should not be called during loading")
 
 
+class _QSAIntervalLifecycle:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.interval_start = 7
+        self.interval_start_snapshot: int | None = None
+        self.skip_topk = False
+
+    def snapshot_qsa_interval_starts(self) -> None:
+        self.calls.append("snapshot")
+        self.interval_start_snapshot = self.interval_start
+
+    def restore_qsa_interval_starts(self) -> None:
+        self.calls.append("restore")
+        assert self.interval_start_snapshot is not None
+        self.interval_start = self.interval_start_snapshot
+
+    def set_skip_topk(self, skip: bool) -> None:
+        self.calls.append(f"skip_topk={skip}")
+        self.skip_topk = skip
+
+    def compact_topk_indices(self, last_token_indices: torch.Tensor) -> None:
+        self.calls.append("compact_topk")
+
+
 def _mock_base_model_load(monkeypatch):
     monkeypatch.setattr(
         base_spec_module,
@@ -80,6 +113,103 @@ def _mock_base_model_load(monkeypatch):
         "_validate_local_argmax_reduction",
         lambda self: None,
     )
+
+
+def test_mtp_speculator_rolls_back_qsa_anchor_around_lookahead() -> None:
+    lifecycle = _QSAIntervalLifecycle()
+    speculator = object.__new__(MTPSpeculator)
+    speculator.model = SimpleNamespace(model=lifecycle)
+    speculator.rollback_qsa_interval_starts = True
+    speculator.share_mtp_topk_indices = False
+
+    speculator.on_multi_step_decode_begin(num_reqs=3)
+    speculator.on_multi_step_decode_end(num_reqs=3)
+
+    assert lifecycle.calls == ["snapshot", "restore"]
+
+
+def test_propose_restores_mtp_state_when_draft_decode_raises(monkeypatch) -> None:
+    lifecycle = _QSAIntervalLifecycle()
+    speculator = object.__new__(MTPSpeculator)
+    speculator.model = SimpleNamespace(model=lifecycle)
+    speculator.rollback_qsa_interval_starts = True
+    speculator.share_mtp_topk_indices = True
+    speculator.num_speculative_steps = 2
+    speculator.max_model_len = 32
+    speculator.max_num_reqs = 1
+    speculator.hidden_states = torch.zeros(3, 2)
+    speculator.last_token_indices = torch.zeros(1, dtype=torch.int64)
+    speculator.current_draft_step = torch.tensor(0, dtype=torch.int64)
+    speculator.input_buffers = SimpleNamespace()
+    speculator.draft_tokens = torch.zeros((1, 2), dtype=torch.int64)
+    speculator.prefill_cudagraph_manager = object()
+    speculator.decode_cudagraph_manager = object()
+    speculator.dp_size = 1
+    speculator.dp_rank = 0
+    speculator.use_fused_multi_step_decode = False
+    speculator.mrope_positions = None
+    speculator._copy_request_inputs = Mock()
+    speculator._prepare_eplb_forward = Mock()
+    speculator._prefill = Mock()
+
+    def fail_decode(*args, **kwargs) -> None:
+        lifecycle.interval_start = 19
+        raise RuntimeError("draft decode failed")
+
+    speculator._multi_step_decode = fail_decode
+
+    monkeypatch.setattr(spec_module, "prepare_prefill_inputs", Mock())
+    monkeypatch.setattr(spec_module, "prepare_decode_inputs", Mock())
+    monkeypatch.setattr(
+        spec_module,
+        "get_uniform_decode_token_count",
+        lambda *args, **kwargs: 3,
+    )
+    monkeypatch.setattr(
+        spec_module,
+        "dispatch_cg_and_sync_dp",
+        lambda *args, **kwargs: (
+            SimpleNamespace(cg_mode=CUDAGraphMode.NONE, num_tokens=3),
+            None,
+        ),
+    )
+
+    input_batch = SimpleNamespace(
+        num_tokens=3,
+        num_tokens_after_padding=3,
+        num_reqs=1,
+        num_scheduled_tokens=torch.tensor([3]),
+        seq_lens_cpu_upper_bound=torch.tensor([5]),
+        idx_mapping=torch.tensor([0]),
+        has_prefill=False,
+        seq_lens=torch.tensor([5]),
+    )
+
+    with pytest.raises(RuntimeError, match="draft decode failed"):
+        speculator.propose(
+            input_batch=input_batch,
+            attn_metadata={},
+            slot_mappings={},
+            last_hidden_states=torch.zeros(3, 2),
+            aux_hidden_states=None,
+            num_sampled=torch.tensor([1]),
+            num_rejected=torch.tensor([0]),
+            last_sampled=torch.tensor([1]),
+            next_prefill_tokens=torch.tensor([0]),
+            temperature=torch.tensor([1.0]),
+            seeds=torch.tensor([0]),
+        )
+
+    assert lifecycle.interval_start == 7
+    assert not lifecycle.skip_topk
+    assert lifecycle.calls == [
+        "skip_topk=False",
+        "compact_topk",
+        "snapshot",
+        "skip_topk=True",
+        "restore",
+        "skip_topk=False",
+    ]
 
 
 def _make_speculator(
@@ -99,6 +229,7 @@ def _make_speculator(
         input_ids=torch.arange(4),
         positions=torch.arange(4),
     )
+    speculator.mrope_positions = None
     speculator.hidden_states = torch.zeros(4, 3)
     speculator.model = _DraftModel(output)
     return speculator
@@ -106,7 +237,7 @@ def _make_speculator(
 
 def test_mm_support_configured_after_model_load(monkeypatch):
     target_model_config = object()
-    draft_model_config = object()
+    draft_model_config = SimpleNamespace(uses_mrope=False)
     vllm_config = SimpleNamespace(model_config=target_model_config)
     draft_model = _MultimodalDraftModel()
 
@@ -197,9 +328,11 @@ def test_load_model_disables_mm_support_for_text_only_drafter(monkeypatch):
 
     assert not speculator.supports_mm_inputs
     assert warning_messages == [
-        "Draft model _TextOnlyDraftModel does not support external multimodal "
-        "embeddings. Embeddings from the target model will not be passed to the "
-        "drafter; using text-only draft inputs instead."
+        (
+            "Draft model _TextOnlyDraftModel does not support external multimodal "
+            "embeddings. Embeddings from the target model will not be passed to the "
+            "drafter; using text-only draft inputs instead."
+        )
     ]
 
 
@@ -282,6 +415,199 @@ def test_run_model_reuses_tensor_return_for_mtp(monkeypatch):
 
     assert actual_logits_hidden is hidden
     assert actual_feedback_hidden is hidden
+
+
+def test_run_model_uses_persistent_mrope_positions(monkeypatch):
+    hidden = torch.zeros(4, 3)
+    speculator = _make_speculator(monkeypatch, hidden)
+    speculator.mrope_positions = torch.arange(15).reshape(3, 5)
+
+    speculator._run_model(
+        4,
+        attn_metadata=None,
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+
+    positions = speculator.model.last_kwargs["positions"]
+    assert positions.shape == (3, 4)
+    assert positions.stride() == (5, 1)
+    assert positions.data_ptr() == speculator.mrope_positions.data_ptr()
+
+
+def test_default_model_state_exposes_prepared_model_positions():
+    expected = torch.arange(15).reshape(3, 5)
+    rope_state = SimpleNamespace(get_positions=Mock(return_value=expected))
+    state = object.__new__(DefaultModelState)
+    state.rope_state = rope_state
+    input_batch = SimpleNamespace(
+        positions=torch.arange(4),
+        num_tokens_after_padding=4,
+    )
+
+    actual = state.get_model_positions(input_batch)
+
+    assert actual is expected
+    rope_state.get_positions.assert_called_once_with(4)
+
+
+def test_mrope_profile_uses_scalar_positions_before_target_state_is_bound(monkeypatch):
+    speculator = _make_speculator(monkeypatch, torch.zeros(4, 3))
+    speculator.mrope_positions = torch.zeros(3, 5, dtype=torch.int64)
+    assert not hasattr(speculator, "model_state")
+    input_batch = SimpleNamespace(positions=torch.arange(4, dtype=torch.int64))
+
+    actual = speculator._target_model_positions(input_batch, is_profile=True)
+
+    assert actual is input_batch.positions
+
+    with pytest.raises(RuntimeError, match="target model state is not bound"):
+        speculator._target_model_positions(input_batch, is_profile=False)
+
+
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="accelerator required")
+def test_mrope_prefill_compaction_and_continuation_kernels():
+    device = torch.device("cuda")
+    sentinel = -777
+    input_buffers = SimpleNamespace(
+        input_ids=torch.full((8,), sentinel, dtype=torch.int32, device=device),
+        positions=torch.full((8,), sentinel, dtype=torch.int64, device=device),
+        query_start_loc=torch.full((4,), sentinel, dtype=torch.int32, device=device),
+        seq_lens=torch.full((3,), sentinel, dtype=torch.int32, device=device),
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        input_ids=torch.arange(1, 8, dtype=torch.int32, device=device),
+        positions=torch.arange(100, 107, dtype=torch.int64, device=device),
+        idx_mapping=torch.tensor([1, 0], dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 4, 7], dtype=torch.int32, device=device),
+        seq_lens=torch.tensor([10, 20], dtype=torch.int32, device=device),
+    )
+    target_model_positions = torch.stack(
+        [
+            torch.arange(10, 17, dtype=torch.int64, device=device),
+            torch.arange(20, 27, dtype=torch.int64, device=device),
+            torch.arange(30, 37, dtype=torch.int64, device=device),
+        ]
+    )
+    mrope_positions = torch.full((3, 9), sentinel, dtype=torch.int64, device=device)
+    mrope_positions_scratch = torch.empty((3, 3), dtype=torch.int64, device=device)
+    backing_ptr = mrope_positions.data_ptr()
+    last_token_indices = torch.zeros(2, dtype=torch.int64, device=device)
+    current_draft_step = torch.tensor(9, dtype=torch.int64, device=device)
+    num_rejected = torch.tensor([1, 0], dtype=torch.int32, device=device)
+
+    prepare_prefill_inputs(
+        last_token_indices,
+        current_draft_step,
+        input_buffers,
+        input_batch,
+        num_sampled=torch.ones(2, dtype=torch.int32, device=device),
+        num_rejected=num_rejected,
+        last_sampled=torch.tensor([90, 91], dtype=torch.int64, device=device),
+        next_prefill_tokens=torch.zeros(2, dtype=torch.int32, device=device),
+        max_num_reqs=3,
+        target_model_positions=target_model_positions,
+        draft_mrope_positions=mrope_positions,
+    )
+    torch.accelerator.synchronize()
+
+    assert last_token_indices.tolist() == [2, 6]
+    assert current_draft_step.item() == 0
+    assert input_buffers.positions.tolist() == [
+        100,
+        101,
+        102,
+        sentinel,
+        104,
+        105,
+        106,
+        sentinel,
+    ]
+    assert mrope_positions[:, 3].tolist() == [sentinel, sentinel, sentinel]
+    assert torch.equal(mrope_positions[:, :3], target_model_positions[:, :3])
+    assert torch.equal(mrope_positions[:, 4:7], target_model_positions[:, 4:7])
+
+    compact_mrope_positions(
+        mrope_positions,
+        mrope_positions_scratch,
+        last_token_indices,
+        num_reqs=2,
+    )
+    input_buffers.positions[:2] = torch.tensor([102, 106], device=device)
+    prepare_decode_inputs(
+        draft_tokens=torch.tensor([70, 71], dtype=torch.int64, device=device),
+        target_seq_lens=input_batch.seq_lens,
+        num_rejected=num_rejected,
+        input_buffers=input_buffers,
+        max_model_len=4096,
+        max_num_reqs=3,
+        mrope_positions=mrope_positions,
+    )
+    torch.accelerator.synchronize()
+
+    assert input_buffers.positions[:2].tolist() == [103, 107]
+    assert mrope_positions[:, :2].tolist() == [[13, 17], [13, 17], [13, 17]]
+    assert mrope_positions.data_ptr() == backing_ptr
+
+    overlapping_positions = torch.tensor(
+        [
+            [10, 11, 12, sentinel],
+            [20, 21, 22, sentinel],
+            [30, 31, 32, sentinel],
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    compact_mrope_positions(
+        overlapping_positions,
+        mrope_positions_scratch,
+        torch.tensor([1, 2], dtype=torch.int64, device=device),
+        num_reqs=2,
+    )
+    torch.accelerator.synchronize()
+    assert overlapping_positions[:, :2].tolist() == [
+        [11, 12],
+        [21, 22],
+        [31, 32],
+    ]
+
+    large_num_reqs = 128
+    permuted_positions = torch.arange(
+        3 * (large_num_reqs + 1), dtype=torch.int64, device=device
+    ).reshape(3, large_num_reqs + 1)
+    permutation = torch.arange(
+        large_num_reqs - 1, -1, -1, dtype=torch.int64, device=device
+    )
+    expected_permutation = permuted_positions[:, permutation].clone()
+    large_scratch = torch.empty((3, large_num_reqs), dtype=torch.int64, device=device)
+    compact_mrope_positions(
+        permuted_positions,
+        large_scratch,
+        permutation,
+        num_reqs=large_num_reqs,
+    )
+    torch.accelerator.synchronize()
+    assert torch.equal(permuted_positions[:, :large_num_reqs], expected_permutation)
+
+    update_draft_inputs(
+        draft_tokens=torch.tensor([80, 81], dtype=torch.int64, device=device),
+        current_draft_step=torch.tensor(1, dtype=torch.int64, device=device),
+        hidden_states=torch.arange(8, dtype=torch.float32, device=device).reshape(2, 4),
+        output_draft_tokens=torch.zeros((2, 3), dtype=torch.int64, device=device),
+        next_input_hidden_states=torch.zeros((2, 4), device=device),
+        input_buffers=input_buffers,
+        num_reqs=2,
+        max_model_len=4096,
+        num_speculative_steps=3,
+        mrope_positions=mrope_positions,
+    )
+    torch.accelerator.synchronize()
+
+    assert input_buffers.positions[:2].tolist() == [104, 108]
+    assert mrope_positions[:, :2].tolist() == [[14, 18], [14, 18], [14, 18]]
+    assert mrope_positions.data_ptr() == backing_ptr
 
 
 @pytest.mark.parametrize(

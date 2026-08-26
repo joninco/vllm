@@ -217,6 +217,19 @@ class DFlashSpeculator(DraftModelSpeculator):
                     )
                 }
 
+    def reset_attn(self) -> None:
+        """Release DFlash state derived from the target KV-cache layout."""
+        for name in (
+            "draft_kv_cache_group_ids",
+            "draft_kv_cache_group_id",
+            "_context_slot_mappings",
+            "_layer_group_idx",
+            "_group_causal",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
+        super().reset_attn()
+
     @torch.inference_mode()
     def _run_model(
         self,

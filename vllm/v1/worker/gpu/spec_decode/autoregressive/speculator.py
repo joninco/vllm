@@ -40,6 +40,22 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self.inputs_embeds: torch.Tensor | None = None
 
+        self.mrope_positions: torch.Tensor | None = None
+        self.mrope_positions_scratch: torch.Tensor | None = None
+        if self.draft_model_config.uses_mrope:
+            # The extra column preserves the non-contiguous layout expected by
+            # torch.compile, matching the target RopeState buffer.
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_tokens + 1),
+                dtype=torch.int64,
+                device=device,
+            )
+            self.mrope_positions_scratch = torch.empty(
+                (3, self.max_num_reqs),
+                dtype=torch.int64,
+                device=device,
+            )
+
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
@@ -267,6 +283,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             last_sampled,
             next_prefill_tokens,
             self.max_num_reqs,
+            target_model_positions=self._target_model_positions(
+                input_batch, is_profile
+            ),
+            draft_mrope_positions=self.mrope_positions,
         )
 
         # When all requests are decoding (no true prefills), each has
@@ -324,6 +344,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.max_model_len,
             self.max_num_reqs,
             advance_draft_positions=self.advance_draft_positions,
+            mrope_positions=self.mrope_positions,
         )
 
         # Each request produces exactly 1 token per draft generation step,
@@ -345,14 +366,16 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             if self.use_fused_multi_step_decode
             else self._multi_step_decode
         )
-        decode_fn(
-            num_reqs,
-            dummy_run and skip_attn_for_dummy_run,
-            decode_batch_desc,
-            num_tokens_across_dp,
-            input_batch.seq_lens_cpu_upper_bound,
-        )
-        self.on_multi_step_decode_end(num_reqs)
+        try:
+            decode_fn(
+                num_reqs,
+                dummy_run and skip_attn_for_dummy_run,
+                decode_batch_desc,
+                num_tokens_across_dp,
+                input_batch.seq_lens_cpu_upper_bound,
+            )
+        finally:
+            self.on_multi_step_decode_end(num_reqs)
 
         return self.draft_tokens[:num_reqs]
 
@@ -393,7 +416,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
             model_inputs = dict(
                 input_ids=self.input_buffers.input_ids[:num_tokens],
-                positions=self.input_buffers.positions[:num_tokens],
+                positions=self._model_positions(num_tokens),
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
@@ -415,6 +438,24 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             last_hidden_states = ret_hidden_states
             hidden_states = ret_hidden_states
         return last_hidden_states, hidden_states
+
+    def _model_positions(self, num_tokens: int) -> torch.Tensor:
+        if self.mrope_positions is not None:
+            return self.mrope_positions[:, :num_tokens]
+        return self.input_buffers.positions[:num_tokens]
+
+    def _target_model_positions(
+        self, input_batch: InputBatch, is_profile: bool
+    ) -> torch.Tensor | None:
+        if self.mrope_positions is None:
+            return None
+        if not hasattr(self, "model_state"):
+            # KV-cache profiling runs before set_attn() binds the target state.
+            # Its dummy text positions are identical on all MRoPE axes.
+            if not is_profile:
+                raise RuntimeError("target model state is not bound for MRoPE drafting")
+            return input_batch.positions
+        return self.model_state.get_model_positions(input_batch)
 
     def _prefill(
         self,
@@ -453,6 +494,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.hidden_states[:num_reqs] = sample_hidden_states
         else:
             self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
+        if self.mrope_positions is not None:
+            assert self.mrope_positions_scratch is not None
+            compact_mrope_positions(
+                self.mrope_positions,
+                self.mrope_positions_scratch,
+                last_token_indices,
+                num_reqs,
+            )
         self.input_buffers.positions[:num_reqs] = positions
 
     def _multi_step_decode(
@@ -646,6 +695,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.max_model_len,
             self.num_speculative_steps,
             advance_draft_positions=self.advance_draft_positions,
+            mrope_positions=self.mrope_positions,
         )
 
 
@@ -659,6 +709,10 @@ def _prepare_prefill_inputs_kernel(
     draft_seq_lens_ptr,
     target_input_ids_ptr,
     target_positions_ptr,
+    draft_mrope_positions_ptr,
+    draft_mrope_positions_stride,
+    target_model_positions_ptr,
+    target_model_positions_stride,
     idx_mapping_ptr,
     last_sampled_ptr,
     next_prefill_tokens_ptr,
@@ -668,6 +722,8 @@ def _prepare_prefill_inputs_kernel(
     seq_lens_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
+    USES_MROPE: tl.constexpr,
+    TARGET_USES_MROPE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     num_reqs = tl.num_programs(0)
@@ -707,6 +763,24 @@ def _prepare_prefill_inputs_kernel(
         mask = block < query_len
         target_pos = tl.load(target_positions_ptr + query_start + block, mask=mask)
         tl.store(draft_positions_ptr + query_start + block, target_pos, mask=mask)
+        if USES_MROPE:
+            for axis in tl.static_range(3):
+                source_axis = axis if TARGET_USES_MROPE else 0
+                model_pos = tl.load(
+                    target_model_positions_ptr
+                    + source_axis * target_model_positions_stride
+                    + query_start
+                    + block,
+                    mask=mask,
+                )
+                tl.store(
+                    draft_mrope_positions_ptr
+                    + axis * draft_mrope_positions_stride
+                    + query_start
+                    + block,
+                    model_pos,
+                    mask=mask,
+                )
 
     # Copy query start locations.
     tl.store(draft_query_start_loc_ptr + req_idx, query_start)
@@ -747,8 +821,25 @@ def prepare_prefill_inputs(
     # [max_num_reqs]
     next_prefill_tokens: torch.Tensor,
     max_num_reqs,
+    target_model_positions: torch.Tensor | None = None,
+    draft_mrope_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_reqs = input_batch.num_reqs
+    uses_mrope = draft_mrope_positions is not None
+    if uses_mrope:
+        assert draft_mrope_positions is not None
+        if draft_mrope_positions.ndim != 2 or draft_mrope_positions.shape[0] != 3:
+            raise ValueError("draft MRoPE positions must have shape [3, capacity]")
+        if target_model_positions is None:
+            target_model_positions = input_batch.positions
+        if target_model_positions.ndim not in (1, 2):
+            raise ValueError("target model positions must be one- or two-dimensional")
+        if target_model_positions.ndim == 2 and target_model_positions.shape[0] != 3:
+            raise ValueError("target MRoPE positions must have shape [3, rows]")
+    else:
+        draft_mrope_positions = input_buffers.positions
+        target_model_positions = input_batch.positions
+    target_uses_mrope = target_model_positions.ndim == 2
     _prepare_prefill_inputs_kernel[(num_reqs,)](
         last_token_indices,
         current_draft_step,
@@ -758,6 +849,10 @@ def prepare_prefill_inputs(
         input_buffers.seq_lens,
         input_batch.input_ids,
         input_batch.positions,
+        draft_mrope_positions,
+        draft_mrope_positions.stride(0) if uses_mrope else 0,
+        target_model_positions,
+        target_model_positions.stride(0) if target_uses_mrope else 0,
         input_batch.idx_mapping,
         last_sampled,
         next_prefill_tokens,
@@ -767,8 +862,94 @@ def prepare_prefill_inputs(
         input_batch.seq_lens,
         max_num_reqs,
         BLOCK_SIZE=1024,
+        USES_MROPE=uses_mrope,
+        TARGET_USES_MROPE=target_uses_mrope,
     )
     return last_token_indices
+
+
+@triton.jit
+def _gather_mrope_positions_kernel(
+    mrope_positions_ptr,
+    mrope_positions_stride,
+    scratch_ptr,
+    scratch_stride,
+    last_token_indices_ptr,
+    num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    axis = tl.program_id(0)
+    req_idx = tl.arange(0, BLOCK_SIZE)
+    mask = req_idx < num_reqs
+    last_token_idx = tl.load(last_token_indices_ptr + req_idx, mask=mask)
+    positions = tl.load(
+        mrope_positions_ptr + axis * mrope_positions_stride + last_token_idx,
+        mask=mask,
+    )
+    tl.store(
+        scratch_ptr + axis * scratch_stride + req_idx,
+        positions,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _store_compacted_mrope_positions_kernel(
+    mrope_positions_ptr,
+    mrope_positions_stride,
+    scratch_ptr,
+    scratch_stride,
+    num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    axis = tl.program_id(0)
+    req_idx = tl.arange(0, BLOCK_SIZE)
+    mask = req_idx < num_reqs
+    positions = tl.load(
+        scratch_ptr + axis * scratch_stride + req_idx,
+        mask=mask,
+    )
+    tl.store(
+        mrope_positions_ptr + axis * mrope_positions_stride + req_idx,
+        positions,
+        mask=mask,
+    )
+
+
+def compact_mrope_positions(
+    mrope_positions: torch.Tensor,
+    scratch: torch.Tensor,
+    last_token_indices: torch.Tensor,
+    num_reqs: int,
+) -> None:
+    if mrope_positions.ndim != 2 or mrope_positions.shape[0] != 3:
+        raise ValueError("draft MRoPE positions must have shape [3, capacity]")
+    if scratch.ndim != 2 or scratch.shape[0] != 3:
+        raise ValueError("MRoPE compaction scratch must have shape [3, capacity]")
+    if num_reqs < 0 or num_reqs > scratch.shape[1]:
+        raise ValueError("MRoPE compaction scratch is too small for the batch")
+    if num_reqs > last_token_indices.numel():
+        raise ValueError("last token indices are too small for the batch")
+    if num_reqs == 0:
+        return
+    block_size = triton.next_power_of_2(num_reqs)
+    _gather_mrope_positions_kernel[(3,)](
+        mrope_positions,
+        mrope_positions.stride(0),
+        scratch,
+        scratch.stride(0),
+        last_token_indices,
+        num_reqs,
+        BLOCK_SIZE=block_size,
+    )
+    _store_compacted_mrope_positions_kernel[(3,)](
+        mrope_positions,
+        mrope_positions.stride(0),
+        scratch,
+        scratch.stride(0),
+        num_reqs,
+        BLOCK_SIZE=block_size,
+    )
 
 
 @triton.jit
@@ -779,12 +960,15 @@ def _prepare_decode_inputs_kernel(
     num_rejected_ptr,
     input_ids_ptr,
     positions_ptr,
+    mrope_positions_ptr,
+    mrope_positions_stride,
     query_start_loc_ptr,
     seq_lens_ptr,
     max_model_len,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
     ADVANCE_DRAFT_POSITIONS: tl.constexpr,
+    USES_MROPE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     num_reqs = tl.num_programs(0) - 1
@@ -817,6 +1001,14 @@ def _prepare_decode_inputs_kernel(
         position = tl.load(positions_ptr + req_idx)
         position = tl.minimum(position + 1, max_model_len - 1)
         tl.store(positions_ptr + req_idx, position)
+        if USES_MROPE:
+            model_position = tl.load(mrope_positions_ptr + req_idx)
+            model_position = tl.minimum(model_position + 1, max_model_len - 1)
+            for axis in tl.static_range(3):
+                tl.store(
+                    mrope_positions_ptr + axis * mrope_positions_stride + req_idx,
+                    model_position,
+                )
         seq_len = tl.minimum(seq_len + 1, max_model_len)
     tl.store(seq_lens_ptr + req_idx, seq_len)
 
@@ -829,8 +1021,15 @@ def prepare_decode_inputs(
     max_model_len: int,
     max_num_reqs: int,
     advance_draft_positions: bool = True,
+    mrope_positions: torch.Tensor | None = None,
 ):
     num_reqs = draft_tokens.shape[0]
+    uses_mrope = mrope_positions is not None
+    if mrope_positions is None:
+        mrope_positions = input_buffers.positions
+        mrope_positions_stride = 0
+    else:
+        mrope_positions_stride = mrope_positions.stride(0)
     _prepare_decode_inputs_kernel[(num_reqs + 1,)](
         draft_tokens,
         draft_tokens.stride(0),
@@ -838,12 +1037,15 @@ def prepare_decode_inputs(
         num_rejected,
         input_buffers.input_ids,
         input_buffers.positions,
+        mrope_positions,
+        mrope_positions_stride,
         input_buffers.query_start_loc,
         input_buffers.seq_lens,
         max_model_len,
         max_num_reqs,
         BLOCK_SIZE=1024,
         ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
+        USES_MROPE=uses_mrope,
     )
 
 
@@ -855,6 +1057,8 @@ def _update_draft_inputs_kernel(
     next_input_hidden_states_stride,
     input_ids_ptr,
     positions_ptr,
+    mrope_positions_ptr,
+    mrope_positions_stride,
     seq_lens_ptr,
     draft_tokens_ptr,
     current_draft_step_ptr,
@@ -865,6 +1069,7 @@ def _update_draft_inputs_kernel(
     num_speculative_steps,
     BLOCK_SIZE: tl.constexpr,
     ADVANCE_DRAFT_POSITIONS: tl.constexpr,
+    USES_MROPE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
 
@@ -908,6 +1113,14 @@ def _update_draft_inputs_kernel(
         position = tl.load(positions_ptr + req_idx)
         position = tl.minimum(position + 1, max_model_len - 1)
         tl.store(positions_ptr + req_idx, position)
+        if USES_MROPE:
+            model_position = tl.load(mrope_positions_ptr + req_idx)
+            model_position = tl.minimum(model_position + 1, max_model_len - 1)
+            for axis in tl.static_range(3):
+                tl.store(
+                    mrope_positions_ptr + axis * mrope_positions_stride + req_idx,
+                    model_position,
+                )
 
         seq_len = tl.load(seq_lens_ptr + req_idx)
         seq_len = tl.minimum(seq_len + 1, max_model_len)
@@ -925,8 +1138,15 @@ def update_draft_inputs(
     max_model_len: int,
     num_speculative_steps: int,
     advance_draft_positions: bool = True,
+    mrope_positions: torch.Tensor | None = None,
 ):
     _, hidden_size = hidden_states.shape
+    uses_mrope = mrope_positions is not None
+    if mrope_positions is None:
+        mrope_positions = input_buffers.positions
+        mrope_positions_stride = 0
+    else:
+        mrope_positions_stride = mrope_positions.stride(0)
     _update_draft_inputs_kernel[(num_reqs,)](
         output_draft_tokens,
         output_draft_tokens.stride(0),
@@ -934,6 +1154,8 @@ def update_draft_inputs(
         next_input_hidden_states.stride(0),
         input_buffers.input_ids,
         input_buffers.positions,
+        mrope_positions,
+        mrope_positions_stride,
         input_buffers.seq_lens,
         draft_tokens,
         current_draft_step,
@@ -944,4 +1166,5 @@ def update_draft_inputs(
         num_speculative_steps,
         BLOCK_SIZE=1024,
         ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
+        USES_MROPE=uses_mrope,
     )

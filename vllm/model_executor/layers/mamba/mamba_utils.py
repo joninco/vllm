@@ -17,6 +17,7 @@ from vllm.utils.torch_utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
     get_kv_cache_torch_dtype,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 logger = init_logger(__name__)
 
@@ -342,6 +343,9 @@ class MambaCopySpec:
 
 MambaStateCopyFunc: TypeAlias = Callable[
     [torch.Tensor, list[int], int, int], MambaCopySpec
+]
+MambaStateCopyFuncsByType: TypeAlias = dict[
+    MambaAttentionBackendEnum, tuple[MambaStateCopyFunc, ...]
 ]
 """
 Type alias for a function that computes a MambaCopySpec for copying state slices.

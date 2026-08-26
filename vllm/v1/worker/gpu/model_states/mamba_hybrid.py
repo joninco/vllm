@@ -24,7 +24,10 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 from vllm.v1.worker.mamba_utils import (
     MambaSpecDecodeGPUContext,
+    MambaStateCopyFuncsByType,
+    get_mamba_groups,
     preprocess_mamba_align_fused_kernel,
+    resolve_mamba_state_copy_funcs,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -102,6 +105,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
+            self._mamba_copy_funcs_by_type: MambaStateCopyFuncsByType | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -113,21 +117,19 @@ class MambaHybridModelState(DefaultModelState):
                 (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
             )
 
+    def reset_kv_cache_state(self) -> None:
+        """Release pointer metadata derived from Mamba cache allocations."""
+        if self._align_mode:
+            self._mamba_ctx = None
+            self._mamba_copy_funcs_by_type = None
+        if self.recoverssm is not None:
+            self.recoverssm.reset()
+
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
     ) -> tuple[list[int], MambaSpec]:
         if self._mamba_spec is None:
-            group_ids: list[int] = []
-            specs: list[MambaSpec] = []
-            for i, group in enumerate(kv_cache_config.kv_cache_groups):
-                spec = group.kv_cache_spec
-                if isinstance(spec, MambaSpec):
-                    group_ids.append(i)
-                    specs.append(spec)
-            assert specs, "no mamba layers in the model"
-            assert all(specs[0] == s for s in specs)
-            self._mamba_group_ids = group_ids
-            self._mamba_spec = specs[0]
+            self._mamba_group_ids, self._mamba_spec = get_mamba_groups(kv_cache_config)
         return self._mamba_group_ids, self._mamba_spec
 
     def _ensure_align_ctx(
@@ -137,7 +139,9 @@ class MambaHybridModelState(DefaultModelState):
         block_tables: tuple[torch.Tensor, ...],
     ) -> MambaSpecDecodeGPUContext:
         if self._mamba_ctx is None:
-            copy_funcs = self.model.get_mamba_state_copy_func()
+            self._mamba_copy_funcs_by_type = resolve_mamba_state_copy_funcs(
+                self.model, kv_cache_config
+            )
             # Both SD and DS conv layouts support a >0 spec-decode shift: the
             # fused pre-copy kernel (``_copy_mamba_state_block``) applies the
             # ``token_bias = num_accepted - 1`` window shift per conv layout
@@ -146,11 +150,12 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx = MambaSpecDecodeGPUContext.create(
                 max_num_reqs=self.max_num_reqs,
                 kv_cache_config=kv_cache_config,
-                num_state_types=len(copy_funcs),
+                num_state_types=None,
                 device=self.device,
                 make_buffer=lambda n, dtype: CpuGpuBuffer(
                     n, dtype=dtype, device=self.device
                 ),
+                copy_funcs_by_type=self._mamba_copy_funcs_by_type,
             )
         ctx = self._mamba_ctx
         if not ctx.is_initialized:
@@ -161,7 +166,7 @@ class MambaHybridModelState(DefaultModelState):
             ctx.initialize_from_forward_context(
                 kv_cache_config,
                 forward_context,
-                self.model.get_mamba_state_copy_func(),
+                self._mamba_copy_funcs_by_type,
                 [block_tables[gid] for gid in mamba_group_ids],
             )
         return ctx

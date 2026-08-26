@@ -13,8 +13,14 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
     get_temporal_copy_spec,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.mamba_utils import (
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
@@ -22,7 +28,10 @@ from vllm.v1.worker.mamba_utils import (
     batch_memcpy,
     collect_mamba_copy_meta,
     do_mamba_copy_block,
+    get_mamba_groups,
+    get_mamba_layer_groups,
     preprocess_mamba,
+    resolve_mamba_state_copy_funcs,
     stage_postprocess_inputs_to_gpu,
 )
 
@@ -399,6 +408,211 @@ def _make_kv_cache_config(cfg: _TestConfig, layer_names: list[str]) -> KVCacheCo
     )
 
 
+def _make_heterogeneous_mamba_specs(
+    block_size: int = 16,
+) -> tuple[MambaSpec, MambaSpec]:
+    gdn_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((4, 8), (2, 8, 8)),
+        dtypes=(torch.float16, torch.float16),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode="align",
+        num_speculative_blocks=2,
+    )
+    short_conv_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((3, 32),),
+        dtypes=(torch.float16,),
+        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
+        mamba_cache_mode="align",
+        num_speculative_blocks=2,
+    )
+    return gdn_spec, short_conv_spec
+
+
+def test_discovers_heterogeneous_mamba_uniform_group() -> None:
+    gdn_spec, short_conv_spec = _make_heterogeneous_mamba_specs()
+    wrapped_spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={"gdn": gdn_spec, "ple": short_conv_spec},
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["gdn", "ple"],
+                kv_cache_spec=wrapped_spec,
+            )
+        ],
+    )
+
+    layer_groups = get_mamba_layer_groups(kv_cache_config)
+    group_ids, scheduling_spec = get_mamba_groups(kv_cache_config)
+
+    assert kv_cache_config.has_mamba_layers
+    assert group_ids == [0]
+    assert scheduling_spec.block_size == 16
+    assert list(layer_groups[0].layer_specs) == ["gdn", "ple"]
+    assert layer_groups[0].layer_specs["gdn"].mamba_type == (
+        MambaAttentionBackendEnum.GDN_ATTN
+    )
+    assert layer_groups[0].layer_specs["ple"].mamba_type == (
+        MambaAttentionBackendEnum.SHORT_CONV
+    )
+
+    funcs_by_type = {
+        MambaAttentionBackendEnum.GDN_ATTN: _COPY_FUNCS,
+        MambaAttentionBackendEnum.SHORT_CONV: (get_conv_copy_spec,),
+    }
+    buffers = MambaCopyBuffers.create(
+        max_num_reqs=4,
+        kv_cache_config=kv_cache_config,
+        copy_funcs=funcs_by_type,
+        make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, torch.device("cpu")),
+    )
+    assert len(buffers.src_ptrs.np) == 4 * 3
+    assert len(buffers.dst_ptrs.np) == 4 * 3
+    assert len(buffers.sizes.np) == 4 * 3
+
+
+def test_mamba_group_discovery_rejects_mismatched_scheduling_block_size() -> None:
+    gdn_spec, _ = _make_heterogeneous_mamba_specs(block_size=16)
+    _, short_conv_spec = _make_heterogeneous_mamba_specs(block_size=32)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["gdn"], gdn_spec),
+            KVCacheGroupSpec(["ple"], short_conv_spec),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="same scheduling block size"):
+        get_mamba_layer_groups(kv_cache_config)
+
+
+def test_resolves_legacy_single_type_mamba_copy_api() -> None:
+    cfg = _TestConfig(num_layers=1)
+    kv_cache_config = _make_kv_cache_config(cfg, ["layer_0"])
+
+    class LegacyModel:
+        @classmethod
+        def get_mamba_state_copy_func(cls):
+            return _COPY_FUNCS
+
+    funcs_by_type = resolve_mamba_state_copy_funcs(LegacyModel(), kv_cache_config)
+
+    assert funcs_by_type == {MambaAttentionBackendEnum.MAMBA2: _COPY_FUNCS}
+
+
+def test_populates_heterogeneous_mamba_metadata_with_group_association() -> None:
+    gdn_spec, short_conv_spec = _make_heterogeneous_mamba_specs()
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["gdn"], gdn_spec),
+            KVCacheGroupSpec(["ple"], short_conv_spec),
+        ],
+    )
+    funcs_by_type = {
+        MambaAttentionBackendEnum.GDN_ATTN: _COPY_FUNCS,
+        MambaAttentionBackendEnum.SHORT_CONV: (get_conv_copy_spec,),
+    }
+    device = torch.device("cpu")
+
+    def make_buffer(n, dtype):
+        return _MockCpuGpuBuffer(n, dtype, device)
+
+    context = MambaSpecDecodeGPUContext.create(
+        max_num_reqs=4,
+        kv_cache_config=kv_cache_config,
+        num_state_types=None,
+        device=device,
+        make_buffer=make_buffer,
+        copy_funcs_by_type=funcs_by_type,
+    )
+    gdn_conv = torch.empty(8, 4, 8, dtype=torch.float16)
+    gdn_temporal = torch.empty(8, 2, 8, 8, dtype=torch.float16)
+    ple_conv = torch.empty(8, 3, 32, dtype=torch.float16)
+    forward_context = {
+        "gdn": _make_mock_attention(gdn_conv, gdn_temporal),
+        "ple": MagicMock(kv_cache=[ple_conv]),
+    }
+    block_tables = [
+        torch.zeros(4, 6, dtype=torch.int32),
+        torch.ones(4, 6, dtype=torch.int32),
+    ]
+
+    context.initialize_from_forward_context(
+        kv_cache_config,
+        forward_context,
+        funcs_by_type,
+        block_tables,
+    )
+
+    assert context.total_states == 3
+    assert context.state_group_indices.tolist() == [0, 0, 1]
+    assert context.state_base_addrs.tolist() == [
+        gdn_conv.data_ptr(),
+        gdn_temporal.data_ptr(),
+        ple_conv.data_ptr(),
+    ]
+    assert context.block_table_ptrs.tolist() == [
+        block_tables[0].data_ptr(),
+        block_tables[1].data_ptr(),
+    ]
+
+
+def test_heterogeneous_copy_capacity_is_checked_before_writes() -> None:
+    gdn_spec, short_conv_spec = _make_heterogeneous_mamba_specs()
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["gdn"], gdn_spec),
+            KVCacheGroupSpec(["ple"], short_conv_spec),
+        ],
+    )
+    funcs_by_type = {
+        MambaAttentionBackendEnum.GDN_ATTN: _COPY_FUNCS,
+        MambaAttentionBackendEnum.SHORT_CONV: (get_conv_copy_spec,),
+    }
+    buffers = MambaCopyBuffers.create(
+        max_num_reqs=1,
+        kv_cache_config=kv_cache_config,
+        copy_funcs=funcs_by_type,
+        make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, torch.device("cpu")),
+    )
+    buffers.offset = 1
+    before = buffers.src_ptrs.np.copy()
+    request = MagicMock(block_ids={0: [0, 1], 1: [0, 1]})
+    forward_context = {
+        "gdn": _make_mock_attention(
+            torch.empty(8, 4, 8),
+            torch.empty(8, 2, 8, 8),
+        ),
+        "ple": MagicMock(kv_cache=[torch.empty(8, 3, 32)]),
+    }
+
+    with pytest.raises(RuntimeError, match="planned capacity"):
+        collect_mamba_copy_meta(
+            buffers,
+            kv_cache_config,
+            funcs_by_type,
+            [0, 1],
+            src_block_idx=0,
+            dest_block_idx=1,
+            accept_token_bias=0,
+            req_state=request,
+            forward_context=forward_context,
+        )
+
+    assert buffers.offset == 1
+    np.testing.assert_array_equal(buffers.src_ptrs.np, before)
+
+
 def _make_input_batch(
     req_ids: list[str],
     num_accepted_tokens: list[int],
@@ -650,13 +864,13 @@ def _run_gpu_postprocess(
     torch.accelerator.synchronize()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="accelerator required")
 class TestPostprocessMambaFusedKernel:
     """Tests for postprocess_mamba_fused_kernel comparing GPU vs CPU paths."""
 
     @pytest.fixture
     def device(self):
-        return torch.device("cuda:0")
+        return torch.device("cuda", torch.accelerator.current_device_index())
 
     @pytest.fixture
     def test_config(self):

@@ -1170,7 +1170,11 @@ class KVCacheConfig:
 
     @property
     def has_mamba_layers(self) -> bool:
-        return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
+        return any(
+            isinstance(spec, MambaSpec)
+            for group in self.kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
 
     @property
     def has_mixed_precision_kv_cache(self) -> bool:

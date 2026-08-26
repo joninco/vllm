@@ -30,6 +30,10 @@ logger = init_logger(__name__)
 
 
 class BaseSpeculator(ABC):
+    def reset_attn(self) -> None:
+        """Release objects derived from a target KV-cache allocation."""
+        return None
+
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
@@ -228,6 +232,27 @@ class DraftModelSpeculator(BaseSpeculator):
         self.target_input_buffers = target_input_buffers
         self.target_attn_groups = target_attn_groups
 
+    def reset_attn(self) -> None:
+        """Release attention builders, tables, and graphs created by set_attn."""
+        for name in (
+            "model_state",
+            "kv_cache_config",
+            "attn_groups",
+            "attn_cg_support",
+            "block_tables",
+            "target_attn_groups",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
+        for name in (
+            "prefill_cudagraph_manager",
+            "decode_cudagraph_manager",
+            "cudagraph_manager",
+            "query_cudagraph_manager",
+        ):
+            if hasattr(self, name):
+                setattr(self, name, None)
+
     def _build_draft_attn_metadata(
         self,
         num_reqs: int,
@@ -273,6 +298,12 @@ class DraftModelSpeculator(BaseSpeculator):
             out=draft_seq_lens_cpu_upper_bound[:num_reqs],
         )
         draft_seq_lens_cpu_upper_bound[:num_reqs].clamp_(max=self.max_model_len)
+        model_specific_attn_metadata = self.model_state.prepare_draft_attn_metadata(
+            idx_mapping=self.idx_mapping,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            draft_index=step,
+        )
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs_padded,
@@ -294,6 +325,7 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+            model_specific_attn_metadata=model_specific_attn_metadata,
         )
         return attn_metadata
 

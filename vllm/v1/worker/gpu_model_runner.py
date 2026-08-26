@@ -248,6 +248,7 @@ from .utils import (
     copy_kv_cache_blocks_inplace,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
+    unbind_kv_cache,
 )
 
 if TYPE_CHECKING:
@@ -1111,10 +1112,13 @@ class GPUModelRunner(
         # decode + hybrid model.
         assert self.cache_config.mamba_cache_mode == "align"
         if self._mamba_bufs is None:
+            copy_funcs = mamba_utils.resolve_mamba_state_copy_funcs(
+                self.model, self.kv_cache_config
+            )
             self._mamba_bufs = mamba_utils.MambaBuffers.create(
                 max_num_reqs=self.max_num_reqs,
                 kv_cache_config=self.kv_cache_config,
-                copy_funcs=self.model.get_mamba_state_copy_func(),
+                copy_funcs=copy_funcs,
                 make_buffer=self._make_buffer,
                 device=self.device,
                 with_postprocess_align=(
@@ -1651,7 +1655,9 @@ class GPUModelRunner(
                 input_batch=self.input_batch,
                 kv_cache_config=self.kv_cache_config,
                 forward_context=self.compilation_config.static_forward_context,
-                mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
+                mamba_state_copy_funcs=(
+                    self._get_mamba_bufs().preprocess.copy_funcs_by_type
+                ),
             )
 
             assert self.num_accepted_tokens_event is not None
@@ -4449,7 +4455,7 @@ class GPUModelRunner(
                     self.input_batch,
                     self.requests,
                     self.compilation_config.static_forward_context,
-                    self.model.get_mamba_state_copy_func(),
+                    mamba_bufs.preprocess.copy_funcs_by_type,
                     mamba_bufs.preprocess,
                     align_ctx=mamba_bufs.postprocess_align,
                 )
@@ -6638,10 +6644,12 @@ class GPUModelRunner(
         # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
         saved_override = self.cache_config.num_gpu_blocks_override
         self.cache_config.num_gpu_blocks_override = min_blocks
-        minimal_config = get_kv_cache_config_from_groups(
-            self.vllm_config, kv_cache_groups, available_memory=0
-        )
-        self.cache_config.num_gpu_blocks_override = saved_override
+        try:
+            minimal_config = get_kv_cache_config_from_groups(
+                self.vllm_config, kv_cache_groups, available_memory=0
+            )
+        finally:
+            self.cache_config.num_gpu_blocks_override = saved_override
 
         self.initialize_kv_cache(minimal_config, is_profiling=True)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks
@@ -6704,23 +6712,14 @@ class GPUModelRunner(
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
+        if hasattr(self, "drafter") and hasattr(self.drafter, "draft_attn_groups"):
+            self.drafter.draft_attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
             delattr(self, "kv_cache_config")
         self.cache_config.num_gpu_blocks = None
 
-        for layer in self.compilation_config.static_forward_context.values():
-            if hasattr(layer, "kv_cache"):
-                kv_cache = layer.kv_cache
-                layer.kv_cache = (
-                    torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
-                )
-            # Clean up quantized KV cache scale views
-            # (int8_per_token_head, fp8_per_token_head)
-            if hasattr(layer, "impl"):
-                if hasattr(layer.impl, "_k_scale_cache"):
-                    layer.impl._k_scale_cache = None
-                if hasattr(layer.impl, "_v_scale_cache"):
-                    layer.impl._v_scale_cache = None
+        unbind_kv_cache(self.compilation_config.static_forward_context)
+        self._mamba_bufs = None
 
         gc.collect()
         torch.accelerator.empty_cache()
@@ -6765,8 +6764,14 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
-        with set_current_vllm_config(self.vllm_config):
-            self._init_minimal_kv_cache_for_profiling()
+        profiling_state_initialized = False
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                self._init_minimal_kv_cache_for_profiling()
+            profiling_state_initialized = True
+        finally:
+            if not profiling_state_initialized:
+                self._cleanup_profiling_kv_cache()
 
         saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
 

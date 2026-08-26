@@ -50,6 +50,10 @@ def _make_fake_speculator(
         kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
         max_model_len=max_model_len,
         draft_max_seq_len=draft_max_seq_len,
+        idx_mapping=torch.arange(max_num_reqs, dtype=torch.int32),
+        model_state=SimpleNamespace(
+            prepare_draft_attn_metadata=lambda **_: None,
+        ),
     )
 
 
@@ -126,3 +130,31 @@ def test_build_draft_attn_metadata_clamps_to_max_model_len():
     bound = captured["seq_lens_cpu_upper_bound"]
     # 1023 + 3 = 1026 -> clamped to 1024; 500 + 3 = 503 unaffected.
     assert torch.equal(bound, torch.tensor([1024, 503], dtype=torch.int32))
+
+
+def test_build_draft_attn_metadata_forwards_model_specific_metadata():
+    fake = _make_fake_speculator()
+    hook_args: dict[str, object] = {}
+    model_metadata = object()
+
+    def prepare_draft_attn_metadata(**kwargs):
+        hook_args.update(kwargs)
+        return model_metadata
+
+    fake.model_state.prepare_draft_attn_metadata = prepare_draft_attn_metadata
+    captured = _run_build(
+        fake,
+        num_reqs=2,
+        num_reqs_padded=4,
+        num_tokens_padded=4,
+        base=torch.tensor([10, 20], dtype=torch.int32),
+        step=1,
+    )
+
+    assert hook_args == {
+        "idx_mapping": fake.idx_mapping,
+        "num_reqs": 2,
+        "num_reqs_padded": 4,
+        "draft_index": 1,
+    }
+    assert captured["model_specific_attn_metadata"] is model_metadata

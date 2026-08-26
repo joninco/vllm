@@ -155,6 +155,11 @@ class DefaultModelState(ModelState):
         positions = self.rope_state.get_positions(input_batch.num_tokens_after_padding)
         return {"positions": positions}
 
+    def get_model_positions(self, input_batch: InputBatch) -> torch.Tensor:
+        if self.rope_state is None:
+            return super().get_model_positions(input_batch)
+        return self.rope_state.get_positions(input_batch.num_tokens_after_padding)
+
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = {}
         if self.supports_mm_inputs or self.prompt_embeds_state is not None:

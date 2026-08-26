@@ -37,7 +37,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, unbind_kv_cache
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -700,6 +700,26 @@ _FULL_GRAPH_PROFILING_SAMPLES = 2
 _MIN_PER_GRAPH_BYTES = 1 << 20
 
 
+def _profiling_cudagraph_managers(runner: "GPUModelRunner") -> list[CudaGraphManager]:
+    managers: list[CudaGraphManager] = []
+    if isinstance(runner.cudagraph_manager, CudaGraphManager):
+        managers.append(runner.cudagraph_manager)
+    speculator = runner.speculator
+    if speculator is not None:
+        for name in (
+            "prefill_cudagraph_manager",
+            "decode_cudagraph_manager",
+            "cudagraph_manager",
+            "query_cudagraph_manager",
+        ):
+            candidate = getattr(speculator, name, None)
+            if isinstance(candidate, CudaGraphManager) and all(
+                candidate is not manager for manager in managers
+            ):
+                managers.append(candidate)
+    return managers
+
+
 @torch.inference_mode()
 def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
@@ -723,8 +743,14 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     gc.collect()
     torch.accelerator.empty_cache()
 
-    with set_current_vllm_config(runner.vllm_config):
-        _init_minimal_kv_cache_for_profiling(runner)
+    profiling_state_initialized = False
+    try:
+        with set_current_vllm_config(runner.vllm_config):
+            _init_minimal_kv_cache_for_profiling(runner)
+        profiling_state_initialized = True
+    finally:
+        if not profiling_state_initialized:
+            _teardown_profiling_state(runner)
 
     manager = runner.cudagraph_manager
     assert manager is not None
@@ -734,6 +760,12 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     saved_capture_triggers = compilation_counter.num_gpu_runner_capture_triggers
     all_wrappers: list[Any] = []
     original_pools: dict[int, Any] = {}
+    graph_managers = _profiling_cudagraph_managers(runner)
+    original_manager_pools = {
+        id(graph_manager): graph_manager.pool for graph_manager in graph_managers
+    }
+    platform_cls = type(current_platform)
+    persistent_global_pool = current_platform.get_global_graph_pool()
     try:
         if not manager.needs_capture():
             return 0
@@ -745,6 +777,14 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         # to 0, and the real capture on the same pool trips the c10 allocator's
         # create_or_incref_pool assert ("use_count > 0 INTERNAL ASSERT FAILED").
         manager.pool = current_platform.graph_pool_handle()
+        # AOT compilation can construct piecewise wrappers during the first
+        # warmup inside capture_model(), after the snapshot below. Route those
+        # late-created wrappers to the profiling pool as well. Otherwise they
+        # capture into the persistent pool, teardown drops its use_count to
+        # zero, and the real capture cannot reuse it.
+        platform_cls._global_graph_pool = manager.pool
+        for graph_manager in graph_managers:
+            graph_manager.pool = manager.pool
         if manager.use_breakable_cg:
             # The breakable runner is otherwise created lazily during capture,
             # after the pool swap below, and would capture into the global
@@ -775,9 +815,16 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         compilation_counter.num_gpu_runner_capture_triggers = saved_capture_triggers
         CUDAGraphWrapper.clear_all_graphs()
         BreakableCUDAGraphWrapper.clear_all_graphs()
-        for wrapper in all_wrappers:
-            if id(wrapper) in original_pools:
-                wrapper.graph_pool = original_pools[id(wrapper)]
+        for graph_manager in graph_managers:
+            graph_manager.graphs.clear()
+            graph_manager._graphs_captured = False
+            graph_manager.pool = original_manager_pools[id(graph_manager)]
+        live_wrappers = list(CUDAGraphWrapper._all_instances) + list(
+            BreakableCUDAGraphWrapper._all_instances
+        )
+        for wrapper in live_wrappers:
+            wrapper.graph_pool = original_pools.get(id(wrapper), persistent_global_pool)
+        platform_cls._global_graph_pool = persistent_global_pool
         _teardown_profiling_state(runner)
 
 
@@ -829,19 +876,24 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         runner.attn_groups.clear()
     if hasattr(runner, "kv_cache_config"):
         del runner.kv_cache_config
+    if hasattr(runner, "block_tables"):
+        del runner.block_tables
+    runner.pcp_manager = None
+    runner.adaptive_verification = None
     # Dropping the manager releases the profiling graphs and throwaway pool.
     runner.cudagraph_manager = None
     # Release encoder graphs captured during profiling; the real
     # capture_model() re-captures them.
     if runner.model_state.supports_mm_inputs:
         runner.model_state.encoder_runner.clear()
-    # Detach profiling KV tensors held by attention layers.
-    for layer in runner.compilation_config.static_forward_context.values():
-        if hasattr(layer, "kv_cache"):
-            kv_cache = layer.kv_cache
-            layer.kv_cache = (
-                torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
-            )
+    # Detach profiling KV tensors and every layer-derived cache view/binding.
+    unbind_kv_cache(runner.compilation_config.static_forward_context)
+    reset_model_state = getattr(runner.model_state, "reset_kv_cache_state", None)
+    if callable(reset_model_state):
+        reset_model_state()
+    speculator = getattr(runner, "speculator", None)
+    if speculator is not None:
+        speculator.reset_attn()
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
     gc.collect()

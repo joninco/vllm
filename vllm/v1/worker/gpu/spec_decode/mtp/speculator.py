@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 class MTPSpeculator(AutoRegressiveSpeculator):
     share_mtp_topk_indices: bool = False
+    rollback_qsa_interval_starts: bool = False
 
     def load_draft_model(
         self,
@@ -32,6 +33,9 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )
+        self.rollback_qsa_interval_starts = hasattr(
+            draft_model.model, "snapshot_qsa_interval_starts"
+        ) and hasattr(draft_model.model, "restore_qsa_interval_starts")
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
@@ -48,11 +52,15 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             self.model.model.compact_topk_indices(self.last_token_indices[:num_reqs])
 
     def on_multi_step_decode_begin(self, num_reqs: int) -> None:
+        if self.rollback_qsa_interval_starts:
+            self.model.model.snapshot_qsa_interval_starts()
         # Switch to reuse mode so draft steps 1+ skip the indexer op and read
         # the indices that step 0 wrote into the shared buffer.
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(True)
 
     def on_multi_step_decode_end(self, num_reqs: int) -> None:
+        if self.rollback_qsa_interval_starts:
+            self.model.model.restore_qsa_interval_starts()
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(False)

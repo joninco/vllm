@@ -16,6 +16,74 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 
 
+def test_reset_kv_cache_state_recreates_align_context(monkeypatch) -> None:
+    import vllm.v1.worker.gpu.model_states.mamba_hybrid as state_module
+
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state._mamba_ctx = object()
+    state._mamba_copy_funcs_by_type = object()
+    state._mamba_group_ids = [1]
+    state._mamba_spec = object()
+    state.recoverssm = RecoverSSMState()
+    state.recoverssm._step = (object(),)
+    state.model = object()
+    state.max_num_reqs = 2
+    state.device = torch.device("cpu")
+    new_cache = torch.empty(2, 1)
+    forward_context = {"layer": SimpleNamespace(kv_cache=(new_cache,))}
+    state.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=forward_context)
+    )
+    kv_cache_config = object()
+    unused_block_table = torch.empty(2, 1, dtype=torch.int32)
+    new_block_table = torch.empty(2, 1, dtype=torch.int32)
+    copy_funcs = object()
+    initialized_with: list[tuple[object, object, object]] = []
+
+    class _Context:
+        is_initialized = False
+
+        def initialize_from_forward_context(
+            self, config, context, funcs, block_tables
+        ) -> None:
+            initialized_with.append((config, context, block_tables[0]))
+            assert funcs is copy_funcs
+            assert context["layer"].kv_cache[0] is new_cache
+            self.is_initialized = True
+
+    created_context = _Context()
+    monkeypatch.setattr(
+        state_module,
+        "resolve_mamba_state_copy_funcs",
+        lambda model, config: copy_funcs,
+    )
+    monkeypatch.setattr(
+        state_module.MambaSpecDecodeGPUContext,
+        "create",
+        lambda **_kwargs: created_context,
+    )
+
+    previous_group_ids = state._mamba_group_ids
+    previous_spec = state._mamba_spec
+    state.reset_kv_cache_state()
+
+    assert state._mamba_ctx is None
+    assert state._mamba_copy_funcs_by_type is None
+    assert state._mamba_group_ids is previous_group_ids
+    assert state._mamba_spec is previous_spec
+    assert state.recoverssm._step is None
+
+    result = state._ensure_align_ctx(
+        kv_cache_config,
+        state._mamba_group_ids,
+        (unused_block_table, new_block_table),
+    )
+
+    assert result is created_context
+    assert initialized_with == [(kv_cache_config, forward_context, new_block_table)]
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 @pytest.mark.parametrize(("num_sampled", "expected_value"), [(0, 1), (3, 3)])
 def test_postprocess_state_scalar_with_int32_mapping(

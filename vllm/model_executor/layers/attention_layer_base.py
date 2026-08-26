@@ -31,6 +31,22 @@ class AttentionLayerBase(ABC):
         """
         self.kv_cache = kv_cache
 
+    def unbind_kv_cache(self) -> None:
+        """Release cache tensors and views retained by this layer.
+
+        This is the lifecycle inverse of :meth:`bind_kv_cache`. Subclasses
+        that derive cache views, bindings, or plans must clear those references
+        before delegating here.
+        """
+        self.kv_cache = torch.tensor([])
+        impl = getattr(self, "impl", None)
+        if impl is not None:
+            # Quantized Triton attention derives scale views from the cache.
+            if hasattr(impl, "_k_scale_cache"):
+                impl._k_scale_cache = None
+            if hasattr(impl, "_v_scale_cache"):
+                impl._v_scale_cache = None
+
     @abstractmethod
     def get_attn_backend(self) -> type[AttentionBackend]:
         """Get the attention backend class for this layer."""
