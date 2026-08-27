@@ -304,7 +304,12 @@ class Qwen3_8FlashNextQSABackend(B12xPagedAttentionBackend):
     """Sparse QSA backend using one padded, unsplit BLHNC manager page."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
     forward_includes_kv_cache_update: bool = True
 
     @staticmethod
@@ -385,8 +390,8 @@ class Qwen3_8FlashNextQSABackend(B12xPagedAttentionBackend):
         del use_sparse
         if dtype != torch.bfloat16:
             return "Qwen3.8-Flash-Next QSA requires BF16 queries"
-        if kv_cache_dtype not in (None, "auto", "bfloat16"):
-            return "Qwen3.8-Flash-Next QSA requires a BF16 KV cache"
+        if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8", "fp8_e4m3"):
+            return "Qwen3.8-Flash-Next QSA requires BF16 or FP8 E4M3 KV cache"
         if use_mla or has_sink or use_mm_prefix:
             return "QSA does not support MLA, attention sinks, or MM-prefix attention"
         if not cls.supports_block_size(block_size):
@@ -438,8 +443,8 @@ class Qwen3_8FlashNextQSAImpl(AttentionImpl[Qwen3_8FlashNextQSAMetadata]):
             raise NotImplementedError("QSA does not support logits soft cap")
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError("QSA supports causal decoder attention only")
-        if kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("QSA requires a BF16 main KV cache")
+        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+            raise NotImplementedError("QSA requires BF16 or FP8 E4M3 main KV cache")
         if head_size != 256 or num_heads % num_kv_heads:
             raise ValueError("QSA requires head_dim=256 and valid grouped-query heads")
         if not math.isclose(scale, head_size**-0.5, rel_tol=1e-5, abs_tol=1e-7):
@@ -463,8 +468,24 @@ class Qwen3_8FlashNextQSAImpl(AttentionImpl[Qwen3_8FlashNextQSAMetadata]):
         value_cache = value_cache.unflatten(-1, (self.num_kv_heads, self.head_size))
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
-        if key_cache.dtype != torch.bfloat16 or value_cache.dtype != torch.bfloat16:
-            raise TypeError("QSA main K/V cache views must be BF16")
+        expected_dtype = (
+            current_platform.fp8_dtype()
+            if self.kv_cache_dtype
+            in (
+                "fp8",
+                "fp8_e4m3",
+            )
+            else torch.bfloat16
+        )
+        if key_cache.dtype == torch.uint8 and expected_dtype != torch.bfloat16:
+            key_cache = key_cache.view(expected_dtype)
+        if value_cache.dtype == torch.uint8 and expected_dtype != torch.bfloat16:
+            value_cache = value_cache.view(expected_dtype)
+        if key_cache.dtype != expected_dtype or value_cache.dtype != expected_dtype:
+            raise TypeError(
+                f"QSA main K/V cache views must be {expected_dtype}, got "
+                f"{key_cache.dtype}/{value_cache.dtype}"
+            )
         return key_cache, value_cache
 
     def do_kv_cache_update(
@@ -800,8 +821,13 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             raise ValueError("QSA requires a paged KV cache")
         if model_config.dtype != torch.bfloat16:
             raise NotImplementedError("QSA currently requires BF16 activations")
-        if cache_config.cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("QSA requires a BF16 main KV cache")
+        if cache_config.cache_dtype not in (
+            "auto",
+            "bfloat16",
+            "fp8",
+            "fp8_e4m3",
+        ):
+            raise NotImplementedError("QSA requires BF16 or FP8 E4M3 main KV cache")
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("QSA does not support KV-cache quantization")
         parallel = vllm_config.parallel_config
@@ -883,8 +909,18 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != torch.bfloat16:
-            raise NotImplementedError("QSA cache storage must resolve to BF16")
+        self.kv_cache_kernel_dtype = (
+            current_platform.fp8_dtype()
+            if self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+            else self.kv_cache_torch_dtype
+        )
+        if self.kv_cache_kernel_dtype not in (
+            torch.bfloat16,
+            current_platform.fp8_dtype(),
+        ):
+            raise NotImplementedError(
+                "QSA cache storage must resolve to BF16 or FP8 E4M3"
+            )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
@@ -1195,6 +1231,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
                 ),
                 rms_norm_eps=float(self.indexer.q_layernorm.variance_epsilon),
                 dtype=torch.bfloat16,
+                kv_dtype=self.kv_cache_kernel_dtype,
             )
         )
         scratch_spec = plan.scratch_specs()[0]
@@ -1215,6 +1252,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             scratch=scratch,
             main_k_cache=main_k_cache,
             main_v_cache=main_v_cache,
+            k_descale=self._k_scale,
+            v_descale=self._v_scale,
             main_block_table=self._main_block_table,
             compressed_k_cache=compressed_cache,
             compressed_block_table=self._main_block_table,
@@ -1768,6 +1807,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             query[:mapped_rows],
             main_k_cache,
             main_v_cache,
+            self._k_scale,
+            self._v_scale,
             selected,
             self._main_block_table,
             request_ids,

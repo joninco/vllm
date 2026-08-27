@@ -188,6 +188,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_descale_ptr,
+    v_descale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -219,6 +221,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -291,6 +294,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if KV_IS_FP8:
+            keys = (keys.to(tl.float32) * tl.load(k_descale_ptr)).to(tl.bfloat16)
+            values = (values.to(tl.float32) * tl.load(v_descale_ptr)).to(tl.bfloat16)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -826,12 +832,14 @@ def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
     logical_indices: torch.Tensor,
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 or FP8 E4M3 K/V caches."""
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
@@ -849,7 +857,18 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    assert q.dtype == torch.bfloat16
+    assert k_cache.dtype == v_cache.dtype
+    assert k_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+    if k_cache.dtype == torch.float8_e4m3fn:
+        for descale, name in ((k_descale, "k_descale"), (v_descale, "v_descale")):
+            if (
+                descale.dtype != torch.float32
+                or descale.device != q.device
+                or descale.numel() != 1
+                or not descale.is_contiguous()
+            ):
+                raise ValueError(f"{name} must be one contiguous CUDA float32 value")
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -911,6 +930,8 @@ def qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_descale,
+        v_descale,
         logical_indices,
         block_table,
         token_to_req,
@@ -942,6 +963,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        KV_IS_FP8=k_cache.dtype == torch.float8_e4m3fn,
         num_warps=partial_warps,
         num_stages=2,
     )

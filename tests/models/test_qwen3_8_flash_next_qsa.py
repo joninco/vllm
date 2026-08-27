@@ -27,6 +27,7 @@ from vllm.models.qwen3_8_flash_next.nvidia.ops.qsa import (
 from vllm.models.qwen3_8_flash_next.nvidia.qsa import (
     Qwen3_8FlashNextQSAAttention,
     Qwen3_8FlashNextQSABackend,
+    Qwen3_8FlashNextQSAImpl,
     Qwen3_8FlashNextQSAMetadataBuilder,
     _commit_prefill_qsa_state_kernel,
 )
@@ -60,10 +61,21 @@ def test_qsa_backend_platform_probe_uses_b12x_selector_geometry(
     )
 
     packed = Qwen3_8FlashNextQSABackend.customize_spec(probe)
+    fp8_probe = FullAttentionSpec(
+        block_size=1,
+        num_kv_heads=2,
+        head_size=256,
+        head_size_v=256,
+        dtype=torch.uint8,
+    )
+    fp8_packed = Qwen3_8FlashNextQSABackend.customize_spec(fp8_probe)
 
     assert packed.unpadded_page_size_bytes == 2048
     assert packed.page_size_padded == 2128
     assert packed.page_size_bytes == 2128
+    assert fp8_packed.unpadded_page_size_bytes == 1024
+    assert fp8_packed.page_size_padded == 1104
+    assert fp8_packed.page_size_bytes == 1104
     assert calls == [
         {
             "main_page_size": 4,
@@ -72,7 +84,17 @@ def test_qsa_backend_platform_probe_uses_b12x_selector_geometry(
             "compress_ratio": 4,
             "index_head_dim": 128,
             "dtype": torch.bfloat16,
-        }
+            "kv_dtype": torch.bfloat16,
+        },
+        {
+            "main_page_size": 4,
+            "kv_heads": 2,
+            "head_dim": 256,
+            "compress_ratio": 4,
+            "index_head_dim": 128,
+            "dtype": torch.bfloat16,
+            "kv_dtype": torch.float8_e4m3fn,
+        },
     ]
 
 
@@ -127,6 +149,52 @@ def test_qsa_selector_tail_is_zero_copy_in_block_outer_layer_pages() -> None:
     assert torch.all(tails[0] == 11)
     assert torch.all(tails[1] == 22)
     assert tails[0].data_ptr() != tails[1].data_ptr()
+
+
+def test_qsa_selector_tail_remains_bf16_with_fp8_main_cache() -> None:
+    num_pages = 3
+    page_size = 8
+    packed_kv_width = 512
+    main_page_nbytes = 2 * page_size * packed_kv_width
+    tail_elements = page_size // 4 * 128
+    tail_nbytes = tail_elements * torch.bfloat16.itemsize
+    padded_page_nbytes = main_page_nbytes + tail_nbytes
+    backing = torch.zeros(num_pages * padded_page_nbytes, dtype=torch.uint8)
+    main_cache = backing.view(torch.float8_e4m3fn).as_strided(
+        (num_pages, 2, page_size, packed_kv_width),
+        (padded_page_nbytes, page_size * packed_kv_width, packed_kv_width, 1),
+    )
+
+    tail = qsa_compressed_cache_view(
+        main_cache,
+        compress_ratio=4,
+        index_head_dim=128,
+    )
+    tail.fill_(7)
+
+    assert tail.dtype == torch.bfloat16
+    assert tail.stride(0) == padded_page_nbytes // torch.bfloat16.itemsize
+    for page in range(num_pages):
+        start = page * padded_page_nbytes
+        assert torch.count_nonzero(backing[start : start + main_page_nbytes]) == 0
+    assert torch.all(tail == 7)
+
+
+def test_qsa_main_cache_views_reinterpret_fp8_storage() -> None:
+    impl = Qwen3_8FlashNextQSAImpl.__new__(Qwen3_8FlashNextQSAImpl)
+    impl.num_kv_heads = 1
+    impl.head_size = 256
+    impl.kv_cache_dtype = "fp8"
+    storage = torch.empty(2, 2, 16, 256, dtype=torch.uint8)
+
+    key_cache, value_cache = impl._kv_cache_views(storage)
+
+    assert key_cache.dtype == current_platform.fp8_dtype()
+    assert value_cache.dtype == current_platform.fp8_dtype()
+    assert key_cache.shape == value_cache.shape == (2, 16, 1, 256)
+    assert (
+        key_cache.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
+    )
 
 
 def test_qsa_bind_preserves_context_plan_with_smaller_profile_cache(
@@ -212,6 +280,10 @@ def test_qsa_bind_preserves_context_plan_with_smaller_profile_cache(
     owner._raw_state_slot_ids = torch.empty(2, dtype=torch.int32)
     owner._decode_output = torch.empty(6, 6, 256, dtype=torch.bfloat16)
     owner._selected_positions = torch.empty(8, 2051, dtype=torch.int32)
+    owner._k_scale = torch.ones(1, dtype=torch.float32)
+    owner._v_scale = torch.ones(1, dtype=torch.float32)
+    owner.kv_cache_torch_dtype = torch.bfloat16
+    owner.kv_cache_kernel_dtype = torch.bfloat16
 
     kv_cache = torch.empty(
         actual_pages,
@@ -230,6 +302,8 @@ def test_qsa_bind_preserves_context_plan_with_smaller_profile_cache(
     assert owner._main_block_table.shape == (owner.max_seqs, planned_pages)
     assert bind_kwargs["main_k_cache"] is main_k_cache
     assert bind_kwargs["main_v_cache"] is main_v_cache
+    assert bind_kwargs["k_descale"] is owner._k_scale
+    assert bind_kwargs["v_descale"] is owner._v_scale
     assert bind_kwargs["compressed_k_cache"] is compressed_cache
     assert main_k_cache.shape[0] < caps.num_main_cache_pages
     assert compressed_cache.shape[0] < caps.num_compressed_cache_pages
@@ -1193,7 +1267,14 @@ def test_qsa_rope_staging_masks_graph_padding() -> None:
     assert torch.equal(output[8:], torch.full_like(output[8:], -1))
 
 
-def test_qsa_portable_prefill_matches_pytorch_oracle() -> None:
+@pytest.mark.parametrize(
+    "kv_cache_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8_e4m3"],
+)
+def test_qsa_portable_prefill_matches_pytorch_oracle(
+    kv_cache_dtype: torch.dtype,
+) -> None:
     from b12x.attention.qsa.reference import (
         gemma_rmsnorm_reference,
         score_select_reference,
@@ -1306,28 +1387,46 @@ def test_qsa_portable_prefill_matches_pytorch_oracle() -> None:
     query = torch.randn(
         rows, query_heads, main_head_dim, dtype=torch.bfloat16, device=device
     )
-    key_cache = torch.randn(
+    key_source = torch.randn(
         1, page_size, 1, main_head_dim, dtype=torch.bfloat16, device=device
     )
-    value_cache = torch.randn_like(key_cache)
+    value_source = torch.randn_like(key_source)
+    if kv_cache_dtype == torch.float8_e4m3fn:
+        k_descale = torch.tensor([0.0125], dtype=torch.float32, device=device)
+        v_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
+        key_cache = (key_source.float() / k_descale).to(kv_cache_dtype)
+        value_cache = (value_source.float() / v_descale).to(kv_cache_dtype)
+        reference_key_cache = key_cache.float() * k_descale
+        reference_value_cache = value_cache.float() * v_descale
+        atol = 3e-2
+    else:
+        key_cache = key_source
+        value_cache = value_source
+        k_descale = torch.ones(1, dtype=torch.float32, device=device)
+        v_descale = torch.ones(1, dtype=torch.float32, device=device)
+        reference_key_cache = key_cache
+        reference_value_cache = value_cache
+        atol = 2e-2
     actual = qsa_sparse_paged_attention(
         query,
         key_cache,
         value_cache,
+        k_descale,
+        v_descale,
         selected,
         block_table,
         request_ids,
     )
     expected = sparse_paged_gqa_reference(
         query,
-        key_cache,
-        value_cache,
+        reference_key_cache,
+        reference_value_cache,
         block_table,
         request_ids,
         expected_selected,
         logical_positions,
     )
-    torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-2)
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=atol)
 
 
 def test_qsa_portable_chunk_handoff_uses_exact_tagged_ring() -> None:
@@ -1485,10 +1584,13 @@ def test_qsa_portable_paged_io_crosses_signed_int32_offsets() -> None:
         key_cache[main_high_page, 0, 0].normal_()
         value_cache[main_high_page, 0, 0].normal_()
         query = torch.randn(1, 4, main_head_dim, dtype=torch.bfloat16, device=device)
+        descale = torch.ones(1, dtype=torch.float32, device=device)
         output = qsa_sparse_paged_attention(
             query,
             key_cache,
             value_cache,
+            descale,
+            descale,
             torch.tensor([[0]], dtype=torch.int32, device=device),
             torch.tensor([[main_high_page]], dtype=torch.int32, device=device),
             torch.tensor([0], dtype=torch.int32, device=device),

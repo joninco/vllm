@@ -33,13 +33,15 @@ def qsa_padded_page_size_bytes(
     # compressed storage back to the probe width. Real manager pages are already
     # ratio-aligned and therefore consume the returned byte count directly.
     geometry_page_size = math.lcm(main_page_size, int(compress_ratio))
+    kv_dtype = torch.float8_e4m3fn if spec.dtype == torch.uint8 else spec.dtype
     requirements = qsa.cache_requirements(
         main_page_size=geometry_page_size,
         kv_heads=int(spec.num_kv_heads),
         head_dim=int(spec.head_size),
         compress_ratio=compress_ratio,
         index_head_dim=index_head_dim,
-        dtype=spec.dtype,
+        dtype=torch.bfloat16,
+        kv_dtype=kv_dtype,
     )
     scaled_bytes, remainder = divmod(
         int(requirements.compressed_page_nbytes) * main_page_size,
@@ -65,8 +67,8 @@ def qsa_compressed_cache_view(
     when multiple layers are interleaved inside the BLHNC allocation.
     """
 
-    if kv_cache.dtype != torch.bfloat16:
-        raise TypeError("QSA main and compressed caches must be BF16")
+    if kv_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8):
+        raise TypeError("QSA main cache must be BF16 or FP8 E4M3FN storage")
     if kv_cache.ndim != 4 or int(kv_cache.shape[1]) != 2:
         raise ValueError(
             "QSA main cache must have logical shape "
@@ -92,27 +94,46 @@ def qsa_compressed_cache_view(
 
     compressed_page_size = main_page_size // compress_ratio
     main_page_elements = math.prod(map(int, kv_cache.shape[1:]))
+    main_page_nbytes = main_page_elements * int(kv_cache.element_size())
     tail_elements = compressed_page_size * int(index_head_dim)
-    physical_page_stride = int(kv_cache.stride(0))
-    if physical_page_stride < main_page_elements + tail_elements:
+    tail_nbytes = tail_elements * torch.bfloat16.itemsize
+    physical_page_stride_nbytes = int(kv_cache.stride(0)) * int(kv_cache.element_size())
+    if physical_page_stride_nbytes < main_page_nbytes + tail_nbytes:
         raise ValueError("QSA physical page stride does not preserve the selector tail")
     # For BLHNC with multiple layers, stride(0) spans every interleaved layer
     # page and is larger than one padded page. Storage-capacity validation below
     # is therefore the reliable check; equality is neither required nor wanted.
-    tail_offset = int(kv_cache.storage_offset()) + main_page_elements
-    tail_end = tail_offset + (num_pages - 1) * physical_page_stride + tail_elements
-    storage_elements = int(kv_cache.untyped_storage().nbytes()) // int(
-        kv_cache.element_size()
+    tail_offset_nbytes = (
+        int(kv_cache.storage_offset()) * int(kv_cache.element_size()) + main_page_nbytes
     )
-    if tail_end > storage_elements:
+    tail_end_nbytes = (
+        tail_offset_nbytes + (num_pages - 1) * physical_page_stride_nbytes + tail_nbytes
+    )
+    storage_nbytes = int(kv_cache.untyped_storage().nbytes())
+    if tail_end_nbytes > storage_nbytes:
         raise ValueError(
             "QSA main cache storage does not include the required selector tail"
         )
-
-    return kv_cache.as_strided(
+    if tail_offset_nbytes % torch.bfloat16.itemsize or (
+        physical_page_stride_nbytes % torch.bfloat16.itemsize
+    ):
+        raise ValueError("QSA selector tail is not BF16 aligned")
+    if storage_nbytes % torch.bfloat16.itemsize:
+        raise ValueError("QSA cache storage is not BF16 aligned")
+    bf16_storage = torch.empty(0, dtype=torch.bfloat16, device=kv_cache.device).set_(
+        kv_cache.untyped_storage(),
+        0,
+        (storage_nbytes // torch.bfloat16.itemsize,),
+        (1,),
+    )
+    return bf16_storage.as_strided(
         (num_pages, compressed_page_size, int(index_head_dim)),
-        (physical_page_stride, int(index_head_dim), 1),
-        storage_offset=tail_offset,
+        (
+            physical_page_stride_nbytes // torch.bfloat16.itemsize,
+            int(index_head_dim),
+            1,
+        ),
+        storage_offset=tail_offset_nbytes // torch.bfloat16.itemsize,
     )
 
 
