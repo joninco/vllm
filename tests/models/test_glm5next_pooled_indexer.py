@@ -408,6 +408,116 @@ def test_glm53_decode_tail_completes_the_same_pool_as_prefill() -> None:
     torch.testing.assert_close(actual_scale, expected_scale.reshape(1), rtol=0, atol=0)
 
 
+def test_glm53_decode_writer_matches_batched_prefill_writer() -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(56)
+    key = torch.randn(
+        (8, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gate = torch.randn(
+        (8, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    prefill_cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=device)
+    decode_cache = torch.zeros_like(prefill_cache)
+    prefill_tail = torch.full(
+        (1, 2, 4, 128), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    decode_tail = torch.full_like(prefill_tail, float("nan"))
+    state_slots = torch.zeros(1, dtype=torch.int32, device=device)
+
+    update_decode_pools(
+        prefill_cache,
+        prefill_tail,
+        state_slots,
+        torch.tensor([0, 8], dtype=torch.int32, device=device),
+        key,
+        gate,
+        ape,
+        torch.tensor([-1, -1, -1, 0, -1, -1, -1, 1], device=device),
+        torch.arange(8, dtype=torch.int64, device=device),
+        1,
+    )
+    for position in range(8):
+        update_decode_pools(
+            decode_cache,
+            decode_tail,
+            state_slots,
+            torch.tensor([0, 1], dtype=torch.int32, device=device),
+            key[position : position + 1],
+            gate[position : position + 1],
+            ape,
+            torch.tensor(
+                [position // 4 if position % 4 == 3 else -1],
+                dtype=torch.int64,
+                device=device,
+            ),
+            torch.tensor([position], dtype=torch.int64, device=device),
+            1,
+        )
+
+    assert torch.equal(decode_cache, prefill_cache)
+    assert torch.equal(decode_tail, prefill_tail)
+
+
+def test_glm53_tail_state_isolated_between_requests() -> None:
+    device = _require_glm_gpu()
+    generator = torch.Generator(device=device).manual_seed(57)
+    keys = torch.randn(
+        (2, 4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    gates = torch.randn(
+        (2, 4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    ape = torch.randn(
+        (4, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=device)
+    tail = torch.full((2, 2, 4, 128), float("nan"), dtype=torch.bfloat16, device=device)
+    state_slots = torch.tensor([1, 0], dtype=torch.int32, device=device)
+
+    update_decode_pools(
+        cache,
+        tail,
+        state_slots,
+        torch.tensor([0, 3, 6], dtype=torch.int32, device=device),
+        torch.cat((keys[0, :3], keys[1, :3])),
+        torch.cat((gates[0, :3], gates[1, :3])),
+        ape,
+        torch.full((6,), -1, dtype=torch.int64, device=device),
+        torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int64, device=device),
+        2,
+    )
+    torch.testing.assert_close(tail[1, 0, :3], keys[0, :3])
+    torch.testing.assert_close(tail[1, 1, :3], gates[0, :3])
+    torch.testing.assert_close(tail[0, 0, :3], keys[1, :3])
+    torch.testing.assert_close(tail[0, 1, :3], gates[1, :3])
+    update_decode_pools(
+        cache,
+        tail,
+        state_slots,
+        torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+        keys[:, 3],
+        gates[:, 3],
+        ape,
+        torch.tensor([0, 1], dtype=torch.int64, device=device),
+        torch.tensor([3, 3], dtype=torch.int64, device=device),
+        2,
+    )
+
+    for request in range(2):
+        actual_key, actual_scale = _read_cache_entry(cache, 0, request)
+        expected_key, expected_scale = _pool_reference(
+            keys[request], gates[request], ape
+        )
+        assert torch.equal(actual_key, expected_key)
+        torch.testing.assert_close(
+            actual_scale, expected_scale.reshape(1), rtol=0, atol=0
+        )
+
+
 def test_glm53_pool_expansion_appends_only_the_incomplete_tail() -> None:
     device = _require_glm_gpu()
     pool_ids = torch.full((3, 512), -1, dtype=torch.int32, device=device)

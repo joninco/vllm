@@ -33,6 +33,11 @@ from vllm.models.glm5next.nvidia.mtp import (
     Glm5NextMTP,
     Glm5NextMultiTokenPredictor,
 )
+from vllm.transformers_utils.configs.glm5_next import (
+    Glm5NextConfig,
+    Glm5NextTextConfig,
+    Glm5NextVisionConfig,
+)
 from vllm.transformers_utils.processors import glm5next as glm5next_processor
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xGLM5NextMLASparseBackend,
@@ -41,6 +46,37 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _make_eagle_draft_vllm_config,
 )
+
+
+def test_glm5next_config_preserves_official_sparse_moe_fields() -> None:
+    text_config = Glm5NextTextConfig(
+        topk_method="noaux_tc",
+        norm_topk_prob=False,
+        indexer_rope_interleave=True,
+        logit_scale=0.5,
+        swiglu_limit=10.0,
+    )
+    vision_config = Glm5NextVisionConfig(swiglu_limit=10.0)
+
+    assert text_config.topk_method == "noaux_tc"
+    assert not text_config.moe_renormalize
+    assert text_config.indexer_rope_interleave
+    assert text_config.logit_scale == 0.5
+    assert text_config.swiglu_limit == 10.0
+    assert vision_config.swiglu_limit == 10.0
+
+
+def test_glm5next_config_accepts_prebuilt_subconfigs() -> None:
+    text_config = Glm5NextTextConfig(hidden_size=1024)
+    vision_config = Glm5NextVisionConfig(hidden_size=768)
+
+    config = Glm5NextConfig(
+        text_config=text_config,
+        vision_config=vision_config,
+    )
+
+    assert config.text_config is text_config
+    assert config.vision_config is vision_config
 
 
 @pytest.mark.parametrize(
