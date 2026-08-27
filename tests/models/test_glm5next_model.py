@@ -1,0 +1,644 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import json
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+import pytest
+import torch
+from transformers import AutoTokenizer
+
+from vllm.model_executor.layers import mla as mla_layer
+from vllm.model_executor.layers.mamba.gdn import kimi_gdn_linear_attn
+from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+    KimiGatedDeltaNetAttention,
+)
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+)
+from vllm.model_executor.models.glm4_1v import Glm4vForConditionalGeneration
+from vllm.model_executor.models.interfaces import supports_pp
+from vllm.models.glm5next.nvidia import attention as glm5next_attention
+from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
+from vllm.models.glm5next.nvidia.model import (
+    Glm5NextDecoderLayer,
+    Glm5NextForCausalLM,
+    Glm5NextForConditionalGeneration,
+    Glm5NextModel,
+    _load_glm5next_fused_conv1d,
+    _remap_glm5next_weight_name,
+)
+from vllm.models.glm5next.nvidia.mtp import (
+    Glm5NextMTP,
+    Glm5NextMultiTokenPredictor,
+)
+from vllm.transformers_utils.processors import glm5next as glm5next_processor
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+    B12xGLM5NextMLASparseBackend,
+)
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+    _make_eagle_draft_vllm_config,
+)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_name", "parameter_name"),
+    [
+        (
+            "model.layers.0.self_attn.forget_gate.f_b_proj.weight",
+            "model.layers.0.self_attn.f_b_proj.weight",
+        ),
+        (
+            "model.layers.0.self_attn.forget_gate.A_log",
+            "model.layers.0.self_attn.A_log",
+        ),
+        (
+            "model.layers.3.attn_hc.fn",
+            "model.layers.3.hc_attn_fn",
+        ),
+        (
+            "model.layers.3.ffn_hc.scale",
+            "model.layers.3.hc_ffn_scale",
+        ),
+    ],
+)
+def test_glm5next_checkpoint_weight_name_remapping(
+    checkpoint_name: str,
+    parameter_name: str,
+) -> None:
+    assert _remap_glm5next_weight_name(checkpoint_name) == parameter_name
+
+
+def test_glm5next_kda_adapts_shared_out_buffer_forward(monkeypatch) -> None:
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    hidden_states = torch.randn(2, 4)
+    positions = torch.arange(2)
+
+    def fake_forward(self, hidden_states, positions, output) -> None:
+        output.copy_(hidden_states + positions[:, None])
+
+    monkeypatch.setattr(KimiGatedDeltaNetAttention, "forward", fake_forward)
+
+    actual = layer(hidden_states, positions)
+
+    torch.testing.assert_close(actual, hidden_states + positions[:, None])
+
+
+def test_glm5next_kda_splits_mixed_decode_prefill_batch(monkeypatch) -> None:
+    from vllm.models.kimi_k3.nvidia.ops.third_party import kda as kda_ops
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+    prefix = "model.layers.0.self_attn"
+    chunk_indices = torch.tensor([[0, 0]], dtype=torch.int32)
+    chunk_offsets = torch.tensor([0], dtype=torch.int32)
+    metadata = GDNAttentionMetadata(
+        num_prefills=1,
+        num_prefill_tokens=2,
+        num_decodes=2,
+        num_decode_tokens=2,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=4,
+        has_initial_state=torch.tensor([True, True, False]),
+        non_spec_query_start_loc=torch.tensor([0, 1, 2, 4], dtype=torch.int32),
+        non_spec_state_indices_tensor=torch.tensor([1, 2, 3], dtype=torch.int32),
+        prefill_query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        prefill_state_indices=torch.tensor([3], dtype=torch.int32),
+        prefill_has_initial_state=torch.tensor([False]),
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+    )
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = prefix
+    layer.head_dim = 1
+    layer.local_projection_size = 1
+    layer.local_num_heads = 1
+    layer.gate_lower_bound = -5.0
+    layer.A_log = torch.ones(1)
+    layer.dt_bias = torch.ones(1)
+    layer._b12x_kda_binding = None
+    layer.conv1d = SimpleNamespace(
+        weight=torch.ones(3, 1, 3),
+        bias=torch.zeros(3),
+    )
+    layer.kv_cache = (torch.zeros(4, 3, 3), torch.zeros(4, 1, 1, 1))
+
+    class IdentityGate(torch.nn.Module):
+        def forward(self, value, gate):
+            return value
+
+    layer.o_norm = IdentityGate()
+
+    calls: dict[str, object] = {}
+
+    def fake_conv(x, *args, **kwargs):
+        return x
+
+    def fake_recurrent(*, q, cu_seqlens, ssm_state_indices, **kwargs):
+        calls["decode_q_len"] = q.shape[1]
+        calls["decode_query_start_loc"] = cu_seqlens.clone()
+        calls["decode_state_indices"] = ssm_state_indices.clone()
+        return torch.full_like(q, 11), None
+
+    def fake_chunk(
+        *, q, initial_state, cu_seqlens, chunk_indices, chunk_offsets, **kwargs
+    ):
+        calls["prefill_q_len"] = q.shape[1]
+        calls["prefill_query_start_loc"] = cu_seqlens.clone()
+        calls["chunk_indices"] = chunk_indices
+        calls["chunk_offsets"] = chunk_offsets
+        return torch.full_like(q, 22), torch.full_like(initial_state, 33)
+
+    def fake_gather(state, indices, has_initial_state):
+        calls["prefill_state_indices"] = indices.clone()
+        calls["prefill_has_initial_state"] = has_initial_state.clone()
+        return state.index_select(0, indices.long())
+
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={prefix: metadata}),
+    )
+    monkeypatch.setattr(kimi_gdn_linear_attn, "is_conv_state_dim_first", lambda: True)
+    monkeypatch.setattr(kimi_gdn_linear_attn, "causal_conv1d_fn", fake_conv)
+    monkeypatch.setattr(kimi_gdn_linear_attn, "gather_initial_states", fake_gather)
+    monkeypatch.setattr(kda_ops, "fused_recurrent_kda", fake_recurrent)
+    monkeypatch.setattr(kda_ops, "chunk_kda_with_fused_gate", fake_chunk)
+
+    core_attn_out = torch.empty(1, 4, 1, 1)
+    layer._forward(
+        mixed_qkv=torch.arange(12, dtype=torch.float32).view(4, 3),
+        g1=torch.ones(1, 4, 1, 1),
+        g2=torch.ones(4, 1, 1),
+        beta=torch.ones(1, 4, 1),
+        core_attn_out=core_attn_out,
+    )
+
+    assert calls["decode_q_len"] == 2
+    assert torch.equal(
+        calls["decode_query_start_loc"], torch.tensor([0, 1, 2], dtype=torch.int32)
+    )
+    assert torch.equal(
+        calls["decode_state_indices"], torch.tensor([1, 2], dtype=torch.int32)
+    )
+    assert calls["prefill_q_len"] == 2
+    assert torch.equal(
+        calls["prefill_query_start_loc"], torch.tensor([0, 2], dtype=torch.int32)
+    )
+    assert calls["chunk_indices"] is chunk_indices
+    assert calls["chunk_offsets"] is chunk_offsets
+    assert torch.equal(
+        calls["prefill_state_indices"], torch.tensor([3], dtype=torch.int32)
+    )
+    assert torch.equal(calls["prefill_has_initial_state"], torch.tensor([False]))
+    assert torch.equal(core_attn_out[:, :2], torch.full((1, 2, 1, 1), 11.0))
+    assert torch.equal(core_attn_out[:, 2:], torch.full((1, 2, 1, 1), 22.0))
+    assert torch.equal(layer.kv_cache[1][3], torch.full((1, 1, 1), 33.0))
+
+
+def test_glm5next_alone_opts_into_b12x_kda_decode() -> None:
+    assert not KimiGatedDeltaNetAttention.enable_b12x_kda_decode
+    assert Glm5NextLinearAttention.enable_b12x_kda_decode
+    assert KimiGatedDeltaNetAttention.b12x_kda_null_state_index is None
+    assert Glm5NextLinearAttention.b12x_kda_null_state_index == 0
+
+
+def test_glm5next_b12x_mhc_builds_first_layer_broadcast_fn() -> None:
+    hidden_size = 4
+    hc_mult = 4
+    layer = Glm5NextDecoderLayer.__new__(Glm5NextDecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.hidden_size = hidden_size
+    layer.n = hc_mult
+    layer.hc_attn_fn = torch.nn.Parameter(
+        torch.arange(24 * hc_mult * hidden_size, dtype=torch.float32).view(
+            24, hc_mult * hidden_size
+        )
+    )
+    layer.hc_attn_fn_broadcast = None
+    layer._b12x_mhc = object()
+
+    model = Glm5NextModel.__new__(Glm5NextModel)
+    torch.nn.Module.__init__(model)
+    model.start_layer = 0
+    model.end_layer = 1
+    model.layers = torch.nn.ModuleList([layer])
+
+    model.finalize_mhc_broadcast_weights()
+
+    expected = layer.hc_attn_fn.detach().view(24, hc_mult, hidden_size).sum(dim=1)
+    torch.testing.assert_close(layer.hc_attn_fn_broadcast, expected)
+    assert layer.hc_attn_fn_broadcast.shape == (24, hidden_size)
+    assert layer.hc_attn_fn_broadcast.is_contiguous()
+
+    broadcast_data_ptr = layer.hc_attn_fn_broadcast.data_ptr()
+    with torch.no_grad():
+        layer.hc_attn_fn.add_(1)
+    model.finalize_mhc_broadcast_weights()
+
+    expected = layer.hc_attn_fn.detach().view(24, hc_mult, hidden_size).sum(dim=1)
+    torch.testing.assert_close(layer.hc_attn_fn_broadcast, expected)
+    assert layer.hc_attn_fn_broadcast.data_ptr() == broadcast_data_ptr
+
+
+def test_glm5next_conditional_post_load_finalizes_language_model() -> None:
+    class FakeLanguageModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finalize_calls = 0
+
+        def process_weights_after_loading(self) -> None:
+            self.finalize_calls += 1
+
+    model = Glm5NextForConditionalGeneration.__new__(Glm5NextForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.language_model = FakeLanguageModel()
+
+    model.process_weights_after_loading()
+
+    assert model.language_model.finalize_calls == 1
+
+
+def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
+    captured_caps = {}
+
+    class FakeApi:
+        @staticmethod
+        def Caps(**kwargs):
+            captured_caps.update(kwargs)
+            return kwargs
+
+        @staticmethod
+        def plan(caps):
+            return caps
+
+    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer._b12x_kda_api = FakeApi()
+    layer._b12x_kda_max_tokens = 16
+    layer._b12x_kda_max_seqs = 4
+    layer._b12x_kda_state_index_columns = 4
+    layer.local_num_heads = 8
+    layer.head_dim = 128
+    layer.model_config = SimpleNamespace(dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        KimiGatedDeltaNetAttention,
+        "get_state_dtype",
+        lambda self: (torch.bfloat16, torch.float32),
+    )
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "current_platform",
+        SimpleNamespace(current_device=lambda: "cuda:0"),
+    )
+
+    plan = layer._make_b12x_kda_plan(max_state_slots=32)
+
+    assert plan == captured_caps
+    assert captured_caps["null_state_index"] == 0
+
+
+def test_glm5next_sparse_mla_selects_b12x_backend(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeLinear(torch.nn.Module):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+            self.qrep_active = False
+
+    class FakeIndexer(torch.nn.Module):
+        topk_tokens = 2048
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+            self.indexer_op = None
+
+    class FakeMLAAttention(torch.nn.Module):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__()
+            captured.update(kwargs)
+            self.layer_name = str(kwargs["prefix"])
+
+    for name in (
+        "DeepSeekV2FusedQkvAProjLinear",
+        "ColumnParallelLinear",
+        "ReplicatedLinear",
+        "RowParallelLinear",
+        "RMSNorm",
+    ):
+        monkeypatch.setattr(glm5next_attention, name, FakeLinear)
+    monkeypatch.setattr(glm5next_attention, "Glm5NextPooledIndexer", FakeIndexer)
+    monkeypatch.setattr(
+        glm5next_attention, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(mla_layer, "MLAAttention", FakeMLAAttention)
+
+    glm5next_attention.Glm5NextMLAAttention(
+        vllm_config=SimpleNamespace(
+            attention_config=SimpleNamespace(backend=AttentionBackendEnum.B12X)
+        ),
+        config=SimpleNamespace(rms_norm_eps=1e-5, index_topk=2048),
+        hidden_size=8,
+        num_heads=1,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=0,
+        v_head_dim=4,
+        q_lora_rank=4,
+        kv_lora_rank=4,
+        cache_config=SimpleNamespace(),
+        topk_indices_buffer=torch.empty((2, 2051), dtype=torch.int32),
+        skip_rope=True,
+    )
+
+    assert captured["attn_backend"] is B12xGLM5NextMLASparseBackend
+    assert captured["use_sparse"] is True
+
+
+def test_glm5next_rejects_pipeline_parallelism() -> None:
+    assert not supports_pp(Glm5NextForCausalLM)
+    assert not supports_pp(Glm5NextForConditionalGeneration)
+
+
+def test_glm5next_processor_resolves_repository_video_config(
+    monkeypatch, tmp_path
+) -> None:
+    processor_config = tmp_path / "processor_config.json"
+    processor_config.write_text(
+        json.dumps(
+            {
+                "video_processor": {
+                    "video_processor_type": "Glm5NextVideoProcessor",
+                    "max_image_tokens": 240_000,
+                }
+            }
+        )
+    )
+    calls = {}
+    tokenizer = object()
+
+    monkeypatch.setattr(
+        AutoTokenizer,
+        "from_pretrained",
+        lambda model, **kwargs: tokenizer,
+    )
+    monkeypatch.setattr(
+        glm5next_processor,
+        "get_image_processor_config",
+        lambda model, **kwargs: {"image_processor_type": "ignored"},
+    )
+
+    def fake_cached_file(model, filename, **kwargs):
+        calls["cached_file"] = (model, filename, kwargs)
+        return str(processor_config)
+
+    monkeypatch.setattr(glm5next_processor, "cached_file", fake_cached_file)
+    monkeypatch.setattr(
+        glm5next_processor,
+        "Glm5NextImageProcessor",
+        lambda **kwargs: ("image", kwargs),
+    )
+    monkeypatch.setattr(
+        glm5next_processor,
+        "Glm5NextVideoProcessor",
+        lambda **kwargs: ("video", kwargs),
+    )
+
+    def fake_init(self, **kwargs) -> None:
+        self.loaded_components = kwargs
+
+    monkeypatch.setattr(glm5next_processor.Glm5NextProcessor, "__init__", fake_init)
+
+    processor = glm5next_processor.Glm5NextProcessor.from_pretrained(
+        "zai-org/GLM-5.3-Flash",
+        revision="test-revision",
+        local_files_only=True,
+    )
+
+    assert calls["cached_file"] == (
+        "zai-org/GLM-5.3-Flash",
+        "processor_config.json",
+        {"local_files_only": True, "revision": "test-revision"},
+    )
+    assert processor.loaded_components["tokenizer"] is tokenizer
+    assert processor.loaded_components["video_processor"] == (
+        "video",
+        {"max_image_tokens": 30_000},
+    )
+
+
+def test_glm5next_processor_counts_video_only_tokens() -> None:
+    class FakeVideoProcessor:
+        merge_size = 2
+
+        @staticmethod
+        def get_number_of_video_patches(*args) -> int:
+            return 20
+
+    processor = glm5next_processor.Glm5NextProcessor.__new__(
+        glm5next_processor.Glm5NextProcessor
+    )
+    processor.video_processor = FakeVideoProcessor()
+
+    actual = processor._get_num_multimodal_tokens(video_sizes=[(1, 2, 3)])
+
+    assert actual.num_video_tokens == [5]
+
+
+def test_glm5next_fused_conv1d_loads_three_logical_shards() -> None:
+    param = torch.nn.Parameter(torch.empty(12, 1, 4))
+    loaded = torch.arange(12 * 4).reshape(12, 1, 4)
+    calls = []
+
+    def weight_loader(param, loaded_weight, shard_id) -> None:
+        calls.append((param, loaded_weight.clone(), shard_id))
+
+    param.weight_loader = weight_loader
+
+    _load_glm5next_fused_conv1d(param, loaded)
+
+    assert [shard_id for _, _, shard_id in calls] == [0, 1, 2]
+    assert all(loaded_param is param for loaded_param, _, _ in calls)
+    assert torch.equal(calls[0][1], loaded[:4])
+    assert torch.equal(calls[1][1], loaded[4:8])
+    assert torch.equal(calls[2][1], loaded[8:])
+
+
+def test_glm5next_loads_separate_conv1d_shards() -> None:
+    param = torch.nn.Parameter(torch.empty(12, 1, 4))
+    calls = []
+
+    def weight_loader(param, loaded_weight, shard_id) -> None:
+        calls.append((param, loaded_weight.clone(), shard_id))
+
+    param.weight_loader = weight_loader
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(
+                is_moe=False,
+                is_linear_attn=True,
+                mla_nope=False,
+                qk_rope_head_dim=0,
+            )
+
+        def named_parameters(self):
+            return iter([("layers.0.self_attn.conv1d.weight", param)])
+
+    weights = [
+        (f"layers.0.self_attn.{name}_conv1d.weight", torch.full((4, 1, 4), i))
+        for i, name in enumerate(("q", "k", "v"))
+    ]
+
+    loaded_params = Glm5NextModel.load_weights(FakeModel(), weights)
+
+    assert loaded_params == {"layers.0.self_attn.conv1d.weight"}
+    assert [shard_id for _, _, shard_id in calls] == [0, 1, 2]
+    assert all(loaded_param is param for loaded_param, _, _ in calls)
+    assert all(
+        torch.equal(weight, weights[i][1]) for i, (_, weight, _) in enumerate(calls)
+    )
+
+
+def test_glm5next_mtp_uses_draft_kernel_overrides() -> None:
+    @dataclass
+    class KernelConfig:
+        moe_backend: str
+
+    @dataclass
+    class AttentionConfig:
+        backend: AttentionBackendEnum | None
+
+    @dataclass
+    class CacheConfig:
+        cache_dtype: str
+
+    @dataclass
+    class VllmConfig:
+        kernel_config: KernelConfig
+        attention_config: AttentionConfig
+        cache_config: CacheConfig
+        speculative_config: SimpleNamespace
+
+    target_config = VllmConfig(
+        kernel_config=KernelConfig(moe_backend="b12x"),
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.FLASH_ATTN),
+        cache_config=CacheConfig(cache_dtype="fp8"),
+        speculative_config=SimpleNamespace(
+            moe_backend="humming",
+            attention_backend=AttentionBackendEnum.B12X,
+            kv_cache_dtype=None,
+        ),
+    )
+
+    draft_config = _make_eagle_draft_vllm_config(target_config)  # type: ignore[arg-type]
+
+    assert draft_config.kernel_config.moe_backend == "humming"
+    assert draft_config.attention_config.backend == AttentionBackendEnum.B12X
+    assert target_config.kernel_config.moe_backend == "b12x"
+    assert target_config.attention_config.backend == AttentionBackendEnum.FLASH_ATTN
+
+
+def test_glm5next_mtp_maps_multimodal_quantization_prefix() -> None:
+    quantized_layers = {
+        "model.language_model.layers.45.mlp.experts": {"quant_algo": "MXFP8"}
+    }
+
+    mapped = Glm5NextMTP.hf_to_vllm_mapper.apply_dict(quantized_layers)
+
+    assert mapped == {"model.layers.45.mlp.experts": {"quant_algo": "MXFP8"}}
+
+
+def test_glm5next_mtp_reuses_wrapped_mla_topk_indices() -> None:
+    topk_indices_buffer = torch.tensor(
+        [[10, 11], [20, 21], [30, 31], [40, 41]], dtype=torch.int32
+    )
+    mla_attn = SimpleNamespace(
+        skip_topk=False,
+        topk_indices_buffer=topk_indices_buffer,
+    )
+    predictor = SimpleNamespace(
+        layers={
+            "45": SimpleNamespace(
+                mtp_block=SimpleNamespace(self_attn=SimpleNamespace(mla_attn=mla_attn))
+            )
+        }
+    )
+
+    Glm5NextMultiTokenPredictor.set_skip_topk(predictor, True)
+    Glm5NextMultiTokenPredictor.compact_topk_indices(
+        predictor, torch.tensor([2, 0], dtype=torch.int64)
+    )
+
+    assert mla_attn.skip_topk
+    assert torch.equal(
+        mla_attn.topk_indices_buffer[:2],
+        torch.tensor([[30, 31], [10, 11]], dtype=torch.int32),
+    )
+
+
+def test_glm5next_mtp_rolls_back_selector_interval_starts() -> None:
+    calls: list[str] = []
+
+    class FakeIndexer:
+        def snapshot_speculative_interval_starts(self) -> None:
+            calls.append("snapshot")
+
+        def restore_speculative_interval_starts(self) -> None:
+            calls.append("restore")
+
+    predictor = SimpleNamespace(
+        layers={
+            "45": SimpleNamespace(
+                mtp_block=SimpleNamespace(
+                    self_attn=SimpleNamespace(indexer=FakeIndexer())
+                )
+            ),
+            "46": SimpleNamespace(
+                mtp_block=SimpleNamespace(self_attn=SimpleNamespace(indexer=None))
+            ),
+        }
+    )
+
+    Glm5NextMultiTokenPredictor.snapshot_qsa_interval_starts(predictor)
+    Glm5NextMultiTokenPredictor.restore_qsa_interval_starts(predictor)
+
+    assert calls == ["snapshot", "restore"]
+
+
+def test_glm5next_mtp_maps_target_normalized_quantization_prefix() -> None:
+    quantized_layers = {
+        "model.language_model.layers.45.mlp.experts": {"quant_algo": "MXFP8"}
+    }
+    target_mapped = Glm4vForConditionalGeneration.hf_to_vllm_mapper.apply_dict(
+        quantized_layers
+    )
+
+    mapped = Glm5NextMTP.hf_to_vllm_mapper.apply_dict(target_mapped)
+
+    assert mapped == {"model.layers.45.mlp.experts": {"quant_algo": "MXFP8"}}
+
+
+@pytest.mark.parametrize("map_through_target", [False, True])
+def test_glm5next_mtp_resolves_mxfp8_quantization(
+    map_through_target: bool,
+) -> None:
+    quantized_layers = {
+        "model.language_model.layers.45.mlp.experts": {"quant_algo": "MXFP8"}
+    }
+    if map_through_target:
+        quantized_layers = Glm4vForConditionalGeneration.hf_to_vllm_mapper.apply_dict(
+            quantized_layers
+        )
+    quantized_layers = Glm5NextMTP.hf_to_vllm_mapper.apply_dict(quantized_layers)
+    quant_config = ModelOptMixedPrecisionConfig.__new__(ModelOptMixedPrecisionConfig)
+    quant_config.quantized_layers = quantized_layers
+    quant_config.packed_modules_mapping = {}
+
+    assert quant_config._resolve_quant_algo("model.layers.45.mlp.experts") == "MXFP8"
