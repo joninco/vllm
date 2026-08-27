@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 
 _GLM_NEXT_MODEL_TYPES = frozenset(("glm5_next", "glm5_next_text"))
 _GLM_NEXT_CACHE_RECORD_BYTES = 528
-_GLM_NEXT_INDEX_CACHE_BYTES = 128 * torch.bfloat16.itemsize
+_GLM_NEXT_INDEX_TAIL_BYTES_PER_TOKEN = 132 // 4
 
 
 def _is_glm_next_config(hf_config: object | None) -> bool:
@@ -94,8 +94,7 @@ def _selected_index_block_stride_rows(
 ) -> int:
     if is_glm_next:
         # GLM_NEXT selected indices are physical token slots. The b12x kernel
-        # applies the cache's byte page stride itself, including the adjacent
-        # pooled-index tail, so padding must not be expressed as fake rows.
+        # applies the cache's byte page stride itself.
         return block_size
     record_width = int(kv_cache.shape[-1])
     return int(kv_cache.stride(0)) // record_width
@@ -140,18 +139,10 @@ class B12xMLASparseBackend(AttentionBackend):
                 "B12X GLM5Next sparse MLA requires head_size=512, got "
                 f"{spec.head_size}."
             )
-        if spec.block_size % 4 != 0:
-            raise ValueError(
-                "B12X GLM5Next pooled-index cache requires block_size divisible "
-                f"by index_kpool=4, got {spec.block_size}."
-            )
-        index_tail_bytes = spec.block_size // 4 * _GLM_NEXT_INDEX_CACHE_BYTES
         return replace(
             spec,
             state_content_bytes=_GLM_NEXT_CACHE_RECORD_BYTES,
-            page_size_padded=(
-                spec.block_size * _GLM_NEXT_CACHE_RECORD_BYTES + index_tail_bytes
-            ),
+            page_tail_bytes_per_token=_GLM_NEXT_INDEX_TAIL_BYTES_PER_TOKEN,
             model_version="glm5_next",
         )
 
@@ -249,9 +240,8 @@ class B12xGLM5NextMLASparseBackend(B12xMLASparseBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # GLM's B12x kernels specialize on the physical page size. Keeping the
-        # hybrid manager page intact also keeps its pooled-index tail inside
-        # BLHNC block copies.
+        # Keep the hybrid manager page intact so its FP8 pooled-index tail is
+        # copied and recycled with the corresponding MLA page.
         return [MultipleOf(64)]
 
 
@@ -271,6 +261,7 @@ class B12xMLASparseMetadata(AttentionMetadata):
     num_decode_tokens: int
     prefill_max_seq_len: int = 0
     prefill: MLACommonPrefillMetadata | None = None
+    prefill_query_lens_cpu: torch.Tensor | None = None
     block_size: int = 64
     topk_tokens: int = 2048
     cp_kv_cache_interleave_size: int = 1
@@ -500,6 +491,12 @@ class B12xMLASparseMetadataBuilder(
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
 
         metadata.cache_seq_lens_per_token = per_token_lens
+        if metadata.num_prefills:
+            prefill_start = metadata.num_decodes
+            prefill_end = prefill_start + metadata.num_prefills + 1
+            metadata.prefill_query_lens_cpu = torch.diff(
+                common.query_start_loc_cpu[prefill_start:prefill_end]
+            )
         (
             metadata.selector_state_slot_ids,
             metadata.selector_state_is_fresh,

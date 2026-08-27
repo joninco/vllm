@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
-TRAFFICCONTROL_BIN="${TRAFFICCONTROL_BIN:-/home/luke/projects/trafficcontrol/target/release/trafficcontrol}"
 
 MODEL_PATH="${MODEL_PATH:-/data/models/GLM-5.3-Flash-NVFP4}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-zai-org/GLM-5.3-Flash}"
@@ -18,7 +17,6 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-auto}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
-TC_TIMEOUT="${TC_TIMEOUT:-31536000}"
 
 if [[ ! "${NUM_SPECULATIVE_TOKENS}" =~ ^[0-9]+$ ]]; then
   echo "NUM_SPECULATIVE_TOKENS must be a non-negative integer; got '${NUM_SPECULATIVE_TOKENS}'" >&2
@@ -35,10 +33,6 @@ HUMMING_NVRTC_LIB_DIR="$(
 )"
 if [[ ! -f "${HUMMING_NVRTC_LIB_DIR}/libnvrtc-builtins.so.13.0" ]]; then
   echo "Humming CUDA 13 NVRTC builtins not found: ${HUMMING_NVRTC_LIB_DIR}" >&2
-  exit 1
-fi
-if [[ ! -x "${TRAFFICCONTROL_BIN}" ]]; then
-  echo "TrafficControl not found or not executable: ${TRAFFICCONTROL_BIN}" >&2
   exit 1
 fi
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
@@ -58,26 +52,6 @@ fi
 IFS=, read -r -a device_id_list <<< "${DEVICE_IDS}"
 if ((${#device_id_list[@]} != TP_SIZE)); then
   echo "TP_SIZE=${TP_SIZE} requires ${TP_SIZE} DEVICE_IDS; got '${DEVICE_IDS}'" >&2
-  exit 2
-fi
-first_device_id=$((10#${device_id_list[0]}))
-for ((index = 0; index < ${#device_id_list[@]}; index++)); do
-  device_id=$((10#${device_id_list[index]}))
-  if ((device_id != first_device_id + index)); then
-    echo "DEVICE_IDS must be contiguous for TrafficControl; got '${DEVICE_IDS}'" >&2
-    exit 2
-  fi
-done
-last_device_id=$((first_device_id + ${#device_id_list[@]} - 1))
-expected_tc_resource="physical-gpus-${first_device_id}-${last_device_id}"
-if [[ "${DEVICE_IDS}" != "${DEFAULT_DEVICE_IDS}" \
-  && -z "${B12X_TC_RESOURCE:-}" ]]; then
-  echo "B12X_TC_RESOURCE must be set explicitly when overriding DEVICE_IDS" >&2
-  exit 2
-fi
-if [[ -n "${B12X_TC_RESOURCE:-}" \
-  && "${B12X_TC_RESOURCE}" != "${expected_tc_resource}" ]]; then
-  echo "B12X_TC_RESOURCE must match DEVICE_IDS: expected '${expected_tc_resource}', got '${B12X_TC_RESOURCE}'" >&2
   exit 2
 fi
 if [[ "${CUDA_DEVICE_ORDER:-PCI_BUS_ID}" != PCI_BUS_ID ]]; then
@@ -101,7 +75,6 @@ export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
 export INSTANTTENSOR_BACKEND="${INSTANTTENSOR_BACKEND:-BUFFERED}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_B12X_MOE_FP4_FORCE_A16="${VLLM_B12X_MOE_FP4_FORCE_A16:-1}"
-export B12X_TC_RESOURCE="${expected_tc_resource}"
 
 speculative_args=()
 if ((NUM_SPECULATIVE_TOKENS > 0)); then
@@ -128,7 +101,7 @@ command=(
   --kv-cache-dtype fp8
   --quantization modelopt_mixed
   --attention-backend B12X
-  --block-size 64
+  --block-size 256
   --moe-backend b12x
   --no-enable-flashinfer-autotune
   --load-format "${LOAD_FORMAT}"
@@ -144,12 +117,7 @@ command=(
 )
 
 cd "${SCRIPT_DIR}"
-printf 'Launching %s as %s on devices %s through %s\n' \
-  "${MODEL_PATH}" "${SERVED_MODEL_NAME}" "${DEVICE_IDS}" \
-  "${B12X_TC_RESOURCE}" >&2
+printf 'Launching %s as %s directly on devices %s\n' \
+  "${MODEL_PATH}" "${SERVED_MODEL_NAME}" "${DEVICE_IDS}" >&2
 printf 'Serving NVFP4 routed experts through B12X W4A16 (BF16 activations)\n' >&2
-exec "${TRAFFICCONTROL_BIN}" \
-  --resource-env B12X_TC_RESOURCE \
-  --slots 1 \
-  --timeout "${TC_TIMEOUT}" \
-  -- "${command[@]}"
+exec "${command[@]}"

@@ -237,7 +237,9 @@ def _run_paged_topk(
     )
 
 
-class DeepseekV4B12xSparseIndexer(nn.Module):
+class B12xC4SparseIndexer(nn.Module):
+    """Shared C4 FP8 paged indexer used by DeepSeek V4 and GLM-5.3-Flash."""
+
     def __init__(
         self,
         k_cache,
@@ -255,20 +257,19 @@ class DeepseekV4B12xSparseIndexer(nn.Module):
         super().__init__()
         del quant_block_size, scale_fmt, max_total_seq_len
         if not skip_k_cache_insert:
-            raise ValueError("B12x requires the fused DSV4 index-cache insert path.")
+            raise ValueError("B12x C4 indexing requires a model-owned cache writer.")
         if use_fp4_cache:
-            raise ValueError("B12x DSV4 indexing requires the FP8 index cache.")
+            raise ValueError("B12x C4 indexing requires the FP8 index cache.")
         if compress_ratio != 4:
             raise ValueError(
-                f"B12x DSV4 indexing requires compress_ratio=4, got {compress_ratio}."
+                f"B12x C4 indexing requires compress_ratio=4, got {compress_ratio}."
             )
         if head_dim != _INDEX_HEAD_DIM:
             raise ValueError(
-                f"B12x DSV4 indexing requires head_dim={_INDEX_HEAD_DIM}, "
-                f"got {head_dim}."
+                f"B12x C4 indexing requires head_dim={_INDEX_HEAD_DIM}, got {head_dim}."
             )
         if topk_indices_buffer is None:
-            raise ValueError("B12x DSV4 indexing requires a top-k output buffer.")
+            raise ValueError("B12x C4 indexing requires a top-k output buffer.")
         _require_b12x_indexer()
         self.k_cache = k_cache
         self.topk_tokens = int(topk_tokens)
@@ -299,6 +300,43 @@ class DeepseekV4B12xSparseIndexer(nn.Module):
                 _assert_prefill_route(plan)
             current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
 
+    def reserve_profile_workspace(self, q: torch.Tensor) -> None:
+        self._reserve_profile_workspace(q)
+
+    def run_paged_topk(
+        self,
+        *,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        output: torch.Tensor,
+        shared_page_table: bool,
+        schedule_metadata: torch.Tensor | None = None,
+        active_width: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the shared C4 scorer against caller-owned paged metadata."""
+        if output.shape != (int(q.shape[0]), self.topk_tokens):
+            raise ValueError(
+                "B12x C4 output must have shape "
+                f"{(int(q.shape[0]), self.topk_tokens)}, got {tuple(output.shape)}."
+            )
+        output.fill_(-1)
+        _run_paged_topk(
+            q=q,
+            weights=weights,
+            kv_cache=kv_cache,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            schedule_metadata=schedule_metadata,
+            active_width=active_width,
+            output=output,
+            topk=self.topk_tokens,
+            shared_page_table=shared_page_table,
+        )
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -308,9 +346,9 @@ class DeepseekV4B12xSparseIndexer(nn.Module):
     ) -> torch.Tensor:
         del hidden_states
         if not isinstance(q_quant, torch.Tensor):
-            raise ValueError("B12x DSV4 indexing requires FP8 index queries.")
+            raise ValueError("B12x C4 indexing requires FP8 index queries.")
         if k is not None:
-            raise ValueError("B12x DSV4 index K is written by the compressor.")
+            raise ValueError("B12x C4 index K must be written before selection.")
 
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -396,6 +434,10 @@ class DeepseekV4B12xSparseIndexer(nn.Module):
             )
 
         return self.topk_indices_buffer
+
+
+# Preserve the DeepSeek-specific import surface while GLM imports the shared name.
+DeepseekV4B12xSparseIndexer = B12xC4SparseIndexer
 
 
 def b12x_indexer_is_supported() -> bool:

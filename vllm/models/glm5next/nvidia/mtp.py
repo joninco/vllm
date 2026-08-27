@@ -54,6 +54,12 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             dtype=torch.int32,
             device=current_platform.device_type,
         )
+        pool_topk_indices_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            topk_tokens // kpool,
+            dtype=torch.int32,
+            device=current_platform.device_type,
+        )
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
         )
@@ -67,6 +73,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             layer_idx=layer_idx,
             prefix=prefix,
             topk_indices_buffer=topk_indices_buffer,
+            pool_topk_indices_buffer=pool_topk_indices_buffer,
             is_mtp_layer=True,
         )
 

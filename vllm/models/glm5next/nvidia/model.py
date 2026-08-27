@@ -314,6 +314,7 @@ class Glm5NextDecoderLayer(nn.Module):
         layer_idx: int,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        pool_topk_indices_buffer: torch.Tensor | None = None,
         is_mtp_layer: bool = False,
         **kwargs,
     ) -> None:
@@ -360,6 +361,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 quant_config=None,  # MLA projections are BF16 in checkpoint
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
+                pool_topk_indices_buffer=pool_topk_indices_buffer,
                 skip_rope=getattr(config, "mla_nope", False),
             )
 
@@ -669,9 +671,16 @@ class Glm5NextModel(nn.Module):
                 dtype=torch.int32,
                 device=self.device,
             )
+            pool_topk_indices_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                topk_tokens // kpool,
+                dtype=torch.int32,
+                device=self.device,
+            )
         else:
             # Full-MLA config (no kpool sparse indexer): no topk buffer.
             topk_indices_buffer = None
+            pool_topk_indices_buffer = None
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -690,6 +699,7 @@ class Glm5NextModel(nn.Module):
                 layer_idx=layer_idx,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                pool_topk_indices_buffer=pool_topk_indices_buffer,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(

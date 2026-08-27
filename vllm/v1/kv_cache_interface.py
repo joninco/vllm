@@ -281,6 +281,8 @@ def compute_layout_strides(
     )
     order = layout.stride_order
     padded_page_size = getattr(spec, "page_size_padded", None)
+    if getattr(spec, "page_tail_bytes_per_token", 0):
+        padded_page_size = spec.page_size_bytes
     if padded_page_size is not None:
         assert kernel_block_size is None or kernel_block_size == spec.block_size, (
             "Padded KV pages do not support kernel block splitting."
@@ -544,6 +546,8 @@ class MLAAttentionSpec(FullAttentionSpec):
     # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
+    page_tail_bytes_per_token: int = 0
+    """Opaque bytes appended after each MLA page for model-owned state."""
     # Marks draft groups that flatten a non-causal query block into decode rows.
     non_causal_multi_token_decode: bool = False
     # MLA stores a single latent vector per state; there is no separate V.
@@ -551,7 +555,15 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.page_tail_bytes_per_token < 0:
+            raise ValueError("page_tail_bytes_per_token must be non-negative")
         _apply_alignment_padding(self)
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            super().page_size_bytes + self.block_size * self.page_tail_bytes_per_token
+        )
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -561,13 +573,17 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        page_tail_bytes_per_token_set = set(
+            spec.page_tail_bytes_per_token for spec in specs
+        )
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
+            and len(page_tail_bytes_per_token_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, tokens per state, and model version."
+            "quantization method, tokens per state, model version, and page tail."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -581,6 +597,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
+            page_tail_bytes_per_token=page_tail_bytes_per_token_set.pop(),
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
             ),

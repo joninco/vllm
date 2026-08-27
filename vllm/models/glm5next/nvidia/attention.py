@@ -58,6 +58,7 @@ class Glm5NextMLAAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        pool_topk_indices_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
         skip_rope: bool | None = False,
         attn_backend: type | None = None,
@@ -164,6 +165,7 @@ class Glm5NextMLAAttention(nn.Module):
                 quant_config,
                 cache_config,
                 topk_indices_buffer,
+                pool_topk_indices_buffer,
                 main_layer_name=f"{prefix}.attn",
                 prefix=f"{prefix}.indexer",
             )
