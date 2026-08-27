@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from einops import rearrange
@@ -24,6 +24,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.b12x import get_b12x_gdn_decode
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from ...linear import (
@@ -154,6 +155,9 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
 
 @PluggableLayer.register("kimi_gated_delta_net_attention")
 class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
+    enable_b12x_kda_decode = False
+    b12x_kda_null_state_index: int | None = None
+
     def get_state_dtype(
         self,
     ) -> tuple[torch.dtype, torch.dtype]:
@@ -302,6 +306,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 prefix=f"{prefix}.g_b_proj",
             )
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+        self._b12x_kda_api: Any | None = None
+        self._b12x_kda_plan = None
+        self._b12x_kda_binding = None
+        self._initialize_b12x_kda_decode(vllm_config)
         self.o_proj = RowParallelLinear(
             self.projection_size,
             self.hidden_size,
@@ -315,6 +323,157 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def _initialize_b12x_kda_decode(self, vllm_config: VllmConfig) -> None:
+        if (
+            not self.enable_b12x_kda_decode
+            or self.gate_lower_bound is None
+            or self.head_dim != 128
+            or self.model_config.dtype != torch.bfloat16
+            or self.get_state_dtype()[1] not in (torch.bfloat16, torch.float32)
+            or not current_platform.is_cuda()
+        ):
+            return
+
+        api = get_b12x_gdn_decode()
+        device = torch.device(current_platform.current_device())
+        if (
+            api is None
+            or not hasattr(api, "bind_kda")
+            or not hasattr(api, "run_kda")
+            or not api.is_supported(device)
+        ):
+            return
+
+        max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        state_index_columns = max(1, self.num_spec + 1)
+        if state_index_columns > 8:
+            return
+        max_tokens = max_seqs * state_index_columns
+
+        self._b12x_kda_api = api
+        self._b12x_kda_max_tokens = max_tokens
+        self._b12x_kda_max_seqs = max_seqs
+        self._b12x_kda_state_index_columns = state_index_columns
+
+        provisional = self._make_b12x_kda_plan(max_state_slots=1)
+        factory = dict(device=device, dtype=torch.bfloat16)
+        self.register_buffer(
+            "_b12x_kda_mixed_qkv",
+            torch.empty(max_tokens, provisional.caps.packed_qkv_width, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_raw_g",
+            torch.empty(max_tokens, self.local_num_heads, self.head_dim, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_raw_beta",
+            torch.empty(max_tokens, self.local_num_heads, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_z",
+            torch.empty(max_tokens, self.local_num_heads, self.head_dim, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_output",
+            torch.empty(max_tokens, self.local_num_heads, self.head_dim, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_query_start_loc",
+            torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_num_accepted_tokens",
+            torch.ones(max_seqs, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_state_indices",
+            torch.zeros(
+                max_seqs,
+                state_index_columns,
+                dtype=torch.int32,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_num_seqs",
+            torch.zeros(1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_kda_num_tokens",
+            torch.zeros(1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        scratch_spec = provisional.scratch_specs()[0]
+        self.register_buffer(
+            "_b12x_kda_scratch",
+            torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
+            persistent=False,
+        )
+
+    def _make_b12x_kda_plan(self, max_state_slots: int):
+        api = self._b12x_kda_api
+        if api is None:
+            raise RuntimeError("b12x KDA decode was not initialized")
+        return api.plan(
+            api.Caps(
+                device=current_platform.current_device(),
+                max_tokens=self._b12x_kda_max_tokens,
+                max_seqs=self._b12x_kda_max_seqs,
+                max_state_slots=max_state_slots,
+                key_heads=self.local_num_heads,
+                value_heads=self.local_num_heads,
+                key_head_dim=self.head_dim,
+                value_head_dim=self.head_dim,
+                state_index_columns=self._b12x_kda_state_index_columns,
+                model_dtype=self.model_config.dtype,
+                state_dtype=self.get_state_dtype()[1],
+                gate_activation="sigmoid",
+                qk_l2norm=True,
+                null_state_index=self.b12x_kda_null_state_index,
+            )
+        )
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        api = self._b12x_kda_api
+        if api is None:
+            return
+        recurrent_state = self.kv_cache[1]
+        plan = self._make_b12x_kda_plan(max_state_slots=recurrent_state.shape[0])
+        self._b12x_kda_plan = plan
+        self._b12x_kda_binding = api.bind_kda(
+            plan,
+            scratch=self._b12x_kda_scratch,
+            mixed_qkv=self._b12x_kda_mixed_qkv,
+            raw_g=self._b12x_kda_raw_g,
+            raw_beta=self._b12x_kda_raw_beta,
+            z=self._b12x_kda_z,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
+            norm_weight=self.o_norm.weight,
+            recurrent_state=recurrent_state,
+            query_start_loc=self._b12x_kda_query_start_loc,
+            num_accepted_tokens=self._b12x_kda_num_accepted_tokens,
+            state_indices=self._b12x_kda_state_indices,
+            num_seqs=self._b12x_kda_num_seqs,
+            num_tokens=self._b12x_kda_num_tokens,
+            output=self._b12x_kda_output,
+        )
+
+    def unbind_kv_cache(self) -> None:
+        self._b12x_kda_binding = None
+        self._b12x_kda_plan = None
+        super().unbind_kv_cache()
+
     def rearrange_mixed_qkv(
         self, mixed_qkv: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -324,6 +483,89 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         # QKV-major permutation. Each unbound tensor is then contiguous.
         qkv = qkv.permute(1, 0, 2, 3).contiguous().unsqueeze(1)
         return qkv.unbind(0)
+
+    def _can_use_b12x_kda_decode(self, m: GDNAttentionMetadata) -> bool:
+        if (
+            self._b12x_kda_binding is None
+            or m.num_prefills != 0
+            or (m.num_decodes == 0 and m.num_spec_decodes == 0)
+        ):
+            return False
+        if m.spec_sequence_masks is None:
+            return (
+                m.num_spec_decodes == 0
+                and m.non_spec_state_indices_tensor is not None
+                and m.non_spec_query_start_loc is not None
+            )
+        return (
+            m.num_decodes == 0
+            and m.num_spec_decodes > 0
+            and m.spec_state_indices_tensor is not None
+            and m.spec_query_start_loc is not None
+            and m.num_accepted_tokens is not None
+        )
+
+    def _run_b12x_kda_decode_post_conv(
+        self,
+        *,
+        mixed_qkv: torch.Tensor,
+        raw_g: torch.Tensor,
+        raw_beta: torch.Tensor,
+        z: torch.Tensor,
+        output: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_accepted_tokens: torch.Tensor | None,
+        num_requests: int,
+    ) -> None:
+        binding = self._b12x_kda_binding
+        api = self._b12x_kda_api
+        if binding is None or api is None:
+            raise RuntimeError("b12x KDA KV cache was not bound before inference")
+        num_tokens = int(mixed_qkv.shape[0])
+        state_columns = int(state_indices.shape[1])
+        if (
+            num_tokens > self._b12x_kda_max_tokens
+            or num_requests > self._b12x_kda_max_seqs
+            or state_columns > self._b12x_kda_state_index_columns
+        ):
+            raise ValueError(
+                "b12x KDA capacity exceeded: "
+                f"tokens={num_tokens}/{self._b12x_kda_max_tokens}, "
+                f"requests={num_requests}/{self._b12x_kda_max_seqs}, "
+                f"state_columns={state_columns}/"
+                f"{self._b12x_kda_state_index_columns}"
+            )
+
+        self._b12x_kda_mixed_qkv[:num_tokens].copy_(mixed_qkv)
+        self._b12x_kda_raw_g[:num_tokens].copy_(raw_g)
+        self._b12x_kda_raw_beta[:num_tokens].copy_(raw_beta)
+        self._b12x_kda_z[:num_tokens].copy_(z)
+        self._b12x_kda_query_start_loc.zero_()
+        self._b12x_kda_query_start_loc[: num_requests + 1].copy_(
+            query_start_loc[: num_requests + 1]
+        )
+        self._b12x_kda_num_accepted_tokens.fill_(1)
+        if num_accepted_tokens is not None:
+            self._b12x_kda_num_accepted_tokens[:num_requests].copy_(
+                num_accepted_tokens[:num_requests]
+            )
+        self._b12x_kda_state_indices.zero_()
+        self._b12x_kda_state_indices[:num_requests, :state_columns].copy_(
+            state_indices[:num_requests]
+        )
+        self._b12x_kda_num_seqs.fill_(num_requests)
+        self._b12x_kda_num_tokens.copy_(
+            query_start_loc[num_requests : num_requests + 1]
+        )
+
+        api.run_kda(
+            binding,
+            lower_bound=self.gate_lower_bound,
+            eps=self.o_norm.eps,
+            scale=self.head_dim**-0.5,
+        )
+        output[:num_tokens].copy_(self._b12x_kda_output[:num_tokens])
 
     def forward(
         self,
@@ -435,6 +677,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
+        g2_actual = g2[:num_actual_tokens]
+        use_b12x_kda = self._can_use_b12x_kda_decode(m)
 
         constant_caches = self.kv_cache
 
@@ -461,6 +705,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv_spec = mixed_qkv
                 g1_spec, beta_spec = g1, beta
                 mixed_qkv_ns = g1_ns = beta_ns = None
+                g2_spec, g2_ns = g2_actual, None
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 g1_spec = g1.index_select(1, spec_token_indx)
@@ -468,9 +713,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv_ns = mixed_qkv.index_select(0, non_spec_token_indx)
                 g1_ns = g1.index_select(1, non_spec_token_indx)
                 beta_ns = beta.index_select(1, non_spec_token_indx)
+                g2_spec = g2_ns = None
         else:
             mixed_qkv_spec = g1_spec = beta_spec = None
             mixed_qkv_ns, g1_ns, beta_ns = mixed_qkv, g1, beta
+            g2_spec, g2_ns = None, g2_actual
 
         # ---------- spec-decode multi-query path ----------
         core_attn_out_spec = None
@@ -500,32 +747,47 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 validate_data=False,
                 out=spec_conv_out,
             )
-            q_spec, k_spec, v_spec = (
-                rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
-                for x in mixed_qkv_spec.split(self.local_projection_size, dim=-1)
-            )
             spec_cu_seqlens = spec_query_start_loc[: m.num_spec_decodes + 1]
-            # Spec-only batches write directly into core_attn_out.
-            spec_out = (
-                core_attn_out[:, : q_spec.shape[1]]
-                if m.num_prefills == 0 and m.num_decodes == 0
-                else None
-            )
-            core_attn_out_spec, _ = fused_recurrent_kda(
-                q=q_spec,
-                k=k_spec,
-                v=v_spec,
-                raw_g=g1_spec,
-                raw_beta=beta_spec,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                lower_bound=self.gate_lower_bound,
-                initial_state=recurrent_state,
-                cu_seqlens=spec_cu_seqlens,
-                ssm_state_indices=spec_state_indices_tensor,
-                num_accepted_tokens=num_accepted_tokens,
-                out=spec_out,
-            )
+            if use_b12x_kda:
+                assert g2_spec is not None
+                core_attn_out_spec = core_attn_out[:, : mixed_qkv_spec.shape[0]]
+                self._run_b12x_kda_decode_post_conv(
+                    mixed_qkv=mixed_qkv_spec,
+                    raw_g=g1_spec[0],
+                    raw_beta=beta_spec[0],
+                    z=g2_spec,
+                    output=core_attn_out_spec[0],
+                    state_indices=spec_state_indices_tensor,
+                    query_start_loc=spec_cu_seqlens,
+                    num_accepted_tokens=num_accepted_tokens,
+                    num_requests=m.num_spec_decodes,
+                )
+            else:
+                q_spec, k_spec, v_spec = (
+                    rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
+                    for x in mixed_qkv_spec.split(self.local_projection_size, dim=-1)
+                )
+                # Spec-only batches write directly into core_attn_out.
+                spec_out = (
+                    core_attn_out[:, : q_spec.shape[1]]
+                    if m.num_prefills == 0 and m.num_decodes == 0
+                    else None
+                )
+                core_attn_out_spec, _ = fused_recurrent_kda(
+                    q=q_spec,
+                    k=k_spec,
+                    v=v_spec,
+                    raw_g=g1_spec,
+                    raw_beta=beta_spec,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    lower_bound=self.gate_lower_bound,
+                    initial_state=recurrent_state,
+                    cu_seqlens=spec_cu_seqlens,
+                    ssm_state_indices=spec_state_indices_tensor,
+                    num_accepted_tokens=num_accepted_tokens,
+                    out=spec_out,
+                )
 
         # ---------- non-spec path (prefill or plain decode) ----------
         core_attn_out_non_spec = None
@@ -568,10 +830,50 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
                 assert non_spec_state_indices_tensor is not None
                 assert has_initial_state is not None
+
+                # Mixed non-spec batches are decode-first. Peel the length-one
+                # decodes off because the chunk kernel only consumes the
+                # prefill-tail metadata produced by the GDN builder.
+                core_attn_out_decode = None
+                split_non_spec = spec_sequence_masks is None and m.num_decodes > 0
+                if split_non_spec:
+                    assert non_spec_query_start_loc is not None
+                    nd_tok = m.num_decode_tokens
+                    core_attn_out_decode, _ = fused_recurrent_kda(
+                        q=q_ns[:, :nd_tok],
+                        k=k_ns[:, :nd_tok],
+                        v=v_ns[:, :nd_tok],
+                        raw_g=g1_ns[:, :nd_tok],
+                        raw_beta=beta_ns[:, :nd_tok],
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=recurrent_state,
+                        cu_seqlens=non_spec_query_start_loc[: m.num_decodes + 1],
+                        ssm_state_indices=non_spec_state_indices_tensor[
+                            : m.num_decodes
+                        ],
+                    )
+                    q_ns = q_ns[:, nd_tok:]
+                    k_ns = k_ns[:, nd_tok:]
+                    v_ns = v_ns[:, nd_tok:]
+                    g1_ns = g1_ns[:, nd_tok:]
+                    beta_ns = beta_ns[:, nd_tok:]
+                    prefill_query_start_loc = m.prefill_query_start_loc
+                    prefill_state_indices = m.prefill_state_indices
+                    prefill_has_initial_state = m.prefill_has_initial_state
+                    assert prefill_query_start_loc is not None
+                    assert prefill_state_indices is not None
+                    assert prefill_has_initial_state is not None
+                else:
+                    prefill_query_start_loc = non_spec_query_start_loc
+                    prefill_state_indices = non_spec_state_indices_tensor
+                    prefill_has_initial_state = has_initial_state
+
                 initial_state = gather_initial_states(
                     recurrent_state,
-                    non_spec_state_indices_tensor,
-                    has_initial_state,
+                    prefill_state_indices,
+                    prefill_has_initial_state,
                 )
                 (
                     core_attn_out_non_spec,
@@ -588,10 +890,17 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     initial_state=initial_state,
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=non_spec_query_start_loc,
+                    cu_seqlens=prefill_query_start_loc,
+                    chunk_indices=m.chunk_indices,
+                    chunk_offsets=m.chunk_offsets,
                 )
                 # Init cache
-                recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+                recurrent_state[prefill_state_indices] = last_recurrent_state
+
+                if split_non_spec:
+                    core_attn_out_non_spec = torch.cat(
+                        [core_attn_out_decode, core_attn_out_non_spec], dim=1
+                    )
 
             else:
                 # pure-decode non-spec batch
@@ -616,16 +925,34 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     validate_data=True,
                     out=packed_conv_out,
                 )
-                core_attn_out_non_spec, _ = fused_recurrent_kda_packed_decode(
-                    mixed_qkv=mixed_qkv_ns,
-                    raw_g=g1_ns,
-                    raw_beta=beta_ns,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=recurrent_state,
-                    state_indices=decode_conv_indices,
-                )
+                if use_b12x_kda:
+                    assert non_spec_query_start_loc is not None
+                    assert g2_ns is not None
+                    core_attn_out_non_spec = core_attn_out[:, : mixed_qkv_ns.shape[0]]
+                    self._run_b12x_kda_decode_post_conv(
+                        mixed_qkv=mixed_qkv_ns,
+                        raw_g=g1_ns[0],
+                        raw_beta=beta_ns[0],
+                        z=g2_ns,
+                        output=core_attn_out_non_spec[0],
+                        state_indices=non_spec_state_indices_tensor[
+                            : m.num_decodes, None
+                        ],
+                        query_start_loc=non_spec_query_start_loc,
+                        num_accepted_tokens=None,
+                        num_requests=m.num_decodes,
+                    )
+                else:
+                    core_attn_out_non_spec, _ = fused_recurrent_kda_packed_decode(
+                        mixed_qkv=mixed_qkv_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=recurrent_state,
+                        state_indices=decode_conv_indices,
+                    )
 
         # ---------- merge spec and non-spec outputs ----------
         if core_attn_out_spec is not None and core_attn_out_non_spec is not None:
@@ -644,4 +971,5 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             ]
         else:
             assert core_attn_out_spec is not None
-        core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+        if not use_b12x_kda:
+            core_attn_out.copy_(self.o_norm(core_attn_out, g2))

@@ -5,11 +5,16 @@
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 
 from vllm.config import AttentionConfig, set_current_vllm_config
 from vllm.model_executor.layers.attention.mla_attention import (
+    MLAAttention,
     _canonicalize_sparse_mla_kv_cache_dtype,
+)
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SparseMLACommonMetadataBuilder,
 )
 from vllm.models.deepseek_v4.nvidia import b12x as b12x_mla
 from vllm.models.deepseek_v4.nvidia import b12x_indexer
@@ -23,8 +28,20 @@ from vllm.v1.attention.backends.b12x import B12xPagedAttentionBackend
 from vllm.v1.attention.backends.mla import b12x_indexer as generic_b12x_indexer
 from vllm.v1.attention.backends.mla import b12x_mla_sparse
 from vllm.v1.attention.backends.mla.b12x_indexer import B12xIndexerBackend
-from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseBackend
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+    B12xGLM5NextMLASparseBackend,
+    B12xGLM5NextMLASparseMetadataBuilder,
+    B12xMLASparseBackend,
+    B12xMLASparseImpl,
+    B12xMLASparseMetadata,
+    B12xMLASparseMetadataBuilder,
+    _selected_index_block_stride_rows,
+)
+from vllm.v1.attention.backends.mla.sparse_utils import _remap_tiling
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.worker.utils import select_common_block_size
 
 
 class _Workspace:
@@ -85,6 +102,459 @@ def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
         _canonicalize_sparse_mla_kv_cache_dtype(B12xMLASparseBackend, "auto")
         == "fp8_ds_mla"
     )
+
+
+def _glm5_next_config(*, dcp_size: int = 1, **overrides: int) -> SimpleNamespace:
+    recipe = dict(
+        model_type="glm5_next_text",
+        kv_lora_rank=512,
+        qk_nope_head_dim=256,
+        qk_rope_head_dim=0,
+        v_head_dim=256,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_topk=2048,
+        index_kpool=4,
+    )
+    recipe.update(overrides)
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(**recipe)),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size),
+    )
+
+
+def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    config = _glm5_next_config()
+    probe = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        state_content_bytes=656,
+    )
+
+    unidentified = B12xMLASparseBackend.customize_spec(probe)
+    packed_by_glm_backend = B12xGLM5NextMLASparseBackend.customize_spec(probe)
+    with set_current_vllm_config(config):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=512,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="fp8",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+        packed = B12xMLASparseBackend.customize_spec(probe)
+        layouts = B12xMLASparseBackend.supported_kv_cache_layouts()
+    packed_without_config_context = B12xMLASparseBackend.customize_spec(packed)
+
+    assert invalid_reasons == []
+    assert unidentified == probe
+    assert packed_by_glm_backend.state_content_bytes == 528
+    assert packed_by_glm_backend.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed_by_glm_backend.model_version == "glm5_next"
+    assert packed.state_content_bytes == 528
+    assert packed.page_size_padded == 64 * 528 + 16 * 128 * 2
+    assert packed.model_version == "glm5_next"
+    assert packed_without_config_context == packed
+    assert layouts == (KVCacheLayout.BLHNC,)
+
+
+def test_b12x_glm5_next_keeps_hybrid_manager_page_unsplit() -> None:
+    supported = B12xGLM5NextMLASparseBackend.get_supported_kernel_block_sizes()
+
+    assert len(supported) == 1
+    assert supported[0].base == 64
+    assert select_common_block_size(2304, [B12xGLM5NextMLASparseBackend]) == 2304
+    assert B12xGLM5NextMLASparseBackend.supported_kv_cache_layouts() == (
+        KVCacheLayout.BLHNC,
+    )
+
+
+def test_b12x_glm5_next_rejects_dcp(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    with set_current_vllm_config(_glm5_next_config(dcp_size=2)):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=512,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="fp8",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == [
+        "B12X GLM5Next sparse MLA does not support decode context parallelism"
+    ]
+
+
+def test_b12x_glm5_next_rejects_dsv4_head_size(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    with set_current_vllm_config(_glm5_next_config()):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=576,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="fp8",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == ["B12X GLM5Next sparse MLA requires head_size=512"]
+
+
+def test_b12x_glm5_next_rejects_recipe_drift(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    with set_current_vllm_config(_glm5_next_config(index_kpool=8)):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=512,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="fp8",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == [
+        "B12X GLM5Next sparse MLA requires index_kpool=8 (expected 4)"
+    ]
+
+
+def test_b12x_glm5_next_selected_indices_use_physical_slots() -> None:
+    storage = torch.empty((2 * 37888,), dtype=torch.uint8)
+    cache = torch.as_strided(
+        storage,
+        size=(2, 64, 528),
+        stride=(37888, 528, 1),
+    )
+    assert (
+        _selected_index_block_stride_rows(
+            cache,
+            block_size=64,
+            is_glm_next=True,
+        )
+        == 64
+    )
+
+
+def test_sparse_index_remap_tiling_covers_glm5_next_width() -> None:
+    assert _remap_tiling(2048, 128, True) == (True, 2048, 1, 8)
+    assert _remap_tiling(2051, 128, True) == (False, 128, 17, 4)
+
+
+def test_b12x_glm5_next_cache_writer_ignores_empty_rope() -> None:
+    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._concat_and_cache_glm_next_mla = lambda *args: calls.append(args)
+    kv_c = torch.empty((3, 512), dtype=torch.bfloat16)
+    kv_cache = torch.empty((2, 64, 528), dtype=torch.uint8)
+    slots = torch.tensor([0, 64, -1], dtype=torch.int64)
+
+    impl.do_kv_cache_update(
+        kv_c,
+        torch.empty((3, 1, 0), dtype=torch.bfloat16),
+        kv_cache,
+        slots,
+        "fp8_ds_mla",
+        torch.ones((), dtype=torch.float32),
+    )
+
+    assert calls == [(kv_c, kv_cache, slots)]
+
+
+def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> None:
+    planned: list[SimpleNamespace] = []
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+
+    class FakeCaps(SimpleNamespace):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+
+    class FakeModule:
+        Caps = FakeCaps
+
+        @staticmethod
+        def plan(caps):
+            planned.append(caps)
+            return caps
+
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = True
+    impl._module = FakeModule
+    impl._kernel_page_size = 64
+    impl._input_num_heads = 64
+    impl._max_tokens = 4096
+    impl._max_seqs = 4
+    impl._topk_tokens = 2051
+    impl._kv_dtype = torch.uint8
+    impl._q_head_dim = 512
+    impl.kv_lora_rank = 512
+    impl._model_type = 1
+    impl._decode_plan = SimpleNamespace()
+    impl._extend_plan = SimpleNamespace()
+    owner = SimpleNamespace(impl=impl, indexer=None)
+    cache = torch.empty((2, 1, 2304, 528), dtype=torch.uint8)
+
+    MLAAttention.bind_kv_cache(owner, cache)
+
+    assert owner.kv_cache.shape == (2, 2304, 528)
+    assert impl._kernel_page_size == 2304
+    assert [(caps.mode, caps.page_size) for caps in planned] == [
+        ("decode", 2304),
+        ("extend", 2304),
+    ]
+    assert [(caps.max_q_rows, caps.max_batch) for caps in planned] == [
+        (4096, 4096),
+        (4096, 4096),
+    ]
+
+
+def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
+    builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
+    builder.requires_glm_next_selector_metadata = True
+    builder.supports_draft_decode_metadata_update = True
+    builder.dcp_world_size = 1
+    builder._capture_default_state_slot_ids = torch.arange(4, dtype=torch.int32)
+    builder._capture_state_slot_ids = torch.empty(4, dtype=torch.int32)
+    builder._capture_state_is_fresh = torch.ones(4, dtype=torch.bool)
+    builder._capture_num_accepted_tokens = torch.ones(4, dtype=torch.int32)
+    builder._capture_is_prefilling = torch.zeros(4, dtype=torch.bool)
+    return builder
+
+
+def _build_short_packed_metadata(
+    builder_cls: type[B12xMLASparseMetadataBuilder],
+    *,
+    seq_lens: list[int],
+    query_lens: list[int],
+    is_prefilling: list[bool],
+) -> B12xMLASparseMetadata:
+    builder = object.__new__(builder_cls)
+    builder.metadata_cls = B12xMLASparseMetadata
+    builder.require_uniform_decodes = False
+    builder.use_pcp = False
+    builder.reorder_batch_threshold = 128
+    builder._prefill_backend = None
+    builder.topk_tokens = 2048
+    builder.cp_kv_cache_interleave_size = 1
+    builder.kv_cache_spec = SimpleNamespace(block_size=64)
+    builder.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    rows = sum(query_lens)
+    query_start_loc = torch.tensor(
+        [0, *torch.tensor(query_lens).cumsum(0).tolist()],
+        dtype=torch.int32,
+    )
+    request_ids = torch.repeat_interleave(
+        torch.arange(len(query_lens), dtype=torch.int32),
+        torch.tensor(query_lens),
+    )
+    builder._build_req_id_per_token = lambda common: request_ids
+    positions = torch.cat(
+        [torch.arange(length, dtype=torch.int64) for length in query_lens]
+    )
+    common = SimpleNamespace(
+        num_reqs=len(seq_lens),
+        num_actual_tokens=rows,
+        max_query_len=max(query_lens),
+        max_seq_len=max(seq_lens),
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        block_table_tensor=torch.arange(len(seq_lens), dtype=torch.int32).view(-1, 1),
+        slot_mapping=torch.arange(rows, dtype=torch.int64),
+        positions=positions,
+        is_prefilling=torch.tensor(is_prefilling),
+    )
+    return SparseMLACommonMetadataBuilder.build(builder, 0, common)
+
+
+def test_glm_short_packed_prefills_do_not_use_selector_decode_transactions() -> None:
+    fresh = _build_short_packed_metadata(
+        B12xGLM5NextMLASparseMetadataBuilder,
+        seq_lens=[2, 3],
+        query_lens=[2, 3],
+        is_prefilling=[True, True],
+    )
+    assert fresh.num_decodes == 0
+    assert fresh.num_prefills == 2
+    assert fresh.num_decode_tokens == 0
+    assert fresh.req_id_per_token.tolist() == [0, 0, 1, 1, 1]
+    assert fresh.query_start_loc.tolist() == [0, 2, 5]
+
+    mixed = _build_short_packed_metadata(
+        B12xGLM5NextMLASparseMetadataBuilder,
+        seq_lens=[4, 2],
+        query_lens=[1, 2],
+        is_prefilling=[False, True],
+    )
+    assert mixed.num_decodes == 1
+    assert mixed.num_prefills == 1
+    assert mixed.num_decode_tokens == 1
+    assert mixed.req_id_per_token.tolist() == [0, 1, 1]
+    assert mixed.query_start_loc.tolist() == [0, 1, 3]
+
+    dsv4 = _build_short_packed_metadata(
+        B12xMLASparseMetadataBuilder,
+        seq_lens=[2, 3],
+        query_lens=[2, 3],
+        is_prefilling=[True, True],
+    )
+    assert dsv4.num_decodes == 2
+    assert dsv4.num_prefills == 0
+    assert dsv4.num_decode_tokens == 5
+
+
+def test_glm_selector_metadata_builder_stages_padded_rows_and_capture(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        SparseMLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+    builder = _bare_glm_selector_metadata_builder()
+    common = SimpleNamespace(
+        num_reqs=4,
+        num_actual_tokens=4,
+        max_query_len=1,
+        seq_lens=torch.tensor([8, 9, 0, 0], dtype=torch.int32),
+        dcp_local_seq_lens=None,
+    )
+
+    captured = builder.build_for_cudagraph_capture(common)
+    pointers = tuple(
+        tensor.data_ptr()
+        for tensor in (
+            captured.selector_state_slot_ids,
+            captured.selector_state_is_fresh,
+            captured.selector_num_accepted_tokens,
+            captured.selector_is_prefilling,
+        )
+    )
+    assert torch.equal(
+        captured.selector_state_slot_ids,
+        torch.arange(4, dtype=torch.int32),
+    )
+    assert captured.selector_state_is_fresh.all()
+    assert torch.equal(
+        captured.selector_num_accepted_tokens,
+        torch.ones(4, dtype=torch.int32),
+    )
+    assert not captured.selector_is_prefilling.any()
+
+    runtime = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        selector_state_slot_ids=torch.tensor([7, 3, -1, -1], dtype=torch.int32),
+        selector_state_is_fresh=torch.tensor([False, True, True, True]),
+        selector_num_accepted_tokens=torch.tensor([4, 2, 1, 1], dtype=torch.int32),
+        selector_is_prefilling=torch.tensor([False, True, False, False]),
+    )
+    assert (
+        tuple(
+            tensor.data_ptr()
+            for tensor in (
+                runtime.selector_state_slot_ids,
+                runtime.selector_state_is_fresh,
+                runtime.selector_num_accepted_tokens,
+                runtime.selector_is_prefilling,
+            )
+        )
+        == pointers
+    )
+    assert torch.equal(
+        runtime.selector_state_slot_ids,
+        torch.tensor([7, 3, -1, -1], dtype=torch.int32),
+    )
+    assert torch.equal(
+        runtime.selector_state_is_fresh,
+        torch.tensor([False, True, True, True]),
+    )
+    assert torch.equal(
+        runtime.selector_num_accepted_tokens,
+        torch.tensor([4, 2, 1, 1], dtype=torch.int32),
+    )
+    assert torch.equal(
+        runtime.selector_is_prefilling,
+        torch.tensor([False, True, False, False]),
+    )
+
+
+def test_glm_selector_metadata_builder_requires_complete_runtime_state(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        SparseMLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+    builder = _bare_glm_selector_metadata_builder()
+    common = SimpleNamespace(
+        num_reqs=1,
+        num_actual_tokens=1,
+        max_query_len=1,
+        seq_lens=torch.ones(1, dtype=torch.int32),
+        dcp_local_seq_lens=None,
+    )
+
+    with pytest.raises(RuntimeError, match="requires selector state slots"):
+        builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+
+def test_glm_selector_metadata_builder_updates_draft_acceptance() -> None:
+    builder = _bare_glm_selector_metadata_builder()
+    accepted = torch.tensor([4, 2, 1, 1], dtype=torch.int32)
+    metadata = SimpleNamespace(selector_num_accepted_tokens=accepted)
+
+    builder.update_draft_decode_metadata(metadata)
+
+    assert torch.equal(accepted, torch.ones(4, dtype=torch.int32))
+
+
+def test_dsv4_metadata_builder_does_not_claim_glm_selector_state() -> None:
+    builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
+    builder.requires_glm_next_selector_metadata = False
+
+    assert builder._stage_glm_next_selector_metadata(
+        num_reqs=2,
+        for_cudagraph_capture=False,
+        selector_state_slot_ids=None,
+        selector_state_is_fresh=None,
+        selector_num_accepted_tokens=None,
+        selector_is_prefilling=None,
+    ) == (None, None, None, None)
+    with pytest.raises(TypeError, match="non-GLM"):
+        builder._stage_glm_next_selector_metadata(
+            num_reqs=2,
+            for_cudagraph_capture=False,
+            selector_state_slot_ids=torch.arange(2, dtype=torch.int32),
+            selector_state_is_fresh=None,
+            selector_num_accepted_tokens=None,
+            selector_is_prefilling=None,
+        )
 
 
 def test_b12x_dsv4_backend_preserves_cache_contract() -> None:

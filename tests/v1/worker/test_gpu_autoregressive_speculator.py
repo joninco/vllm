@@ -115,6 +115,47 @@ def _mock_base_model_load(monkeypatch):
     )
 
 
+def test_glm5next_mtp_uses_collapsed_hidden_size() -> None:
+    draft_model_config = SimpleNamespace(
+        get_hidden_size=lambda: 4096,
+        get_vocab_size=lambda: 154880,
+        hf_config=SimpleNamespace(
+            model_type="glm5_next_mtp",
+            hc_mult=4,
+            mhc=True,
+        ),
+        uses_mrope=False,
+    )
+    speculative_config = SimpleNamespace(
+        method="mtp",
+        num_speculative_tokens=5,
+        draft_model_config=draft_model_config,
+        use_local_argmax_reduction=False,
+        draft_sample_method="greedy",
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=2,
+            max_num_batched_tokens=8,
+        ),
+        model_config=SimpleNamespace(
+            max_model_len=1024,
+            dtype=torch.bfloat16,
+            use_fp64_gumbel=False,
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_rank=0,
+        ),
+    )
+
+    speculator = _TestSpeculator(vllm_config, torch.device("cpu"))
+
+    assert speculator.hidden_size == 4096
+    assert speculator.hidden_states.shape == (8, 4096)
+
+
 def test_mtp_speculator_rolls_back_qsa_anchor_around_lookahead() -> None:
     lifecycle = _QSAIntervalLifecycle()
     speculator = object.__new__(MTPSpeculator)

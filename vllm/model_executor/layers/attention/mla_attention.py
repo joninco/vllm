@@ -658,6 +658,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
+        bind_impl = getattr(self.impl, "bind_kv_cache", None)
+        if bind_impl is not None:
+            bind_impl(self.kv_cache)
+        bind_indexer = getattr(self.indexer, "bind_main_kv_cache", None)
+        if bind_indexer is not None:
+            bind_indexer(self.kv_cache)
+
+    def unbind_kv_cache(self) -> None:
+        unbind_indexer = getattr(self.indexer, "unbind_main_kv_cache", None)
+        if unbind_indexer is not None:
+            unbind_indexer()
+        super().unbind_kv_cache()
 
     @property
     def chunked_prefill_workspace_size(self) -> int:
@@ -1469,7 +1481,7 @@ class MLACommonBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [320, 576]
+        return [320, 512, 576]
 
     @classmethod
     def is_mla(cls) -> bool:

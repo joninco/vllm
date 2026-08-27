@@ -38,6 +38,7 @@ _B12X_SUBMODULES = {
         "b12x.attention.sparse_mla",
         "b12x.attention.compressed_sparse_mla",
         "b12x.attention.dsa_indexer",
+        "b12x.attention.glm_pooled_indexer",
         "b12x.attention.qsa",
         "b12x.gemm.blockscaled",
         "b12x.gemm.wo_projection",
@@ -88,6 +89,10 @@ def get_b12x_sparse_mla() -> ModuleType | None:
 
 def get_b12x_dsa_indexer() -> ModuleType | None:
     return _get_submodule("b12x.attention.dsa_indexer")
+
+
+def get_b12x_glm_pooled_indexer() -> ModuleType | None:
+    return _get_submodule("b12x.attention.glm_pooled_indexer")
 
 
 def get_b12x_intrinsics() -> ModuleType | None:
