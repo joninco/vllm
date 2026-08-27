@@ -558,10 +558,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "GDN decode kernel 'b12x' requires b12x.sequence.gdn_decode"
             )
         device = torch.device(current_platform.current_device())
-        if not api.is_supported(device):
-            raise RuntimeError(
-                "GDN decode kernel 'b12x' requires an SM120 or SM121 CUDA device"
-            )
 
         max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         state_index_columns = max(1, self.num_spec + 1)

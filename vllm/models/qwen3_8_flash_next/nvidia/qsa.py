@@ -372,7 +372,8 @@ class Qwen3_8FlashNextQSABackend(B12xPagedAttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return (capability.major, capability.minor) in ((12, 0), (12, 1))
+        del capability
+        return True
 
     @classmethod
     def supports_combination(
@@ -387,7 +388,7 @@ class Qwen3_8FlashNextQSABackend(B12xPagedAttentionBackend):
         use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        del use_sparse
+        del use_sparse, device_capability
         if dtype != torch.bfloat16:
             return "Qwen3.8-Flash-Next QSA requires BF16 queries"
         if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8", "fp8_e4m3"):
@@ -402,13 +403,6 @@ class Qwen3_8FlashNextQSABackend(B12xPagedAttentionBackend):
         qsa = get_b12x_qsa()
         if qsa is None:
             return "Install the b12x backend with `pip install vllm[b12x]`"
-        if not qsa.is_supported():
-            return "b12x QSA is not supported on the current device"
-        if (device_capability.major, device_capability.minor) not in (
-            (12, 0),
-            (12, 1),
-        ):
-            return "b12x QSA requires SM120 or SM121"
         return None
 
 
