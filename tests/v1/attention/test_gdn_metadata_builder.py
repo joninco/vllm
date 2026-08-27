@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -252,3 +253,185 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def test_gdn_block_table_reuse_supports_regular_and_spec_decode() -> None:
+    assert _create_gdn_builder().supports_update_block_table
+    assert _create_gdn_builder(num_speculative_tokens=2).supports_update_block_table
+
+
+def test_gdn_update_block_table_uses_current_builders_graph_buffers() -> None:
+    builder_a = _create_gdn_builder(full_cuda_graph=True)
+    builder_b = _create_gdn_builder(full_cuda_graph=True)
+    batch = BatchSpec(seq_lens=[40, 30, 20], query_lens=[1, 1, 1])
+    metadata_a = _build(builder_a, batch)
+    block_table_b = torch.tensor(
+        [[11, 12, 13], [21, 22, 23], [31, 32, 33]],
+        dtype=torch.int32,
+    )
+
+    metadata_b = builder_b.update_block_table(
+        metadata_a,
+        block_table_b,
+        torch.zeros(3, dtype=torch.int64),
+    )
+
+    assert metadata_b.non_spec_state_indices_tensor is not None
+    assert (
+        metadata_b.non_spec_state_indices_tensor.data_ptr()
+        == builder_b.non_spec_state_indices_tensor.data_ptr()
+    )
+    assert metadata_b.non_spec_query_start_loc is not None
+    assert (
+        metadata_b.non_spec_query_start_loc.data_ptr()
+        == builder_b.non_spec_query_start_loc.data_ptr()
+    )
+    expected_state_indices = mamba_get_block_table_tensor(
+        block_table_b,
+        metadata_a.seq_lens,
+        builder_b.kv_cache_spec,
+        builder_b.vllm_config.cache_config.mamba_cache_mode,
+    )
+    torch.testing.assert_close(
+        metadata_b.non_spec_state_indices_tensor,
+        expected_state_indices[:, 0],
+    )
+    torch.testing.assert_close(
+        metadata_b.non_spec_query_start_loc,
+        metadata_a.non_spec_query_start_loc,
+    )
+
+
+def test_gdn_build_uses_precomputed_aligned_state_indices(monkeypatch) -> None:
+    builder = _create_gdn_builder()
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    aligned_state_indices = torch.tensor(
+        [[101, 102], [201, 202], [301, 302]],
+        dtype=torch.int32,
+    )
+    builder.mamba_aligned_state_indices = aligned_state_indices
+
+    def fail_fallback(*_args, **_kwargs):
+        raise AssertionError("per-group aligned state-index fallback was used")
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.gdn_attn.mamba_get_block_table_tensor",
+        fail_fallback,
+    )
+    metadata = _build(
+        builder,
+        BatchSpec(seq_lens=[40, 30, 20], query_lens=[1, 1, 1]),
+    )
+
+    torch.testing.assert_close(
+        metadata.non_spec_state_indices_tensor,
+        aligned_state_indices[:, 0],
+    )
+
+
+def test_gdn_spec_update_uses_current_builders_graph_buffers() -> None:
+    builder_a = _create_gdn_builder(
+        num_speculative_tokens=2,
+        full_cuda_graph=True,
+    )
+    builder_b = _create_gdn_builder(
+        num_speculative_tokens=2,
+        full_cuda_graph=True,
+    )
+    builder_a.mamba_aligned_state_indices = torch.tensor(
+        [[101, 102, 103], [201, 202, 203]],
+        dtype=torch.int32,
+    )
+    builder_b.mamba_aligned_state_indices = torch.tensor(
+        [[111, 112, 113], [211, 212, 213]],
+        dtype=torch.int32,
+    )
+    batch = BatchSpec(seq_lens=[40, 30], query_lens=[3, 3])
+    metadata_a = _build(builder_a, batch, num_decode_draft_tokens=[2, 2])
+    block_table_b = torch.tensor(
+        [[11, 12, 13], [21, 22, 23]],
+        dtype=torch.int32,
+    )
+
+    metadata_b = builder_b.update_block_table(
+        metadata_a,
+        block_table_b,
+        torch.zeros(6, dtype=torch.int64),
+    )
+
+    assert metadata_b.spec_state_indices_tensor is not None
+    assert (
+        metadata_b.spec_state_indices_tensor.data_ptr()
+        == builder_b.spec_state_indices_tensor.data_ptr()
+    )
+    assert metadata_b.spec_sequence_masks is not None
+    assert (
+        metadata_b.spec_sequence_masks.data_ptr()
+        == builder_b.spec_sequence_masks.data_ptr()
+    )
+    assert metadata_b.spec_query_start_loc is not None
+    assert (
+        metadata_b.spec_query_start_loc.data_ptr()
+        == builder_b.spec_query_start_loc.data_ptr()
+    )
+    assert metadata_b.num_accepted_tokens is not None
+    assert (
+        metadata_b.num_accepted_tokens.data_ptr()
+        == builder_b.num_accepted_tokens.data_ptr()
+    )
+    torch.testing.assert_close(
+        metadata_b.spec_state_indices_tensor,
+        builder_b.mamba_aligned_state_indices,
+    )
+    torch.testing.assert_close(
+        metadata_b.spec_sequence_masks,
+        metadata_a.spec_sequence_masks,
+    )
+    torch.testing.assert_close(
+        metadata_b.spec_query_start_loc,
+        metadata_a.spec_query_start_loc,
+    )
+    torch.testing.assert_close(
+        metadata_b.num_accepted_tokens,
+        metadata_a.num_accepted_tokens,
+    )
+
+
+def test_gdn_mixed_spec_update_selects_group_specific_state_indices() -> None:
+    builder_a = _create_gdn_builder(num_speculative_tokens=2)
+    builder_b = _create_gdn_builder(num_speculative_tokens=2)
+    builder_a.mamba_aligned_state_indices = torch.tensor(
+        [[101, 102, 103], [201, 202, 203]],
+        dtype=torch.int32,
+    )
+    builder_b.mamba_aligned_state_indices = torch.tensor(
+        [[111, 112, 113], [211, 212, 213]],
+        dtype=torch.int32,
+    )
+    metadata_a = _build(
+        builder_a,
+        BatchSpec(seq_lens=[65, 20], query_lens=[1, 3]),
+        num_decode_draft_tokens=[-1, 2],
+    )
+
+    metadata_b = builder_b.update_block_table(
+        metadata_a,
+        torch.zeros((2, 3), dtype=torch.int32),
+        torch.zeros(4, dtype=torch.int64),
+    )
+
+    assert metadata_b.spec_state_indices_tensor is not None
+    assert metadata_b.non_spec_state_indices_tensor is not None
+    assert metadata_b.prefill_state_indices is not None
+    torch.testing.assert_close(
+        metadata_b.spec_state_indices_tensor,
+        builder_b.mamba_aligned_state_indices[1:2],
+    )
+    torch.testing.assert_close(
+        metadata_b.non_spec_state_indices_tensor,
+        builder_b.mamba_aligned_state_indices[0:1, 0],
+    )
+    torch.testing.assert_close(
+        metadata_b.prefill_state_indices,
+        builder_b.mamba_aligned_state_indices[0:1, 0],
+    )

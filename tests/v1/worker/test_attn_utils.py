@@ -7,6 +7,8 @@ while keeping per-block content compact, so padding bytes at the end of each pag
 never addressed by the logical view.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -23,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     compute_layout_strides,
 )
 from vllm.v1.worker.gpu.attn_utils import (
+    build_attn_metadata,
     get_attn_cg_support,
     get_query_lens_mismatch_unsupported_backend,
 )
@@ -51,6 +54,29 @@ class _DraftBackend:
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         return False
+
+
+class _CachingMetadataBuilder:
+    supports_update_block_table = True
+
+    def __init__(self):
+        self.num_builds = 0
+        self.num_updates = 0
+
+    def build(self, common_prefix_len, common_attn_metadata, **_kwargs):
+        self.num_builds += 1
+        return SimpleNamespace(
+            block_table=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+        )
+
+    def update_block_table(self, metadata, block_table, slot_mapping):
+        self.num_updates += 1
+        return SimpleNamespace(
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+            reused=metadata,
+        )
 
 
 def test_attention_checks_preserve_global_and_target_scoped_support():
@@ -116,6 +142,59 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         )
         == "_DraftBackend"
     )
+
+
+def test_build_attn_metadata_reuses_equivalent_cache_group_builds():
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    builders = [_CachingMetadataBuilder(), _CachingMetadataBuilder()]
+    groups = []
+    cache_groups = []
+    for group_id, builder in enumerate(builders):
+        layer_name = f"layer.{group_id}"
+        group = AttentionGroup(
+            _TargetBackend,  # type: ignore[arg-type]
+            [layer_name],
+            spec,
+            group_id,
+        )
+        group.metadata_builders = [builder]  # type: ignore[list-item]
+        groups.append([group])
+        cache_groups.append(KVCacheGroupSpec([layer_name], spec))
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=cache_groups,
+    )
+    block_tables = [
+        torch.full((2, 1), group_id, dtype=torch.int32) for group_id in range(2)
+    ]
+    slot_mappings = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
+
+    metadata = build_attn_metadata(
+        attn_groups=groups,
+        num_reqs=2,
+        num_tokens=2,
+        query_start_loc_gpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+        max_seq_len=1,
+        block_tables=block_tables,
+        slot_mappings=slot_mappings,
+        kv_cache_config=kv_cache_config,
+    )
+
+    assert [builder.num_builds for builder in builders] == [1, 0]
+    assert [builder.num_updates for builder in builders] == [0, 1]
+    assert metadata["layer.0"].block_table is block_tables[0]
+    assert metadata["layer.1"].block_table is block_tables[1]
+    assert metadata["layer.1"].reused is metadata["layer.0"]
 
 
 def test_reshape_padded_kv_cache_strides_by_padded_page():

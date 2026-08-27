@@ -164,6 +164,7 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
 
     requires_qsa_metadata: ClassVar[bool] = True
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_draft_decode_metadata_update = True
 
     def __init__(
         self,
@@ -199,6 +200,7 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
         qsa_state_slot_ids: torch.Tensor | None = None,
         qsa_state_is_fresh: torch.Tensor | None = None,
         qsa_num_accepted_tokens: torch.Tensor | None = None,
+        qsa_is_prefilling: torch.Tensor | None = None,
     ) -> Qwen3_8FlashNextQSAMetadata:
         del common_prefix_len, fast_build
         cm = common_attn_metadata
@@ -218,7 +220,9 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
         qsa_state_slot_ids = self._capture_state_slot_ids[:num_reqs]
         qsa_state_is_fresh = self._capture_state_is_fresh[:num_reqs]
         qsa_num_accepted_tokens = self._capture_num_accepted_tokens[:num_reqs]
-        is_prefilling = cm.is_prefilling
+        is_prefilling = qsa_is_prefilling
+        if is_prefilling is None:
+            is_prefilling = cm.is_prefilling
         if is_prefilling is not None:
             self._capture_is_prefilling[:num_reqs].copy_(is_prefilling[:num_reqs])
             is_prefilling = self._capture_is_prefilling[:num_reqs]
@@ -241,6 +245,58 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
             qsa_state_slot_ids=qsa_state_slot_ids,
             qsa_state_is_fresh=qsa_state_is_fresh,
             qsa_num_accepted_tokens=qsa_num_accepted_tokens,
+        )
+
+    def update_draft_decode_metadata(
+        self,
+        metadata: B12xPagedMetadata,
+    ) -> None:
+        qsa_metadata = cast(Qwen3_8FlashNextQSAMetadata, metadata)
+        if qsa_metadata.qsa_num_accepted_tokens is None:
+            raise RuntimeError(
+                "QSA draft decode metadata requires accepted-token counts"
+            )
+        qsa_metadata.qsa_num_accepted_tokens.fill_(1)
+
+    def update_block_table(
+        self,
+        metadata: B12xPagedMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> Qwen3_8FlashNextQSAMetadata:
+        if not isinstance(metadata, Qwen3_8FlashNextQSAMetadata):
+            raise TypeError(f"expected QSA metadata, got {type(metadata)!r}")
+        num_reqs = metadata.seq_lens.shape[0]
+        num_tokens = metadata.num_actual_tokens
+        assert metadata.request_ids is not None
+        assert metadata.qsa_state_slot_ids is not None
+        assert metadata.qsa_state_is_fresh is not None
+        assert metadata.qsa_num_accepted_tokens is not None
+        self._request_ids[:num_tokens].copy_(metadata.request_ids[:num_tokens])
+        is_prefilling = None
+        if metadata.is_prefilling is not None:
+            self._capture_is_prefilling[:num_reqs].copy_(
+                metadata.is_prefilling[:num_reqs]
+            )
+            is_prefilling = self._capture_is_prefilling[:num_reqs]
+        self._capture_state_slot_ids[:num_reqs].copy_(
+            metadata.qsa_state_slot_ids[:num_reqs]
+        )
+        self._capture_state_is_fresh[:num_reqs].copy_(
+            metadata.qsa_state_is_fresh[:num_reqs]
+        )
+        self._capture_num_accepted_tokens[:num_reqs].copy_(
+            metadata.qsa_num_accepted_tokens[:num_reqs]
+        )
+        return replace(
+            metadata,
+            block_table=blk_table,
+            slot_mapping=slot_mapping,
+            request_ids=self._request_ids[:num_tokens],
+            is_prefilling=is_prefilling,
+            qsa_state_slot_ids=self._capture_state_slot_ids[:num_reqs],
+            qsa_state_is_fresh=self._capture_state_is_fresh[:num_reqs],
+            qsa_num_accepted_tokens=self._capture_num_accepted_tokens[:num_reqs],
         )
 
 

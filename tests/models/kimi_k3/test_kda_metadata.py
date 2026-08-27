@@ -45,6 +45,7 @@ PRUNED_METADATA_FIELDS = {
     "prefill_state_indices",
     "prefill_has_initial_state",
     "spec_sequence_masks",
+    "spec_sequence_masks_cpu",
 }
 
 
@@ -511,6 +512,7 @@ def test_kimi_k3_kda_backend_uses_private_metadata_builder():
     assert issubclass(KimiK3KDAAttentionBackend, GDNAttentionBackend)
     assert issubclass(KimiK3KDAMetadata, GDNAttentionMetadata)
     assert issubclass(KimiK3KDAMetadataBuilder, GDNAttentionMetadataBuilder)
+    assert not KimiK3KDAMetadataBuilder.supports_update_block_table
 
 
 def test_kimi_k3_metadata_uses_precomputed_aligned_state_indices():

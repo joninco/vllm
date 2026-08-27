@@ -394,6 +394,7 @@ def _bare_qwen_model_state_for_draft_metadata() -> Qwen3_8FlashNextModelState:
     state.qsa_num_accepted_tokens = torch.ones(8, dtype=torch.int32)
     state.num_accepted_tokens_gpu = torch.ones(8, dtype=torch.int32)
     state._qsa_draft_is_prefilling = torch.zeros(8, dtype=torch.bool)
+    state._qsa_draft_is_prefilling_gpu = torch.zeros(8, dtype=torch.bool)
     return state
 
 
@@ -422,6 +423,10 @@ def test_qsa_draft_metadata_uses_persistent_slot_and_safe_padding() -> None:
         torch.tensor([3, 1, 1, 1], dtype=torch.int32),
     )
     assert not torch.any(metadata.is_prefilling)
+    assert (
+        metadata.qsa_is_prefilling.data_ptr()
+        == state._qsa_draft_is_prefilling_gpu.data_ptr()
+    )
 
 
 def test_qsa_draft_metadata_tracks_batch_reordering_by_persistent_slot() -> None:
@@ -657,12 +662,14 @@ def test_qsa_builder_stages_runtime_state_in_capture_buffers() -> None:
     runtime_slots = torch.tensor([7, 1, 2, 3], dtype=torch.int32)
     runtime_fresh = torch.tensor([False, True, True, True])
     runtime_accepted = torch.ones(4, dtype=torch.int32)
+    runtime_is_prefilling = torch.tensor([False, True, False, False])
     runtime = builder.build(
         common_prefix_len=0,
         common_attn_metadata=common,
         qsa_state_slot_ids=runtime_slots,
         qsa_state_is_fresh=runtime_fresh,
         qsa_num_accepted_tokens=runtime_accepted,
+        qsa_is_prefilling=runtime_is_prefilling,
     )
 
     assert captured.qsa_state_slot_ids.data_ptr() == slot_ptr
@@ -675,6 +682,7 @@ def test_qsa_builder_stages_runtime_state_in_capture_buffers() -> None:
     assert torch.equal(captured.qsa_state_slot_ids, runtime_slots)
     assert torch.equal(captured.qsa_state_is_fresh, runtime_fresh)
     assert torch.equal(captured.qsa_num_accepted_tokens, runtime_accepted)
+    assert torch.equal(captured.is_prefilling, runtime_is_prefilling)
 
     runtime_slots.fill_(99)
     runtime_fresh.fill_(False)
@@ -695,13 +703,14 @@ def test_qsa_builder_stages_runtime_state_in_capture_buffers() -> None:
     reordered_slots = torch.tensor([3, 7, 2, 3], dtype=torch.int32)
     reordered_fresh = torch.tensor([False, False, True, True])
     reordered_accepted = torch.tensor([1, 3, 1, 1], dtype=torch.int32)
-    common.is_prefilling.copy_(torch.tensor([True, False, False, False]))
+    reordered_is_prefilling = torch.tensor([True, False, False, False])
     reordered = builder.build(
         common_prefix_len=0,
         common_attn_metadata=common,
         qsa_state_slot_ids=reordered_slots,
         qsa_state_is_fresh=reordered_fresh,
         qsa_num_accepted_tokens=reordered_accepted,
+        qsa_is_prefilling=reordered_is_prefilling,
     )
 
     assert reordered.qsa_state_slot_ids.data_ptr() == slot_ptr
@@ -714,6 +723,101 @@ def test_qsa_builder_stages_runtime_state_in_capture_buffers() -> None:
     assert torch.equal(
         captured.is_prefilling,
         torch.tensor([True, False, False, False]),
+    )
+
+
+def test_qsa_builder_updates_cached_metadata_into_its_own_buffers() -> None:
+    def make_builder() -> Qwen3_8FlashNextQSAMetadataBuilder:
+        builder = Qwen3_8FlashNextQSAMetadataBuilder.__new__(
+            Qwen3_8FlashNextQSAMetadataBuilder
+        )
+        builder._request_ids = torch.empty(4, dtype=torch.int32)
+        builder.max_speculative_tokens = 2
+        builder._capture_state_slot_ids = torch.arange(4, dtype=torch.int32)
+        builder._capture_state_is_fresh = torch.ones(4, dtype=torch.bool)
+        builder._capture_num_accepted_tokens = torch.ones(4, dtype=torch.int32)
+        builder._capture_is_prefilling = torch.zeros(4, dtype=torch.bool)
+        return builder
+
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([8, 9, 0, 0], dtype=torch.int32),
+        num_reqs=4,
+        num_actual_tokens=4,
+        max_query_len=1,
+        max_seq_len=9,
+        block_table_tensor=torch.zeros((4, 1), dtype=torch.int32),
+        slot_mapping=torch.full((4,), -1, dtype=torch.int64),
+        is_prefilling=torch.tensor([False, True, False, False]),
+    )
+    builder_a = make_builder()
+    builder_b = make_builder()
+    metadata_a = builder_a.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        qsa_state_slot_ids=torch.tensor([7, 3, 2, 1], dtype=torch.int32),
+        qsa_state_is_fresh=torch.tensor([False, True, True, True]),
+        qsa_num_accepted_tokens=torch.tensor([2, 1, 1, 1], dtype=torch.int32),
+    )
+    block_table_b = torch.ones((4, 1), dtype=torch.int32)
+    slot_mapping_b = torch.arange(4, dtype=torch.int64)
+
+    metadata_b = builder_b.update_block_table(
+        metadata_a,
+        block_table_b,
+        slot_mapping_b,
+    )
+
+    assert metadata_b.block_table is block_table_b
+    assert metadata_b.slot_mapping is slot_mapping_b
+    assert metadata_b.request_ids.data_ptr() == builder_b._request_ids.data_ptr()
+    assert (
+        metadata_b.qsa_state_slot_ids.data_ptr()
+        == builder_b._capture_state_slot_ids.data_ptr()
+    )
+    assert (
+        metadata_b.qsa_state_is_fresh.data_ptr()
+        == builder_b._capture_state_is_fresh.data_ptr()
+    )
+    assert (
+        metadata_b.qsa_num_accepted_tokens.data_ptr()
+        == builder_b._capture_num_accepted_tokens.data_ptr()
+    )
+    assert (
+        metadata_b.is_prefilling.data_ptr()
+        == builder_b._capture_is_prefilling.data_ptr()
+    )
+    torch.testing.assert_close(
+        metadata_b.qsa_state_slot_ids,
+        metadata_a.qsa_state_slot_ids,
+    )
+    torch.testing.assert_close(
+        metadata_b.qsa_state_is_fresh,
+        metadata_a.qsa_state_is_fresh,
+    )
+    torch.testing.assert_close(
+        metadata_b.qsa_num_accepted_tokens,
+        metadata_a.qsa_num_accepted_tokens,
+    )
+
+
+def test_qsa_builder_updates_fused_draft_acceptance_in_place() -> None:
+    builder = Qwen3_8FlashNextQSAMetadataBuilder.__new__(
+        Qwen3_8FlashNextQSAMetadataBuilder
+    )
+    accepted = torch.tensor([4, 2, 1, 1], dtype=torch.int32)
+    accepted_ptr = accepted.data_ptr()
+    metadata = SimpleNamespace(qsa_num_accepted_tokens=accepted)
+
+    assert builder.supports_draft_decode_metadata_update
+
+    builder.update_draft_decode_metadata(metadata)
+
+    assert metadata.qsa_num_accepted_tokens.data_ptr() == accepted_ptr
+    assert torch.equal(
+        metadata.qsa_num_accepted_tokens,
+        torch.ones(4, dtype=torch.int32),
     )
 
 

@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -40,6 +41,7 @@ class Qwen3_8FlashNextAttnMetadata(MambaHybridAttnMetadata):
     qsa_state_slot_ids: torch.Tensor | None = None
     qsa_state_is_fresh: torch.Tensor | None = None
     qsa_num_accepted_tokens: torch.Tensor | None = None
+    qsa_is_prefilling: torch.Tensor | None = None
 
     def get_extra_attn_kwargs(
         self,
@@ -52,10 +54,12 @@ class Qwen3_8FlashNextAttnMetadata(MambaHybridAttnMetadata):
         assert self.qsa_state_slot_ids is not None
         assert self.qsa_state_is_fresh is not None
         assert self.qsa_num_accepted_tokens is not None
+        assert self.qsa_is_prefilling is not None
         kwargs.update(
             qsa_state_slot_ids=self.qsa_state_slot_ids[:num_reqs],
             qsa_state_is_fresh=self.qsa_state_is_fresh[:num_reqs],
             qsa_num_accepted_tokens=self.qsa_num_accepted_tokens[:num_reqs],
+            qsa_is_prefilling=self.qsa_is_prefilling[:num_reqs],
         )
         return kwargs
 
@@ -96,10 +100,20 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        self.qsa_is_prefilling = CpuGpuBuffer(
+            self.max_num_reqs,
+            dtype=torch.bool,
+            device=self.device,
+        )
         self._qsa_draft_is_prefilling = torch.zeros(
             self.max_num_reqs,
             dtype=torch.bool,
             device="cpu",
+        )
+        self._qsa_draft_is_prefilling_gpu = torch.zeros(
+            self.max_num_reqs,
+            dtype=torch.bool,
+            device=self.device,
         )
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
         if not self.uses_ngram_embedding:
@@ -227,6 +241,7 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             qsa_state_slot_ids=self.qsa_state_slot_ids[:num_reqs_padded],
             qsa_state_is_fresh=self.qsa_state_is_fresh[:num_reqs_padded],
             qsa_num_accepted_tokens=self.qsa_num_accepted_tokens[:num_reqs_padded],
+            qsa_is_prefilling=self._qsa_draft_is_prefilling_gpu[:num_reqs_padded],
         )
 
     def prepare_attn(
@@ -253,10 +268,10 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
         else:
             max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
 
-        is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
-        is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
-            input_batch.is_prefilling_np
-        )
+        self.qsa_is_prefilling.np[:num_reqs] = False
+        self.qsa_is_prefilling.np[: input_batch.num_reqs] = input_batch.is_prefilling_np
+        is_prefilling = self.qsa_is_prefilling.cpu[:num_reqs]
+        qsa_is_prefilling = self.qsa_is_prefilling.copy_to_gpu(num_reqs)
         if (
             _B12X_STATE_DIAGNOSTICS
             and not self._b12x_state_diagnostic_reported
@@ -316,6 +331,7 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             qsa_state_slot_ids=qsa_state_slot_ids,
             qsa_state_is_fresh=qsa_state_is_fresh,
             qsa_num_accepted_tokens=qsa_num_accepted_tokens,
+            qsa_is_prefilling=qsa_is_prefilling,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
