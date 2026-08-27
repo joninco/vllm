@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import os
 
 import pytest
@@ -159,6 +160,28 @@ def test_glm53_packed_c4_metadata_uses_parent_stride() -> None:
         lengths.cpu(), torch.tensor([0, 1, 1, 2, 2], dtype=torch.int32)
     )
 
+    dcp_positions = torch.tensor(
+        [0, 3, 7, 11, 15, 19, 31], dtype=torch.int64, device=device
+    )
+    expected_by_rank = (
+        [0, 1, 1, 1, 1, 2, 2],
+        [0, 0, 1, 1, 1, 1, 2],
+        [0, 0, 0, 1, 1, 1, 2],
+        [0, 0, 0, 0, 1, 1, 2],
+    )
+    for rank, expected in enumerate(expected_by_rank):
+        local_lengths = torch.empty(7, dtype=torch.int32, device=device)
+        pool_seq_lens(
+            dcp_positions,
+            local_lengths,
+            dcp_size=4,
+            dcp_rank=rank,
+            pool_interleave=1,
+        )
+        torch.testing.assert_close(
+            local_lengths.cpu(), torch.tensor(expected, dtype=torch.int32)
+        )
+
 
 def _packed_main_cache(
     *, device: torch.device, blocks: int, layers: int, block_size: int, layer: int
@@ -191,6 +214,33 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     assert indexer._decode_block_table.shape[0] == indexer.max_tokens
     assert indexer._decode_block_table.shape[0] > (
         indexer.max_seqs * (indexer.max_speculative_tokens + 1)
+    )
+
+
+def test_glm53_parent_table_width_tracks_dcp_sharding() -> None:
+    max_model_len = 524288
+    block_size = 2304
+
+    assert Glm5NextPooledIndexer._max_parent_table_width(
+        max_model_len,
+        0,
+        block_size,
+        dcp_world_size=1,
+    ) == math.ceil(max_model_len / block_size)
+    assert Glm5NextPooledIndexer._max_parent_table_width(
+        max_model_len,
+        0,
+        block_size,
+        dcp_world_size=4,
+    ) == math.ceil(max_model_len / (block_size * 4))
+    assert (
+        Glm5NextPooledIndexer._max_parent_table_width(
+            block_size,
+            1,
+            block_size,
+            dcp_world_size=1,
+        )
+        == 2
     )
 
 

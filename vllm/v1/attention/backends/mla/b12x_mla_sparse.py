@@ -86,6 +86,21 @@ def _glm_next_recipe_error(hf_config: object) -> str | None:
     return None
 
 
+def _glm_next_dcp_error(vllm_config: VllmConfig) -> str | None:
+    parallel_config = vllm_config.parallel_config
+    dcp_size = int(parallel_config.decode_context_parallel_size)
+    if dcp_size <= 1:
+        return None
+    interleave = int(parallel_config.cp_kv_cache_interleave_size)
+    if interleave % 4:
+        return (
+            "B12X GLM5Next C4 DCP requires cp_kv_cache_interleave_size divisible by 4"
+        )
+    if vllm_config.speculative_config is not None:
+        return "B12X GLM5Next C4 DCP does not yet support speculative decoding"
+    return None
+
+
 def _selected_index_block_stride_rows(
     kv_cache: torch.Tensor,
     *,
@@ -202,18 +217,8 @@ class B12xMLASparseBackend(AttentionBackend):
                     return recipe_error
                 if head_size != 512:
                     return "B12X GLM5Next sparse MLA requires head_size=512"
-                dcp_size = int(
-                    getattr(
-                        getattr(vllm_config, "parallel_config", None),
-                        "decode_context_parallel_size",
-                        1,
-                    )
-                )
-                if dcp_size > 1:
-                    return (
-                        "B12X GLM5Next sparse MLA does not support decode "
-                        "context parallelism"
-                    )
+                if dcp_error := _glm_next_dcp_error(vllm_config):
+                    return dcp_error
                 return None
             if head_size != 576:
                 return "B12X sparse MLA requires head_size=576"
@@ -288,22 +293,11 @@ class B12xMLASparseMetadataBuilder(
     ) -> None:
         hf_config = vllm_config.model_config.hf_text_config
         self.requires_glm_next_selector_metadata = _is_glm_next_config(hf_config)
-        configured_dcp_size = int(
-            getattr(
-                vllm_config.parallel_config,
-                "decode_context_parallel_size",
-                1,
-            )
-        )
-        if self.requires_glm_next_selector_metadata and configured_dcp_size > 1:
-            raise ValueError(
-                "B12X GLM5Next sparse MLA does not support decode context parallelism"
-            )
+        if self.requires_glm_next_selector_metadata and (
+            dcp_error := _glm_next_dcp_error(vllm_config)
+        ):
+            raise ValueError(dcp_error)
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        if self.requires_glm_next_selector_metadata and self.dcp_world_size > 1:
-            raise ValueError(
-                "B12X GLM5Next sparse MLA does not support decode context parallelism"
-            )
         self.supports_draft_decode_metadata_update = (
             self.requires_glm_next_selector_metadata
         )
@@ -450,6 +444,7 @@ class B12xMLASparseMetadataBuilder(
             if use_dcp and common.dcp_local_seq_lens is not None
             else common.seq_lens
         )
+        metadata.seq_lens = seq_lens
 
         if common.max_query_len <= 1 and num_tokens == common.num_reqs:
             per_token_lens = seq_lens[:num_tokens]
@@ -616,18 +611,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if self._is_glm_next:
             if recipe_error := _glm_next_recipe_error(hf_config):
                 raise ValueError(recipe_error)
-            configured_dcp_size = int(
-                getattr(
-                    vllm_config.parallel_config,
-                    "decode_context_parallel_size",
-                    1,
-                )
-            )
-            if configured_dcp_size > 1 or self.dcp_world_size > 1:
-                raise ValueError(
-                    "B12X GLM5Next sparse MLA does not support decode context "
-                    "parallelism"
-                )
+            if dcp_error := _glm_next_dcp_error(vllm_config):
+                raise ValueError(dcp_error)
             if head_size != 512:
                 raise ValueError("B12X GLM5Next sparse MLA requires head_size=512.")
         else:

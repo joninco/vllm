@@ -195,6 +195,7 @@ def _run_paged_topk(
     schedule_metadata: torch.Tensor | None,
     active_width: torch.Tensor | None,
     output: torch.Tensor,
+    scores: torch.Tensor | None,
     topk: int,
     shared_page_table: bool,
 ) -> None:
@@ -234,6 +235,7 @@ def _run_paged_topk(
         page_size=module.PAGED_INDEX_PAGE_SIZE,
         expected_num_q_heads=int(q.shape[1]),
         out_indices=output,
+        out_scores=scores,
     )
 
 
@@ -312,6 +314,7 @@ class B12xC4SparseIndexer(nn.Module):
         seq_lens: torch.Tensor,
         block_table: torch.Tensor,
         output: torch.Tensor,
+        scores: torch.Tensor | None = None,
         shared_page_table: bool,
         schedule_metadata: torch.Tensor | None = None,
         active_width: torch.Tensor | None = None,
@@ -321,6 +324,12 @@ class B12xC4SparseIndexer(nn.Module):
             raise ValueError(
                 "B12x C4 output must have shape "
                 f"{(int(q.shape[0]), self.topk_tokens)}, got {tuple(output.shape)}."
+            )
+        if scores is not None and (
+            scores.shape != output.shape or scores.dtype != torch.float32
+        ):
+            raise ValueError(
+                "B12x C4 scores must be float32 with the same shape as output"
             )
         output.fill_(-1)
         _run_paged_topk(
@@ -332,6 +341,7 @@ class B12xC4SparseIndexer(nn.Module):
             schedule_metadata=schedule_metadata,
             active_width=active_width,
             output=output,
+            scores=scores,
             topk=self.topk_tokens,
             shared_page_table=shared_page_table,
         )
@@ -397,6 +407,7 @@ class B12xC4SparseIndexer(nn.Module):
                     schedule_metadata=None,
                     active_width=None,
                     output=output,
+                    scores=None,
                     topk=self.topk_tokens,
                     shared_page_table=True,
                 )
@@ -429,6 +440,7 @@ class B12xC4SparseIndexer(nn.Module):
                 schedule_metadata=decode.schedule_metadata,
                 active_width=active_width,
                 output=output,
+                scores=None,
                 topk=self.topk_tokens,
                 shared_page_table=False,
             )

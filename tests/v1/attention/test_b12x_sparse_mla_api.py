@@ -104,7 +104,14 @@ def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
     )
 
 
-def _glm5_next_config(*, dcp_size: int = 1, **overrides: int) -> SimpleNamespace:
+def _glm5_next_config(
+    *,
+    dcp_size: int = 1,
+    cp_interleave: int = 1,
+    speculative: bool = False,
+    prefix_caching: bool = False,
+    **overrides: int,
+) -> SimpleNamespace:
     recipe = dict(
         model_type="glm5_next_text",
         kv_lora_rank=512,
@@ -119,7 +126,12 @@ def _glm5_next_config(*, dcp_size: int = 1, **overrides: int) -> SimpleNamespace
     recipe.update(overrides)
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=SimpleNamespace(**recipe)),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp_size,
+            cp_kv_cache_interleave_size=cp_interleave,
+        ),
+        speculative_config=object() if speculative else None,
+        cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
     )
 
 
@@ -178,7 +190,7 @@ def test_b12x_glm5_next_keeps_hybrid_manager_page_unsplit() -> None:
     )
 
 
-def test_b12x_glm5_next_rejects_dcp(monkeypatch) -> None:
+def test_b12x_glm5_next_rejects_unaligned_dcp(monkeypatch) -> None:
     monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
     with set_current_vllm_config(_glm5_next_config(dcp_size=2)):
         invalid_reasons = B12xMLASparseBackend.validate_configuration(
@@ -196,8 +208,80 @@ def test_b12x_glm5_next_rejects_dcp(monkeypatch) -> None:
         )
 
     assert invalid_reasons == [
-        "B12X GLM5Next sparse MLA does not support decode context parallelism"
+        "B12X GLM5Next C4 DCP requires cp_kv_cache_interleave_size divisible by 4"
     ]
+
+
+def test_b12x_glm5_next_accepts_pool_aligned_dcp_without_speculation(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    with set_current_vllm_config(_glm5_next_config(dcp_size=4, cp_interleave=4)):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=512,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="fp8",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == []
+
+
+def test_b12x_glm5_next_rejects_dcp_with_speculation(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    with set_current_vllm_config(
+        _glm5_next_config(dcp_size=4, cp_interleave=4, speculative=True)
+    ):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=512,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="fp8",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == [
+        "B12X GLM5Next C4 DCP does not yet support speculative decoding"
+    ]
+
+
+def test_b12x_glm5_next_accepts_dcp_with_prefix_caching(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    with set_current_vllm_config(
+        _glm5_next_config(
+            dcp_size=4,
+            cp_interleave=4,
+            prefix_caching=True,
+        )
+    ):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=512,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="fp8",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == []
 
 
 def test_b12x_glm5_next_rejects_dsv4_head_size(monkeypatch) -> None:
@@ -873,6 +957,7 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
     monkeypatch.setattr(b12x_indexer, "current_workspace_manager", lambda: _Workspace())
 
     output = torch.empty((3, 4), dtype=torch.int32)
+    scores = torch.empty((3, 4), dtype=torch.float32)
     b12x_indexer._run_paged_topk(
         q=torch.empty((3, 16, 128), dtype=torch.float8_e4m3fn),
         weights=torch.empty((3, 16, 1), dtype=torch.float32),
@@ -882,9 +967,12 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
         schedule_metadata=None,
         active_width=None,
         output=output,
+        scores=scores,
         topk=4,
         shared_page_table=True,
     )
+
+    assert calls["run"]["out_scores"] is scores
 
     builder = object.__new__(b12x_indexer.DeepseekV4B12xIndexerMetadataBuilder)
     builder.prefill_k_rows = 32768

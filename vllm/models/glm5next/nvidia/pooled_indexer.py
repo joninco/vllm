@@ -13,6 +13,7 @@ from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
+from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import LayerNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -20,6 +21,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     B12xC4SparseIndexer,
 )
+from vllm.v1.attention.backends.mla.b12x_indexer import _merge_dcp_topk
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
@@ -110,6 +112,16 @@ class Glm5NextPooledIndexer(nn.Module):
         self.max_model_len = int(vllm_config.model_config.max_model_len)
         self.max_speculative_tokens = int(vllm_config.num_speculative_tokens)
         self.block_size = int(cache_config.block_size)
+        parallel_config = vllm_config.parallel_config
+        self.dcp_world_size = int(parallel_config.decode_context_parallel_size)
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        token_interleave = int(parallel_config.cp_kv_cache_interleave_size)
+        if self.dcp_world_size > 1 and token_interleave % _POOL_SIZE:
+            raise ValueError(
+                "GLM C4 DCP requires cp_kv_cache_interleave_size to be "
+                f"divisible by {_POOL_SIZE}, got {token_interleave}"
+            )
+        self.pool_interleave = max(token_interleave // _POOL_SIZE, 1)
         if int(topk_indices_buffer.shape[0]) != self.max_tokens:
             raise ValueError("GLM token selection buffer has the wrong row capacity")
         if int(pool_topk_indices_buffer.shape[0]) != self.max_tokens:
@@ -205,6 +217,15 @@ class Glm5NextPooledIndexer(nn.Module):
             persistent=False,
         )
         self.register_buffer(
+            "_pool_scores",
+            torch.empty(
+                (self.max_tokens, _POOL_TOPK),
+                dtype=torch.float32,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
             "_pool_block_table",
             torch.empty((self.max_seqs, 1), dtype=torch.int32, device=device),
             persistent=False,
@@ -227,6 +248,17 @@ class Glm5NextPooledIndexer(nn.Module):
     @property
     def _aligned_max_seq_len(self) -> int:
         return math.ceil(self.max_model_len / _POOL_SIZE) * _POOL_SIZE
+
+    @staticmethod
+    def _max_parent_table_width(
+        max_model_len: int,
+        max_speculative_tokens: int,
+        block_size: int,
+        dcp_world_size: int,
+    ) -> int:
+        return math.ceil(
+            (max_model_len + max_speculative_tokens) / (block_size * dcp_world_size)
+        )
 
     @staticmethod
     def _index_cache_view(
@@ -282,8 +314,11 @@ class Glm5NextPooledIndexer(nn.Module):
     def bind_main_kv_cache(self, main_cache: torch.Tensor) -> None:
         index_cache, subpages, parent_stride_pages = self._index_cache_view(main_cache)
         block_size = int(main_cache.shape[1])
-        parent_table_width = math.ceil(
-            (self._aligned_max_seq_len + self.max_speculative_tokens) / block_size
+        parent_table_width = self._max_parent_table_width(
+            self._aligned_max_seq_len,
+            self.max_speculative_tokens,
+            block_size,
+            self.dcp_world_size,
         )
         pool_table_width = parent_table_width * subpages
         device = main_cache.device
@@ -405,9 +440,16 @@ class Glm5NextPooledIndexer(nn.Module):
             parent_stride_pages=self._parent_stride_pages,
         )
         seq_lens = self._pool_seq_lens[:live_rows]
-        pool_seq_lens(positions[:live_rows], seq_lens)
+        pool_seq_lens(
+            positions[:live_rows],
+            seq_lens,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            pool_interleave=self.pool_interleave,
+        )
         pool_ids = self.pool_topk_indices_buffer[:rows]
         pool_ids.fill_(-1)
+        pool_scores = self._pool_scores[:rows] if self.dcp_world_size > 1 else None
 
         if decode_rows:
             decode_table = self._decode_block_table[:decode_rows]
@@ -423,8 +465,17 @@ class Glm5NextPooledIndexer(nn.Module):
                 seq_lens=seq_lens[:decode_rows],
                 block_table=decode_table,
                 output=pool_ids[:decode_rows],
+                scores=(pool_scores[:decode_rows] if pool_scores is not None else None),
                 shared_page_table=False,
             )
+            if pool_scores is not None:
+                _merge_dcp_topk(
+                    pool_ids[:decode_rows],
+                    pool_scores[:decode_rows],
+                    self.dcp_rank,
+                    self.dcp_world_size,
+                    self.pool_interleave,
+                )
 
         if decode_rows < live_rows:
             query_lens_cpu = main_metadata.prefill_query_lens_cpu
@@ -444,8 +495,21 @@ class Glm5NextPooledIndexer(nn.Module):
                     seq_lens=seq_lens[row_start:row_end],
                     block_table=shared_table,
                     output=pool_ids[row_start:row_end],
+                    scores=(
+                        pool_scores[row_start:row_end]
+                        if pool_scores is not None
+                        else None
+                    ),
                     shared_page_table=True,
                 )
+                if pool_scores is not None:
+                    _merge_dcp_topk(
+                        pool_ids[row_start:row_end],
+                        pool_scores[row_start:row_end],
+                        self.dcp_rank,
+                        self.dcp_world_size,
+                        self.pool_interleave,
+                    )
                 row_start = row_end
             if row_start != live_rows:
                 raise RuntimeError(

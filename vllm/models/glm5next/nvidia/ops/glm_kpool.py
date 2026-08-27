@@ -436,28 +436,54 @@ def gather_c4_block_table_rows(
 
 @triton.jit
 def _pool_seq_lens_kernel(
-    positions, output, rows, POOL_SIZE: tl.constexpr, BLOCK: tl.constexpr
+    positions,
+    output,
+    rows,
+    dcp_size,
+    dcp_rank,
+    pool_interleave,
+    POOL_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = row < rows
     position = tl.load(positions + row, mask=mask, other=-1).to(tl.int64)
-    pool_len = (position + 1) // POOL_SIZE
-    tl.store(output + row, pool_len, mask=mask)
+    global_pool_len = (position + 1) // POOL_SIZE
+    rounds = global_pool_len // (dcp_size * pool_interleave)
+    remainder = global_pool_len % (dcp_size * pool_interleave)
+    remainder = tl.maximum(remainder - dcp_rank * pool_interleave, 0)
+    remainder = tl.minimum(remainder, pool_interleave)
+    local_pool_len = rounds * pool_interleave + remainder
+    tl.store(output + row, local_pool_len, mask=mask)
 
 
-def pool_seq_lens(positions: torch.Tensor, output: torch.Tensor) -> None:
-    """Write the number of complete four-token pools visible to each row."""
+def pool_seq_lens(
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    pool_interleave: int = 1,
+) -> None:
+    """Write the rank-local number of complete four-token pools per row."""
     rows = int(positions.shape[0])
     if positions.dtype != torch.int64 or positions.ndim != 1:
         raise TypeError("GLM positions must be int64 [rows]")
     if output.dtype != torch.int32 or output.shape != (rows,):
         raise ValueError("GLM pool sequence-length output must be int32 [rows]")
+    if dcp_size < 1 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError("GLM pool DCP rank must be within the DCP world")
+    if pool_interleave < 1:
+        raise ValueError("GLM pool interleave must be positive")
     if rows:
         block = 256
         _pool_seq_lens_kernel[(triton.cdiv(rows, block),)](
             positions,
             output,
             rows,
+            dcp_size,
+            dcp_rank,
+            pool_interleave,
             POOL_SIZE=_POOL_SIZE,
             BLOCK=block,
             num_warps=4,
