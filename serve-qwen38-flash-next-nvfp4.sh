@@ -192,6 +192,8 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 export NCCL_PROTO="${NCCL_PROTO:-LL,LL128,Simple}"
+export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
+export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
 export INSTANTTENSOR_BACKEND="${INSTANTTENSOR_BACKEND:-BUFFERED}"
@@ -258,7 +260,6 @@ command=(
   --device-ids "${DEVICE_IDS}"
   --tensor-parallel-size "${TP_SIZE}"
   --pipeline-parallel-size 1
-  --disable-custom-all-reduce
   --mamba-cache-mode align
   --enable-prefix-caching
   --enable-chunked-prefill
