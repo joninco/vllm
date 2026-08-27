@@ -272,6 +272,7 @@ command=(
   --max-num-seqs "${MAX_NUM_SEQS}"
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --speculative-config "${speculative_config}"
+  --gdn-decode-kernel b12x
   --linear-backend b12x
   --moe-backend b12x
   --no-enable-flashinfer-autotune

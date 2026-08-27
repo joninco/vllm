@@ -16,6 +16,10 @@ import vllm.models.qwen3_8_flash_next.hyperconnection as hyperconnection_module
 import vllm.models.qwen3_8_flash_next.model as model_module
 import vllm.models.qwen3_8_flash_next.ple_layer as ple_layer_module
 from vllm.config.compilation import CompilationMode
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+    _resolve_gdn_decode_kernel,
+)
 from vllm.models.qwen3_8_flash_next.ple_layer import Qwen3_8FlashNextPLELayer
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
@@ -84,6 +88,19 @@ def _set_tensor_attributes(module: nn.Module, *names: str) -> None:
 def test_ple_cpu_offload_env_alias(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
     assert ple_layer_module._resolve_ple_table_memory(None) == "mapped_host"
+
+
+def test_qwen3_8_prefers_b12x_gdn_unless_explicitly_overridden(monkeypatch) -> None:
+    config = SimpleNamespace(additional_config={})
+    monkeypatch.delenv("VLLM_GDN_DECODE_KERNEL", raising=False)
+    assert _resolve_gdn_decode_kernel(config, prefer_b12x=True) == ("b12x", False)
+    assert _resolve_gdn_decode_kernel(config, prefer_b12x=False) == ("cuda", False)
+
+    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "triton")
+    assert _resolve_gdn_decode_kernel(config, prefer_b12x=True) == ("triton", True)
+
+    config.additional_config["gdn_decode_kernel"] = "b12x"
+    assert _resolve_gdn_decode_kernel(config, prefer_b12x=False) == ("b12x", True)
 
 
 def test_explicit_ple_table_memory_overrides_env_alias(monkeypatch) -> None:
@@ -316,3 +333,130 @@ def test_ple_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
     assert layer.kv_cache[0] is not conv_state
     assert plan.bind_kwargs["conv_state"] is layer.kv_cache[0]
     assert layer._binding is plan.binding
+
+
+def test_b12x_gdn_bind_preserves_exact_aligned_page_stride(monkeypatch) -> None:
+    shapes = ((2_560, 5), (12, 128, 128))
+    dtypes = (torch.bfloat16, torch.float32)
+    raw_cache = _allocate_aligned_mamba_cache(
+        layer_name="model.layers.0.linear_attn",
+        shapes=shapes,
+        dtypes=dtypes,
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    plan = _RecordingPlan()
+    planned_slots: list[int] = []
+
+    monkeypatch.setattr(QwenGatedDeltaNetAttention, "get_state_shape", lambda _: shapes)
+    monkeypatch.setattr(QwenGatedDeltaNetAttention, "get_state_dtype", lambda _: dtypes)
+
+    def make_plan(_self, max_state_slots: int):
+        planned_slots.append(max_state_slots)
+        return plan
+
+    monkeypatch.setattr(QwenGatedDeltaNetAttention, "_make_b12x_gdn_plan", make_plan)
+    layer = QwenGatedDeltaNetAttention.__new__(QwenGatedDeltaNetAttention)
+    nn.Module.__init__(layer)
+    layer.gdn_decode_kernel = "b12x"
+    layer._b12x_binding = None
+    layer._b12x_plan = None
+    _set_tensor_attributes(
+        layer,
+        "_b12x_scratch",
+        "_b12x_mixed_qkv",
+        "_b12x_a",
+        "_b12x_b",
+        "_b12x_z",
+        "_b12x_query_start_loc",
+        "_b12x_num_accepted_tokens",
+        "_b12x_state_indices",
+        "_b12x_num_seqs",
+        "_b12x_num_tokens",
+        "_b12x_output",
+    )
+    layer.A_log = nn.Parameter(torch.empty(0))
+    layer.dt_bias = nn.Parameter(torch.empty(0))
+    layer.norm = SimpleNamespace(weight=torch.empty(0))
+
+    layer.bind_kv_cache(raw_cache)
+
+    conv_state, recurrent_state = layer.kv_cache
+    assert conv_state.stride() == (409_088, 5, 1)
+    assert recurrent_state.stride() == (204_544, 16_384, 128, 1)
+    assert recurrent_state.storage_offset() == 6_400
+    assert recurrent_state.data_ptr() == raw_cache.data_ptr() + 25_600
+    assert not recurrent_state.is_contiguous()
+    assert recurrent_state[0].is_contiguous()
+    assert planned_slots == [2]
+    assert plan.bind_kwargs is not None
+    assert plan.bind_kwargs["recurrent_state"] is recurrent_state
+    assert layer._b12x_binding is plan.binding
+
+    layer.unbind_kv_cache()
+
+    assert layer.kv_cache == ()
+    assert layer._b12x_plan is None
+    assert layer._b12x_binding is None
+
+
+def test_b12x_gdn_stages_speculative_rollback_metadata() -> None:
+    layer = QwenGatedDeltaNetAttention.__new__(QwenGatedDeltaNetAttention)
+    nn.Module.__init__(layer)
+    layer._b12x_max_tokens = 6
+    layer._b12x_max_seqs = 2
+    layer._b12x_state_index_columns = 3
+    layer._b12x_binding = object()
+    layer.layer_norm_epsilon = 1e-6
+    layer.head_k_dim = 128
+    layer._b12x_mixed_qkv = torch.empty(6, 8)
+    layer._b12x_a = torch.empty(6, 2)
+    layer._b12x_b = torch.empty(6, 2)
+    layer._b12x_z = torch.empty(6, 2, 4)
+    layer._b12x_output = torch.full((6, 2, 4), 17.0)
+    layer._b12x_query_start_loc = torch.full((3,), -1, dtype=torch.int32)
+    layer._b12x_num_accepted_tokens = torch.full((2,), -1, dtype=torch.int32)
+    layer._b12x_state_indices = torch.full((2, 3), -1, dtype=torch.int32)
+    layer._b12x_num_seqs = torch.zeros(1, dtype=torch.int32)
+    layer._b12x_num_tokens = torch.zeros(1, dtype=torch.int32)
+    calls: list[tuple[object, float, float]] = []
+
+    def run(binding, *, eps: float, scale: float) -> None:
+        calls.append((binding, eps, scale))
+
+    layer._b12x_gdn_api = SimpleNamespace(run=run)
+    mixed_qkv = torch.arange(40, dtype=torch.float32).reshape(5, 8)
+    a = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    b = a + 20
+    output_gate = torch.arange(40, dtype=torch.float32).reshape(5, 2, 4)
+    state_indices = torch.tensor([[7, 8, 9], [4, 5, 6]], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 3, 5], dtype=torch.int32)
+    accepted = torch.tensor([1, 2], dtype=torch.int32)
+    core_attn_out = torch.zeros(5, 2, 4)
+
+    layer._run_b12x_gdn_decode_post_conv(
+        mixed_qkv=mixed_qkv,
+        b=b,
+        a=a,
+        output_gate=output_gate,
+        core_attn_out=core_attn_out,
+        state_indices=state_indices,
+        query_start_loc=query_start_loc,
+        num_accepted_tokens=accepted,
+        num_requests=2,
+    )
+
+    torch.testing.assert_close(layer._b12x_mixed_qkv[:5], mixed_qkv)
+    torch.testing.assert_close(layer._b12x_a[:5], a)
+    torch.testing.assert_close(layer._b12x_b[:5], b)
+    torch.testing.assert_close(layer._b12x_z[:5], output_gate)
+    torch.testing.assert_close(layer._b12x_query_start_loc, query_start_loc)
+    torch.testing.assert_close(layer._b12x_num_accepted_tokens, accepted)
+    torch.testing.assert_close(layer._b12x_state_indices, state_indices)
+    torch.testing.assert_close(
+        layer._b12x_num_seqs, torch.tensor([2], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        layer._b12x_num_tokens, torch.tensor([5], dtype=torch.int32)
+    )
+    torch.testing.assert_close(core_attn_out, torch.full_like(core_attn_out, 17.0))
+    assert calls == [(layer._b12x_binding, 1e-6, 128**-0.5)]

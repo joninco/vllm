@@ -3,7 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import os
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from einops import rearrange
@@ -59,6 +59,7 @@ from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
+from vllm.utils.b12x import get_b12x_gdn_decode
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -88,6 +89,31 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
+
+def _resolve_gdn_decode_kernel(
+    vllm_config: VllmConfig, prefer_b12x: bool
+) -> tuple[str, bool]:
+    additional_config = vllm_config.additional_config
+    configured = (
+        additional_config.get("gdn_decode_kernel")
+        if isinstance(additional_config, dict)
+        else None
+    )
+    explicitly_configured = (
+        configured is not None or "VLLM_GDN_DECODE_KERNEL" in os.environ
+    )
+    if configured is not None:
+        requested = str(configured).strip().lower()
+    elif "VLLM_GDN_DECODE_KERNEL" in os.environ:
+        requested = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
+    elif prefer_b12x:
+        requested = "b12x"
+    else:
+        requested = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
+    if requested not in ("b12x", "cuda", "triton"):
+        raise ValueError(f"Unsupported GDN decode kernel: {requested!r}")
+    return requested, explicitly_configured
 
 
 def _resolve_gdn_prefill_backend(
@@ -368,6 +394,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         prefix: str = "",
         gqa_interleaved_layout=False,
         reduce_results: bool = True,
+        prefer_b12x_gdn_decode: bool = False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
@@ -489,25 +516,182 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
-        self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
+        (
+            self.gdn_decode_kernel,
+            gdn_decode_kernel_is_explicit,
+        ) = _resolve_gdn_decode_kernel(
+            vllm_config,
+            prefer_b12x_gdn_decode,
+        )
         if self.gdn_decode_kernel == "cuda":
             reason = self._fused_gdn_decode_unsupported_reason(vllm_config)
             if reason is not None:
-                if "VLLM_GDN_DECODE_KERNEL" in os.environ:
+                if gdn_decode_kernel_is_explicit:
                     raise ValueError(
-                        f"VLLM_GDN_DECODE_KERNEL=cuda is not supported: {reason}"
+                        f"GDN decode kernel 'cuda' is not supported: {reason}"
                     )
                 logger.info_once(
                     "Falling back to the Triton GDN decode path: %s", reason
                 )
                 self.gdn_decode_kernel = "triton"
-        self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
+        self.enable_fused_gdn_decode = self.gdn_decode_kernel in ("b12x", "cuda")
+        self._b12x_gdn_api: Any | None = None
+        self._b12x_plan = None
+        self._b12x_binding = None
+        if self.gdn_decode_kernel == "b12x":
+            self._initialize_b12x_gdn_decode(vllm_config)
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def _initialize_b12x_gdn_decode(self, vllm_config: VllmConfig) -> None:
+        if self.gqa_interleaved_layout:
+            raise RuntimeError(
+                "GDN decode kernel 'b12x' requires non-interleaved Q/K/V/Z projections"
+            )
+        api = get_b12x_gdn_decode()
+        if api is None:
+            raise RuntimeError(
+                "GDN decode kernel 'b12x' requires b12x.sequence.gdn_decode"
+            )
+        device = torch.device(current_platform.current_device())
+        if not api.is_supported(device):
+            raise RuntimeError(
+                "GDN decode kernel 'b12x' requires an SM120 or SM121 CUDA device"
+            )
+
+        max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        state_index_columns = max(1, self.num_spec + 1)
+        max_tokens = max_seqs * state_index_columns
+        local_key_heads = divide(self.num_k_heads, self.tp_size)
+        local_value_heads = divide(self.num_v_heads, self.tp_size)
+
+        self._b12x_gdn_api = api
+        self._b12x_max_tokens = max_tokens
+        self._b12x_max_seqs = max_seqs
+        self._b12x_state_index_columns = state_index_columns
+        self._b12x_local_key_heads = local_key_heads
+        self._b12x_local_value_heads = local_value_heads
+
+        provisional = self._make_b12x_gdn_plan(max_state_slots=1)
+        caps = provisional.caps
+        factory = dict(device=device, dtype=torch.bfloat16)
+        self.register_buffer(
+            "_b12x_mixed_qkv",
+            torch.empty(max_tokens, caps.packed_qkv_width, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_a",
+            torch.empty(max_tokens, local_value_heads, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_b",
+            torch.empty(max_tokens, local_value_heads, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_z",
+            torch.empty(max_tokens, local_value_heads, self.head_v_dim, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_output",
+            torch.empty(max_tokens, local_value_heads, self.head_v_dim, **factory),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_query_start_loc",
+            torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_num_accepted_tokens",
+            torch.ones(max_seqs, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_state_indices",
+            torch.zeros(
+                max_seqs,
+                state_index_columns,
+                dtype=torch.int32,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_num_seqs",
+            torch.zeros(1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_b12x_num_tokens",
+            torch.zeros(1, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        scratch_spec = provisional.scratch_specs()[0]
+        self.register_buffer(
+            "_b12x_scratch",
+            torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
+            persistent=False,
+        )
+
+    def _make_b12x_gdn_plan(self, max_state_slots: int):
+        api = self._b12x_gdn_api
+        if api is None:
+            raise RuntimeError("b12x GDN decode was not initialized")
+        return api.plan(
+            api.Caps(
+                device=current_platform.current_device(),
+                max_tokens=self._b12x_max_tokens,
+                max_seqs=self._b12x_max_seqs,
+                max_state_slots=max_state_slots,
+                key_heads=self._b12x_local_key_heads,
+                value_heads=self._b12x_local_value_heads,
+                key_head_dim=self.head_k_dim,
+                value_head_dim=self.head_v_dim,
+                state_index_columns=self._b12x_state_index_columns,
+                model_dtype=self.model_config.dtype,
+                state_dtype=self.get_state_dtype()[1],
+                gate_activation=self.norm.activation,
+                qk_l2norm=True,
+            )
+        )
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        if self.gdn_decode_kernel != "b12x":
+            return
+        recurrent_state = self.kv_cache[1]
+        plan = self._make_b12x_gdn_plan(max_state_slots=recurrent_state.shape[0])
+        self._b12x_plan = plan
+        self._b12x_binding = plan.bind(
+            scratch=self._b12x_scratch,
+            mixed_qkv=self._b12x_mixed_qkv,
+            a=self._b12x_a,
+            b=self._b12x_b,
+            z=self._b12x_z,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            norm_weight=self.norm.weight,
+            recurrent_state=recurrent_state,
+            query_start_loc=self._b12x_query_start_loc,
+            num_accepted_tokens=self._b12x_num_accepted_tokens,
+            state_indices=self._b12x_state_indices,
+            num_seqs=self._b12x_num_seqs,
+            num_tokens=self._b12x_num_tokens,
+            output=self._b12x_output,
+        )
+
+    def unbind_kv_cache(self) -> None:
+        self._b12x_binding = None
+        self._b12x_plan = None
+        super().unbind_kv_cache()
 
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
@@ -517,7 +701,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.gqa_interleaved_layout
             or self.head_k_dim != 128
             or self.head_v_dim != 128
-            or self.norm.activation != "silu"
+            or self.norm.activation not in ("silu", "sigmoid")
             or vllm_config.model_config.dtype != torch.bfloat16
             or conv_state_dtype != torch.bfloat16
             or recurrent_state_dtype not in FUSED_GDN_STATE_DTYPES
@@ -525,8 +709,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ):
             return (
                 "the fused CUDA kernel requires a BF16 GDN model with "
-                "K=V=128, SiLU gating, non-interleaved GQA layout, BF16 "
-                "convolution cache, BF16 or FP32 recurrent state, and a "
+                "K=V=128, SiLU or sigmoid gating, non-interleaved GQA "
+                "layout, BF16 convolution cache, BF16 or FP32 recurrent "
+                "state, and a "
                 "GPU with compute capability 8.0+"
             )
         if not hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp"):
@@ -1766,6 +1951,140 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             norm_eps=self.layer_norm_epsilon,
         )
 
+    def _run_b12x_gdn_decode_post_conv(
+        self,
+        *,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        output_gate: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_accepted_tokens: torch.Tensor | None,
+        num_requests: int,
+    ) -> None:
+        binding = self._b12x_binding
+        api = self._b12x_gdn_api
+        if binding is None or api is None:
+            raise RuntimeError("b12x GDN KV cache was not bound before inference")
+        num_input_tokens = mixed_qkv.shape[0]
+        if (
+            num_input_tokens > self._b12x_max_tokens
+            or num_requests > self._b12x_max_seqs
+            or state_indices.shape[1] > self._b12x_state_index_columns
+        ):
+            raise ValueError(
+                "b12x GDN capacity exceeded: "
+                f"tokens={num_input_tokens}/{self._b12x_max_tokens}, "
+                f"requests={num_requests}/{self._b12x_max_seqs}, "
+                f"state_columns={state_indices.shape[1]}/"
+                f"{self._b12x_state_index_columns}"
+            )
+
+        self._b12x_mixed_qkv[:num_input_tokens].copy_(mixed_qkv)
+        self._b12x_a[:num_input_tokens].copy_(a)
+        self._b12x_b[:num_input_tokens].copy_(b)
+        self._b12x_z[:num_input_tokens].copy_(output_gate)
+        self._b12x_query_start_loc.zero_()
+        self._b12x_query_start_loc[: num_requests + 1].copy_(
+            query_start_loc[: num_requests + 1]
+        )
+        self._b12x_num_accepted_tokens.fill_(1)
+        if num_accepted_tokens is not None:
+            self._b12x_num_accepted_tokens[:num_requests].copy_(
+                num_accepted_tokens[:num_requests]
+            )
+        self._b12x_state_indices.zero_()
+        self._b12x_state_indices[:num_requests, : state_indices.shape[1]].copy_(
+            state_indices[:num_requests]
+        )
+        self._b12x_num_seqs.fill_(num_requests)
+        self._b12x_num_tokens.copy_(query_start_loc[num_requests : num_requests + 1])
+
+        api.run(
+            binding,
+            eps=self.layer_norm_epsilon,
+            scale=self.head_k_dim**-0.5,
+        )
+        core_attn_out[:num_input_tokens].copy_(self._b12x_output[:num_input_tokens])
+
+    def _forward_core_decode_b12x_fused_norm(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        output_gate: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> None:
+        is_spec_decode = attn_metadata.spec_sequence_masks is not None
+        if is_spec_decode:
+            state_indices = attn_metadata.spec_state_indices_tensor
+            query_start_loc = attn_metadata.spec_query_start_loc
+            num_accepted_tokens = attn_metadata.num_accepted_tokens
+            num_requests = attn_metadata.num_spec_decodes
+            assert state_indices is not None
+            assert query_start_loc is not None
+            assert num_accepted_tokens is not None
+            conv_state_indices = state_indices[:num_requests, 0]
+        else:
+            non_spec_state_indices = attn_metadata.non_spec_state_indices_tensor
+            query_start_loc = attn_metadata.non_spec_query_start_loc
+            num_accepted_tokens = None
+            num_requests = attn_metadata.num_decodes
+            assert non_spec_state_indices is not None
+            assert query_start_loc is not None
+            state_indices = non_spec_state_indices[:, None]
+            conv_state_indices = non_spec_state_indices[
+                : attn_metadata.num_actual_tokens
+            ]
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        if is_spec_decode:
+            assert num_accepted_tokens is not None
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv[:num_actual_tokens],
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=conv_state_indices,
+                num_accepted_tokens=num_accepted_tokens[:num_requests],
+                query_start_loc=query_start_loc[: num_requests + 1],
+                max_query_len=state_indices.size(1),
+                validate_data=False,
+            )
+        else:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv[:num_actual_tokens],
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=conv_state_indices,
+                validate_data=False,
+            )
+        self._run_b12x_gdn_decode_post_conv(
+            mixed_qkv=mixed_qkv,
+            b=b[:num_actual_tokens],
+            a=a[:num_actual_tokens],
+            output_gate=output_gate[:num_actual_tokens],
+            core_attn_out=core_attn_out,
+            state_indices=state_indices,
+            query_start_loc=query_start_loc,
+            num_accepted_tokens=num_accepted_tokens,
+            num_requests=num_requests,
+        )
+
     def _forward_core_fused_norm_packed(
         self,
         mixed_qkvz: torch.Tensor,
@@ -1813,6 +2132,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and state_indices is not None
             and state_indices.size(1) <= MAX_FUSED_GDN_MTP_TOKENS
             and hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
+        )
+
+    def _can_use_b12x_gdn_decode(self, attn_metadata: GDNAttentionMetadata) -> bool:
+        if (
+            self.gdn_decode_kernel != "b12x"
+            or self._b12x_binding is None
+            or attn_metadata.num_prefills != 0
+        ):
+            return False
+        if attn_metadata.spec_sequence_masks is not None:
+            state_indices = attn_metadata.spec_state_indices_tensor
+            return (
+                attn_metadata.num_decodes == 0
+                and attn_metadata.num_spec_decodes > 0
+                and state_indices is not None
+                and state_indices.size(1) <= self._b12x_state_index_columns
+            )
+        return (
+            attn_metadata.num_spec_decodes == 0
+            and attn_metadata.num_decodes > 0
+            and attn_metadata.non_spec_state_indices_tensor is not None
         )
 
     def _rms_norm_gated_cuda(
@@ -1867,6 +2207,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if self._can_use_b12x_gdn_decode(attn_metadata):
+            self._forward_core_decode_b12x_fused_norm(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                output_gate=output_gate,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            )
+            return
         if (
             self._can_use_fused_gdn_mtp_decode(attn_metadata)
             and attn_metadata.num_prefills == 0

@@ -767,6 +767,7 @@ class EngineArgs:
 
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
+    gdn_decode_kernel: Literal["b12x", "cuda", "triton"] | None = None
     kda_prefill_backend: Literal["auto", "triton", "flashkda"] | None = None
 
     def __post_init__(self):
@@ -1725,6 +1726,13 @@ class EngineArgs:
             help="Select GDN prefill backend.",
         )
         parser.add_argument(
+            "--gdn-decode-kernel",
+            dest="gdn_decode_kernel",
+            choices=["b12x", "cuda", "triton"],
+            default=None,
+            help="Select GDN decode kernel.",
+        )
+        parser.add_argument(
             "--kda-prefill-backend",
             dest="kda_prefill_backend",
             choices=["auto", "triton", "flashkda"],
@@ -2530,6 +2538,8 @@ class EngineArgs:
 
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
+        if self.gdn_decode_kernel is not None:
+            self.additional_config["gdn_decode_kernel"] = self.gdn_decode_kernel
         if self.kda_prefill_backend is not None:
             self.additional_config["kda_prefill_backend"] = self.kda_prefill_backend
 

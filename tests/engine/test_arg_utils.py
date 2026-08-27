@@ -351,6 +351,21 @@ def test_compilation_config():
     )
 
 
+def test_gdn_decode_kernel():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    assert EngineArgs.from_cli_args(args).gdn_decode_kernel is None
+
+    for kernel in ("b12x", "cuda", "triton"):
+        args = parser.parse_args(["--gdn-decode-kernel", kernel])
+        assert EngineArgs.from_cli_args(args).gdn_decode_kernel == kernel
+
+    parser.exit_on_error = False
+    with pytest.raises(ArgumentError):
+        parser.parse_args(["--gdn-decode-kernel", "invalid"])
+
+
 def test_attention_config():
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from importlib import import_module
 from itertools import islice
@@ -15,7 +14,6 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -81,27 +79,6 @@ from .hyperconnection import (
     HyperConnectionWorkspace,
 )
 from .ple_layer import Qwen3_8FlashNextPLELayer
-
-_B12X_FINITE_DIAGNOSTICS = os.getenv(
-    "VLLM_QWEN38_B12X_FINITE_DIAGNOSTICS", "0"
-).strip().lower() in ("1", "true")
-
-
-def _assert_finite(
-    tensor: torch.Tensor,
-    label: str,
-    query_start_loc: torch.Tensor | None,
-) -> None:
-    if not _B12X_FINITE_DIAGNOSTICS:
-        return
-    finite = torch.isfinite(tensor).flatten(1).all(dim=1)
-    is_padding = get_forward_context().is_padding
-    if is_padding is not None:
-        finite = finite | is_padding[: tensor.shape[0]]
-    if query_start_loc is not None:
-        row = torch.arange(tensor.shape[0], device=tensor.device)
-        finite = finite | (row >= query_start_loc[-1])
-    torch._assert_async(finite.all(), label)
 
 
 def _remap_qsa_cache_scale_name(name: str, qsa_layer_ids: frozenset[int]) -> str:
@@ -196,6 +173,7 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
+                prefer_b12x_gdn_decode=True,
             )
         elif layer_type == "full_attention":
             if getattr(config, "indexer_n_heads", None) is None:
@@ -277,12 +255,6 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
             hidden_states = hidden_states + self.ple(
                 hidden_states, input_ids, query_start_loc, ngram_context
             )
-            _assert_finite(
-                hidden_states,
-                f"layer {self.layer_idx} PLE output",
-                query_start_loc,
-            )
-
         if prev_block_output is not None and prev_injection is not None:
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
                 hidden_states, prev_block_output, prev_injection
@@ -290,43 +262,16 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
-        _assert_finite(
-            block_input,
-            f"layer {self.layer_idx} attention input",
-            query_start_loc,
-        )
-
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
         else:
             attn_out = self.self_attn(hidden_states=block_input, positions=positions)
-        _assert_finite(
-            attn_out,
-            f"layer {self.layer_idx} attention output",
-            query_start_loc,
-        )
-
         hidden_states, block_input, injection = (
             self.mlp_hyper_connection.combine_and_mix(
                 hidden_states, attn_out, injection
             )
         )
-        _assert_finite(
-            hidden_states,
-            f"layer {self.layer_idx} hidden state",
-            query_start_loc,
-        )
-        _assert_finite(
-            block_input,
-            f"layer {self.layer_idx} MLP input",
-            query_start_loc,
-        )
         mlp_out = self.mlp(block_input)
-        _assert_finite(
-            mlp_out,
-            f"layer {self.layer_idx} MLP output",
-            query_start_loc,
-        )
         return hidden_states, mlp_out, injection
 
 
