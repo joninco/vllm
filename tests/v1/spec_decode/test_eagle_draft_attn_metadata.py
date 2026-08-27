@@ -37,10 +37,14 @@ def _make_fake_speculator(
     fake_input_buffers = SimpleNamespace(
         query_start_loc=torch.zeros(max_num_reqs + 1, dtype=torch.int32),
         seq_lens=torch.zeros(max_num_reqs, dtype=torch.int32),
+        dcp_local_seq_lens=torch.zeros(max_num_reqs, dtype=torch.int32),
     )
     fake_block_tables = SimpleNamespace(
         input_block_tables=[torch.zeros(max_num_reqs, 4, dtype=torch.int32)],
         slot_mappings=torch.zeros(1, max_num_tokens, dtype=torch.int64),
+        cp_size=1,
+        cp_rank=0,
+        cp_interleave=1,
     )
     return SimpleNamespace(
         arange=torch.arange(max_num_reqs + 1, dtype=torch.int32, device="cpu"),
@@ -158,3 +162,37 @@ def test_build_draft_attn_metadata_forwards_model_specific_metadata():
         "draft_index": 1,
     }
     assert captured["model_specific_attn_metadata"] is model_metadata
+
+
+def test_build_draft_attn_metadata_populates_dcp_local_seq_lens():
+    fake = _make_fake_speculator()
+    fake.block_tables.cp_size = 4
+    fake.block_tables.cp_rank = 2
+    fake.block_tables.cp_interleave = 1
+    fake.input_buffers.seq_lens[:4] = torch.tensor([1, 2, 5, 8])
+
+    def fake_prepare(out, seq_lens, num_reqs, dcp_size, dcp_rank, interleave):
+        for index in range(num_reqs):
+            length = int(seq_lens[index])
+            rounds, remainder = divmod(length, dcp_size * interleave)
+            owned_remainder = min(max(remainder - dcp_rank * interleave, 0), interleave)
+            out[index] = rounds * interleave + owned_remainder
+
+    with patch.object(
+        base_speculator,
+        "prepare_dcp_local_seq_lens",
+        fake_prepare,
+    ):
+        captured = _run_build(
+            fake,
+            num_reqs=4,
+            num_reqs_padded=4,
+            num_tokens_padded=4,
+            base=torch.tensor([1, 2, 5, 8], dtype=torch.int32),
+            step=1,
+        )
+
+    assert torch.equal(
+        captured["dcp_local_seq_lens"],
+        torch.tensor([0, 0, 1, 2], dtype=torch.int32),
+    )

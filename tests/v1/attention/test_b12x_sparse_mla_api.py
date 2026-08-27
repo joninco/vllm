@@ -234,7 +234,7 @@ def test_b12x_glm5_next_accepts_pool_aligned_dcp_without_speculation(
     assert invalid_reasons == []
 
 
-def test_b12x_glm5_next_rejects_dcp_with_speculation(monkeypatch) -> None:
+def test_b12x_glm5_next_accepts_dcp_with_speculation(monkeypatch) -> None:
     monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
     with set_current_vllm_config(
         _glm5_next_config(dcp_size=4, cp_interleave=4, speculative=True)
@@ -253,9 +253,7 @@ def test_b12x_glm5_next_rejects_dcp_with_speculation(monkeypatch) -> None:
             attn_type="decoder",
         )
 
-    assert invalid_reasons == [
-        "B12X GLM5Next C4 DCP does not yet support speculative decoding"
-    ]
+    assert invalid_reasons == []
 
 
 def test_b12x_glm5_next_accepts_dcp_with_prefix_caching(monkeypatch) -> None:
