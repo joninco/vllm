@@ -217,7 +217,6 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             self.hyper_connection_mixer = GatedResidual(
                 hc_config,
                 self.hyper_connection_workspace,
-                combined_slot=0,
                 use_combine=False,
                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
             )

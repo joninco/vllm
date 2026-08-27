@@ -10,6 +10,7 @@ from typing import Any
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -17,6 +18,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -37,6 +39,8 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from .config import Qwen3_8FlashNextTextConfig
 
+logger = init_logger(__name__)
+
 
 def _b12x_module(name: str) -> Any:
     api = {
@@ -49,6 +53,19 @@ def _b12x_module(name: str) -> Any:
             "install the b12x serving extra"
         )
     return api
+
+
+def _resolve_ple_table_memory(additional_config: Any) -> str:
+    if isinstance(additional_config, dict) and "ple_table_memory" in additional_config:
+        table_memory = additional_config["ple_table_memory"]
+    else:
+        table_memory = "mapped_host" if envs.VLLM_PLE_CPU_OFFLOAD else "device"
+    if table_memory not in {"device", "mapped_host"}:
+        raise ValueError(
+            "additional_config.ple_table_memory must be 'device' or "
+            f"'mapped_host', got {table_memory!r}"
+        )
+    return table_memory
 
 
 def _copy_embedding_shard(
@@ -80,34 +97,47 @@ class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
 
 
 class _NGramEmbeddingStorage(nn.Module):
-    def __init__(self, plan: Any, device: torch.device) -> None:
+    def __init__(self, plan: Any) -> None:
         super().__init__()
+        self._table_storage = plan.allocate_storage()
         self.weight = nn.Parameter(
-            torch.empty(plan.weight_shape, dtype=plan.weight_dtype, device=device),
+            self._table_storage.weight,
             requires_grad=False,
         )
         if plan.weight_scale_shape is None:
             self.register_parameter("weight_scale", None)
         else:
+            weight_scale = self._table_storage.weight_scale
+            assert weight_scale is not None
             self.weight_scale = nn.Parameter(
-                torch.empty(
-                    plan.weight_scale_shape,
-                    dtype=plan.weight_scale_dtype,
-                    device=device,
-                ),
+                weight_scale,
                 requires_grad=False,
             )
         if plan.weight_scale_2_shape is None:
             self.register_parameter("weight_scale_2", None)
         else:
+            weight_scale_2 = self._table_storage.weight_scale_2
+            assert weight_scale_2 is not None
             self.weight_scale_2 = nn.Parameter(
-                torch.empty(
-                    plan.weight_scale_2_shape,
-                    dtype=plan.weight_scale_2_dtype,
-                    device=device,
-                ),
+                weight_scale_2,
                 requires_grad=False,
             )
+
+    @property
+    def weight_load_view(self) -> torch.Tensor:
+        return self._table_storage.weight_load_view
+
+    @property
+    def weight_scale_load_view(self) -> torch.Tensor | None:
+        return self._table_storage.weight_scale_load_view
+
+    @property
+    def weight_scale_2_load_view(self) -> torch.Tensor | None:
+        return self._table_storage.weight_scale_2_load_view
+
+    @property
+    def mapped_host_nbytes(self) -> int:
+        return int(self._table_storage.mapped_host_nbytes)
 
 
 class Qwen3_8FlashNextNGramEmbedding(nn.Module):
@@ -132,6 +162,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         owner_prefix: str,
         prefix: str,
         dtype: torch.dtype,
+        table_memory: str,
     ) -> None:
         super().__init__()
         self.embedding_dim = int(embedding_dim)
@@ -180,6 +211,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 tp_size=get_tensor_model_parallel_world_size(),
                 tp_rank=get_tensor_model_parallel_rank(),
                 quant_mode=self._quant_mode,
+                table_memory=table_memory,
                 output_dtype=dtype,
             )
         )
@@ -190,7 +222,13 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         self.register_buffer("ngram_heads_offsets", self._plan.table_offsets)
         self.register_buffer("ngram_heads_vocab_sizes", self._plan.prime_sizes)
 
-        self.ngram_embedding = _NGramEmbeddingStorage(self._plan, device)
+        self.ngram_embedding = _NGramEmbeddingStorage(self._plan)
+        if self.ngram_embedding.mapped_host_nbytes:
+            logger.info(
+                "Using %.2f GiB of CUDA-mapped host memory for this TP rank's "
+                "PLE table",
+                self.ngram_embedding.mapped_host_nbytes / (1 << 30),
+            )
 
         scratch_spec = self._plan.scratch_specs()[0]
         self.register_buffer(
@@ -416,10 +454,14 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                         "PLE embedding weight_scale must be finite and positive"
                     )
                 with torch.no_grad():
-                    embedding.weight_scale.copy_(
+                    target = getattr(
+                        embedding, "weight_scale_load_view", embedding.weight_scale
+                    )
+                    assert target is not None
+                    target.copy_(
                         loaded_weight.to(
-                            device=embedding.weight_scale.device,
-                            dtype=embedding.weight_scale.dtype,
+                            device=target.device,
+                            dtype=target.dtype,
                         )
                     )
                 self._weight_scale_loaded = True
@@ -452,8 +494,14 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                         "PLE embedding weight_scale_2 must be finite and positive"
                     )
                 with torch.no_grad():
-                    embedding.weight_scale_2.copy_(
-                        loaded_weight.to(device=embedding.weight_scale_2.device)
+                    target = getattr(
+                        embedding,
+                        "weight_scale_2_load_view",
+                        embedding.weight_scale_2,
+                    )
+                    assert target is not None
+                    target.copy_(
+                        loaded_weight.to(device=target.device, dtype=target.dtype)
                     )
                 self._weight_scale_2_loaded = True
                 self._embedding_validated = False
@@ -482,7 +530,9 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 if suffix == "weight":
                     expected_shape = (expected_rows, self._plan.weight_shape[1])
                     expected_dtype = self._plan.weight_dtype
-                    destination = embedding.weight.data
+                    destination = getattr(
+                        embedding, "weight_load_view", embedding.weight.data
+                    )
                 else:
                     if self._quant_mode != "nvfp4_group16":
                         regular_weights.append((name, loaded_weight))
@@ -494,7 +544,12 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                         self._plan.weight_scale_shape[1],
                     )
                     expected_dtype = self._plan.weight_scale_dtype
-                    destination = embedding.weight_scale.data
+                    destination = getattr(
+                        embedding,
+                        "weight_scale_load_view",
+                        embedding.weight_scale.data,
+                    )
+                    assert destination is not None
                 if tuple(loaded_weight.shape) != expected_shape:
                     raise ValueError(
                         f"shape mismatch for PLE shard {shard_index} {suffix}: "
@@ -580,6 +635,8 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         if dtype != torch.bfloat16:
             raise TypeError("b12x PLE requires a BF16 model")
 
+        table_memory = _resolve_ple_table_memory(vllm_config.additional_config)
+
         self.ple_embedding = Qwen3_8FlashNextNGramEmbedding(
             config,
             int(config.ple_embed_dim),
@@ -589,6 +646,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             prefix,
             f"{prefix}.ple_embedding",
             dtype,
+            table_memory,
         )
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),

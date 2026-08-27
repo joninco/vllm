@@ -102,29 +102,20 @@ class HyperConnectionWorkspace(nn.Module):
             persistent=False,
         )
         self.register_buffer(
-            "combined_0", torch.empty(max_tokens, width, **factory), persistent=False
-        )
-        self.register_buffer(
-            "combined_1", torch.empty(max_tokens, width, **factory), persistent=False
-        )
-        self.register_buffer(
             "injection",
             torch.empty(max_tokens, config.hc_count, **factory),
             persistent=False,
         )
 
-        # Validate both fixed output layouts before Dynamo traces live prefix
+        # Validate the fixed output layout before Dynamo traces live prefix
         # views. The registered buffers and their addresses do not change.
-        self.bind(max_tokens, 0)
-        self.bind(max_tokens, 1)
+        self.bind(max_tokens)
 
-    def bind(self, tokens: int, combined_slot: int):
-        combined = self.combined_0 if combined_slot == 0 else self.combined_1
+    def bind(self, tokens: int):
         return self.plan.bind(
             normalized=self.normalized,
             bottleneck=self.bottleneck,
             block_input=self.block_input,
-            combined=combined,
             tokens=tokens,
         )
 
@@ -137,7 +128,6 @@ class GatedResidual(nn.Module):
         config: HyperConnectionConfig,
         workspace: HyperConnectionWorkspace,
         *,
-        combined_slot: int,
         use_combine: bool = True,
         prefix: str = "",
     ) -> None:
@@ -153,7 +143,6 @@ class GatedResidual(nn.Module):
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.use_combine = use_combine
-        self.combined_slot = int(combined_slot)
 
         norm_size = self.hyper_hidden_size
         self.hc_norm = GroupedGemmaRMSNorm(
@@ -206,9 +195,8 @@ class GatedResidual(nn.Module):
     def workspace(self) -> HyperConnectionWorkspace:
         return self._workspace
 
-    def _binding(self, hidden_states: torch.Tensor, *, alternate: bool = False):
-        slot = self.combined_slot ^ int(alternate)
-        return self.workspace.bind(hidden_states.shape[0], slot)
+    def _binding(self, hidden_states: torch.Tensor):
+        return self.workspace.bind(hidden_states.shape[0])
 
     def _mix_normalized(self, normalized: torch.Tensor, binding):
         api = _hyperconnection_api()
@@ -254,15 +242,15 @@ class GatedResidual(nn.Module):
         prev_injection: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         api = _hyperconnection_api()
-        binding = self._binding(hidden_states)
         combined, normalized = api.run_combine_norm(
             hidden_states,
             prev_block_output,
             prev_injection,
             self.hc_norm.weight,
             eps=self.config.rms_norm_eps,
-            binding=binding,
+            plan=self.workspace.plan,
         )
+        binding = self._binding(normalized)
         block_input, injection = self._mix_normalized(normalized, binding)
         return combined, block_input, injection
 
@@ -271,16 +259,13 @@ class GatedResidual(nn.Module):
         hidden_states: torch.Tensor,
         block_output: torch.Tensor,
         injection: torch.Tensor,
-        *,
-        alternate: bool = False,
     ) -> torch.Tensor:
         api = _hyperconnection_api()
-        binding = self._binding(hidden_states, alternate=alternate)
         return api.run_combine(
             hidden_states,
             block_output,
             injection,
-            binding=binding,
+            plan=self.workspace.plan,
         )
 
 

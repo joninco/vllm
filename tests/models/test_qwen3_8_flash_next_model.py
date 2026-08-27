@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import torch
 from torch import nn
@@ -11,7 +12,9 @@ from torch import nn
 import vllm.distributed.parallel_state as parallel_state
 import vllm.distributed.utils as distributed_utils
 import vllm.model_executor.offloader as offloader
+import vllm.models.qwen3_8_flash_next.hyperconnection as hyperconnection_module
 import vllm.models.qwen3_8_flash_next.model as model_module
+import vllm.models.qwen3_8_flash_next.ple_layer as ple_layer_module
 from vllm.config.compilation import CompilationMode
 from vllm.models.qwen3_8_flash_next.ple_layer import Qwen3_8FlashNextPLELayer
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -76,6 +79,75 @@ def _allocate_aligned_mamba_cache(
 def _set_tensor_attributes(module: nn.Module, *names: str) -> None:
     for name in names:
         setattr(module, name, torch.empty(0))
+
+
+def test_ple_cpu_offload_env_alias(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
+    assert ple_layer_module._resolve_ple_table_memory(None) == "mapped_host"
+
+
+def test_explicit_ple_table_memory_overrides_env_alias(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
+    assert (
+        ple_layer_module._resolve_ple_table_memory({"ple_table_memory": "device"})
+        == "device"
+    )
+
+
+def test_gated_residual_uses_canonical_combine_ops(monkeypatch) -> None:
+    combined = torch.full((2, 8), 3.0, dtype=torch.bfloat16)
+    normalized = torch.full((2, 8), 5.0, dtype=torch.bfloat16)
+    plan = object()
+    binding = object()
+    workspace = SimpleNamespace(plan=plan, bind=Mock(return_value=binding))
+    api = SimpleNamespace(
+        run_combine_norm=Mock(return_value=(combined, normalized)),
+        run_combine=Mock(return_value=combined),
+    )
+
+    mixer = hyperconnection_module.GatedResidual.__new__(
+        hyperconnection_module.GatedResidual
+    )
+    nn.Module.__init__(mixer)
+    mixer.config = SimpleNamespace(rms_norm_eps=1e-6)
+    mixer.hc_norm = SimpleNamespace(weight=torch.empty(8, dtype=torch.bfloat16))
+    object.__setattr__(mixer, "_workspace", workspace)
+    monkeypatch.setattr(hyperconnection_module, "_hyperconnection_api", lambda: api)
+    monkeypatch.setattr(
+        hyperconnection_module.GatedResidual,
+        "_mix_normalized",
+        lambda _self, value, _binding: (value[:, :2], None),
+    )
+
+    hidden_states = torch.empty((2, 8), dtype=torch.bfloat16)
+    block_output = torch.empty((2, 2), dtype=torch.bfloat16)
+    injection = torch.empty((2, 4), dtype=torch.bfloat16)
+    actual_combined, block_input, actual_injection = mixer.combine_and_mix(
+        hidden_states,
+        block_output,
+        injection,
+    )
+    final_combined = mixer.combine(hidden_states, block_output, injection)
+
+    assert actual_combined is combined
+    assert block_input.data_ptr() == normalized.data_ptr()
+    assert actual_injection is None
+    assert final_combined is combined
+    api.run_combine_norm.assert_called_once_with(
+        hidden_states,
+        block_output,
+        injection,
+        mixer.hc_norm.weight,
+        eps=1e-6,
+        plan=plan,
+    )
+    workspace.bind.assert_called_once_with(2)
+    api.run_combine.assert_called_once_with(
+        hidden_states,
+        block_output,
+        injection,
+        plan=plan,
+    )
 
 
 def test_decoder_layer_factory_accepts_make_layers_prefix(monkeypatch) -> None:

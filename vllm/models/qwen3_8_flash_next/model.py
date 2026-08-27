@@ -246,13 +246,11 @@ class Qwen3_8FlashNextDecoderLayer(nn.Module):
         self.attn_hyper_connection = GatedResidual(
             hc_config,
             workspace,
-            combined_slot=0,
             prefix=maybe_prefix(prefix, "attn_hyper_connection"),
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
             workspace,
-            combined_slot=1,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
 
@@ -438,7 +436,6 @@ class Qwen3_8FlashNextModel(nn.Module):
             self.hyper_connection_mixer = GatedResidual(
                 hc_config,
                 self.hyper_connection_workspace,
-                combined_slot=0,
                 use_combine=False,
                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
             )
@@ -526,7 +523,6 @@ class Qwen3_8FlashNextModel(nn.Module):
                     hidden_states,
                     block_output,
                     injection,
-                    alternate=True,
                 )
                 block_output = injection = None
                 hidden_states = hidden_states + deepstack_embed
