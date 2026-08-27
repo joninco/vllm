@@ -392,15 +392,89 @@ def _bare_qwen_model_state_for_draft_metadata() -> Qwen3_8FlashNextModelState:
     state._qsa_default_slot_ids = state.qsa_state_slot_ids.clone()
     state.qsa_state_is_fresh = torch.ones(8, dtype=torch.bool)
     state.qsa_num_accepted_tokens = torch.ones(8, dtype=torch.int32)
+    state.mamba_num_accepted_tokens = torch.ones(8, dtype=torch.int32)
     state.num_accepted_tokens_gpu = torch.ones(8, dtype=torch.int32)
+    state.qsa_committed_num_accepted_tokens_gpu = torch.ones(8, dtype=torch.int32)
     state._qsa_draft_is_prefilling = torch.zeros(8, dtype=torch.bool)
     state._qsa_draft_is_prefilling_gpu = torch.zeros(8, dtype=torch.bool)
     return state
 
 
+def test_qsa_acceptance_survives_mamba_state_page_alignment_reset() -> None:
+    state = _bare_qwen_model_state_for_draft_metadata()
+    state.qsa_state_is_fresh_gpu = torch.zeros(8, dtype=torch.bool)
+    state.qsa_committed_num_accepted_tokens_gpu[7] = 3
+    state.num_accepted_tokens_gpu[7] = 1
+
+    _, _, accepted = state._prepare_qsa_state(
+        SimpleNamespace(
+            num_reqs=1,
+            idx_mapping=torch.tensor([7], dtype=torch.int32),
+        ),
+        num_reqs=1,
+    )
+
+    assert torch.equal(accepted, torch.tensor([3], dtype=torch.int32))
+
+
+def test_qsa_and_mamba_use_independent_acceptance_after_page_alignment() -> None:
+    state = _bare_qwen_model_state_for_draft_metadata()
+    state.qsa_state_is_fresh_gpu = torch.zeros(8, dtype=torch.bool)
+    state.qsa_committed_num_accepted_tokens_gpu[7] = 4
+    state.num_accepted_tokens_gpu[7] = 1
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping=torch.tensor([7], dtype=torch.int32),
+    )
+
+    _, _, qsa_accepted = state._prepare_qsa_state(input_batch, num_reqs=1)
+    mamba_accepted = state._prepare_mamba_acceptance(input_batch, num_reqs=1)
+
+    assert torch.equal(qsa_accepted, torch.tensor([4], dtype=torch.int32))
+    assert torch.equal(mamba_accepted, torch.tensor([1], dtype=torch.int32))
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_qsa_postprocess_commits_acceptance_before_mamba_alignment_reset() -> None:
+    class ResetAcceptedTokens:
+        def run_fused_postprocess_align(
+            self,
+            num_reqs: int,
+            num_accepted_tokens_gpu: torch.Tensor,
+            state_idx_gpu: torch.Tensor,
+            num_computed_tokens: torch.Tensor,
+            idx_mapping: torch.Tensor,
+        ) -> None:
+            num_accepted_tokens_gpu.fill_(1)
+
+    state = Qwen3_8FlashNextModelState.__new__(Qwen3_8FlashNextModelState)
+    state.uses_qsa = True
+    state.qsa_committed_num_accepted_tokens_gpu = torch.full(
+        (5,), 9, dtype=torch.int32, device="cuda"
+    )
+    state.qsa_state_is_fresh_gpu = torch.ones(5, dtype=torch.bool, device="cuda")
+    state.num_accepted_tokens_gpu = torch.full(
+        (5,), 9, dtype=torch.int32, device="cuda"
+    )
+    state._align_mode = True
+    state._mamba_ctx = ResetAcceptedTokens()
+    state._mamba_state_idx_gpu = torch.zeros(5, dtype=torch.int32, device="cuda")
+    state.recoverssm = None
+
+    idx_mapping = torch.tensor([3, -1, 1], dtype=torch.int32, device="cuda")
+    num_sampled = torch.tensor([4, 2, 3], dtype=torch.int32, device="cuda")
+    num_computed_tokens = torch.zeros(5, dtype=torch.int32, device="cuda")
+
+    state.postprocess_state(idx_mapping, num_sampled, num_computed_tokens)
+
+    assert state.num_accepted_tokens_gpu.tolist() == [1, 1, 1, 1, 1]
+    assert state.qsa_committed_num_accepted_tokens_gpu.tolist() == [9, 3, 9, 4, 9]
+    assert state.qsa_state_is_fresh_gpu.tolist() == [True, False, True, False, True]
+
+
 def test_qsa_draft_metadata_uses_persistent_slot_and_safe_padding() -> None:
     state = _bare_qwen_model_state_for_draft_metadata()
-    state.num_accepted_tokens_gpu[7] = 3
+    state.qsa_committed_num_accepted_tokens_gpu[7] = 3
 
     metadata = state.prepare_draft_attn_metadata(
         idx_mapping=torch.tensor([7, -1, -1, -1], dtype=torch.int32),
@@ -431,7 +505,7 @@ def test_qsa_draft_metadata_uses_persistent_slot_and_safe_padding() -> None:
 
 def test_qsa_draft_metadata_tracks_batch_reordering_by_persistent_slot() -> None:
     state = _bare_qwen_model_state_for_draft_metadata()
-    state.num_accepted_tokens_gpu[7] = 3
+    state.qsa_committed_num_accepted_tokens_gpu[7] = 3
 
     first = state.prepare_draft_attn_metadata(
         idx_mapping=torch.tensor([7, 3], dtype=torch.int32),
@@ -482,7 +556,7 @@ def test_qsa_draft_metadata_tracks_batch_reordering_by_persistent_slot() -> None
 
 def test_qsa_draft_metadata_uses_one_accepted_token_after_first_lookahead() -> None:
     state = _bare_qwen_model_state_for_draft_metadata()
-    state.num_accepted_tokens_gpu[7] = 3
+    state.qsa_committed_num_accepted_tokens_gpu[7] = 3
 
     metadata = state.prepare_draft_attn_metadata(
         idx_mapping=torch.tensor([7, 3], dtype=torch.int32),
@@ -528,8 +602,8 @@ def test_non_qsa_draft_metadata_is_a_noop_at_step_zero() -> None:
 def test_qsa_mtp_metadata_preserves_previous_acceptance_until_first_lookahead() -> None:
     state = _bare_qwen_model_state_for_draft_metadata()
     state.qsa_state_is_fresh_gpu = torch.zeros(8, dtype=torch.bool)
-    state.num_accepted_tokens_gpu[3] = 2
-    state.num_accepted_tokens_gpu[7] = 4
+    state.qsa_committed_num_accepted_tokens_gpu[3] = 2
+    state.qsa_committed_num_accepted_tokens_gpu[7] = 4
     idx_mapping = torch.tensor([7, 3, -1, -1], dtype=torch.int32)
 
     def make_builder() -> Qwen3_8FlashNextQSAMetadataBuilder:
@@ -576,8 +650,8 @@ def test_qsa_mtp_metadata_preserves_previous_acceptance_until_first_lookahead() 
         previous_accepted,
     )
 
-    state.num_accepted_tokens_gpu[3] = 3
-    state.num_accepted_tokens_gpu[7] = 2
+    state.qsa_committed_num_accepted_tokens_gpu[3] = 3
+    state.qsa_committed_num_accepted_tokens_gpu[7] = 2
     assert torch.equal(
         reused_target_metadata.qsa_num_accepted_tokens,
         previous_accepted,

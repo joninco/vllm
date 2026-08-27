@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-runner state for Qwen3.8-Flash-Next PLE and QSA inputs."""
 
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,7 +11,6 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -26,12 +24,6 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
 )
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
-
-logger = init_logger(__name__)
-
-_B12X_STATE_DIAGNOSTICS = os.getenv(
-    "VLLM_QWEN38_B12X_STATE_DIAGNOSTICS", "0"
-).strip().lower() in ("1", "true")
 
 
 @dataclass
@@ -75,8 +67,6 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
         device: torch.device,
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
-        self._b12x_state_diagnostic_pending = False
-        self._b12x_state_diagnostic_reported = False
         config = self.model_config.hf_text_config
         self.uses_qsa = getattr(config, "indexer_n_heads", None) is not None
         self.qsa_state_is_fresh_gpu = torch.ones(
@@ -96,6 +86,16 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             device=self.device,
         )
         self.qsa_num_accepted_tokens = torch.ones(
+            self.max_num_reqs,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.mamba_num_accepted_tokens = torch.ones(
+            self.max_num_reqs,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.qsa_committed_num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs,
             dtype=torch.int32,
             device=self.device,
@@ -160,6 +160,7 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             # flag remains set through the complete next model forward so every
             # QSA layer independently resets its slot.
             self.qsa_state_is_fresh_gpu[req_index].fill_(True)
+            self.qsa_committed_num_accepted_tokens_gpu[req_index].fill_(1)
 
     def _prepare_qsa_state(
         self,
@@ -180,7 +181,7 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
                 out=self.qsa_state_is_fresh[:num_actual_reqs],
             )
             torch.index_select(
-                self.num_accepted_tokens_gpu,
+                self.qsa_committed_num_accepted_tokens_gpu,
                 0,
                 idx_mapping,
                 out=self.qsa_num_accepted_tokens[:num_actual_reqs],
@@ -190,6 +191,23 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             self.qsa_state_is_fresh[:num_reqs],
             self.qsa_num_accepted_tokens[:num_reqs],
         )
+
+    def _prepare_mamba_acceptance(
+        self,
+        input_batch: InputBatch,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        accepted = self.mamba_num_accepted_tokens[:num_reqs]
+        accepted.fill_(1)
+        num_actual_reqs = input_batch.num_reqs
+        if num_actual_reqs:
+            torch.index_select(
+                self.num_accepted_tokens_gpu,
+                0,
+                input_batch.idx_mapping[:num_actual_reqs],
+                out=accepted[:num_actual_reqs],
+            )
+        return accepted
 
     def prepare_draft_attn_metadata(
         self,
@@ -229,7 +247,7 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             # decode interval and therefore retain the neutral count of one.
             if draft_index == 1:
                 torch.index_select(
-                    self.num_accepted_tokens_gpu,
+                    self.qsa_committed_num_accepted_tokens_gpu,
                     0,
                     idx_mapping[:num_reqs],
                     out=self.qsa_num_accepted_tokens[:num_reqs],
@@ -272,14 +290,6 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
         self.qsa_is_prefilling.np[: input_batch.num_reqs] = input_batch.is_prefilling_np
         is_prefilling = self.qsa_is_prefilling.cpu[:num_reqs]
         qsa_is_prefilling = self.qsa_is_prefilling.copy_to_gpu(num_reqs)
-        if (
-            _B12X_STATE_DIAGNOSTICS
-            and not self._b12x_state_diagnostic_reported
-            and not for_capture
-            and input_batch.num_reqs > 0
-            and not torch.all(is_prefilling[: input_batch.num_reqs]).item()
-        ):
-            self._b12x_state_diagnostic_pending = True
         (
             qsa_state_slot_ids,
             qsa_state_is_fresh,
@@ -289,7 +299,15 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
-            num_accepted_tokens = qsa_num_accepted_tokens
+            # Mamba page alignment resets its accepted-token offset to one
+            # after migrating the accepted state into a new block. QSA keeps
+            # the pre-migration accepted count to advance its independent
+            # selector interval, so the two consumers must not share this
+            # batch-aligned buffer.
+            num_accepted_tokens = self._prepare_mamba_acceptance(
+                input_batch,
+                num_reqs,
+            )
             num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
             if num_draft_tokens_per_req is not None:
@@ -365,79 +383,26 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
         num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
+        if self.uses_qsa and idx_mapping.numel():
+            if isinstance(num_sampled, int):
+                _fill_qsa_request_state_kernel[(idx_mapping.numel(),)](
+                    idx_mapping,
+                    self.qsa_committed_num_accepted_tokens_gpu,
+                    self.qsa_state_is_fresh_gpu,
+                    max(num_sampled, 1),
+                )
+            else:
+                _commit_qsa_request_state_kernel[(idx_mapping.numel(),)](
+                    idx_mapping,
+                    num_sampled,
+                    self.qsa_committed_num_accepted_tokens_gpu,
+                    self.qsa_state_is_fresh_gpu,
+                )
         super().postprocess_state(
             idx_mapping,
             num_sampled,
             num_computed_tokens,
         )
-        if self._b12x_state_diagnostic_pending:
-            self._report_b12x_state_diagnostics()
-            self._b12x_state_diagnostic_pending = False
-            self._b12x_state_diagnostic_reported = True
-        if self.uses_qsa and idx_mapping.numel():
-            _clear_qsa_fresh_kernel[(idx_mapping.numel(),)](
-                idx_mapping,
-                self.qsa_state_is_fresh_gpu,
-            )
-
-    def _report_b12x_state_diagnostics(self) -> None:
-        gdn_diagnostics: dict[str, dict[str, Any]] = {}
-        qsa_diagnostics: dict[str, dict[str, Any]] = {}
-        for layer_name, layer in self.model.named_modules():
-            gdn_binding = getattr(layer, "_b12x_binding", None)
-            if gdn_binding is not None:
-                raw_num_tokens = int(layer._b12x_num_tokens.item())
-                raw_num_seqs = int(layer._b12x_num_seqs.item())
-                num_tokens = max(0, min(raw_num_tokens, gdn_binding.output.shape[0]))
-                num_seqs = max(
-                    0,
-                    min(raw_num_seqs, layer._b12x_state_indices.shape[0]),
-                )
-                state_slots = torch.unique(layer._b12x_state_indices[:num_seqs]).long()
-                active_slots = state_slots[
-                    (state_slots >= 0)
-                    & (state_slots < gdn_binding.recurrent_state.shape[0])
-                ]
-                gdn_diagnostics[layer_name] = {
-                    "error_code": int(gdn_binding.error_code.item()),
-                    "num_tokens": raw_num_tokens,
-                    "num_seqs": raw_num_seqs,
-                    "output": self._finiteness(gdn_binding.output[:num_tokens]),
-                    "recurrent_state": self._finiteness(
-                        gdn_binding.recurrent_state.index_select(0, active_slots)
-                    ),
-                    "state_slots": state_slots.tolist(),
-                }
-
-            qsa_binding = getattr(layer, "_qsa_binding", None)
-            request_ids = getattr(layer, "_b12x_diagnostic_request_ids", None)
-            if qsa_binding is None or request_ids is None:
-                continue
-            active = request_ids >= 0
-            qsa_diagnostics[layer_name] = {
-                "request_ids": request_ids[active].tolist(),
-                "state_errors": qsa_binding.state_errors[: request_ids.numel()][
-                    active
-                ].tolist(),
-                "output": self._finiteness(
-                    qsa_binding.output[: request_ids.numel()][active]
-                ),
-            }
-
-        logger.warning(
-            "Qwen3.8-Flash-Next first decode B12X state diagnostic: gdn=%s qsa=%s",
-            gdn_diagnostics,
-            qsa_diagnostics,
-        )
-
-    @staticmethod
-    def _finiteness(tensor: torch.Tensor) -> dict[str, int | bool]:
-        nonfinite = int(torch.count_nonzero(~torch.isfinite(tensor)).item())
-        return {
-            "all_finite": nonfinite == 0,
-            "nonfinite": nonfinite,
-            "elements": tensor.numel(),
-        }
 
     def _prepare_ngram_context(
         self,
@@ -518,13 +483,31 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
 
 
 @triton.jit
-def _clear_qsa_fresh_kernel(
+def _commit_qsa_request_state_kernel(
     idx_mapping_ptr,
+    num_sampled_ptr,
+    qsa_num_accepted_ptr,
     state_is_fresh_ptr,
 ):
     row = tl.program_id(0)
     state_slot = tl.load(idx_mapping_ptr + row)
     if state_slot >= 0:
+        num_sampled = tl.load(num_sampled_ptr + row)
+        tl.store(qsa_num_accepted_ptr + state_slot, tl.maximum(num_sampled, 1))
+        tl.store(state_is_fresh_ptr + state_slot, 0)
+
+
+@triton.jit
+def _fill_qsa_request_state_kernel(
+    idx_mapping_ptr,
+    qsa_num_accepted_ptr,
+    state_is_fresh_ptr,
+    num_sampled,
+):
+    row = tl.program_id(0)
+    state_slot = tl.load(idx_mapping_ptr + row)
+    if state_slot >= 0:
+        tl.store(qsa_num_accepted_ptr + state_slot, num_sampled)
         tl.store(state_is_fresh_ptr + state_slot, 0)
 
 
