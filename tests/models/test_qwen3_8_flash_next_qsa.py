@@ -1429,6 +1429,46 @@ def test_qsa_portable_prefill_matches_pytorch_oracle(
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=atol)
 
 
+def test_qsa_portable_fp8_tp1_prefill_fits_sm12x_resources() -> None:
+    device = _require_qsa_gpu()
+    torch.manual_seed(17)
+    rows, query_heads, kv_heads, head_dim = 16, 24, 2, 256
+    group_size = query_heads // kv_heads
+    query = torch.randn(
+        rows, query_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    key_source = torch.randn(
+        1, 16, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    value_source = torch.randn_like(key_source)
+    k_descale = torch.tensor([0.0125], dtype=torch.float32, device=device)
+    v_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
+    key_cache = (key_source.float() / k_descale).to(torch.float8_e4m3fn)
+    value_cache = (value_source.float() / v_descale).to(torch.float8_e4m3fn)
+    logical_indices = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
+    logical_indices[:, 0] = 0
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+
+    actual = qsa_sparse_paged_attention(
+        query,
+        key_cache,
+        value_cache,
+        k_descale,
+        v_descale,
+        logical_indices,
+        block_table,
+        token_to_req,
+    )
+    expected_heads = (value_cache[0, 0].float() * v_descale).to(torch.bfloat16)
+    expected = (
+        expected_heads.repeat_interleave(group_size, dim=0)
+        .unsqueeze(0)
+        .expand_as(actual)
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-2)
+
+
 def test_qsa_portable_chunk_handoff_uses_exact_tagged_ring() -> None:
     device = _require_qsa_gpu()
     torch.manual_seed(11)

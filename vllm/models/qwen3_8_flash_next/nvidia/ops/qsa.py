@@ -926,6 +926,8 @@ def qsa_sparse_paged_attention(
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+    # FP8 dequantization pushes the two-stage BLOCK_N=64 kernel over SM12x SMEM.
+    partial_stages = 1 if k_cache.dtype == torch.float8_e4m3fn else 2
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
         k_cache,
@@ -965,7 +967,7 @@ def qsa_sparse_paged_attention(
         BLOCK_N=block_n,
         KV_IS_FP8=k_cache.dtype == torch.float8_e4m3fn,
         num_warps=partial_warps,
-        num_stages=2,
+        num_stages=partial_stages,
     )
     if num_splits == 1:
         return out
