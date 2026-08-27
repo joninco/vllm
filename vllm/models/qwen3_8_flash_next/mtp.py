@@ -312,8 +312,8 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             multi_state=self._feedback_multi_state,
             token_norm_weight=self.pre_fc_norm_embedding.weight,
             state_norm_weight=self.pre_fc_norm_hidden.weight,
-            embedding_fc_weight=self.fc_embedding.weight,
-            hidden_fc_weight=self.fc_hidden.weight,
+            embedding_fc_weight=self.fc_embedding.weight.data,
+            hidden_fc_weight=self.fc_hidden.weight.data,
             output=self._feedback_output,
             tokens=num_tokens,
         )
