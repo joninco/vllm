@@ -17,22 +17,14 @@ from vllm.models.qwen3_8_flash_next.common.qsa_cache import (
     qsa_raw_slot_mapping,
 )
 from vllm.models.qwen3_8_flash_next.model_state import Qwen3_8FlashNextModelState
-from vllm.models.qwen3_8_flash_next.nvidia.ops.qsa import (
-    qsa_compress_groups_with_ratio,
-    qsa_mqa_paged,
-    qsa_select_paged_tokens,
-    qsa_sparse_paged_attention,
-    qsa_store_cache_rows,
-)
 from vllm.models.qwen3_8_flash_next.nvidia.qsa import (
     Qwen3_8FlashNextQSAAttention,
     Qwen3_8FlashNextQSABackend,
     Qwen3_8FlashNextQSAImpl,
+    Qwen3_8FlashNextQSAMetadata,
     Qwen3_8FlashNextQSAMetadataBuilder,
-    _commit_prefill_qsa_state_kernel,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import triton
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
@@ -278,7 +270,7 @@ def test_qsa_bind_preserves_context_plan_with_smaller_profile_cache(
     owner._raw_rope_positions = torch.empty(2, 8, 1, dtype=torch.int64)
     owner._raw_interval_start_positions = torch.empty(2, dtype=torch.int64)
     owner._raw_state_slot_ids = torch.empty(2, dtype=torch.int32)
-    owner._decode_output = torch.empty(6, 6, 256, dtype=torch.bfloat16)
+    owner._qsa_output = torch.empty(8, 6, 256, dtype=torch.bfloat16)
     owner._selected_positions = torch.empty(8, 2051, dtype=torch.int32)
     owner._k_scale = torch.ones(1, dtype=torch.float32)
     owner._v_scale = torch.ones(1, dtype=torch.float32)
@@ -297,6 +289,7 @@ def test_qsa_bind_preserves_context_plan_with_smaller_profile_cache(
     assert len(planned_caps) == 1
     caps = planned_caps[0]
     assert caps.max_seq_len == max_seq_len
+    assert caps.max_q_rows == owner.max_tokens
     assert caps.num_main_cache_pages == planned_pages
     assert caps.num_compressed_cache_pages == planned_pages
     assert owner._main_block_table.shape == (owner.max_seqs, planned_pages)
@@ -352,73 +345,50 @@ def test_qsa_registers_piecewise_splitting_op_once() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    ("query_start_loc", "expected_prefill"),
-    [
-        ([0, 3, 6, 9, 12], False),
-        ([0, 6, 12, 18, 24], True),
-    ],
-)
-def test_qsa_routes_only_oversized_capture_requests_to_portable_prefill(
-    query_start_loc: list[int],
-    expected_prefill: bool,
-) -> None:
-    common_metadata = SimpleNamespace(
-        seq_lens=torch.ones(4, dtype=torch.int32),
-        query_start_loc_cpu=torch.tensor(query_start_loc, dtype=torch.int32),
-        is_prefilling=torch.zeros(4, dtype=torch.bool),
-        max_query_len=max(b - a for a, b in zip(query_start_loc, query_start_loc[1:])),
+def test_qsa_prefill_dispatches_through_the_b12x_transaction(monkeypatch) -> None:
+    rows = 8
+    metadata = Qwen3_8FlashNextQSAMetadata(
+        num_actual_tokens=rows,
+        max_query_len=rows,
+        query_start_loc=torch.tensor([0, rows], dtype=torch.int32),
+        max_seq_len=rows,
+        seq_lens=torch.tensor([rows], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        slot_mapping=torch.arange(rows, dtype=torch.int64),
+        is_prefilling=torch.ones(1, dtype=torch.bool),
     )
-    metadata = SimpleNamespace(
-        seq_lens=common_metadata.seq_lens,
-        query_start_loc=torch.tensor(query_start_loc, dtype=torch.int32),
-        is_prefilling=common_metadata.is_prefilling,
-        max_query_len=common_metadata.max_query_len,
-    )
-
-    has_prefill = qsa_module._qsa_batch_has_prefill(
-        common_metadata,
-        max_speculative_tokens=2,
-    )
-    prefill_requests = qsa_module._qsa_prefill_requests(
-        metadata,
-        max_speculative_tokens=2,
-    )
-
-    assert has_prefill is expected_prefill
-    assert torch.equal(
-        prefill_requests,
-        torch.full((4,), expected_prefill, dtype=torch.bool),
-    )
-
-
-def test_qsa_portable_prefill_ignores_fully_padded_capture_batch() -> None:
     owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
     torch.nn.Module.__init__(owner)
-    owner._compressed_cache = torch.empty(0)
-    owner._main_block_table = torch.empty(0, dtype=torch.int32)
-    owner._stage_runtime_metadata = lambda *_args, **_kwargs: pytest.fail(
-        "fully padded capture must not stage or mutate selector state"
+    owner.layer_name = "model.layers.0.attn"
+    owner.kv_cache = torch.ones(1)
+    calls: list[dict[str, Any]] = []
+    owner._run_b12x_qsa = lambda **kwargs: calls.append(kwargs)
+    monkeypatch.setattr(
+        qsa_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={owner.layer_name: metadata}),
     )
-    rows = 24
-    metadata = SimpleNamespace(slot_mapping=torch.full((rows,), -1, dtype=torch.int64))
-    output = torch.ones(rows, 1, 1)
-    projected = torch.empty(rows, 1, 1)
+    positions = torch.arange(rows, dtype=torch.int64)
+    query = torch.empty(rows, 12, 256)
+    key = torch.empty(rows, 1, 256)
+    value = torch.empty_like(key)
+    index_query = torch.empty(rows, 4, 128)
+    raw_index_key = torch.empty(rows, 128)
+    output = torch.empty_like(query)
 
-    owner._run_portable_qsa(
-        metadata=metadata,
-        positions=torch.empty(rows, dtype=torch.int64),
-        query=projected,
-        key=projected,
-        value=projected,
-        index_query=projected,
-        raw_index_key=projected,
-        is_prefilling=torch.ones(4, dtype=torch.bool),
-        output=output,
-        rows=rows,
+    owner._run_qsa(
+        positions,
+        query,
+        key,
+        value,
+        index_query,
+        raw_index_key,
+        output,
     )
 
-    assert torch.count_nonzero(output) == 0
+    assert len(calls) == 1
+    assert calls[0]["metadata"] is metadata
+    assert calls[0]["rows"] == rows
 
 
 def test_qsa_logical_positions_mark_graph_padding_invalid() -> None:
@@ -969,238 +939,9 @@ def test_qsa_builder_updates_fused_draft_acceptance_in_place() -> None:
     )
 
 
-def _bare_qsa_owner_for_prefill_validation() -> Qwen3_8FlashNextQSAAttention:
+def test_qsa_speculative_anchor_snapshot_restores_all_persistent_slots() -> None:
     owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
     torch.nn.Module.__init__(owner)
-    owner.max_seqs = 2
-    owner.max_seq_len = 64
-    owner.max_speculative_tokens = 0
-    owner.compress_ratio = 4
-    owner.raw_ring_capacity = 4
-    owner._main_block_table = torch.tensor(
-        [[0, 1, 2, 3, 4, 5, 6, 7], [-1, -1, -1, -1, -1, -1, -1, -1]],
-        dtype=torch.int32,
-    )
-    owner._sequence_lengths = torch.tensor([8, 0], dtype=torch.int32)
-    owner._raw_interval_start_positions = torch.tensor([6, -1], dtype=torch.int64)
-    owner._raw_logical_positions = torch.full((2, 4), -1, dtype=torch.int64)
-    owner._raw_logical_positions[0] = torch.tensor([4, 5, 6, 3])
-    owner._raw_rope_positions = torch.full((2, 4, 1), -1, dtype=torch.int64)
-    owner._raw_rope_positions[0, :, 0] = torch.tensor([4, 5, 6, 3])
-    owner.position_axes = 1
-    owner.kv_cache = torch.empty((8, 2, 8, 512), dtype=torch.bfloat16)
-    return owner
-
-
-def test_qsa_prefill_validation_accepts_exact_chunk_handoff() -> None:
-    owner = _bare_qsa_owner_for_prefill_validation()
-    metadata = SimpleNamespace(slot_mapping=torch.tensor([7], dtype=torch.int64))
-
-    mapped_rows, compressed_slots, state_reset_mask = owner._validate_portable_prefill(
-        metadata,
-        request_ids=torch.tensor([0], dtype=torch.int32),
-        logical_positions=torch.tensor([7], dtype=torch.int64),
-        state_slots=torch.tensor([0], dtype=torch.int32),
-        state_is_fresh=torch.tensor([False]),
-        accepted=torch.tensor([1], dtype=torch.int32),
-        is_prefilling=torch.tensor([True]),
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-        num_reqs=1,
-        rows=1,
-    )
-
-    assert mapped_rows == 1
-    assert torch.equal(compressed_slots, torch.tensor([1]))
-    assert not bool(state_reset_mask[0])
-
-
-def test_qsa_prefill_validation_accepts_mixed_prefill_decode_continuations() -> None:
-    owner = _bare_qsa_owner_for_prefill_validation()
-    owner.max_speculative_tokens = 2
-    owner._sequence_lengths[:] = torch.tensor([9, 8], dtype=torch.int32)
-    owner._raw_interval_start_positions[:] = torch.tensor([7, 4], dtype=torch.int64)
-    owner._raw_logical_positions[1] = torch.tensor([4, 5, 6, 3])
-    owner._raw_rope_positions[1, :, 0] = torch.tensor([4, 5, 6, 3])
-    owner._main_block_table[1] = torch.arange(8, 16, dtype=torch.int32)
-    metadata = SimpleNamespace(slot_mapping=torch.tensor([8, 15], dtype=torch.int64))
-
-    mapped_rows, compressed_slots, state_reset_mask = owner._validate_portable_prefill(
-        metadata,
-        request_ids=torch.tensor([0, 1], dtype=torch.int32),
-        logical_positions=torch.tensor([8, 7], dtype=torch.int64),
-        state_slots=torch.tensor([0, 1], dtype=torch.int32),
-        state_is_fresh=torch.tensor([False, False]),
-        accepted=torch.tensor([1, 3], dtype=torch.int32),
-        is_prefilling=torch.tensor([True, False]),
-        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
-        num_reqs=2,
-        rows=2,
-    )
-
-    assert mapped_rows == 2
-    assert torch.equal(compressed_slots, torch.tensor([-1, 17]))
-    assert torch.equal(state_reset_mask, torch.tensor([False, False]))
-
-
-def test_qsa_prefill_validation_rejects_corrupt_chunk_history() -> None:
-    owner = _bare_qsa_owner_for_prefill_validation()
-    owner._raw_logical_positions[0, 1] = 99
-    metadata = SimpleNamespace(slot_mapping=torch.tensor([7], dtype=torch.int64))
-
-    with pytest.raises(RuntimeError, match="committed raw ring"):
-        owner._validate_portable_prefill(
-            metadata,
-            request_ids=torch.tensor([0], dtype=torch.int32),
-            logical_positions=torch.tensor([7], dtype=torch.int64),
-            state_slots=torch.tensor([0], dtype=torch.int32),
-            state_is_fresh=torch.tensor([False]),
-            accepted=torch.tensor([1], dtype=torch.int32),
-            is_prefilling=torch.tensor([True]),
-            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-            num_reqs=1,
-            rows=1,
-        )
-
-
-def test_qsa_prefill_validation_requires_aligned_fresh_prefix() -> None:
-    owner = _bare_qsa_owner_for_prefill_validation()
-    owner._sequence_lengths[0] = 7
-    metadata = SimpleNamespace(slot_mapping=torch.tensor([6], dtype=torch.int64))
-
-    with pytest.raises(RuntimeError, match="complete compression group"):
-        owner._validate_portable_prefill(
-            metadata,
-            request_ids=torch.tensor([0], dtype=torch.int32),
-            logical_positions=torch.tensor([6], dtype=torch.int64),
-            state_slots=torch.tensor([0], dtype=torch.int32),
-            state_is_fresh=torch.tensor([True]),
-            accepted=torch.tensor([1], dtype=torch.int32),
-            is_prefilling=torch.tensor([True]),
-            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-            num_reqs=1,
-            rows=1,
-        )
-
-
-def test_qsa_prefill_validation_rejects_stale_accepted_on_fresh_prefill() -> None:
-    owner = _bare_qsa_owner_for_prefill_validation()
-    owner.max_speculative_tokens = 2
-    owner._sequence_lengths[0] = 9
-    metadata = SimpleNamespace(slot_mapping=torch.tensor([8], dtype=torch.int64))
-
-    with pytest.raises(RuntimeError, match="commit exactly one token"):
-        owner._validate_portable_prefill(
-            metadata,
-            request_ids=torch.tensor([0], dtype=torch.int32),
-            logical_positions=torch.tensor([8], dtype=torch.int64),
-            state_slots=torch.tensor([0], dtype=torch.int32),
-            state_is_fresh=torch.tensor([True]),
-            accepted=torch.tensor([2], dtype=torch.int32),
-            is_prefilling=torch.tensor([True]),
-            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-            num_reqs=1,
-            rows=1,
-        )
-
-
-def test_qsa_prefill_validation_accepts_restored_mtp_chunk_anchor() -> None:
-    owner = _bare_qsa_owner_for_prefill_validation()
-    first_position = 752
-    query_length = 1053
-    sequence_length = first_position + query_length
-    page_size = 752
-    owner.max_seq_len = 4096
-    owner.max_speculative_tokens = 2
-    owner._sequence_lengths[0] = sequence_length
-    owner._raw_interval_start_positions[0] = first_position - 1
-    owner._raw_logical_positions[0] = torch.arange(
-        first_position - owner.raw_ring_capacity,
-        first_position,
-        dtype=torch.int64,
-    )
-    owner._raw_rope_positions[0, :, 0].copy_(owner._raw_logical_positions[0])
-    owner._main_block_table = torch.tensor([[0, 1, 2], [-1, -1, -1]], dtype=torch.int32)
-    owner.kv_cache = torch.empty((0, 2, page_size, 512), dtype=torch.bfloat16)
-
-    request_ids = torch.zeros(query_length, dtype=torch.int32)
-    logical_positions = torch.arange(first_position, sequence_length, dtype=torch.int64)
-    metadata = SimpleNamespace(
-        slot_mapping=torch.zeros(query_length, dtype=torch.int64)
-    )
-    kwargs = dict(
-        request_ids=request_ids,
-        logical_positions=logical_positions,
-        state_slots=torch.tensor([0], dtype=torch.int32),
-        state_is_fresh=torch.tensor([False]),
-        accepted=torch.tensor([1], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, query_length], dtype=torch.int32),
-        num_reqs=1,
-        rows=query_length,
-    )
-
-    mapped_rows, compressed_slots, state_reset_mask = owner._validate_portable_prefill(
-        metadata,
-        is_prefilling=torch.tensor([True]),
-        **kwargs,
-    )
-
-    assert mapped_rows == query_length
-    assert int((compressed_slots >= 0).sum()) == query_length // owner.compress_ratio
-    assert not bool(state_reset_mask[0])
-    owner._raw_interval_start_positions[0] = first_position
-    with pytest.raises(RuntimeError, match="committed selector interval"):
-        owner._validate_portable_prefill(
-            metadata,
-            is_prefilling=torch.tensor([False]),
-            **kwargs,
-        )
-
-
-@pytest.mark.parametrize(
-    ("first_position", "anchor", "accepted", "message"),
-    [
-        # A candidate-mutated anchor is invalid even at a compression boundary.
-        (752, 752, 1, "committed selector interval"),
-        # Candidate replay is not compression-group aligned.
-        (753, 753, 1, "committed selector interval"),
-        # An anchor beyond the current first position is invalid.
-        (752, 753, 1, "committed selector interval"),
-        # Stale accepted counts cannot validate a prefill handoff.
-        (752, 749, 3, "commit exactly one token"),
-    ],
-)
-def test_qsa_prefill_validation_rejects_invalid_mtp_replay(
-    first_position: int,
-    anchor: int,
-    accepted: int,
-    message: str,
-) -> None:
-    owner = _bare_qsa_owner_for_prefill_validation()
-    owner.max_seq_len = 4096
-    owner.max_speculative_tokens = 2
-    owner._sequence_lengths[0] = first_position + 1
-    owner._raw_interval_start_positions[0] = anchor
-    metadata = SimpleNamespace(
-        slot_mapping=torch.tensor([first_position], dtype=torch.int64)
-    )
-
-    with pytest.raises(RuntimeError, match=message):
-        owner._validate_portable_prefill(
-            metadata,
-            request_ids=torch.tensor([0], dtype=torch.int32),
-            logical_positions=torch.tensor([first_position], dtype=torch.int64),
-            state_slots=torch.tensor([0], dtype=torch.int32),
-            state_is_fresh=torch.tensor([False]),
-            accepted=torch.tensor([accepted], dtype=torch.int32),
-            is_prefilling=torch.tensor([True]),
-            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-            num_reqs=1,
-            rows=1,
-        )
-
-
-def test_qsa_speculative_anchor_snapshot_restores_all_persistent_slots() -> None:
-    owner = _bare_qsa_owner_for_prefill_validation()
     owner.max_seqs = 8
     owner._raw_interval_start_positions = torch.tensor(
         [-1, 7, 19, 31, 43, 55, 67, 79], dtype=torch.int64
@@ -1265,384 +1006,3 @@ def test_qsa_rope_staging_masks_graph_padding() -> None:
     assert output.data_ptr() == output_ptr
     assert torch.equal(output[:8], source[:8])
     assert torch.equal(output[8:], torch.full_like(output[8:], -1))
-
-
-@pytest.mark.parametrize(
-    "kv_cache_dtype",
-    [torch.bfloat16, torch.float8_e4m3fn],
-    ids=["bf16", "fp8_e4m3"],
-)
-def test_qsa_portable_prefill_matches_pytorch_oracle(
-    kv_cache_dtype: torch.dtype,
-) -> None:
-    from b12x.attention.qsa.reference import (
-        gemma_rmsnorm_reference,
-        score_select_reference,
-        sparse_paged_gqa_reference,
-    )
-
-    device = _require_qsa_gpu()
-    torch.manual_seed(7)
-    rows = 12
-    compress_ratio = 4
-    budget = 2048
-    index_head_dim = 128
-    index_heads = 4
-    main_head_dim = 256
-    query_heads = 4
-    page_size = 16
-
-    logical_positions = torch.arange(rows, dtype=torch.int64, device=device)
-    request_ids = torch.zeros(rows, dtype=torch.int32, device=device)
-    query_start_loc = torch.tensor([0, rows], dtype=torch.int32, device=device)
-    sequence_lengths = torch.tensor([rows], dtype=torch.int32, device=device)
-    state_slots = torch.tensor([[0]], dtype=torch.int32, device=device)
-    raw_keys = torch.randn(rows, 1, index_head_dim, dtype=torch.bfloat16, device=device)
-    raw_positions = logical_positions[:, None, None].expand(-1, 1, 3)
-    raw_ring = torch.zeros(1, 8, 1, index_head_dim, dtype=torch.bfloat16, device=device)
-    compressed_slots = torch.where(
-        (logical_positions + 1).remainder(compress_ratio) == 0,
-        torch.div(logical_positions, compress_ratio, rounding_mode="floor"),
-        -1,
-    )
-
-    pooled, first_positions = qsa_compress_groups_with_ratio(
-        raw_keys,
-        raw_positions,
-        raw_ring,
-        state_slots,
-        request_ids,
-        query_start_loc,
-        logical_positions,
-        compressed_slots,
-        compress_ratio,
-    )
-    completed_rows = torch.tensor([3, 7, 11], device=device)
-    expected_pooled = torch.stack(
-        [
-            raw_keys[start : start + compress_ratio, 0]
-            .float()
-            .mean(0)
-            .to(torch.bfloat16)
-            for start in range(0, rows, compress_ratio)
-        ]
-    )
-    torch.testing.assert_close(
-        pooled[completed_rows, 0], expected_pooled, rtol=0.0, atol=0.0
-    )
-    assert torch.equal(
-        first_positions[completed_rows, 0],
-        torch.tensor([0, 4, 8], dtype=torch.int64, device=device),
-    )
-
-    index_norm_weight = torch.randn(index_head_dim, dtype=torch.bfloat16, device=device)
-    representatives = gemma_rmsnorm_reference(
-        pooled[completed_rows, 0], index_norm_weight, 1e-6
-    )
-    compressed_cache = torch.zeros(
-        1,
-        page_size // compress_ratio,
-        1,
-        index_head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    qsa_store_cache_rows(
-        compressed_cache,
-        compressed_slots[completed_rows],
-        representatives,
-    )
-    assert torch.equal(compressed_cache[0, :3, 0], representatives)
-
-    raw_index_query = torch.randn(
-        rows,
-        index_heads,
-        index_head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    query_norm_weight = torch.randn(index_head_dim, dtype=torch.bfloat16, device=device)
-    index_query = gemma_rmsnorm_reference(raw_index_query, query_norm_weight, 1e-6)
-    block_table = torch.tensor([[0]], dtype=torch.int32, device=device)
-    selected = qsa_select_paged_tokens(
-        index_query,
-        compressed_cache,
-        block_table,
-        request_ids,
-        logical_positions,
-        sequence_lengths,
-        budget,
-        compress_ratio,
-    )
-    _, expected_selected = score_select_reference(
-        index_query,
-        compressed_cache[0, :, 0],
-        logical_positions,
-        rows,
-        compress_ratio,
-        budget,
-    )
-    assert torch.equal(selected, expected_selected)
-
-    query = torch.randn(
-        rows, query_heads, main_head_dim, dtype=torch.bfloat16, device=device
-    )
-    key_source = torch.randn(
-        1, page_size, 1, main_head_dim, dtype=torch.bfloat16, device=device
-    )
-    value_source = torch.randn_like(key_source)
-    if kv_cache_dtype == torch.float8_e4m3fn:
-        k_descale = torch.tensor([0.0125], dtype=torch.float32, device=device)
-        v_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
-        key_cache = (key_source.float() / k_descale).to(kv_cache_dtype)
-        value_cache = (value_source.float() / v_descale).to(kv_cache_dtype)
-        reference_key_cache = key_cache.float() * k_descale
-        reference_value_cache = value_cache.float() * v_descale
-        atol = 3e-2
-    else:
-        key_cache = key_source
-        value_cache = value_source
-        k_descale = torch.ones(1, dtype=torch.float32, device=device)
-        v_descale = torch.ones(1, dtype=torch.float32, device=device)
-        reference_key_cache = key_cache
-        reference_value_cache = value_cache
-        atol = 2e-2
-    actual = qsa_sparse_paged_attention(
-        query,
-        key_cache,
-        value_cache,
-        k_descale,
-        v_descale,
-        selected,
-        block_table,
-        request_ids,
-    )
-    expected = sparse_paged_gqa_reference(
-        query,
-        reference_key_cache,
-        reference_value_cache,
-        block_table,
-        request_ids,
-        expected_selected,
-        logical_positions,
-    )
-    torch.testing.assert_close(actual, expected, rtol=0.0, atol=atol)
-
-
-def test_qsa_portable_fp8_tp1_prefill_fits_sm12x_resources() -> None:
-    device = _require_qsa_gpu()
-    torch.manual_seed(17)
-    rows, query_heads, kv_heads, head_dim = 16, 24, 2, 256
-    group_size = query_heads // kv_heads
-    query = torch.randn(
-        rows, query_heads, head_dim, dtype=torch.bfloat16, device=device
-    )
-    key_source = torch.randn(
-        1, 16, kv_heads, head_dim, dtype=torch.bfloat16, device=device
-    )
-    value_source = torch.randn_like(key_source)
-    k_descale = torch.tensor([0.0125], dtype=torch.float32, device=device)
-    v_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
-    key_cache = (key_source.float() / k_descale).to(torch.float8_e4m3fn)
-    value_cache = (value_source.float() / v_descale).to(torch.float8_e4m3fn)
-    logical_indices = torch.full((rows, 2051), -1, dtype=torch.int32, device=device)
-    logical_indices[:, 0] = 0
-    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
-    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
-
-    actual = qsa_sparse_paged_attention(
-        query,
-        key_cache,
-        value_cache,
-        k_descale,
-        v_descale,
-        logical_indices,
-        block_table,
-        token_to_req,
-    )
-    expected_heads = (value_cache[0, 0].float() * v_descale).to(torch.bfloat16)
-    expected = (
-        expected_heads.repeat_interleave(group_size, dim=0)
-        .unsqueeze(0)
-        .expand_as(actual)
-    )
-    torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-2)
-
-
-def test_qsa_portable_chunk_handoff_uses_exact_tagged_ring() -> None:
-    device = _require_qsa_gpu()
-    torch.manual_seed(11)
-    index_head_dim = 128
-    ring_capacity = 8
-    first_raw = torch.randn(3, index_head_dim, dtype=torch.bfloat16, device=device)
-    first_rope = torch.arange(3, dtype=torch.int64, device=device).unsqueeze(1)
-    raw_ring = torch.zeros(
-        1, ring_capacity, index_head_dim, dtype=torch.bfloat16, device=device
-    )
-    raw_tags = torch.full((1, ring_capacity), -1, dtype=torch.int64, device=device)
-    raw_rope = torch.full((1, ring_capacity, 1), -1, dtype=torch.int64, device=device)
-    anchors = torch.full((1,), -1, dtype=torch.int64, device=device)
-    state_slots = torch.tensor([0], dtype=torch.int32, device=device)
-    query_start_loc = torch.tensor([0, 3], dtype=torch.int32, device=device)
-
-    _commit_prefill_qsa_state_kernel[(1, ring_capacity)](
-        first_raw,
-        first_rope,
-        torch.tensor([True], dtype=torch.bool, device=device),
-        torch.tensor([3], dtype=torch.int32, device=device),
-        query_start_loc,
-        state_slots,
-        raw_ring,
-        raw_tags,
-        raw_rope,
-        anchors,
-        first_raw.stride(0),
-        first_rope.stride(0),
-        first_rope.stride(1),
-        raw_ring.stride(0),
-        raw_ring.stride(1),
-        raw_tags.stride(0),
-        raw_rope.stride(0),
-        raw_rope.stride(1),
-        anchors.stride(0),
-        1,
-        MAX_STATE_SLOTS=1,
-        RING_CAPACITY=ring_capacity,
-        INDEX_HEAD_DIM=index_head_dim,
-        POSITION_AXES=1,
-        BLOCK_D=triton.next_power_of_2(index_head_dim),
-        num_warps=4,
-    )
-    assert torch.equal(raw_ring[0, :3], first_raw)
-    assert torch.equal(
-        raw_tags[0, :3], torch.arange(3, dtype=torch.int64, device=device)
-    )
-    assert int(anchors[0]) == 2
-
-    final_raw = torch.randn(1, 1, index_head_dim, dtype=torch.bfloat16, device=device)
-    pooled, first_positions = qsa_compress_groups_with_ratio(
-        final_raw,
-        torch.tensor([[[3, 3, 3]]], dtype=torch.int64, device=device),
-        raw_ring.unsqueeze(2),
-        state_slots[:, None],
-        torch.tensor([0], dtype=torch.int32, device=device),
-        torch.tensor([0, 1], dtype=torch.int32, device=device),
-        torch.tensor([3], dtype=torch.int64, device=device),
-        torch.tensor([0], dtype=torch.int64, device=device),
-        4,
-    )
-    expected = (
-        torch.cat((first_raw, final_raw[:, 0]), dim=0)
-        .float()
-        .mean(0)
-        .to(torch.bfloat16)
-    )
-    torch.testing.assert_close(pooled[0, 0], expected, rtol=0.0, atol=0.0)
-    assert torch.equal(
-        first_positions[0], torch.zeros(3, dtype=torch.int64, device=device)
-    )
-
-
-def test_qsa_portable_paged_io_crosses_signed_int32_offsets() -> None:
-    device = _require_qsa_gpu()
-    int32_max = int(torch.iinfo(torch.int32).max)
-    required_headroom = 6 * 2**30
-    free_bytes, _ = current_platform.mem_get_info()
-    if free_bytes < required_headroom:
-        pytest.skip("live QSA high-page regression requires 6 GiB free")
-
-    compressed_cache = None
-    main_backing = None
-    try:
-        index_head_dim = 128
-        compressed_stride = index_head_dim
-        compressed_high_page = int32_max // compressed_stride + 1
-        compressed_cache = torch.empty(
-            compressed_high_page + 1,
-            1,
-            1,
-            index_head_dim,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        representative = torch.randn(
-            1, index_head_dim, dtype=torch.bfloat16, device=device
-        )
-        qsa_store_cache_rows(
-            compressed_cache,
-            torch.tensor([compressed_high_page], dtype=torch.int64, device=device),
-            representative,
-        )
-        index_query = torch.randn(
-            1, 4, index_head_dim, dtype=torch.bfloat16, device=device
-        )
-        logits, visible = qsa_mqa_paged(
-            index_query,
-            compressed_cache,
-            torch.tensor([[compressed_high_page]], dtype=torch.int32, device=device),
-            torch.tensor([0], dtype=torch.int32, device=device),
-            torch.tensor([3], dtype=torch.int64, device=device),
-            torch.tensor([4], dtype=torch.int32, device=device),
-            4,
-        )
-        expected_score = (
-            torch.relu(
-                torch.einsum(
-                    "hd,d->h",
-                    index_query[0].float(),
-                    representative[0].float(),
-                )
-            ).sum()
-            / index_head_dim**0.5
-        )
-        assert compressed_high_page * compressed_cache.stride(0) > int32_max
-        assert int(visible[0]) == 1
-        torch.testing.assert_close(logits[0, 0], expected_score, rtol=0.0, atol=2e-5)
-
-        del compressed_cache
-        compressed_cache = None
-        torch.accelerator.empty_cache()
-
-        main_head_dim = 256
-        combined_page_stride = 2 * main_head_dim
-        main_high_page = int32_max // combined_page_stride + 1
-        main_backing = torch.empty(
-            main_high_page + 1,
-            combined_page_stride,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        key_cache = main_backing.as_strided(
-            (main_high_page + 1, 1, 1, main_head_dim),
-            (combined_page_stride, main_head_dim, main_head_dim, 1),
-        )
-        value_cache = main_backing.as_strided(
-            (main_high_page + 1, 1, 1, main_head_dim),
-            (combined_page_stride, main_head_dim, main_head_dim, 1),
-            storage_offset=main_head_dim,
-        )
-        key_cache[main_high_page, 0, 0].normal_()
-        value_cache[main_high_page, 0, 0].normal_()
-        query = torch.randn(1, 4, main_head_dim, dtype=torch.bfloat16, device=device)
-        descale = torch.ones(1, dtype=torch.float32, device=device)
-        output = qsa_sparse_paged_attention(
-            query,
-            key_cache,
-            value_cache,
-            descale,
-            descale,
-            torch.tensor([[0]], dtype=torch.int32, device=device),
-            torch.tensor([[main_high_page]], dtype=torch.int32, device=device),
-            torch.tensor([0], dtype=torch.int32, device=device),
-        )
-        assert main_high_page * key_cache.stride(0) > int32_max
-        torch.testing.assert_close(
-            output[0],
-            value_cache[main_high_page, 0, 0].expand_as(output[0]),
-            rtol=0.0,
-            atol=2e-2,
-        )
-    finally:
-        del compressed_cache
-        del main_backing
-        torch.accelerator.empty_cache()

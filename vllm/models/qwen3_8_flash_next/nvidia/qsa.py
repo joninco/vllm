@@ -59,7 +59,6 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import (
     canonical_qsa_rope_positions,
     qsa_compressed_cache_view,
-    qsa_compressed_slot_mapping,
     qsa_logical_positions,
     qsa_padded_page_size_bytes,
 )
@@ -104,59 +103,9 @@ class Qwen3_8FlashNextQSAMetadata(B12xPagedMetadata):
 
     request_ids: torch.Tensor | None = None
     is_prefilling: torch.Tensor | None = None
-    has_prefill: bool = False
     qsa_state_slot_ids: torch.Tensor | None = None
     qsa_state_is_fresh: torch.Tensor | None = None
     qsa_num_accepted_tokens: torch.Tensor | None = None
-
-
-def _qsa_batch_has_prefill(
-    common_metadata: CommonAttentionMetadata,
-    *,
-    max_speculative_tokens: int,
-) -> bool:
-    num_reqs = int(common_metadata.seq_lens.shape[0])
-    query_lengths = (
-        common_metadata.query_start_loc_cpu[1 : num_reqs + 1]
-        - common_metadata.query_start_loc_cpu[:num_reqs]
-    )
-    active = query_lengths > 0
-    if common_metadata.is_prefilling is None:
-        flags = torch.full_like(
-            active,
-            common_metadata.max_query_len > 1,
-            dtype=torch.bool,
-        )
-    else:
-        flags = common_metadata.is_prefilling[:num_reqs].to(device="cpu")
-    flags = flags | (query_lengths > 1 + max_speculative_tokens)
-    return bool((active & flags).any().item())
-
-
-def _qsa_prefill_requests(
-    metadata: Qwen3_8FlashNextQSAMetadata,
-    *,
-    max_speculative_tokens: int,
-) -> torch.Tensor:
-    num_reqs = int(metadata.seq_lens.shape[0])
-    query_lengths = (
-        metadata.query_start_loc[1 : num_reqs + 1] - metadata.query_start_loc[:num_reqs]
-    )
-    active = query_lengths > 0
-    if metadata.is_prefilling is None:
-        flags = torch.full(
-            (num_reqs,),
-            metadata.max_query_len > 1,
-            dtype=torch.bool,
-            device=active.device,
-        )
-    else:
-        flags = metadata.is_prefilling[:num_reqs]
-        if flags.device != active.device:
-            raise RuntimeError("QSA prefill flags were not staged on the GPU")
-    # PIECEWISE capture constructs synthetic requests that can exceed the
-    # configured speculative decode envelope while marking them non-prefill.
-    return flags | (query_lengths > 1 + max_speculative_tokens)
 
 
 class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
@@ -205,10 +154,6 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
         del common_prefix_len, fast_build
         cm = common_attn_metadata
         num_reqs = int(cm.seq_lens.shape[0])
-        has_prefill = _qsa_batch_has_prefill(
-            cm,
-            max_speculative_tokens=self.max_speculative_tokens,
-        )
         if qsa_state_slot_ids is not None:
             self._capture_state_slot_ids[:num_reqs].copy_(qsa_state_slot_ids[:num_reqs])
         if qsa_state_is_fresh is not None:
@@ -223,9 +168,13 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
         is_prefilling = qsa_is_prefilling
         if is_prefilling is None:
             is_prefilling = cm.is_prefilling
-        if is_prefilling is not None:
-            self._capture_is_prefilling[:num_reqs].copy_(is_prefilling[:num_reqs])
-            is_prefilling = self._capture_is_prefilling[:num_reqs]
+        if is_prefilling is None:
+            raise RuntimeError(
+                "Qwen3.8 Flash Next QSA requires explicit per-request "
+                "is_prefilling metadata"
+            )
+        self._capture_is_prefilling[:num_reqs].copy_(is_prefilling[:num_reqs])
+        is_prefilling = self._capture_is_prefilling[:num_reqs]
         request_ids = cm.token_to_req_indices(self._request_ids)
         num_mapped_tokens = int(cm.query_start_loc_cpu[-1])
         if num_mapped_tokens < cm.num_actual_tokens:
@@ -241,7 +190,6 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
             causal=cast(bool, cm.causal),
             request_ids=request_ids,
             is_prefilling=is_prefilling,
-            has_prefill=has_prefill,
             qsa_state_slot_ids=qsa_state_slot_ids,
             qsa_state_is_fresh=qsa_state_is_fresh,
             qsa_num_accepted_tokens=qsa_num_accepted_tokens,
@@ -690,111 +638,8 @@ def _stage_qsa_rope_positions_kernel(
     )
 
 
-@triton.jit
-def _commit_prefill_qsa_state_kernel(
-    raw_index_key,
-    rope_positions,
-    is_prefilling,
-    sequence_lengths,
-    query_start_loc,
-    state_slot_ids,
-    raw_k_ring,
-    raw_logical_positions,
-    raw_rope_positions,
-    raw_interval_start_positions,
-    raw_key_row_stride,
-    rope_row_stride,
-    rope_axis_stride,
-    raw_k_slot_stride,
-    raw_k_ring_stride,
-    raw_tag_slot_stride,
-    raw_rope_slot_stride,
-    raw_rope_ring_stride,
-    raw_interval_stride,
-    num_reqs,
-    MAX_STATE_SLOTS: tl.constexpr,
-    RING_CAPACITY: tl.constexpr,
-    INDEX_HEAD_DIM: tl.constexpr,
-    POSITION_AXES: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-) -> None:
-    """Commit each request's final ring-capacity rows without slot races."""
-
-    request = tl.program_id(0)
-    suffix_offset = tl.program_id(1)
-    active_request = request < num_reqs
-    query_start = tl.load(query_start_loc + request, mask=active_request, other=0)
-    query_end = tl.load(query_start_loc + request + 1, mask=active_request, other=0)
-    query_length = query_end - query_start
-    suffix_length = tl.minimum(query_length, RING_CAPACITY)
-    row = query_end - suffix_length + suffix_offset
-    state_slot = tl.load(state_slot_ids + request, mask=active_request, other=-1).to(
-        tl.int64
-    )
-    valid = (
-        active_request
-        & (suffix_offset < suffix_length)
-        & (state_slot >= 0)
-        & (state_slot < MAX_STATE_SLOTS)
-    )
-    sequence_length = tl.load(
-        sequence_lengths + request, mask=active_request, other=0
-    ).to(tl.int64)
-    request_is_prefilling = tl.load(
-        is_prefilling + request, mask=active_request, other=0
-    )
-    logical_position = sequence_length - (query_end - row)
-    ring_slot = logical_position % RING_CAPACITY
-
-    dims = tl.arange(0, BLOCK_D)
-    key = tl.load(
-        raw_index_key + row * raw_key_row_stride + dims,
-        mask=valid & (dims < INDEX_HEAD_DIM),
-        other=0.0,
-    )
-    tl.store(
-        raw_k_ring
-        + state_slot * raw_k_slot_stride
-        + ring_slot * raw_k_ring_stride
-        + dims,
-        key,
-        mask=valid & (dims < INDEX_HEAD_DIM),
-    )
-    tl.store(
-        raw_logical_positions + state_slot * raw_tag_slot_stride + ring_slot,
-        logical_position,
-        mask=valid,
-    )
-
-    axes = tl.arange(0, 4)
-    rope = tl.load(
-        rope_positions + row * rope_row_stride + axes * rope_axis_stride,
-        mask=valid & (axes < POSITION_AXES),
-        other=-1,
-    )
-    tl.store(
-        raw_rope_positions
-        + state_slot * raw_rope_slot_stride
-        + ring_slot * raw_rope_ring_stride
-        + axes,
-        rope,
-        mask=valid & (axes < POSITION_AXES),
-    )
-    if suffix_offset == 0:
-        interval_anchor = tl.where(
-            request_is_prefilling,
-            sequence_length - 1,
-            sequence_length - query_length,
-        )
-        tl.store(
-            raw_interval_start_positions + state_slot * raw_interval_stride,
-            interval_anchor,
-            mask=valid,
-        )
-
-
 class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
-    """Merged main attention, selector state, and b12x decode transaction."""
+    """Merged main attention, selector state, and b12x QSA transaction."""
 
     supports_dcp = False
 
@@ -996,9 +841,9 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             persistent=False,
         )
         self.register_buffer(
-            "_decode_output",
+            "_qsa_output",
             torch.empty(
-                self.max_decode_rows,
+                self.max_tokens,
                 self.num_heads,
                 self.head_dim,
                 dtype=torch.bfloat16,
@@ -1009,7 +854,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self.register_buffer(
             "_query_input",
             torch.empty(
-                self.max_decode_rows,
+                self.max_tokens,
                 self.num_heads,
                 self.head_dim,
                 dtype=torch.bfloat16,
@@ -1020,7 +865,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self.register_buffer(
             "_rope_position_input",
             torch.empty(
-                self.max_decode_rows,
+                self.max_tokens,
                 self.position_axes,
                 dtype=torch.int64,
                 device=device,
@@ -1081,6 +926,11 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self.register_buffer(
             "_num_accepted_tokens",
             torch.ones(self.max_seqs, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_is_prefilling",
+            torch.zeros(self.max_seqs, dtype=torch.bool, device=device),
             persistent=False,
         )
         self._main_block_table: torch.Tensor | None = None
@@ -1202,7 +1052,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
                 device=kv_cache.device,
                 max_batch=self.max_seqs,
                 max_raw_state_slots=self.max_seqs,
-                max_q_rows=self.max_decode_rows,
+                max_q_rows=self.max_tokens,
                 max_seq_len=qsa_max_seq_len,
                 num_main_cache_pages=planned_main_cache_pages,
                 num_compressed_cache_pages=planned_compressed_cache_pages,
@@ -1260,8 +1110,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             index_k_norm_weight=self.indexer.k_layernorm.weight,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
-            output=self._decode_output,
-            selected_positions=self._selected_positions[: self.max_decode_rows],
+            output=self._qsa_output,
+            selected_positions=self._selected_positions,
         )
         self._qsa_plan = plan
         self._qsa_binding = binding
@@ -1356,6 +1206,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         request_ids, state_slots, state_is_fresh, accepted = self._require_qsa_metadata(
             metadata
         )
+        if metadata.is_prefilling is None:
+            raise RuntimeError("QSA prefill metadata is missing")
         num_reqs = int(metadata.seq_lens.shape[0])
         if rows > row_capacity or num_reqs > self.max_seqs:
             raise ValueError("QSA batch exceeds its planned capacity")
@@ -1376,6 +1228,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self._raw_state_slot_ids.fill_(-1)
         self._state_is_fresh.zero_()
         self._num_accepted_tokens.zero_()
+        self._is_prefilling.zero_()
+        self._is_prefilling[:num_reqs].copy_(metadata.is_prefilling[:num_reqs])
         if num_reqs:
             _stage_qsa_request_state_kernel[(num_reqs,)](
                 state_slots,
@@ -1404,7 +1258,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             num_reqs,
         )
 
-    def _prepare_decode_metadata(
+    def _prepare_qsa_metadata(
         self,
         metadata: Qwen3_8FlashNextQSAMetadata,
         rows: int,
@@ -1420,7 +1274,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         ) = self._stage_runtime_metadata(
             metadata,
             rows,
-            row_capacity=self.max_decode_rows,
+            row_capacity=self.max_tokens,
         )
         self._reset_fresh_selector_state(
             state_slot_ids=state_slots,
@@ -1432,384 +1286,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         )
         return request_ids, logical_positions
 
-    @staticmethod
-    def _require_prefill_invariant(
-        condition: torch.Tensor,
-        message: str,
-    ) -> None:
-        # The portable prefill is deliberately an eager reference path. A
-        # host-visible validation barrier keeps every cache mutation after all
-        # continuity and page-table checks.
-        if not bool(condition.all().item()):
-            raise RuntimeError(message)
-
-    def _validate_portable_prefill(
-        self,
-        metadata: Qwen3_8FlashNextQSAMetadata,
-        *,
-        request_ids: torch.Tensor,
-        logical_positions: torch.Tensor,
-        state_slots: torch.Tensor,
-        state_is_fresh: torch.Tensor,
-        accepted: torch.Tensor,
-        is_prefilling: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        num_reqs: int,
-        rows: int,
-    ) -> tuple[int, torch.Tensor, torch.Tensor]:
-        if self._main_block_table is None:
-            raise RuntimeError("QSA main cache is not bound")
-        mapped_rows = int(query_start_loc[num_reqs].item())
-        if not 0 < mapped_rows <= rows:
-            raise RuntimeError("QSA prefill must contain at least one mapped row")
-
-        active_request_ids = request_ids[:mapped_rows]
-        active_logical_positions = logical_positions[:mapped_rows]
-        query_lengths = query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
-        active_requests = query_lengths > 0
-        expected_request_ids = torch.repeat_interleave(
-            torch.arange(
-                num_reqs,
-                dtype=torch.int32,
-                device=request_ids.device,
-            ),
-            query_lengths,
-            output_size=mapped_rows,
-        )
-        self._require_prefill_invariant(
-            active_request_ids == expected_request_ids,
-            "QSA prefill rows are not dense request intervals",
-        )
-        if mapped_rows < rows:
-            self._require_prefill_invariant(
-                request_ids[mapped_rows:rows] == -1,
-                "QSA padded rows must carry request ID -1",
-            )
-
-        active_slots = state_slots[active_requests]
-        self._require_prefill_invariant(
-            (active_slots >= 0) & (active_slots < self.max_seqs),
-            "QSA prefill received an invalid persistent state slot",
-        )
-        if int(torch.unique(active_slots).numel()) != int(active_slots.numel()):
-            raise RuntimeError("QSA prefill state slots must be unique")
-
-        active_lengths = query_lengths[active_requests].to(torch.int64)
-        sequence_lengths = self._sequence_lengths[:num_reqs][active_requests].to(
-            torch.int64
-        )
-        first_positions = sequence_lengths - active_lengths
-        active_fresh = state_is_fresh[active_requests]
-        active_accepted = accepted[active_requests].to(torch.int64)
-        self._require_prefill_invariant(
-            (first_positions >= 0) & (sequence_lengths <= self.max_seq_len),
-            "QSA prefill sequence positions exceed the planned context",
-        )
-        self._require_prefill_invariant(
-            (active_accepted >= 1)
-            & (active_accepted <= self.max_speculative_tokens + 1),
-            "QSA prefill received an invalid accepted-token count",
-        )
-        active_prefilling = is_prefilling[:num_reqs][active_requests].to(
-            device=active_accepted.device
-        )
-        self._require_prefill_invariant(
-            ~active_prefilling | (active_accepted == 1),
-            "QSA prefill requests must commit exactly one token",
-        )
-        self._require_prefill_invariant(
-            ~active_fresh | (first_positions.remainder(self.compress_ratio) == 0),
-            "A fresh QSA prefix must end on a complete compression group",
-        )
-        anchors = self._raw_interval_start_positions.index_select(
-            0, active_slots.to(torch.long)
-        )
-        continues_decode_interval = (~active_prefilling) & (
-            first_positions == anchors + active_accepted
-        )
-        continues_prefill_interval = (
-            active_prefilling
-            & (active_accepted == 1)
-            & (first_positions == anchors + 1)
-        )
-        valid_continuation = (
-            active_fresh | continues_decode_interval | continues_prefill_interval
-        )
-        if not bool(valid_continuation.all().item()):
-            raise RuntimeError(
-                "QSA prefill does not continue the committed selector interval: "
-                f"slots={active_slots.tolist()}, "
-                f"first_positions={first_positions.tolist()}, "
-                f"anchors={anchors.tolist()}, "
-                f"accepted={active_accepted.tolist()}, "
-                f"prefilling={active_prefilling.tolist()}, "
-                f"fresh={active_fresh.tolist()}"
-            )
-        state_reset_mask = state_is_fresh[:num_reqs].clone()
-
-        compressed_slots = qsa_compressed_slot_mapping(
-            block_table=self._main_block_table,
-            request_ids=active_request_ids,
-            logical_positions=active_logical_positions,
-            main_page_size=int(self.kv_cache.shape[2]),
-            compress_ratio=self.compress_ratio,
-        )
-        completed = (active_logical_positions >= self.compress_ratio - 1) & (
-            (active_logical_positions + 1).remainder(self.compress_ratio) == 0
-        )
-        self._require_prefill_invariant(
-            ~completed | (compressed_slots >= 0),
-            "QSA prefill cannot map a completed group into the packed cache",
-        )
-        self._require_prefill_invariant(
-            metadata.slot_mapping[:mapped_rows] >= 0,
-            "QSA prefill cannot map a main K/V row into the cache",
-        )
-
-        row_requests = active_request_ids.to(torch.long)
-        request_first_positions = self._sequence_lengths[:num_reqs].to(
-            torch.int64
-        ) - query_lengths.to(torch.int64)
-        row_first_positions = request_first_positions.index_select(0, row_requests)
-        group_offsets = torch.arange(
-            self.compress_ratio,
-            dtype=torch.int64,
-            device=active_logical_positions.device,
-        )
-        source_positions = (
-            active_logical_positions[:, None] - self.compress_ratio + 1 + group_offsets
-        )
-        needs_history = completed[:, None] & (
-            source_positions < row_first_positions[:, None]
-        )
-        row_state_slots = state_slots.index_select(0, row_requests).to(torch.long)
-        observed_tags = self._raw_logical_positions[
-            row_state_slots[:, None],
-            source_positions.remainder(self.raw_ring_capacity),
-        ]
-        self._require_prefill_invariant(
-            ~needs_history | (observed_tags == source_positions),
-            "QSA prefill cannot complete a group from the committed raw ring",
-        )
-        if self.position_axes == 1:
-            observed_rope = self._raw_rope_positions[
-                row_state_slots[:, None],
-                source_positions.remainder(self.raw_ring_capacity),
-                0,
-            ]
-            self._require_prefill_invariant(
-                ~needs_history | (observed_rope == source_positions),
-                "QSA scalar-RoPE history does not match its logical tags",
-            )
-        return mapped_rows, compressed_slots, state_reset_mask
-
-    def _commit_portable_prefill_state(
-        self,
-        *,
-        raw_index_key: torch.Tensor,
-        rope_positions: torch.Tensor,
-        is_prefilling: torch.Tensor,
-        state_slots: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        num_reqs: int,
-    ) -> None:
-        if not HAS_TRITON:
-            raise RuntimeError("QSA portable prefill state updates require Triton")
-        _commit_prefill_qsa_state_kernel[(num_reqs, self.raw_ring_capacity)](
-            raw_index_key,
-            rope_positions,
-            is_prefilling,
-            self._sequence_lengths,
-            query_start_loc,
-            state_slots,
-            self._raw_k_ring,
-            self._raw_logical_positions,
-            self._raw_rope_positions,
-            self._raw_interval_start_positions,
-            raw_index_key.stride(0),
-            rope_positions.stride(0),
-            rope_positions.stride(1),
-            self._raw_k_ring.stride(0),
-            self._raw_k_ring.stride(1),
-            self._raw_logical_positions.stride(0),
-            self._raw_rope_positions.stride(0),
-            self._raw_rope_positions.stride(1),
-            self._raw_interval_start_positions.stride(0),
-            num_reqs,
-            MAX_STATE_SLOTS=self.max_seqs,
-            RING_CAPACITY=self.raw_ring_capacity,
-            INDEX_HEAD_DIM=self.index_head_dim,
-            POSITION_AXES=self.position_axes,
-            BLOCK_D=triton.next_power_of_2(self.index_head_dim),
-            num_warps=4,
-        )
-
-    def _run_portable_qsa(
-        self,
-        *,
-        metadata: Qwen3_8FlashNextQSAMetadata,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        index_query: torch.Tensor,
-        raw_index_key: torch.Tensor,
-        is_prefilling: torch.Tensor,
-        output: torch.Tensor,
-        rows: int,
-    ) -> None:
-        if self._compressed_cache is None or self._main_block_table is None:
-            raise RuntimeError("QSA caches are not bound")
-        # CUDA-graph profiling executes split ops with every synthetic token
-        # marked as padding. Native K/V writes already treat slot -1 as a
-        # no-op; keep the portable selector path equally side-effect free.
-        if bool((metadata.slot_mapping[:rows] < 0).all().item()):
-            output.zero_()
-            return
-        (
-            request_ids,
-            logical_positions,
-            state_slots,
-            state_is_fresh,
-            accepted,
-            query_start_loc,
-            num_reqs,
-        ) = self._stage_runtime_metadata(
-            metadata,
-            rows,
-            row_capacity=self.max_tokens,
-        )
-        mapped_rows, compressed_slots, state_reset_mask = (
-            self._validate_portable_prefill(
-                metadata,
-                request_ids=request_ids,
-                logical_positions=logical_positions,
-                state_slots=state_slots,
-                state_is_fresh=state_is_fresh,
-                accepted=accepted,
-                is_prefilling=is_prefilling,
-                query_start_loc=query_start_loc,
-                num_reqs=num_reqs,
-                rows=rows,
-            )
-        )
-        request_ids = request_ids[:mapped_rows]
-        logical_positions = logical_positions[:mapped_rows]
-        compressed_slots = compressed_slots[:mapped_rows]
-        active_positions = self._active_positions(positions, mapped_rows)
-        rope_positions = canonical_qsa_rope_positions(
-            active_positions,
-            num_rows=mapped_rows,
-            position_axes=self.position_axes,
-        )
-
-        self._reset_fresh_selector_state(
-            state_slot_ids=state_slots,
-            state_is_fresh=state_reset_mask,
-            sequence_lengths=self._sequence_lengths,
-            query_start_loc=query_start_loc,
-            num_accepted_tokens=accepted,
-            num_reqs=num_reqs,
-        )
-
-        from .ops.qsa import (
-            qsa_compress_groups_with_ratio,
-            qsa_select_paged_tokens,
-            qsa_sparse_paged_attention,
-            qsa_store_cache_rows,
-        )
-
-        active_raw_key = raw_index_key[:mapped_rows]
-        if self.position_axes == 3:
-            raw_positions = rope_positions[:, None, :]
-            rope_cache = self._raw_rope_positions.unsqueeze(2)
-        else:
-            raw_positions = logical_positions[:, None, None].expand(-1, 1, 3)
-            rope_cache = None
-        pooled, first_rope_positions = qsa_compress_groups_with_ratio(
-            active_raw_key.unsqueeze(1),
-            raw_positions,
-            self._raw_k_ring.unsqueeze(2),
-            state_slots[:, None],
-            request_ids,
-            query_start_loc,
-            logical_positions,
-            compressed_slots,
-            self.compress_ratio,
-            rope_cache,
-        )
-        completed = compressed_slots >= 0
-        pooled = torch.where(completed[:, None, None], pooled, 0.0)
-        first_rope_positions = torch.where(completed[:, None], first_rope_positions, 0)
-        compressed_keys = cast(torch.Tensor, self.indexer.k_layernorm(pooled))
-        compressed_key_positions = (
-            first_rope_positions.transpose(0, 1)
-            if self.position_axes == 3
-            else first_rope_positions[:, 0]
-        )
-        compressed_keys = apply_qsa_rope(
-            self.rotary_emb,
-            compressed_key_positions,
-            compressed_keys,
-        )
-        qsa_store_cache_rows(
-            self._compressed_cache.unsqueeze(2),
-            compressed_slots,
-            compressed_keys,
-        )
-        self._commit_portable_prefill_state(
-            raw_index_key=active_raw_key,
-            rope_positions=rope_positions,
-            is_prefilling=is_prefilling,
-            state_slots=state_slots,
-            query_start_loc=query_start_loc,
-            num_reqs=num_reqs,
-        )
-
-        impl = cast(Qwen3_8FlashNextQSAImpl, self.impl)
-        impl.do_kv_cache_update(
-            self,
-            key[:mapped_rows],
-            value[:mapped_rows],
-            self.kv_cache,
-            metadata.slot_mapping[:mapped_rows],
-        )
-        prepared_index_query = cast(
-            torch.Tensor,
-            self.indexer.q_layernorm(index_query[:mapped_rows]),
-        )
-        prepared_index_query = apply_qsa_rope(
-            self.rotary_emb,
-            active_positions,
-            prepared_index_query,
-        )
-        selected = self._selected_positions[:mapped_rows]
-        qsa_select_paged_tokens(
-            prepared_index_query,
-            self._compressed_cache.unsqueeze(2),
-            self._main_block_table,
-            request_ids,
-            logical_positions,
-            self._sequence_lengths,
-            self.budget,
-            self.compress_ratio,
-            selected,
-        )
-        main_k_cache, main_v_cache = impl._kv_cache_views(self.kv_cache)
-        output.zero_()
-        qsa_sparse_paged_attention(
-            query[:mapped_rows],
-            main_k_cache,
-            main_v_cache,
-            self._k_scale,
-            self._v_scale,
-            selected,
-            self._main_block_table,
-            request_ids,
-            output[:mapped_rows],
-        )
-
-    def _run_b12x_decode(
+    def _run_b12x_qsa(
         self,
         *,
         metadata: Qwen3_8FlashNextQSAMetadata,
@@ -1823,8 +1300,8 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         rows: int,
     ) -> None:
         if self._qsa_binding is None:
-            raise RuntimeError("b12x QSA decode was not bound to its cache")
-        request_ids, logical_positions = self._prepare_decode_metadata(metadata, rows)
+            raise RuntimeError("b12x QSA was not bound to its cache")
+        request_ids, logical_positions = self._prepare_qsa_metadata(metadata, rows)
         # The model-state diagnostic reads this stable staged view after CUDA
         # graph replay, when the custom-op body itself does not execute in Python.
         self._b12x_diagnostic_request_ids = request_ids
@@ -1871,6 +1348,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             sequence_lengths=self._sequence_lengths,
             query_start_loc=self._query_start_loc,
             num_accepted_tokens=self._num_accepted_tokens,
+            is_prefilling=self._is_prefilling,
         )
         output.zero_()
         output[:rows].copy_(result)
@@ -1915,35 +1393,17 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         if metadata.causal is not True:
             raise NotImplementedError("QSA supports causal attention only")
 
-        if metadata.has_prefill:
-            prefill_requests = _qsa_prefill_requests(
-                metadata,
-                max_speculative_tokens=self.max_speculative_tokens,
-            )
-            self._run_portable_qsa(
-                metadata=metadata,
-                positions=positions,
-                query=query,
-                key=key,
-                value=value,
-                index_query=index_query,
-                raw_index_key=raw_index_key,
-                is_prefilling=prefill_requests,
-                output=output,
-                rows=rows,
-            )
-        else:
-            self._run_b12x_decode(
-                metadata=metadata,
-                positions=positions,
-                query=query,
-                key=key,
-                value=value,
-                index_query=index_query,
-                raw_index_key=raw_index_key,
-                output=output,
-                rows=rows,
-            )
+        self._run_b12x_qsa(
+            metadata=metadata,
+            positions=positions,
+            query=query,
+            key=key,
+            value=value,
+            index_query=index_query,
+            raw_index_key=raw_index_key,
+            output=output,
+            rows=rows,
+        )
         if rows < output.shape[0]:
             output[rows:].zero_()
 

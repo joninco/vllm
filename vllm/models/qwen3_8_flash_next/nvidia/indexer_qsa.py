@@ -18,11 +18,10 @@ from ..config import Qwen3_8FlashNextTextConfig
 class QSAIndexer(nn.Module):
     """Project raw index Q/K while exposing learned selector norm weights.
 
-    The b12x decode transaction owns Q/K normalization, RoPE, streaming
-    compression, selection, and sparse attention. Prefill uses the same learned
-    weights through the package-local portable kernels. Keeping this module to
-    checkpoint-owned parameters prevents a second cache policy from leaking
-    into the model definition.
+    The b12x QSA transaction owns Q/K normalization, RoPE, streaming
+    compression, selection, and sparse attention for both prefill and decode.
+    Keeping this module to checkpoint-owned parameters prevents a second cache
+    policy from leaking into the model definition.
     """
 
     def __init__(
