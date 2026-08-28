@@ -9,14 +9,32 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-zai-org/GLM-5.3-Flash}"
 LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8001}"
-DEFAULT_DEVICE_IDS=0,1,2,3
+DEFAULT_DEVICE_IDS=8,9
 DEVICE_IDS="${DEVICE_IDS:-${DEFAULT_DEVICE_IDS}}"
-TP_SIZE="${TP_SIZE:-4}"
+TP_SIZE="${TP_SIZE:-2}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.94}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-auto}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
-NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
+SPECULATOR="${SPECULATOR:-mtp}"
+DFLASH2_MODEL="${DFLASH2_MODEL:-incoai/GLM-5.3-Flash-DFlash2}"
+
+case "${SPECULATOR}" in
+  mtp)
+    default_num_speculative_tokens=5
+    ;;
+  dflash2)
+    # The checkpoint is trained for an eight-token block: one verified token
+    # plus seven draft tokens.
+    default_num_speculative_tokens=7
+    ;;
+  *)
+    echo "SPECULATOR must be mtp or dflash2; got '${SPECULATOR}'" >&2
+    exit 2
+    ;;
+esac
+
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-${default_num_speculative_tokens}}"
 
 if [[ ! "${NUM_SPECULATIVE_TOKENS}" =~ ^[0-9]+$ ]]; then
   echo "NUM_SPECULATIVE_TOKENS must be a non-negative integer; got '${NUM_SPECULATIVE_TOKENS}'" >&2
@@ -80,9 +98,18 @@ export VLLM_B12X_MOE_FP4_FORCE_A16="${VLLM_B12X_MOE_FP4_FORCE_A16:-1}"
 
 speculative_args=()
 if ((NUM_SPECULATIVE_TOKENS > 0)); then
-  printf -v speculative_config \
-    '{"method":"mtp","num_speculative_tokens":%s,"moe_backend":"humming","attention_backend":"B12X"}' \
-    "${NUM_SPECULATIVE_TOKENS}"
+  case "${SPECULATOR}" in
+    mtp)
+      printf -v speculative_config \
+        '{"method":"mtp","num_speculative_tokens":%s,"moe_backend":"humming","attention_backend":"B12X"}' \
+        "${NUM_SPECULATIVE_TOKENS}"
+      ;;
+    dflash2)
+      printf -v speculative_config \
+        '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"auto"}' \
+        "${DFLASH2_MODEL}" "${NUM_SPECULATIVE_TOKENS}"
+      ;;
+  esac
   speculative_args=(--speculative-config "${speculative_config}")
 fi
 
@@ -121,4 +148,6 @@ cd "${SCRIPT_DIR}"
 printf 'Launching %s as %s directly on devices %s\n' \
   "${MODEL_PATH}" "${SERVED_MODEL_NAME}" "${DEVICE_IDS}" >&2
 printf 'Serving NVFP4 routed experts through B12X W4A16 (BF16 activations)\n' >&2
+printf 'Speculator: %s (%s draft tokens)\n' \
+  "${SPECULATOR}" "${NUM_SPECULATIVE_TOKENS}" >&2
 exec "${command[@]}"

@@ -18,7 +18,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
 )
 from vllm.model_executor.models.glm4_1v import Glm4vForConditionalGeneration
-from vllm.model_executor.models.interfaces import supports_pp
+from vllm.model_executor.models.interfaces import supports_eagle3, supports_pp
 from vllm.models.glm5next.nvidia import attention as glm5next_attention
 from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
 from vllm.models.glm5next.nvidia.model import (
@@ -43,6 +43,9 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xGLM5NextMLASparseBackend,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+    get_eagle3_aux_layers_from_config,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _make_eagle_draft_vllm_config,
 )
@@ -280,6 +283,71 @@ def test_glm5next_b12x_mhc_builds_first_layer_broadcast_fn() -> None:
     expected = layer.hc_attn_fn.detach().view(24, hc_mult, hidden_size).sum(dim=1)
     torch.testing.assert_close(layer.hc_attn_fn_broadcast, expected)
     assert layer.hc_attn_fn_broadcast.data_ptr() == broadcast_data_ptr
+
+
+def test_glm5next_dflash_contracts_completed_mhc_hidden_state() -> None:
+    completed = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+
+    class FakeMhcLayer:
+        mhc = True
+        n = 4
+
+        def hc_post(self, hidden_states, residual, post, comb):
+            return completed
+
+    model = Glm5NextModel.__new__(Glm5NextModel)
+    torch.nn.Module.__init__(model)
+    model.dflash_capture = True
+
+    actual = model._prepare_aux_hidden_state(
+        FakeMhcLayer(),
+        torch.zeros(2, 3),
+        torch.zeros(2, 4, 3),
+        torch.zeros(2, 4),
+        torch.zeros(2, 4, 4),
+    )
+
+    torch.testing.assert_close(actual, completed.mean(dim=1))
+    assert actual.shape == (2, 3)
+
+
+def test_glm5next_eagle_capture_preserves_completed_mhc_streams() -> None:
+    completed = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+
+    class FakeMhcLayer:
+        mhc = True
+        n = 4
+
+        def hc_post(self, hidden_states, residual, post, comb):
+            return completed
+
+    model = Glm5NextModel.__new__(Glm5NextModel)
+    torch.nn.Module.__init__(model)
+    model.dflash_capture = False
+
+    actual = model._prepare_aux_hidden_state(
+        FakeMhcLayer(),
+        torch.zeros(2, 3),
+        torch.zeros(2, 4, 3),
+        torch.zeros(2, 4),
+        torch.zeros(2, 4, 4),
+    )
+
+    torch.testing.assert_close(actual, completed.flatten(1))
+    assert actual.shape == (2, 12)
+
+
+def test_glm5next_dflash_maps_target_layers_to_completed_outputs() -> None:
+    draft_hf_config = SimpleNamespace(
+        dflash_config={"target_layer_ids": [5, 14, 24, 33, 42]}
+    )
+    spec_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(hf_config=draft_hf_config)
+    )
+
+    assert get_eagle3_aux_layers_from_config(spec_config) == (6, 15, 25, 34, 43)
+    assert supports_eagle3(Glm5NextForCausalLM)
+    assert supports_eagle3(Glm5NextForConditionalGeneration)
 
 
 def test_glm5next_conditional_post_load_finalizes_language_model() -> None:
