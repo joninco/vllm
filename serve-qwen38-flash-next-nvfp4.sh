@@ -10,9 +10,16 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next-4p89bpw}"
 LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-DEFAULT_DEVICE_IDS=8,9
-DEVICE_IDS="${DEVICE_IDS:-${DEFAULT_DEVICE_IDS}}"
 TP_SIZE="${TP_SIZE:-2}"
+if [[ "${TP_SIZE}" == 1 ]]; then
+  DEFAULT_DEVICE_IDS=8
+  default_ple_cpu_offload=1
+else
+  DEFAULT_DEVICE_IDS=8,9
+  default_ple_cpu_offload=0
+fi
+DEVICE_IDS="${DEVICE_IDS:-${DEFAULT_DEVICE_IDS}}"
+VLLM_PLE_CPU_OFFLOAD="${VLLM_PLE_CPU_OFFLOAD:-${default_ple_cpu_offload}}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.94}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-auto}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
@@ -43,6 +50,9 @@ bool_value() {
 usage() {
   printf '%s\n' \
     "Usage: $0 [launcher options] [vLLM options]" \
+    "" \
+    "Environment modes:" \
+    "  TP_SIZE=1                    Use one GPU and mapped-host n-gram tables." \
     "" \
     "Launcher options:" \
     "  --torch-profile [DIR]         Enable a four-step Torch CPU+CUDA capture." \
@@ -124,6 +134,8 @@ TORCH_PROFILE_WITH_FLOPS=$(bool_value \
   TORCH_PROFILE_WITH_FLOPS "${TORCH_PROFILE_WITH_FLOPS}")
 TORCH_PROFILE_USE_GZIP=$(bool_value \
   TORCH_PROFILE_USE_GZIP "${TORCH_PROFILE_USE_GZIP}")
+VLLM_PLE_CPU_OFFLOAD=$(bool_value \
+  VLLM_PLE_CPU_OFFLOAD "${VLLM_PLE_CPU_OFFLOAD}")
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Python interpreter not found or not executable: ${PYTHON_BIN}" >&2
@@ -195,6 +207,7 @@ export NCCL_PROTO="${NCCL_PROTO:-LL,LL128,Simple}"
 export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
 export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+export VLLM_PLE_CPU_OFFLOAD
 export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
 export INSTANTTENSOR_BACKEND="${INSTANTTENSOR_BACKEND:-BUFFERED}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -288,6 +301,9 @@ cd "${SCRIPT_DIR}"
 printf 'Launching %s as %s on devices %s through %s\n' \
   "${MODEL_PATH}" "${SERVED_MODEL_NAME}" "${DEVICE_IDS}" \
   "${B12X_TC_RESOURCE}" >&2
+if [[ "${VLLM_PLE_CPU_OFFLOAD}" == 1 ]]; then
+  printf 'PLE n-gram tables: CUDA-mapped host DRAM\n' >&2
+fi
 if [[ -n "${TORCH_PROFILE_DIR}" ]]; then
   printf 'Torch CPU+CUDA profiling enabled; traces: %s\n' \
     "${TORCH_PROFILE_DIR}" >&2

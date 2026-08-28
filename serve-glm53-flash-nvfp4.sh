@@ -18,6 +18,111 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 SPECULATOR="${SPECULATOR:-mtp}"
 DFLASH2_MODEL="${DFLASH2_MODEL:-incoai/GLM-5.3-Flash-DFlash2}"
+TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-}"
+TORCH_PROFILE_RECORD_SHAPES="${TORCH_PROFILE_RECORD_SHAPES:-0}"
+TORCH_PROFILE_WITH_MEMORY="${TORCH_PROFILE_WITH_MEMORY:-0}"
+TORCH_PROFILE_WITH_STACK="${TORCH_PROFILE_WITH_STACK:-1}"
+TORCH_PROFILE_WITH_FLOPS="${TORCH_PROFILE_WITH_FLOPS:-0}"
+TORCH_PROFILE_USE_GZIP="${TORCH_PROFILE_USE_GZIP:-1}"
+TORCH_PROFILE_DEFAULT_DIR=/tmp/vllm-ds4-decode
+TORCH_PROFILE_MAX_ITERATIONS=4
+
+bool_value() {
+  local name=$1 value=${2,,}
+  case "${value}" in
+    1|true|yes|on) printf '1\n' ;;
+    0|false|no|off) printf '0\n' ;;
+    *)
+      echo "${name} must be 1/0, true/false, yes/no, or on/off; got '${2}'" >&2
+      exit 2
+      ;;
+  esac
+}
+
+usage() {
+  printf '%s\n' \
+    "Usage: $0 [launcher options] [vLLM options]" \
+    "" \
+    "Launcher options:" \
+    "  --torch-profile [DIR]         Enable a four-step Torch CPU+CUDA capture." \
+    "                                DIR defaults to /tmp/vllm-ds4-decode." \
+    "  --torch-profile-record-shapes Record tensor shapes." \
+    "  --torch-profile-with-memory   Record tensor memory activity." \
+    "  --torch-profile-with-flops    Estimate supported operator FLOPs." \
+    "  --torch-profile-no-stack      Disable Python stack capture." \
+    "  --torch-profile-no-gzip       Write uncompressed trace files." \
+    "  -h, --help                    Show this help." \
+    "" \
+    "All other arguments are forwarded to vLLM. Equivalent environment" \
+    "variables use the TORCH_PROFILE_* names declared at the top of the script."
+}
+
+vllm_args=()
+while (($#)); do
+  case "$1" in
+    --torch-profile)
+      if (($# >= 2)) && [[ "$2" != -* ]]; then
+        TORCH_PROFILE_DIR=$2
+        shift 2
+      else
+        TORCH_PROFILE_DIR=${TORCH_PROFILE_DIR:-${TORCH_PROFILE_DEFAULT_DIR}}
+        shift
+      fi
+      ;;
+    --torch-profile=*)
+      TORCH_PROFILE_DIR=${1#*=}
+      if [[ -z "${TORCH_PROFILE_DIR}" ]]; then
+        echo "--torch-profile requires a non-empty output directory" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --torch-profile-record-shapes)
+      TORCH_PROFILE_RECORD_SHAPES=1
+      shift
+      ;;
+    --torch-profile-with-memory)
+      TORCH_PROFILE_WITH_MEMORY=1
+      shift
+      ;;
+    --torch-profile-with-flops)
+      TORCH_PROFILE_WITH_FLOPS=1
+      shift
+      ;;
+    --torch-profile-no-stack)
+      TORCH_PROFILE_WITH_STACK=0
+      shift
+      ;;
+    --torch-profile-no-gzip)
+      TORCH_PROFILE_USE_GZIP=0
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      vllm_args+=("$@")
+      break
+      ;;
+    *)
+      vllm_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+TORCH_PROFILE_RECORD_SHAPES=$(bool_value \
+  TORCH_PROFILE_RECORD_SHAPES "${TORCH_PROFILE_RECORD_SHAPES}")
+TORCH_PROFILE_WITH_MEMORY=$(bool_value \
+  TORCH_PROFILE_WITH_MEMORY "${TORCH_PROFILE_WITH_MEMORY}")
+TORCH_PROFILE_WITH_STACK=$(bool_value \
+  TORCH_PROFILE_WITH_STACK "${TORCH_PROFILE_WITH_STACK}")
+TORCH_PROFILE_WITH_FLOPS=$(bool_value \
+  TORCH_PROFILE_WITH_FLOPS "${TORCH_PROFILE_WITH_FLOPS}")
+TORCH_PROFILE_USE_GZIP=$(bool_value \
+  TORCH_PROFILE_USE_GZIP "${TORCH_PROFILE_USE_GZIP}")
 
 case "${SPECULATOR}" in
   mtp)
@@ -113,6 +218,54 @@ if ((NUM_SPECULATIVE_TOKENS > 0)); then
   speculative_args=(--speculative-config "${speculative_config}")
 fi
 
+profiler_args=()
+if [[ -n "${TORCH_PROFILE_DIR}" ]]; then
+  if [[ "${TORCH_PROFILE_DIR}" != /* ]]; then
+    TORCH_PROFILE_DIR="${SCRIPT_DIR}/${TORCH_PROFILE_DIR}"
+  fi
+  mkdir -p -- "${TORCH_PROFILE_DIR}"
+  profiler_config="$(
+    "${PYTHON_BIN}" - \
+      "${TORCH_PROFILE_DIR}" \
+      "${TORCH_PROFILE_RECORD_SHAPES}" \
+      "${TORCH_PROFILE_WITH_MEMORY}" \
+      "${TORCH_PROFILE_WITH_STACK}" \
+      "${TORCH_PROFILE_WITH_FLOPS}" \
+      "${TORCH_PROFILE_USE_GZIP}" \
+      "${TORCH_PROFILE_MAX_ITERATIONS}" <<'PY'
+import json
+import sys
+
+(
+    output_dir,
+    record_shapes,
+    with_memory,
+    with_stack,
+    with_flops,
+    use_gzip,
+    max_iterations,
+) = sys.argv[1:]
+print(
+    json.dumps(
+        {
+            "profiler": "torch",
+            "torch_profiler_dir": output_dir,
+            "torch_profiler_record_shapes": record_shapes == "1",
+            "torch_profiler_with_memory": with_memory == "1",
+            "torch_profiler_with_stack": with_stack == "1",
+            "torch_profiler_with_flops": with_flops == "1",
+            "torch_profiler_use_gzip": use_gzip == "1",
+            "ignore_frontend": True,
+            "delay_iterations": 0,
+            "max_iterations": int(max_iterations),
+        }
+    )
+)
+PY
+  )"
+  profiler_args=(--profiler-config "${profiler_config}")
+fi
+
 command=(
   "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}"
   --served-model-name "${SERVED_MODEL_NAME}"
@@ -138,10 +291,11 @@ command=(
   --max-num-seqs "${MAX_NUM_SEQS}"
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   "${speculative_args[@]}"
+  "${profiler_args[@]}"
   --reasoning-parser glm45
   --tool-call-parser glm47
   --enable-auto-tool-choice
-  "$@"
+  "${vllm_args[@]}"
 )
 
 cd "${SCRIPT_DIR}"
@@ -150,4 +304,10 @@ printf 'Launching %s as %s directly on devices %s\n' \
 printf 'Serving NVFP4 routed experts through B12X W4A16 (BF16 activations)\n' >&2
 printf 'Speculator: %s (%s draft tokens)\n' \
   "${SPECULATOR}" "${NUM_SPECULATIVE_TOKENS}" >&2
+if [[ -n "${TORCH_PROFILE_DIR}" ]]; then
+  printf 'Torch CPU+CUDA profiling enabled; traces: %s\n' \
+    "${TORCH_PROFILE_DIR}" >&2
+  printf 'Trigger with b12x vllm-take-capture; auto-stop: %s engine steps.\n' \
+    "${TORCH_PROFILE_MAX_ITERATIONS}" >&2
+fi
 exec "${command[@]}"
