@@ -32,6 +32,7 @@ if [[ -z "${KV_CACHE_MEMORY_BYTES+x}" ]]; then
 fi
 SPECULATOR="${SPECULATOR:-mtp}"
 DFLASH2_MODEL="${DFLASH2_MODEL:-incoai/GLM-5.3-Flash-DFlash2}"
+ADAPTIVE_SPECULATIVE_TOKENS="${ADAPTIVE_SPECULATIVE_TOKENS:-0}"
 TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-}"
 TORCH_PROFILE_RECORD_SHAPES="${TORCH_PROFILE_RECORD_SHAPES:-0}"
 TORCH_PROFILE_WITH_MEMORY="${TORCH_PROFILE_WITH_MEMORY:-0}"
@@ -66,6 +67,13 @@ usage() {
     "  --torch-profile-no-stack      Disable Python stack capture." \
     "  --torch-profile-no-gzip       Write uncompressed trace files." \
     "  -h, --help                    Show this help." \
+    "" \
+    "Launcher environment:" \
+    "  ADAPTIVE_SPECULATIVE_TOKENS=1 Enable adaptive MTP draft depth." \
+    "  ADAPTIVE_SPECULATIVE_TOKENS_INITIAL=N" \
+    "                                Initial adaptive depth (default: 3)." \
+    "  ADAPTIVE_SPECULATIVE_TOKENS_WINDOW=N" \
+    "                                Verification steps per update (default: 32)." \
     "" \
     "All other arguments are forwarded to vLLM. Equivalent environment" \
     "variables use the TORCH_PROFILE_* names declared at the top of the script."
@@ -160,6 +168,35 @@ if [[ ! "${NUM_SPECULATIVE_TOKENS}" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
+ADAPTIVE_SPECULATIVE_TOKENS=$(bool_value \
+  ADAPTIVE_SPECULATIVE_TOKENS "${ADAPTIVE_SPECULATIVE_TOKENS}")
+ADAPTIVE_SPECULATIVE_TOKENS_WINDOW="${ADAPTIVE_SPECULATIVE_TOKENS_WINDOW:-32}"
+if [[ -z "${ADAPTIVE_SPECULATIVE_TOKENS_INITIAL+x}" ]]; then
+  if ((NUM_SPECULATIVE_TOKENS < 3)); then
+    ADAPTIVE_SPECULATIVE_TOKENS_INITIAL=${NUM_SPECULATIVE_TOKENS}
+  else
+    ADAPTIVE_SPECULATIVE_TOKENS_INITIAL=3
+  fi
+fi
+if ((ADAPTIVE_SPECULATIVE_TOKENS)); then
+  if [[ "${SPECULATOR}" != mtp ]] || ((NUM_SPECULATIVE_TOKENS == 0)); then
+    echo "ADAPTIVE_SPECULATIVE_TOKENS requires MTP with a positive speculative depth" >&2
+    exit 2
+  fi
+  if [[ ! "${ADAPTIVE_SPECULATIVE_TOKENS_WINDOW}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ADAPTIVE_SPECULATIVE_TOKENS_WINDOW must be a positive integer; got '${ADAPTIVE_SPECULATIVE_TOKENS_WINDOW}'" >&2
+    exit 2
+  fi
+  if [[ ! "${ADAPTIVE_SPECULATIVE_TOKENS_INITIAL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ADAPTIVE_SPECULATIVE_TOKENS_INITIAL must be a positive integer; got '${ADAPTIVE_SPECULATIVE_TOKENS_INITIAL}'" >&2
+    exit 2
+  fi
+  if ((ADAPTIVE_SPECULATIVE_TOKENS_INITIAL > NUM_SPECULATIVE_TOKENS)); then
+    echo "ADAPTIVE_SPECULATIVE_TOKENS_INITIAL must not exceed NUM_SPECULATIVE_TOKENS" >&2
+    exit 2
+  fi
+fi
+
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Python interpreter not found or not executable: ${PYTHON_BIN}" >&2
   exit 1
@@ -225,9 +262,16 @@ speculative_args=()
 if ((NUM_SPECULATIVE_TOKENS > 0)); then
   case "${SPECULATOR}" in
     mtp)
+      adaptive_speculative_config=
+      if ((ADAPTIVE_SPECULATIVE_TOKENS)); then
+        printf -v adaptive_speculative_config \
+          ',"adaptive_speculative_tokens_window":%s,"adaptive_speculative_tokens_initial":%s' \
+          "${ADAPTIVE_SPECULATIVE_TOKENS_WINDOW}" \
+          "${ADAPTIVE_SPECULATIVE_TOKENS_INITIAL}"
+      fi
       printf -v speculative_config \
-        '{"method":"mtp","num_speculative_tokens":%s,"moe_backend":"humming","attention_backend":"B12X"}' \
-        "${NUM_SPECULATIVE_TOKENS}"
+        '{"method":"mtp","num_speculative_tokens":%s,"moe_backend":"humming","attention_backend":"B12X"%s}' \
+        "${NUM_SPECULATIVE_TOKENS}" "${adaptive_speculative_config}"
       ;;
     dflash2)
       printf -v speculative_config \
@@ -337,6 +381,14 @@ if [[ "${LOAD_FORMAT}" == instanttensor && "${TP_SIZE}" == 2 ]]; then
 fi
 printf 'Speculator: %s (%s draft tokens)\n' \
   "${SPECULATOR}" "${NUM_SPECULATIVE_TOKENS}" >&2
+if [[ "${SPECULATOR}" == mtp ]] \
+    && ((NUM_SPECULATIVE_TOKENS > 0)) \
+    && ((ADAPTIVE_SPECULATIVE_TOKENS)); then
+  printf 'Adaptive MTP depth: initial %s, maximum %s, window %s verification steps\n' \
+    "${ADAPTIVE_SPECULATIVE_TOKENS_INITIAL}" \
+    "${NUM_SPECULATIVE_TOKENS}" \
+    "${ADAPTIVE_SPECULATIVE_TOKENS_WINDOW}" >&2
+fi
 if [[ -n "${KV_CACHE_MEMORY_BYTES}" ]]; then
   printf 'K/V cache: %s per GPU; max batched tokens: %s\n' \
     "${KV_CACHE_MEMORY_BYTES}" "${MAX_NUM_BATCHED_TOKENS}" >&2
