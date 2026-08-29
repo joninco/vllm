@@ -189,14 +189,6 @@ def _normalize_expert_scale(scale: torch.Tensor) -> torch.Tensor:
     return scale.to(dtype=torch.float32).contiguous()
 
 
-def _canonicalize_fp4_zero_signs_(packed: torch.Tensor) -> None:
-    """Clear sign bits from packed FP4 zero values in place."""
-    packed = packed.view(torch.uint8)
-    magnitude = packed & 0x77
-    nonzero = (magnitude | (magnitude >> 1) | (magnitude >> 2)) & 0x11
-    packed.bitwise_and_(0x77 | (nonzero << 3))
-
-
 class B12xExperts(mk.FusedMoEExpertsModular):
     """FP4 MoE experts backed by the b12x SM12x planned API."""
 
@@ -295,9 +287,6 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         if self.w1_scale is None or self.w2_scale is None:
             raise ValueError("b12x MoE requires w1 and w2 block scales")
-
-        _canonicalize_fp4_zero_signs_(w1)
-        _canonicalize_fp4_zero_signs_(w2)
 
         fused_moe = _require_b12x_fused_moe()
 

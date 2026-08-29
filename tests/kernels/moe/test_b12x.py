@@ -160,12 +160,6 @@ def _has_b12x_moe() -> bool:
     )
 
 
-def _count_fp4_negative_zeros(packed: torch.Tensor) -> int:
-    low = (packed & 0x0F) == 0x08
-    high = (packed & 0xF0) == 0x80
-    return int(low.sum().item() + high.sum().item())
-
-
 def _make_b12x_moe_kernel(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1148,12 +1142,6 @@ def test_b12x_moe_matches_torch(
                 case.quant_config.a2_gscale,
             )
 
-        checks_zero_canonicalization = (
-            weight_dtype == "nvfp4" and activation_dtype is None
-        )
-        if checks_zero_canonicalization:
-            assert _count_fp4_negative_zeros(case.w1) > 0
-            assert _count_fp4_negative_zeros(case.w2) > 0
         output = _run_b12x_moe(
             case.hidden_states,
             case.w1,
@@ -1163,10 +1151,6 @@ def test_b12x_moe_matches_torch(
             case.activation,
             case.quant_config,
         )
-        if checks_zero_canonicalization:
-            assert _count_fp4_negative_zeros(case.w1) == 0
-            assert _count_fp4_negative_zeros(case.w2) == 0
-
     torch.testing.assert_close(output, reference, atol=2e-1, rtol=2e-1)
     cosine = torch.nn.functional.cosine_similarity(
         output.flatten().float(),
