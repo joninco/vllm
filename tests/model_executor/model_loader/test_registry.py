@@ -61,6 +61,37 @@ def test_default_loader_rejects_multithread_with_non_lazy_strategy():
         )
 
 
+def test_default_loader_accepts_instanttensor_zero_copy():
+    loader = DefaultModelLoader(
+        LoadConfig(
+            load_format="instanttensor",
+            model_loader_extra_config={"instanttensor_copy": False},
+        )
+    )
+    assert loader.instanttensor_copy is False
+
+
+@pytest.mark.parametrize("value", [0, "false", None])
+def test_default_loader_rejects_non_bool_instanttensor_copy(value):
+    with pytest.raises(ValueError, match="instanttensor_copy must be a bool"):
+        DefaultModelLoader(
+            LoadConfig(
+                load_format="instanttensor",
+                model_loader_extra_config={"instanttensor_copy": value},
+            )
+        )
+
+
+def test_default_loader_rejects_instanttensor_copy_for_other_formats():
+    with pytest.raises(ValueError, match="only supported"):
+        DefaultModelLoader(
+            LoadConfig(
+                load_format="safetensors",
+                model_loader_extra_config={"instanttensor_copy": False},
+            )
+        )
+
+
 def test_default_loader_explicit_safetensors_does_not_misread_pt(tmp_path):
     # Explicit safetensors must not fall back to a .pt and open it as safetensors.
     (tmp_path / "model.pt").write_bytes(b"\x00\x00\x00\x00")

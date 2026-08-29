@@ -87,6 +87,7 @@ class DefaultModelLoader(BaseModelLoader):
             )
         allowed_keys = {
             "enable_multithread_load",
+            "instanttensor_copy",
             "num_threads",
             "enable_weights_track",
         }
@@ -116,6 +117,19 @@ class DefaultModelLoader(BaseModelLoader):
         self.enable_weights_track: bool | None = extra_config.get(
             "enable_weights_track", None
         )
+        self.instanttensor_copy = extra_config.get("instanttensor_copy", True)
+        if not isinstance(self.instanttensor_copy, bool):
+            raise ValueError(
+                "instanttensor_copy must be a bool, got "
+                f"{type(self.instanttensor_copy).__name__}"
+            )
+        if (
+            "instanttensor_copy" in extra_config
+            and load_config.load_format != "instanttensor"
+        ):
+            raise ValueError(
+                "instanttensor_copy is only supported with load_format='instanttensor'"
+            )
 
         # The multi-thread loader ignores safetensors_load_strategy, so reject
         # the combination instead of silently dropping the requested strategy.
@@ -288,6 +302,7 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                     weight_name_prefixes=source.weight_name_prefixes,
+                    copy=self.instanttensor_copy,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):

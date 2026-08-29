@@ -1192,6 +1192,7 @@ def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     weight_name_prefixes: Sequence[str] | None = None,
+    copy: bool = True,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
     using instanttensor library."""
@@ -1215,14 +1216,12 @@ def instanttensor_weights_iterator(
 
     device = current_platform.current_device()
 
-    # copy=True yields tensors that own their memory, staying valid after the
-    # context exits or InstantTensor reuses its buffer.
     with instanttensor.safe_open(
         hf_weights_files,
         framework="pt",
         device=device,
         process_group=process_group,
-        copy=True,
+        copy=copy,
     ) as f:
         # Track bytes so the bar reports load throughput (GB/s).
         pbar = tqdm(
