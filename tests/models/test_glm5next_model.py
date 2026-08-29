@@ -495,7 +495,8 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(monkeypatch) -> None:
     layer.gate_lower_bound = -5.0
     layer.A_log = torch.ones(1)
     layer.dt_bias = torch.ones(1)
-    layer._b12x_kda_binding = None
+    layer._b12x_kda_plan = None
+    layer._b12x_kda_scratch = None
     layer.conv1d = SimpleNamespace(
         weight=torch.ones(3, 1, 3),
         bias=torch.zeros(3),
@@ -741,21 +742,22 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
 
     assert plan == captured_caps
     assert captured_caps["null_state_index"] == 0
+    assert captured_caps["kda_metadata_validation"] == "trusted"
 
 
-def test_b12x_kda_binds_metadata_once_and_uses_live_tensors(monkeypatch) -> None:
+def test_b12x_kda_binds_live_invocations_and_shares_metadata(monkeypatch) -> None:
     calls: dict[str, list] = {"bind": [], "run": []}
 
     class FakeApi:
         @staticmethod
-        def bind_kda_metadata(plan, **kwargs):
-            metadata_binding = SimpleNamespace(plan=plan, **kwargs)
-            calls["bind"].append(metadata_binding)
-            return metadata_binding
+        def bind_kda(plan, **kwargs):
+            binding = SimpleNamespace(plan=plan, **kwargs)
+            calls["bind"].append(binding)
+            return binding
 
         @staticmethod
-        def run_kda_live(binding, metadata, **kwargs):
-            calls["run"].append((binding, metadata, kwargs))
+        def run_kda(binding, **kwargs):
+            calls["run"].append((binding, kwargs))
 
     forward_context = SimpleNamespace(additional_kwargs={})
     monkeypatch.setattr(
@@ -767,30 +769,28 @@ def test_b12x_kda_binds_metadata_once_and_uses_live_tensors(monkeypatch) -> None
     plan = SimpleNamespace(caps=SimpleNamespace(max_state_slots=32))
     api = FakeApi()
 
-    def make_layer(binding):
+    def make_layer():
         layer = KimiGatedDeltaNetAttention.__new__(KimiGatedDeltaNetAttention)
         torch.nn.Module.__init__(layer)
-        layer._b12x_kda_binding = binding
         layer._b12x_kda_api = api
-        layer._b12x_kda_live_tensors = True
         layer._b12x_kda_plan = plan
+        layer._b12x_kda_scratch = torch.empty(1)
         layer._b12x_kda_num_accepted_tokens = torch.zeros(2, dtype=torch.int32)
         layer._b12x_kda_num_seqs = torch.zeros(1, dtype=torch.int32)
         layer._b12x_kda_num_tokens = torch.zeros(1, dtype=torch.int32)
         layer._b12x_kda_max_tokens = 2
         layer._b12x_kda_max_seqs = 2
         layer._b12x_kda_state_index_columns = 1
-        layer._b12x_kda_mixed_qkv = torch.full((2, 3), 71.0)
-        layer._b12x_kda_raw_g = torch.full((2, 1, 1), 72.0)
-        layer._b12x_kda_raw_beta = torch.full((2, 1), 73.0)
-        layer._b12x_kda_z = torch.full((2, 1, 1), 74.0)
-        layer._b12x_kda_output = torch.full((2, 1, 1), 75.0)
         layer.gate_lower_bound = -5.0
+        layer.local_num_heads = 1
         layer.head_dim = 1
-        layer.o_norm = SimpleNamespace(eps=1e-6)
+        layer.A_log = torch.ones(1)
+        layer.dt_bias = torch.ones(1)
+        layer.o_norm = SimpleNamespace(eps=1e-6, weight=torch.ones(1))
+        layer.kv_cache = [None, torch.empty(32, 1, 1, 1)]
         return layer
 
-    layers = [make_layer(object()), make_layer(object())]
+    layers = [make_layer(), make_layer()]
     metadata = object()
     mixed_qkv = torch.arange(6, dtype=torch.float32).view(2, 3)
     raw_g = torch.ones(2, 1, 1)
@@ -814,23 +814,30 @@ def test_b12x_kda_binds_metadata_once_and_uses_live_tensors(monkeypatch) -> None
             num_requests=2,
         )
 
-    assert len(calls["bind"]) == 1
+    assert len(calls["bind"]) == 2
     assert len(calls["run"]) == 2
-    assert calls["run"][0][1] is calls["run"][1][1]
-    for (_, _, kwargs), output in zip(calls["run"], outputs):
-        assert kwargs["mixed_qkv"] is mixed_qkv
-        assert kwargs["raw_g"] is raw_g
-        assert kwargs["raw_beta"] is raw_beta
-        assert kwargs["z"] is z
-        assert kwargs["output"] is output
+    for binding, output in zip(calls["bind"], outputs):
+        assert binding.mixed_qkv is mixed_qkv
+        assert binding.raw_g is raw_g
+        assert binding.raw_beta is raw_beta
+        assert binding.z is z
+        assert binding.output is output
+    for (run_binding, _), bind_binding in zip(calls["run"], calls["bind"]):
+        assert run_binding is bind_binding
+    for name in (
+        "query_start_loc",
+        "num_accepted_tokens",
+        "state_indices",
+        "num_seqs",
+        "num_tokens",
+    ):
+        assert getattr(calls["bind"][0], name) is getattr(calls["bind"][1], name)
     assert torch.equal(
         layers[0]._b12x_kda_num_accepted_tokens,
         torch.ones(2, dtype=torch.int32),
     )
     assert layers[0]._b12x_kda_num_seqs.item() == 2
     assert layers[0]._b12x_kda_num_tokens.item() == 2
-    assert torch.equal(layers[0]._b12x_kda_mixed_qkv, torch.full((2, 3), 71.0))
-    assert torch.equal(layers[1]._b12x_kda_mixed_qkv, torch.full((2, 3), 71.0))
 
 
 def test_glm5next_sparse_mla_selects_b12x_backend(monkeypatch) -> None:

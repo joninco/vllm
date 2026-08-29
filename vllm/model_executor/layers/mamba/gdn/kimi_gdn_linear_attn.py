@@ -308,8 +308,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self._b12x_kda_api: Any | None = None
         self._b12x_kda_plan = None
-        self._b12x_kda_binding = None
-        self._b12x_kda_live_tensors = False
         self._initialize_b12x_kda_decode(vllm_config)
         self.o_proj = RowParallelLinear(
             self.projection_size,
@@ -352,58 +350,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         max_tokens = max_seqs * state_index_columns
 
         self._b12x_kda_api = api
-        self._b12x_kda_live_tensors = all(
-            hasattr(api, name) for name in ("bind_kda_metadata", "run_kda_live")
-        )
         self._b12x_kda_max_tokens = max_tokens
         self._b12x_kda_max_seqs = max_seqs
         self._b12x_kda_state_index_columns = state_index_columns
 
-        provisional = self._make_b12x_kda_plan(max_state_slots=1)
-        factory = dict(device=device, dtype=torch.bfloat16)
-        self.register_buffer(
-            "_b12x_kda_mixed_qkv",
-            torch.empty(max_tokens, provisional.caps.packed_qkv_width, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_kda_raw_g",
-            torch.empty(max_tokens, self.local_num_heads, self.head_dim, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_kda_raw_beta",
-            torch.empty(max_tokens, self.local_num_heads, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_kda_z",
-            torch.empty(max_tokens, self.local_num_heads, self.head_dim, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_kda_output",
-            torch.empty(max_tokens, self.local_num_heads, self.head_dim, **factory),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_kda_query_start_loc",
-            torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
-            persistent=False,
-        )
         self.register_buffer(
             "_b12x_kda_num_accepted_tokens",
             torch.ones(max_seqs, dtype=torch.int32, device=device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_b12x_kda_state_indices",
-            torch.zeros(
-                max_seqs,
-                state_index_columns,
-                dtype=torch.int32,
-                device=device,
-            ),
             persistent=False,
         )
         self.register_buffer(
@@ -438,6 +391,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 gate_activation="sigmoid",
                 qk_l2norm=True,
                 null_state_index=self.b12x_kda_null_state_index,
+                kda_metadata_validation="trusted",
             )
         )
 
@@ -451,27 +405,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         (scratch,) = get_b12x_scratch_buffers(plan)
         self._b12x_kda_scratch = scratch
         self._b12x_kda_plan = plan
-        self._b12x_kda_binding = api.bind_kda(
-            plan,
-            scratch=scratch,
-            mixed_qkv=self._b12x_kda_mixed_qkv,
-            raw_g=self._b12x_kda_raw_g,
-            raw_beta=self._b12x_kda_raw_beta,
-            z=self._b12x_kda_z,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
-            norm_weight=self.o_norm.weight,
-            recurrent_state=recurrent_state,
-            query_start_loc=self._b12x_kda_query_start_loc,
-            num_accepted_tokens=self._b12x_kda_num_accepted_tokens,
-            state_indices=self._b12x_kda_state_indices,
-            num_seqs=self._b12x_kda_num_seqs,
-            num_tokens=self._b12x_kda_num_tokens,
-            output=self._b12x_kda_output,
-        )
 
     def unbind_kv_cache(self) -> None:
-        self._b12x_kda_binding = None
         self._b12x_kda_plan = None
         self._b12x_kda_scratch = None
         super().unbind_kv_cache()
@@ -488,7 +423,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def _can_use_b12x_kda_decode(self, m: GDNAttentionMetadata) -> bool:
         if (
-            self._b12x_kda_binding is None
+            self._b12x_kda_plan is None
+            or self._b12x_kda_scratch is None
             or m.num_prefills != 0
             or (m.num_decodes == 0 and m.num_spec_decodes == 0)
         ):
@@ -524,8 +460,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         """Execute B12X KDA after the convolution projection.
 
         Args:
-            metadata: Forward-context metadata used to share one statically
-                checked packed-metadata binding across compatible layers.
+            metadata: Forward-context metadata used to share runtime-owned
+                packed metadata tensors across compatible layers.
             mixed_qkv: Live packed query, key, and value projection.
             raw_g: Live unactivated forget gate.
             raw_beta: Live unactivated update gate.
@@ -538,12 +474,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_requests: Number of packed requests.
 
         Raises:
-            RuntimeError: If the KDA cache binding is unavailable.
+            RuntimeError: If the KDA plan or cache is unavailable.
             ValueError: If the live batch exceeds the planned capacity.
         """
-        binding = self._b12x_kda_binding
         api = self._b12x_kda_api
-        if binding is None or api is None:
+        plan = self._b12x_kda_plan
+        scratch = self._b12x_kda_scratch
+        if api is None or plan is None or scratch is None:
             raise RuntimeError("b12x KDA KV cache was not bound before inference")
         num_tokens = int(mixed_qkv.shape[0])
         state_columns = int(state_indices.shape[1])
@@ -560,85 +497,70 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 f"{self._b12x_kda_state_index_columns}"
             )
 
-        if self._b12x_kda_live_tensors:
-            forward_context = get_forward_context()
-            cache = forward_context.additional_kwargs.setdefault(
-                "b12x_kda_bound_metadata", {}
+        forward_context = get_forward_context()
+        cache = forward_context.additional_kwargs.setdefault(
+            "b12x_kda_metadata_tensors", {}
+        )
+        cache_key = (
+            id(metadata),
+            num_tokens,
+            num_requests,
+            state_columns,
+            plan.caps.max_state_slots,
+        )
+        bound_metadata = cache.get(cache_key)
+        if bound_metadata is None:
+            query_start_loc = query_start_loc[: num_requests + 1]
+            state_indices = state_indices[:num_requests, :state_columns]
+            if num_accepted_tokens is None:
+                accepted_tokens = self._b12x_kda_num_accepted_tokens[:num_requests]
+                accepted_tokens.fill_(1)
+            else:
+                accepted_tokens = num_accepted_tokens[:num_requests]
+            self._b12x_kda_num_seqs.fill_(num_requests)
+            self._b12x_kda_num_tokens.copy_(
+                query_start_loc[num_requests : num_requests + 1]
             )
-            cache_key = (
-                id(metadata),
-                num_tokens,
-                num_requests,
-                state_columns,
-                self._b12x_kda_plan.caps.max_state_slots,
+            bound_metadata = (
+                query_start_loc,
+                accepted_tokens,
+                state_indices,
+                self._b12x_kda_num_seqs,
+                self._b12x_kda_num_tokens,
             )
-            bound_metadata = cache.get(cache_key)
-            if bound_metadata is None:
-                query_start_loc = query_start_loc[: num_requests + 1]
-                state_indices = state_indices[:num_requests, :state_columns]
-                if num_accepted_tokens is None:
-                    accepted_tokens = self._b12x_kda_num_accepted_tokens[:num_requests]
-                    accepted_tokens.fill_(1)
-                else:
-                    accepted_tokens = num_accepted_tokens[:num_requests]
-                self._b12x_kda_num_seqs.fill_(num_requests)
-                self._b12x_kda_num_tokens.copy_(
-                    query_start_loc[num_requests : num_requests + 1]
-                )
-                bound_metadata = api.bind_kda_metadata(
-                    self._b12x_kda_plan,
-                    query_start_loc=query_start_loc,
-                    num_accepted_tokens=accepted_tokens,
-                    state_indices=state_indices,
-                    num_seqs=self._b12x_kda_num_seqs,
-                    num_tokens=self._b12x_kda_num_tokens,
-                    max_tokens=num_tokens,
-                    max_seqs=num_requests,
-                )
-                cache[cache_key] = bound_metadata
-            api.run_kda_live(
-                binding,
-                bound_metadata,
-                mixed_qkv=mixed_qkv,
-                raw_g=raw_g,
-                raw_beta=raw_beta,
-                z=z,
-                output=output,
-                lower_bound=self.gate_lower_bound,
-                eps=self.o_norm.eps,
-                scale=self.head_dim**-0.5,
-            )
-            return
+            cache[cache_key] = bound_metadata
+        (
+            query_start_loc,
+            accepted_tokens,
+            state_indices,
+            num_seqs,
+            num_tokens_tensor,
+        ) = bound_metadata
 
-        self._b12x_kda_mixed_qkv[:num_tokens].copy_(mixed_qkv)
-        self._b12x_kda_raw_g[:num_tokens].copy_(raw_g)
-        self._b12x_kda_raw_beta[:num_tokens].copy_(raw_beta)
-        self._b12x_kda_z[:num_tokens].copy_(z)
-        self._b12x_kda_query_start_loc.zero_()
-        self._b12x_kda_query_start_loc[: num_requests + 1].copy_(
-            query_start_loc[: num_requests + 1]
+        binding = api.bind_kda(
+            plan,
+            scratch=scratch,
+            mixed_qkv=mixed_qkv,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            z=z,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias.view(self.local_num_heads, self.head_dim),
+            norm_weight=self.o_norm.weight,
+            recurrent_state=self.kv_cache[1],
+            query_start_loc=query_start_loc,
+            num_accepted_tokens=accepted_tokens,
+            state_indices=state_indices,
+            num_seqs=num_seqs,
+            num_tokens=num_tokens_tensor,
+            output=output,
         )
-        self._b12x_kda_num_accepted_tokens.fill_(1)
-        if num_accepted_tokens is not None:
-            self._b12x_kda_num_accepted_tokens[:num_requests].copy_(
-                num_accepted_tokens[:num_requests]
-            )
-        self._b12x_kda_state_indices.zero_()
-        self._b12x_kda_state_indices[:num_requests, :state_columns].copy_(
-            state_indices[:num_requests]
-        )
-        self._b12x_kda_num_seqs.fill_(num_requests)
-        self._b12x_kda_num_tokens.copy_(
-            query_start_loc[num_requests : num_requests + 1]
-        )
-
         api.run_kda(
             binding,
             lower_bound=self.gate_lower_bound,
             eps=self.o_norm.eps,
             scale=self.head_dim**-0.5,
         )
-        output[:num_tokens].copy_(self._b12x_kda_output[:num_tokens])
 
     def forward(
         self,
