@@ -309,6 +309,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_kda_api: Any | None = None
         self._b12x_kda_plan = None
         self._b12x_kda_binding = None
+        self._b12x_kda_direct = False
         self._initialize_b12x_kda_decode(vllm_config)
         self.o_proj = RowParallelLinear(
             self.projection_size,
@@ -351,6 +352,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         max_tokens = max_seqs * state_index_columns
 
         self._b12x_kda_api = api
+        self._b12x_kda_direct = all(
+            hasattr(api, name)
+            for name in (
+                "bind_kda_metadata",
+                "validate_kda_metadata",
+                "run_kda_prevalidated",
+            )
+        )
         self._b12x_kda_max_tokens = max_tokens
         self._b12x_kda_max_seqs = max_seqs
         self._b12x_kda_state_index_columns = state_index_columns
@@ -506,6 +515,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _run_b12x_kda_decode_post_conv(
         self,
         *,
+        metadata: GDNAttentionMetadata,
         mixed_qkv: torch.Tensor,
         raw_g: torch.Tensor,
         raw_beta: torch.Tensor,
@@ -534,6 +544,60 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 f"state_columns={state_columns}/"
                 f"{self._b12x_kda_state_index_columns}"
             )
+
+        if self._b12x_kda_direct:
+            forward_context = get_forward_context()
+            cache = forward_context.additional_kwargs.setdefault(
+                "b12x_kda_validated_metadata", {}
+            )
+            cache_key = (
+                id(metadata),
+                num_tokens,
+                num_requests,
+                state_columns,
+                self._b12x_kda_plan.caps.max_state_slots,
+            )
+            validated_metadata = cache.get(cache_key)
+            if validated_metadata is None:
+                query_start_loc = query_start_loc[: num_requests + 1]
+                state_indices = state_indices[
+                    :num_requests, : self._b12x_kda_state_index_columns
+                ]
+                if num_accepted_tokens is None:
+                    accepted_tokens = self._b12x_kda_num_accepted_tokens[:num_requests]
+                    accepted_tokens.fill_(1)
+                else:
+                    accepted_tokens = num_accepted_tokens[:num_requests]
+                self._b12x_kda_num_seqs.fill_(num_requests)
+                self._b12x_kda_num_tokens.copy_(
+                    query_start_loc[num_requests : num_requests + 1]
+                )
+                metadata_binding = api.bind_kda_metadata(
+                    self._b12x_kda_plan,
+                    scratch=self._b12x_kda_scratch,
+                    query_start_loc=query_start_loc,
+                    num_accepted_tokens=accepted_tokens,
+                    state_indices=state_indices,
+                    num_seqs=self._b12x_kda_num_seqs,
+                    num_tokens=self._b12x_kda_num_tokens,
+                    max_tokens=num_tokens,
+                    max_seqs=num_requests,
+                )
+                validated_metadata = api.validate_kda_metadata(metadata_binding)
+                cache[cache_key] = validated_metadata
+            api.run_kda_prevalidated(
+                binding,
+                validated_metadata,
+                mixed_qkv=mixed_qkv,
+                raw_g=raw_g,
+                raw_beta=raw_beta,
+                z=z,
+                output=output,
+                lower_bound=self.gate_lower_bound,
+                eps=self.o_norm.eps,
+                scale=self.head_dim**-0.5,
+            )
+            return
 
         self._b12x_kda_mixed_qkv[:num_tokens].copy_(mixed_qkv)
         self._b12x_kda_raw_g[:num_tokens].copy_(raw_g)
@@ -750,6 +814,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 assert g2_spec is not None
                 core_attn_out_spec = core_attn_out[:, : mixed_qkv_spec.shape[0]]
                 self._run_b12x_kda_decode_post_conv(
+                    metadata=m,
                     mixed_qkv=mixed_qkv_spec,
                     raw_g=g1_spec[0],
                     raw_beta=beta_spec[0],
@@ -928,6 +993,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     assert g2_ns is not None
                     core_attn_out_non_spec = core_attn_out[:, : mixed_qkv_ns.shape[0]]
                     self._run_b12x_kda_decode_post_conv(
+                        metadata=m,
                         mixed_qkv=mixed_qkv_ns,
                         raw_g=g1_ns[0],
                         raw_beta=beta_ns[0],

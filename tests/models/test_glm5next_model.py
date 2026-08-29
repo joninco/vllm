@@ -743,6 +743,106 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert captured_caps["null_state_index"] == 0
 
 
+def test_b12x_kda_validates_shared_metadata_once_and_uses_live_tensors(
+    monkeypatch,
+) -> None:
+    calls: dict[str, list] = {"bind": [], "validate": [], "run": []}
+
+    class FakeApi:
+        @staticmethod
+        def bind_kda_metadata(plan, **kwargs):
+            metadata_binding = SimpleNamespace(plan=plan, **kwargs)
+            calls["bind"].append(metadata_binding)
+            return metadata_binding
+
+        @staticmethod
+        def validate_kda_metadata(metadata_binding):
+            validated = SimpleNamespace(binding=metadata_binding)
+            calls["validate"].append(validated)
+            return validated
+
+        @staticmethod
+        def run_kda_prevalidated(binding, metadata, **kwargs):
+            calls["run"].append((binding, metadata, kwargs))
+
+    forward_context = SimpleNamespace(additional_kwargs={})
+    monkeypatch.setattr(
+        kimi_gdn_linear_attn,
+        "get_forward_context",
+        lambda: forward_context,
+    )
+
+    plan = SimpleNamespace(caps=SimpleNamespace(max_state_slots=32))
+    api = FakeApi()
+
+    def make_layer(binding):
+        layer = KimiGatedDeltaNetAttention.__new__(KimiGatedDeltaNetAttention)
+        torch.nn.Module.__init__(layer)
+        layer._b12x_kda_binding = binding
+        layer._b12x_kda_api = api
+        layer._b12x_kda_direct = True
+        layer._b12x_kda_plan = plan
+        layer._b12x_kda_scratch = torch.empty(16, dtype=torch.uint8)
+        layer._b12x_kda_num_accepted_tokens = torch.zeros(2, dtype=torch.int32)
+        layer._b12x_kda_num_seqs = torch.zeros(1, dtype=torch.int32)
+        layer._b12x_kda_num_tokens = torch.zeros(1, dtype=torch.int32)
+        layer._b12x_kda_max_tokens = 2
+        layer._b12x_kda_max_seqs = 2
+        layer._b12x_kda_state_index_columns = 1
+        layer._b12x_kda_mixed_qkv = torch.full((2, 3), 71.0)
+        layer._b12x_kda_raw_g = torch.full((2, 1, 1), 72.0)
+        layer._b12x_kda_raw_beta = torch.full((2, 1), 73.0)
+        layer._b12x_kda_z = torch.full((2, 1, 1), 74.0)
+        layer._b12x_kda_output = torch.full((2, 1, 1), 75.0)
+        layer.gate_lower_bound = -5.0
+        layer.head_dim = 1
+        layer.o_norm = SimpleNamespace(eps=1e-6)
+        return layer
+
+    layers = [make_layer(object()), make_layer(object())]
+    metadata = object()
+    mixed_qkv = torch.arange(6, dtype=torch.float32).view(2, 3)
+    raw_g = torch.ones(2, 1, 1)
+    raw_beta = torch.ones(2, 1)
+    z = torch.ones(2, 1, 1)
+    outputs = [torch.empty(2, 1, 1), torch.empty(2, 1, 1)]
+    state_indices = torch.tensor([[3], [4]], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+
+    for layer, output in zip(layers, outputs):
+        layer._run_b12x_kda_decode_post_conv(
+            metadata=metadata,
+            mixed_qkv=mixed_qkv,
+            raw_g=raw_g,
+            raw_beta=raw_beta,
+            z=z,
+            output=output,
+            state_indices=state_indices,
+            query_start_loc=query_start_loc,
+            num_accepted_tokens=None,
+            num_requests=2,
+        )
+
+    assert len(calls["bind"]) == 1
+    assert len(calls["validate"]) == 1
+    assert len(calls["run"]) == 2
+    assert calls["run"][0][1] is calls["run"][1][1]
+    for (_, _, kwargs), output in zip(calls["run"], outputs):
+        assert kwargs["mixed_qkv"] is mixed_qkv
+        assert kwargs["raw_g"] is raw_g
+        assert kwargs["raw_beta"] is raw_beta
+        assert kwargs["z"] is z
+        assert kwargs["output"] is output
+    assert torch.equal(
+        layers[0]._b12x_kda_num_accepted_tokens,
+        torch.ones(2, dtype=torch.int32),
+    )
+    assert layers[0]._b12x_kda_num_seqs.item() == 2
+    assert layers[0]._b12x_kda_num_tokens.item() == 2
+    assert torch.equal(layers[0]._b12x_kda_mixed_qkv, torch.full((2, 3), 71.0))
+    assert torch.equal(layers[1]._b12x_kda_mixed_qkv, torch.full((2, 3), 71.0))
+
+
 def test_glm5next_sparse_mla_selects_b12x_backend(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
