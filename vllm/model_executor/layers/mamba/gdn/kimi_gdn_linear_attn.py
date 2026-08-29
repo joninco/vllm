@@ -309,7 +309,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_kda_api: Any | None = None
         self._b12x_kda_plan = None
         self._b12x_kda_binding = None
-        self._b12x_kda_direct = False
+        self._b12x_kda_live_tensors = False
         self._initialize_b12x_kda_decode(vllm_config)
         self.o_proj = RowParallelLinear(
             self.projection_size,
@@ -352,13 +352,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         max_tokens = max_seqs * state_index_columns
 
         self._b12x_kda_api = api
-        self._b12x_kda_direct = all(
-            hasattr(api, name)
-            for name in (
-                "bind_kda_metadata",
-                "validate_kda_metadata",
-                "run_kda_prevalidated",
-            )
+        self._b12x_kda_live_tensors = all(
+            hasattr(api, name) for name in ("bind_kda_metadata", "run_kda_live")
         )
         self._b12x_kda_max_tokens = max_tokens
         self._b12x_kda_max_seqs = max_seqs
@@ -526,6 +521,26 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_accepted_tokens: torch.Tensor | None,
         num_requests: int,
     ) -> None:
+        """Execute B12X KDA after the convolution projection.
+
+        Args:
+            metadata: Forward-context metadata used to share one statically
+                checked packed-metadata binding across compatible layers.
+            mixed_qkv: Live packed query, key, and value projection.
+            raw_g: Live unactivated forget gate.
+            raw_beta: Live unactivated update gate.
+            z: Live output gate.
+            output: Caller-owned destination tensor.
+            state_indices: Packed recurrent-state indices.
+            query_start_loc: Packed request boundaries.
+            num_accepted_tokens: Accepted speculative-token counts, or ``None``
+                for one-token decode requests.
+            num_requests: Number of packed requests.
+
+        Raises:
+            RuntimeError: If the KDA cache binding is unavailable.
+            ValueError: If the live batch exceeds the planned capacity.
+        """
         binding = self._b12x_kda_binding
         api = self._b12x_kda_api
         if binding is None or api is None:
@@ -545,10 +560,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 f"{self._b12x_kda_state_index_columns}"
             )
 
-        if self._b12x_kda_direct:
+        if self._b12x_kda_live_tensors:
             forward_context = get_forward_context()
             cache = forward_context.additional_kwargs.setdefault(
-                "b12x_kda_validated_metadata", {}
+                "b12x_kda_bound_metadata", {}
             )
             cache_key = (
                 id(metadata),
@@ -557,12 +572,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 state_columns,
                 self._b12x_kda_plan.caps.max_state_slots,
             )
-            validated_metadata = cache.get(cache_key)
-            if validated_metadata is None:
+            bound_metadata = cache.get(cache_key)
+            if bound_metadata is None:
                 query_start_loc = query_start_loc[: num_requests + 1]
-                state_indices = state_indices[
-                    :num_requests, : self._b12x_kda_state_index_columns
-                ]
+                state_indices = state_indices[:num_requests, :state_columns]
                 if num_accepted_tokens is None:
                     accepted_tokens = self._b12x_kda_num_accepted_tokens[:num_requests]
                     accepted_tokens.fill_(1)
@@ -572,9 +585,8 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self._b12x_kda_num_tokens.copy_(
                     query_start_loc[num_requests : num_requests + 1]
                 )
-                metadata_binding = api.bind_kda_metadata(
+                bound_metadata = api.bind_kda_metadata(
                     self._b12x_kda_plan,
-                    scratch=self._b12x_kda_scratch,
                     query_start_loc=query_start_loc,
                     num_accepted_tokens=accepted_tokens,
                     state_indices=state_indices,
@@ -583,11 +595,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     max_tokens=num_tokens,
                     max_seqs=num_requests,
                 )
-                validated_metadata = api.validate_kda_metadata(metadata_binding)
-                cache[cache_key] = validated_metadata
-            api.run_kda_prevalidated(
+                cache[cache_key] = bound_metadata
+            api.run_kda_live(
                 binding,
-                validated_metadata,
+                bound_metadata,
                 mixed_qkv=mixed_qkv,
                 raw_g=raw_g,
                 raw_beta=raw_beta,

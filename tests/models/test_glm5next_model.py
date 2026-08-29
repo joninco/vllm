@@ -743,10 +743,8 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert captured_caps["null_state_index"] == 0
 
 
-def test_b12x_kda_validates_shared_metadata_once_and_uses_live_tensors(
-    monkeypatch,
-) -> None:
-    calls: dict[str, list] = {"bind": [], "validate": [], "run": []}
+def test_b12x_kda_binds_metadata_once_and_uses_live_tensors(monkeypatch) -> None:
+    calls: dict[str, list] = {"bind": [], "run": []}
 
     class FakeApi:
         @staticmethod
@@ -756,13 +754,7 @@ def test_b12x_kda_validates_shared_metadata_once_and_uses_live_tensors(
             return metadata_binding
 
         @staticmethod
-        def validate_kda_metadata(metadata_binding):
-            validated = SimpleNamespace(binding=metadata_binding)
-            calls["validate"].append(validated)
-            return validated
-
-        @staticmethod
-        def run_kda_prevalidated(binding, metadata, **kwargs):
+        def run_kda_live(binding, metadata, **kwargs):
             calls["run"].append((binding, metadata, kwargs))
 
     forward_context = SimpleNamespace(additional_kwargs={})
@@ -780,9 +772,8 @@ def test_b12x_kda_validates_shared_metadata_once_and_uses_live_tensors(
         torch.nn.Module.__init__(layer)
         layer._b12x_kda_binding = binding
         layer._b12x_kda_api = api
-        layer._b12x_kda_direct = True
+        layer._b12x_kda_live_tensors = True
         layer._b12x_kda_plan = plan
-        layer._b12x_kda_scratch = torch.empty(16, dtype=torch.uint8)
         layer._b12x_kda_num_accepted_tokens = torch.zeros(2, dtype=torch.int32)
         layer._b12x_kda_num_seqs = torch.zeros(1, dtype=torch.int32)
         layer._b12x_kda_num_tokens = torch.zeros(1, dtype=torch.int32)
@@ -824,7 +815,6 @@ def test_b12x_kda_validates_shared_metadata_once_and_uses_live_tensors(
         )
 
     assert len(calls["bind"]) == 1
-    assert len(calls["validate"]) == 1
     assert len(calls["run"]) == 2
     assert calls["run"][0][1] is calls["run"][1][1]
     for (_, _, kwargs), output in zip(calls["run"], outputs):
