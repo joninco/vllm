@@ -357,6 +357,11 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def reset_graphs(self) -> None:
+        """Destroy FULL graph executables while retaining captured resources."""
+        for graph in self.graphs.values():
+            graph.reset()
+
     @torch.inference_mode()
     def capture(
         self,
@@ -866,6 +871,18 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     finally:
         compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
         compilation_counter.num_gpu_runner_capture_triggers = saved_capture_triggers
+
+        # Graph reset can defer CUDA-side destruction. Keep graph entries and
+        # their Python-owned output/scratch tensors alive until every reset has
+        # completed; otherwise the allocator can reuse those addresses while
+        # the discarded profiling executable still references them.
+        torch.accelerator.synchronize()
+        CUDAGraphWrapper.reset_all_graphs()
+        BreakableCUDAGraphWrapper.reset_all_graphs()
+        for graph_manager in graph_managers:
+            graph_manager.reset_graphs()
+        torch.accelerator.synchronize()
+
         CUDAGraphWrapper.clear_all_graphs()
         BreakableCUDAGraphWrapper.clear_all_graphs()
         for graph_manager in graph_managers:
@@ -951,4 +968,5 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
     gc.collect()
+    torch.accelerator.synchronize()
     torch.accelerator.empty_cache()
