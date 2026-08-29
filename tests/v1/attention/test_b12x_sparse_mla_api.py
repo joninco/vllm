@@ -264,18 +264,18 @@ def test_b12x_glm5_next_accepts_dcp_with_speculation(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("max_query_len", "is_spec_decode", "num_tokens", "expected"),
+    ("max_query_len", "num_decode_tokens", "num_tokens", "expected"),
     [
-        (1, False, 32, False),
-        (6, True, 192, False),
-        (6, False, 192, True),
-        (128, False, 8192, True),
-        (128, False, 600000, False),
+        (1, 0, 32, False),
+        (6, 192, 192, False),
+        (6, 0, 192, True),
+        (128, 0, 8192, True),
+        (128, 0, 600000, False),
     ],
 )
 def test_b12x_full_ckv_gather_excludes_decode_and_mtp_batches(
     max_query_len: int,
-    is_spec_decode: bool,
+    num_decode_tokens: int,
     num_tokens: int,
     expected: bool,
 ) -> None:
@@ -286,7 +286,7 @@ def test_b12x_full_ckv_gather_excludes_decode_and_mtp_batches(
             dcp_world_size=4,
             max_query_len=max_query_len,
             num_tokens=num_tokens,
-            is_spec_decode=is_spec_decode,
+            num_decode_tokens=num_decode_tokens,
             min_tokens=16,
             max_tokens=524288,
         )
@@ -738,7 +738,6 @@ def test_glm_selector_metadata_builder_stages_padded_rows_and_capture(
         lambda *args, **kwargs: SimpleNamespace(
             num_prefills=0,
             num_decode_tokens=0,
-            is_spec_decode=False,
         ),
     )
     builder = _bare_glm_selector_metadata_builder()
@@ -818,7 +817,6 @@ def test_glm_selector_metadata_builder_requires_complete_runtime_state(
         lambda *args, **kwargs: SimpleNamespace(
             num_prefills=0,
             num_decode_tokens=0,
-            is_spec_decode=False,
         ),
     )
     builder = _bare_glm_selector_metadata_builder()

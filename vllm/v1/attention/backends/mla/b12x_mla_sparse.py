@@ -166,7 +166,7 @@ def _use_b12x_full_ckv_gather(
     dcp_world_size: int,
     max_query_len: int,
     num_tokens: int,
-    is_spec_decode: bool,
+    num_decode_tokens: int,
     min_tokens: int,
     max_tokens: int,
 ) -> bool:
@@ -175,7 +175,7 @@ def _use_b12x_full_ckv_gather(
         and is_glm_next
         and dcp_world_size > 1
         and max_query_len > 1
-        and not is_spec_decode
+        and num_decode_tokens == 0
         and num_tokens > min_tokens
         and num_tokens <= max_tokens
     )
@@ -826,18 +826,15 @@ class B12xMLASparseMetadataBuilder(
             metadata.prefill_seq_lens_cpu = seq_lens_cpu_source[
                 prefill_start : prefill_start + metadata.num_prefills
             ].clone()
-        if (
-            _use_b12x_full_ckv_gather(
-                enabled=self._ckv_gather_requested,
-                is_glm_next=self.requires_glm_next_selector_metadata,
-                dcp_world_size=self.dcp_world_size,
-                max_query_len=common.max_query_len,
-                num_tokens=num_tokens,
-                is_spec_decode=metadata.is_spec_decode,
-                min_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS,
-                max_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS,
-            )
-            and metadata.num_decode_tokens == 0
+        if _use_b12x_full_ckv_gather(
+            enabled=self._ckv_gather_requested,
+            is_glm_next=self.requires_glm_next_selector_metadata,
+            dcp_world_size=self.dcp_world_size,
+            max_query_len=common.max_query_len,
+            num_tokens=num_tokens,
+            num_decode_tokens=metadata.num_decode_tokens,
+            min_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS,
+            max_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS,
         ):
             assert self.ckv_selected_indices_buffer is not None
             assert self.ckv_active_counts_buffer is not None
