@@ -3,6 +3,7 @@
 
 import math
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -207,14 +208,26 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     indexer.max_tokens = 128
     indexer.max_seqs = 16
     indexer.max_model_len = 4096
-    indexer.max_speculative_tokens = 5
+    indexer.indexer_op = SimpleNamespace(max_model_len=0)
 
     indexer.bind_main_kv_cache(main)
 
     assert indexer._decode_block_table.shape[0] == indexer.max_tokens
-    assert indexer._decode_block_table.shape[0] > (
-        indexer.max_seqs * (indexer.max_speculative_tokens + 1)
-    )
+    assert indexer._decode_block_table.shape[0] > indexer.max_seqs * (5 + 1)
+    assert indexer.indexer_op.max_model_len == 4096 // 4
+
+
+def test_glm53_selector_capacity_tracks_auto_fit_max_model_len() -> None:
+    indexer = Glm5NextPooledIndexer.__new__(Glm5NextPooledIndexer)
+    nn.Module.__init__(indexer)
+    indexer.max_model_len = 1_048_576
+    indexer.indexer_op = SimpleNamespace(max_model_len=262_144)
+
+    assert indexer._aligned_max_seq_len == 1_048_576
+
+    indexer.update_max_model_len(1_985)
+    assert indexer._aligned_max_seq_len == 1_988
+    assert indexer.indexer_op.max_model_len == 497
 
 
 def test_glm53_parent_table_width_tracks_dcp_sharding() -> None:
@@ -223,24 +236,21 @@ def test_glm53_parent_table_width_tracks_dcp_sharding() -> None:
 
     assert Glm5NextPooledIndexer._max_parent_table_width(
         max_model_len,
-        0,
         block_size,
         dcp_world_size=1,
     ) == math.ceil(max_model_len / block_size)
     assert Glm5NextPooledIndexer._max_parent_table_width(
         max_model_len,
-        0,
         block_size,
         dcp_world_size=4,
     ) == math.ceil(max_model_len / (block_size * 4))
     assert (
         Glm5NextPooledIndexer._max_parent_table_width(
             block_size,
-            1,
             block_size,
             dcp_world_size=1,
         )
-        == 2
+        == 1
     )
 
 

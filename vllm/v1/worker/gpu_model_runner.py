@@ -1009,6 +1009,11 @@ class GPUModelRunner(
             draft_config = self.speculative_config.draft_model_config
             if draft_config is None or draft_config.max_model_len is None:
                 self.effective_drafter_max_model_len = self.max_model_len
+        update_model_len = getattr(
+            getattr(self, "model", None), "update_max_model_len", None
+        )
+        if update_model_len is not None:
+            update_model_len(max_model_len)
 
     def reset_mm_cache(self) -> None:
         """

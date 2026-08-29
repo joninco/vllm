@@ -343,6 +343,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len
+        update_model_len = getattr(
+            getattr(self, "model", None), "update_max_model_len", None
+        )
+        if update_model_len is not None:
+            update_model_len(max_model_len)
+        if isinstance(self.speculator, DraftModelSpeculator):
+            self.speculator.update_max_model_len(max_model_len)
 
     def init_routed_experts_capturer(self) -> None:
         """Initialize target-model capture on every participating worker."""

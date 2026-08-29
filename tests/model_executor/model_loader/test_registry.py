@@ -88,3 +88,29 @@ def test_default_loader_hf_still_falls_back_to_pt(tmp_path):
     )
     assert use_safetensors is False
     assert any(f.endswith("model.pt") for f in files)
+
+
+def test_default_loader_restricts_safetensors_shards_by_weight_prefix(tmp_path):
+    base_shard = tmp_path / "model-00001-of-00002.safetensors"
+    mtp_shard = tmp_path / "model-00002-of-00002.safetensors"
+    base_shard.write_bytes(b"")
+    mtp_shard.write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map": {'
+        f'"model.layers.0.weight": "{base_shard.name}",'
+        f'"model.layers.45.weight": "{mtp_shard.name}"'
+        "}}"
+    )
+    loader = DefaultModelLoader(LoadConfig(load_format="instanttensor"))
+
+    _, files, use_safetensors = loader._prepare_weights(
+        str(tmp_path),
+        None,
+        None,
+        fall_back_to_pt=False,
+        allow_patterns_overrides=None,
+        weight_name_prefixes=("model.layers.45.",),
+    )
+
+    assert use_safetensors
+    assert files == [str(mtp_shard)]

@@ -110,7 +110,6 @@ class Glm5NextPooledIndexer(nn.Module):
         self.max_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
         self.max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
         self.max_model_len = int(vllm_config.model_config.max_model_len)
-        self.max_speculative_tokens = int(vllm_config.num_speculative_tokens)
         self.block_size = int(cache_config.block_size)
         parallel_config = vllm_config.parallel_config
         self.dcp_world_size = int(parallel_config.decode_context_parallel_size)
@@ -153,7 +152,7 @@ class Glm5NextPooledIndexer(nn.Module):
             hidden_size,
             _INDEX_HEAD_DIM,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.wk",
         )
         self.weights_proj = ReplicatedLinear(
@@ -249,16 +248,17 @@ class Glm5NextPooledIndexer(nn.Module):
     def _aligned_max_seq_len(self) -> int:
         return math.ceil(self.max_model_len / _POOL_SIZE) * _POOL_SIZE
 
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.max_model_len = int(max_model_len)
+        self.indexer_op.max_model_len = math.ceil(max_model_len / _POOL_SIZE)
+
     @staticmethod
     def _max_parent_table_width(
         max_model_len: int,
-        max_speculative_tokens: int,
         block_size: int,
         dcp_world_size: int,
     ) -> int:
-        return math.ceil(
-            (max_model_len + max_speculative_tokens) / (block_size * dcp_world_size)
-        )
+        return math.ceil(max_model_len / (block_size * dcp_world_size))
 
     @staticmethod
     def _index_cache_view(
@@ -316,7 +316,6 @@ class Glm5NextPooledIndexer(nn.Module):
         block_size = int(main_cache.shape[1])
         parent_table_width = self._max_parent_table_width(
             self._aligned_max_seq_len,
-            self.max_speculative_tokens,
             block_size,
             self.dcp_world_size,
         )
@@ -413,9 +412,11 @@ class Glm5NextPooledIndexer(nn.Module):
                 "GLM selector token counts are inconsistent: "
                 f"decode={decode_rows}, live={live_rows}, capacity={rows}"
             )
-        if int(main_metadata.block_table.shape[1]) < self._parent_table_width:
+        actual_table_width = int(main_metadata.block_table.shape[1])
+        if actual_table_width < self._parent_table_width:
             raise RuntimeError(
-                "GLM selector block table is narrower than max_model_len"
+                "GLM selector block table is narrower than the runtime context: "
+                f"actual={actual_table_width}, required={self._parent_table_width}"
             )
 
         update_decode_pools(

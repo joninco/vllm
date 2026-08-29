@@ -26,11 +26,14 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .model import (
+    GLM5NEXT_PACKED_MODULES_MAPPING,
     Glm5NextDecoderLayer,
     Glm5NextMoE,
     _try_load_fp8_attn_proj,
+    _try_load_mxfp8_bf16_attn_proj,
     get_spec_layer_idx_from_weight_name,
 )
+from .pooled_indexer import Glm5NextPooledIndexer
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
@@ -129,6 +132,11 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         self._mtp_layers = list(self.layers.values())
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
+    def update_max_model_len(self, max_model_len: int) -> None:
+        for module in self.modules():
+            if isinstance(module, Glm5NextPooledIndexer):
+                module.update_max_model_len(max_model_len)
+
     def set_skip_topk(self, skip: bool):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
         for layer in self.layers.values():
@@ -216,6 +224,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    packed_modules_mapping = GLM5NEXT_PACKED_MODULES_MAPPING
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.language_model.": "model.",
@@ -227,10 +236,26 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.set_moe_parameters()
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        return tuple(
+            prefix
+            for layer_idx in range(
+                self.config.num_hidden_layers,
+                self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
+            )
+            for prefix in (
+                f"model.language_model.layers.{layer_idx}.",
+                f"language_model.model.layers.{layer_idx}.",
+                f"model.layers.{layer_idx}.",
+                f"layers.{layer_idx}.",
+            )
+        )
 
     def set_moe_parameters(self):
         self.num_moe_layers = self.config.num_nextn_predict_layers
@@ -248,6 +273,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.model.update_max_model_len(max_model_len)
 
     def forward(
         self,
@@ -320,7 +348,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        _pending_wk_fp8: dict = {}
+        pending_attn_weights: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
         # ``kv_a_proj_with_mqa``; the FP8-to-BF16 path pads them for the model.
         kv_a_pad_size = 0
@@ -340,15 +368,20 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
 
-            # FP8 checkpoint: dequantize the BF16-kept MLA projections
-            # (q_a_proj / kv_a_proj_with_mqa / o_proj) to BF16, mirroring the
-            # target model. The model holds fused_qkv_a_proj / o_proj in BF16,
-            # so the checkpoint's block-FP8 weight + weight_scale_inv for these
-            # has no param home and would KeyError without this dequant.
+            if _try_load_mxfp8_bf16_attn_proj(
+                name,
+                loaded_weight,
+                pending_attn_weights,
+                params_dict,
+                loaded_params,
+            ):
+                continue
+
+            # Dequantize legacy block-FP8 projections kept in BF16.
             if _try_load_fp8_attn_proj(
                 name,
                 loaded_weight,
-                _pending_wk_fp8,
+                pending_attn_weights,
                 params_dict,
                 loaded_params,
                 kv_a_pad_size,

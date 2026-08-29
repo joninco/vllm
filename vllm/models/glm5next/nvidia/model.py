@@ -42,6 +42,11 @@ from vllm.model_executor.layers.mhc import (
     hc_expand,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_SCALE_DTYPE,
+    MXFP8_VALUE_DTYPE,
+    dequant_mxfp8_to_bf16,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -89,8 +94,16 @@ from .multimodal import (
     Glm5NextProcessingInfo,
     Glm5NextVisionTransformer,
 )
+from .pooled_indexer import Glm5NextPooledIndexer
 
 logger = init_logger(__name__)
+
+GLM5NEXT_PACKED_MODULES_MAPPING = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_qkvgfab": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"],
+    "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+}
 
 _MHC_WEIGHT_RENAMES = (
     (".attn_hc.fn", ".hc_attn_fn"),
@@ -346,6 +359,14 @@ class Glm5NextDecoderLayer(nn.Module):
             # on MLA configs; narrow away the `int | None`.
             assert config.v_head_dim is not None
             assert config.kv_lora_rank is not None
+            # Mixed ModelOpt checkpoints describe each projection independently;
+            # unlisted projections remain BF16.
+            mla_quant_config = (
+                quant_config
+                if quant_config is not None
+                and quant_config.get_name() == "modelopt_mixed"
+                else None
+            )
             self.self_attn = Glm5NextMLAAttention(
                 vllm_config=vllm_config,
                 config=config,
@@ -358,7 +379,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                quant_config=mla_quant_config,
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 pool_topk_indices_buffer=pool_topk_indices_buffer,
@@ -748,6 +769,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         else:
             first_layer.hc_attn_fn_broadcast.copy_(broadcast)
 
+    def update_max_model_len(self, max_model_len: int) -> None:
+        for module in self.modules():
+            if isinstance(module, Glm5NextPooledIndexer):
+                module.update_max_model_len(max_model_len)
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -867,7 +893,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         if self.config.mla_nope and self.config.qk_rope_head_dim > 0:
             kv_a_pad_size = self.config.qk_rope_head_dim
 
-        _pending_wk_fp8: dict = {}
+        pending_attn_weights: dict = {}
 
         for args in weights:
             name, loaded_weight = args[:2]
@@ -897,12 +923,20 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 loaded_params.add(name)
                 continue
 
-            # FP8 checkpoint: dequantize BF16-kept MLA projections
-            # (q_a_proj / kv_a_proj_with_mqa / o_proj) to BF16.
+            if _try_load_mxfp8_bf16_attn_proj(
+                name,
+                loaded_weight,
+                pending_attn_weights,
+                params_dict,
+                loaded_params,
+            ):
+                continue
+
+            # Dequantize legacy block-FP8 projections kept in BF16.
             if _try_load_fp8_attn_proj(
                 name,
                 loaded_weight,
-                _pending_wk_fp8,
+                pending_attn_weights,
                 params_dict,
                 loaded_params,
                 kv_a_pad_size,
@@ -994,6 +1028,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, MixtureOfExperts, IsHybrid, SupportsEagle3
 ):
+    packed_modules_mapping = GLM5NEXT_PACKED_MODULES_MAPPING
     supports_pp: ClassVar[Literal[False]] = False
 
     @staticmethod
@@ -1028,6 +1063,9 @@ class Glm5NextForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.model.update_max_model_len(max_model_len)
 
     def forward(
         self,
@@ -1104,6 +1142,7 @@ class Glm5NextForCausalLM(
 class Glm5NextForConditionalGeneration(
     Glm4vForConditionalGeneration, HasInnerState, IsHybrid, SupportsEagle3
 ):
+    packed_modules_mapping = GLM5NEXT_PACKED_MODULES_MAPPING
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
@@ -1146,6 +1185,9 @@ class Glm5NextForConditionalGeneration(
     def process_weights_after_loading(self) -> None:
         self.language_model.process_weights_after_loading()
 
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.language_model.update_max_model_len(max_model_len)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Glm4vForConditionalGeneration, self).__init__()
         config = vllm_config.model_config.hf_config
@@ -1169,12 +1211,7 @@ class Glm5NextForConditionalGeneration(
                 # the latter onto text_config (1e-5), silently ignoring the
                 # vision tower's own (1e-6) rms_norm_eps.
                 norm_eps=config.vision_config.rms_norm_eps,
-                # Vision tower ships BF16 weights in this fp8 checkpoint (no
-                # weight_scale_inv for visual.*), so it must NOT inherit the
-                # global fp8 quant_config -- doing so incorrectly quantizes
-                # the tower
-                # and yields NaN image features. Mirrors the MLA/KDA proj
-                # pattern (quant_config=None for BF16 submodules).
+                # The vision tower ships BF16 weights and is not quantized.
                 quant_config=None,
                 prefix=maybe_prefix(prefix, "visual"),
             )
@@ -1238,8 +1275,8 @@ def _dequant_fp8_block(
     return out[:out_dim, :in_dim].contiguous()
 
 
-# FP8 checkpoint projections that the MODEL keeps in BF16, so the block-FP8
-# (weight + weight_scale_inv) must be dequantized to BF16 on load.
+# Legacy FP8 checkpoint projections that the model keeps in BF16, so the
+# block-FP8 weight and scale must be dequantized on load.
 # Maps checkpoint proj-suffix -> (buffer key, model target base, fused shard id
 # or None for a direct projection, whether NoPE rope-padding applies).
 _FP8_ATTN_PROJS = {
@@ -1258,14 +1295,10 @@ def _try_load_fp8_attn_proj(
     loaded_params,
     kv_a_pad_size: int,
 ) -> bool:
-    """Dequantize FP8 q_a_proj / kv_a_proj_with_mqa / o_proj to BF16 on load.
+    """Dequantize legacy block-FP8 attention projections to BF16 on load.
 
-    The FP8 checkpoint stores these as block-FP8 (weight + weight_scale_inv),
-    but the model holds them in BF16 (``fused_qkv_a_proj`` is always BF16 via
-    DeepSeekV2FusedQkvAProjLinear; ``o_proj`` is excluded by
-    modules_to_not_convert). When the model target is BF16 (no
-    ``weight_scale_inv`` param) we dequantize; otherwise we return False so the
-    normal stacked/direct path loads the FP8 tensor as-is.
+    When the runtime projection has a serialized scale parameter, the normal
+    loader owns it instead.
     """
     matched = None
     for suffix, info in _FP8_ATTN_PROJS.items():
@@ -1282,10 +1315,11 @@ def _try_load_fp8_attn_proj(
 
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
-    target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
-    # If the model actually kept this projection in FP8, let the normal path
-    # handle it (it has a weight_scale_inv param).
-    if target_s in params_dict:
+    target_scale_inv = f"{layer_prefix}.{target_base}.weight_scale_inv"
+    target_scale = f"{layer_prefix}.{target_base}.weight_scale"
+    # Quantized runtime projections own their serialized scale parameter. Let
+    # the normal path load either block-FP8 or MXFP8 weights directly.
+    if target_scale_inv in params_dict or target_scale in params_dict:
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
@@ -1312,5 +1346,41 @@ def _try_load_fp8_attn_proj(
         param.weight_loader(param, weight_bf16)
     else:
         param.weight_loader(param, weight_bf16, shard_id)
+    loaded_params.add(target_w)
+    return True
+
+
+def _try_load_mxfp8_bf16_attn_proj(
+    name,
+    tensor,
+    buf,
+    params_dict,
+    loaded_params,
+) -> bool:
+    """Dequantize MXFP8 selector weights whose computation requires FP32."""
+    suffix = ".indexer.weights_proj."
+    if suffix not in name:
+        return False
+
+    is_weight = name.endswith(".weight") and tensor.dtype == MXFP8_VALUE_DTYPE
+    is_scale = name.endswith(".weight_scale") and tensor.dtype == MXFP8_SCALE_DTYPE
+    if not is_weight and not is_scale:
+        return False
+
+    layer_prefix = name.rsplit(suffix, 1)[0]
+    target_w = f"{layer_prefix}.indexer.weights_proj.weight"
+    target_scale = f"{layer_prefix}.indexer.weights_proj.weight_scale"
+    if target_scale in params_dict:
+        return False
+
+    entry = buf.setdefault(layer_prefix, {}).setdefault("indexer_weights", {})
+    entry["weight" if is_weight else "scale"] = tensor
+    if "weight" not in entry or "scale" not in entry:
+        return True
+
+    weight = dequant_mxfp8_to_bf16(entry["weight"], entry["scale"])
+    buf[layer_prefix].pop("indexer_weights", None)
+    param = params_dict[target_w]
+    param.weight_loader(param, weight)
     loaded_params.add(target_w)
     return True

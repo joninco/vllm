@@ -20,8 +20,10 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.models.glm4_1v import Glm4vForConditionalGeneration
 from vllm.model_executor.models.interfaces import supports_eagle3, supports_pp
 from vllm.models.glm5next.nvidia import attention as glm5next_attention
+from vllm.models.glm5next.nvidia import model as glm5next_model
 from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
 from vllm.models.glm5next.nvidia.model import (
+    GLM5NEXT_PACKED_MODULES_MAPPING,
     Glm5NextDecoderLayer,
     Glm5NextForCausalLM,
     Glm5NextForConditionalGeneration,
@@ -29,6 +31,7 @@ from vllm.models.glm5next.nvidia.model import (
     Glm5NextMoE,
     _load_glm5next_fused_conv1d,
     _remap_glm5next_weight_name,
+    _try_load_fp8_attn_proj,
 )
 from vllm.models.glm5next.nvidia.mtp import (
     Glm5NextMTP,
@@ -109,6 +112,246 @@ def test_glm5next_checkpoint_weight_name_remapping(
     parameter_name: str,
 ) -> None:
     assert _remap_glm5next_weight_name(checkpoint_name) == parameter_name
+
+
+def test_glm5next_mixed_precision_resolves_fused_attention_projections() -> None:
+    quant_config = ModelOptMixedPrecisionConfig.__new__(ModelOptMixedPrecisionConfig)
+    quant_config.exclude_modules = []
+    quant_config.quantized_layers = {
+        f"model.language_model.layers.{layer}.self_attn.{projection}": {
+            "quant_algo": "MXFP8"
+        }
+        for layer, projection in (
+            (0, "q_proj"),
+            (0, "k_proj"),
+            (0, "v_proj"),
+            (0, "b_proj"),
+            (0, "f_a_proj"),
+            (3, "q_a_proj"),
+            (3, "kv_a_proj_with_mqa"),
+        )
+    }
+    quant_config.packed_modules_mapping = GLM5NEXT_PACKED_MODULES_MAPPING
+    quant_config.apply_vllm_mapper(
+        Glm5NextForConditionalGeneration.hf_to_vllm_mapper.get_rename_mapper()
+    )
+
+    assert (
+        quant_config._resolve_quant_algo(
+            "language_model.model.layers.0.self_attn.in_proj_qkvgfab"
+        )
+        == "MXFP8"
+    )
+    assert (
+        quant_config._resolve_quant_algo(
+            "language_model.model.layers.3.self_attn.fused_qkv_a_proj"
+        )
+        == "MXFP8"
+    )
+    assert Glm5NextForCausalLM.packed_modules_mapping is GLM5NEXT_PACKED_MODULES_MAPPING
+    assert (
+        Glm5NextForConditionalGeneration.packed_modules_mapping
+        is GLM5NEXT_PACKED_MODULES_MAPPING
+    )
+    assert Glm5NextMTP.packed_modules_mapping is GLM5NEXT_PACKED_MODULES_MAPPING
+
+
+def test_glm5next_mtp_resolves_mapped_mxfp8_projection() -> None:
+    quant_config = ModelOptMixedPrecisionConfig.__new__(ModelOptMixedPrecisionConfig)
+    quant_config.exclude_modules = []
+    quant_config.quantized_layers = {
+        f"model.language_model.layers.45.self_attn.{projection}": {
+            "quant_algo": "MXFP8"
+        }
+        for projection in ("q_a_proj", "kv_a_proj_with_mqa")
+    }
+    quant_config.packed_modules_mapping = GLM5NEXT_PACKED_MODULES_MAPPING
+    quant_config.apply_vllm_mapper(Glm5NextMTP.hf_to_vllm_mapper.get_rename_mapper())
+
+    assert (
+        quant_config._resolve_quant_algo("model.layers.45.self_attn.fused_qkv_a_proj")
+        == "MXFP8"
+    )
+
+
+def test_glm5next_mtp_selects_only_draft_checkpoint_weights() -> None:
+    mtp = SimpleNamespace(
+        config=SimpleNamespace(num_hidden_layers=45, num_nextn_predict_layers=1)
+    )
+
+    assert Glm5NextMTP._checkpoint_weight_name_prefixes(mtp) == (
+        "model.language_model.layers.45.",
+        "language_model.model.layers.45.",
+        "model.layers.45.",
+        "layers.45.",
+    )
+
+
+def test_glm5next_mixed_precision_reaches_mla_projections(monkeypatch) -> None:
+    captured = {}
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+    class FakeMLAAttention(FakeModule):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            captured.update(kwargs)
+
+    monkeypatch.setattr(glm5next_model, "Glm5NextMLAAttention", FakeMLAAttention)
+    monkeypatch.setattr(glm5next_model, "Glm5NextMLP", FakeModule)
+    monkeypatch.setattr(glm5next_model, "RMSNorm", FakeModule)
+
+    quant_config = ModelOptMixedPrecisionConfig.__new__(ModelOptMixedPrecisionConfig)
+    config = SimpleNamespace(
+        hidden_size=16,
+        is_moe=False,
+        num_hidden_layers=1,
+        rms_norm_eps=1e-5,
+        n_routed_experts=None,
+        mhc=False,
+        is_kda_layer=lambda layer_idx: False,
+        v_head_dim=4,
+        kv_lora_rank=4,
+        num_attention_heads=2,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=0,
+        q_lora_rank=4,
+        max_position_embeddings=128,
+        mla_nope=True,
+        mlp_layer_types=["dense"],
+        intermediate_size=32,
+        hidden_act="silu",
+        swiglu_limit=None,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=None,
+        quant_config=quant_config,
+        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
+    )
+
+    Glm5NextDecoderLayer(vllm_config, config, 0, prefix="model.layers.0")
+
+    assert captured["quant_config"] is quant_config
+
+
+def test_glm5next_fp8_dequantizer_yields_to_mxfp8_projection() -> None:
+    layer_prefix = "layers.3.self_attn"
+    params_dict = {
+        f"{layer_prefix}.fused_qkv_a_proj.weight": torch.nn.Parameter(torch.empty(1)),
+        f"{layer_prefix}.fused_qkv_a_proj.weight_scale": torch.nn.Parameter(
+            torch.empty(1)
+        ),
+    }
+    pending: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
+
+    handled = _try_load_fp8_attn_proj(
+        f"{layer_prefix}.q_a_proj.weight",
+        torch.empty((1, 1), dtype=torch.float8_e4m3fn),
+        pending,
+        params_dict,
+        set(),
+        0,
+    )
+
+    assert not handled
+    assert not pending
+
+
+def test_glm5next_dequantizes_mxfp8_selector_head_projection() -> None:
+    layer_prefix = "layers.3.self_attn"
+    parameter_name = f"{layer_prefix}.indexer.weights_proj.weight"
+    param = torch.nn.Parameter(torch.empty((1, 32), dtype=torch.bfloat16))
+
+    def weight_loader(param, loaded_weight) -> None:
+        param.data.copy_(loaded_weight)
+
+    param.weight_loader = weight_loader
+    weight = (
+        torch.arange(32, dtype=torch.float32).reshape(1, 32).to(torch.float8_e4m3fn)
+    )
+    scale = torch.full((1, 1), 127, dtype=torch.uint8)
+
+    class FakeModel(torch.nn.Module):
+        config = SimpleNamespace(
+            is_moe=False,
+            is_linear_attn=True,
+            mla_nope=False,
+            qk_rope_head_dim=0,
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+
+        def named_parameters(self):
+            return iter([(parameter_name, param)])
+
+    loaded_params = Glm5NextModel.load_weights(
+        FakeModel(),
+        [
+            (f"{layer_prefix}.indexer.weights_proj.weight", weight),
+            (f"{layer_prefix}.indexer.weights_proj.weight_scale", scale),
+        ],
+    )
+
+    assert loaded_params == {parameter_name}
+    torch.testing.assert_close(param, weight.to(torch.bfloat16))
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_name", "parameter_name", "shard_id"),
+    [
+        (
+            "layers.0.self_attn.q_proj.weight_scale",
+            "layers.0.self_attn.in_proj_qkvgfab.weight_scale",
+            0,
+        ),
+        (
+            "layers.3.self_attn.q_a_proj.weight_scale",
+            "layers.3.self_attn.fused_qkv_a_proj.weight_scale",
+            0,
+        ),
+    ],
+)
+def test_glm5next_loads_mxfp8_fused_projection_scales(
+    checkpoint_name: str,
+    parameter_name: str,
+    shard_id: int,
+) -> None:
+    calls = []
+    param = torch.nn.Parameter(torch.empty(1))
+
+    def weight_loader(param, loaded_weight, loaded_shard_id) -> None:
+        calls.append((param, loaded_weight, loaded_shard_id))
+
+    param.weight_loader = weight_loader
+
+    class FakeModel(torch.nn.Module):
+        config = SimpleNamespace(
+            is_moe=False,
+            is_linear_attn=True,
+            mla_nope=False,
+            qk_rope_head_dim=0,
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+
+        def named_parameters(self):
+            return iter([(parameter_name, param)])
+
+    loaded_weight = torch.ones(1, dtype=torch.uint8)
+    loaded_params = Glm5NextModel.load_weights(
+        FakeModel(), [(checkpoint_name, loaded_weight)]
+    )
+
+    assert loaded_params == {parameter_name}
+    assert len(calls) == 1
+    loaded_param, actual_weight, actual_shard_id = calls[0]
+    assert loaded_param is param
+    assert actual_weight is loaded_weight
+    assert actual_shard_id == shard_id
 
 
 def test_glm5next_kda_adapts_shared_out_buffer_forward(monkeypatch) -> None:

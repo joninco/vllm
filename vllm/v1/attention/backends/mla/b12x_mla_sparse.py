@@ -3,6 +3,7 @@
 """B12x sparse MLA attention backend."""
 
 from dataclasses import dataclass, replace
+from math import prod
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
@@ -35,7 +36,10 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -111,6 +115,28 @@ def _selected_index_block_stride_rows(
         return block_size
     record_width = int(kv_cache.shape[-1])
     return int(kv_cache.stride(0)) // record_width
+
+
+def _max_speculative_decode_query_len(vllm_config: VllmConfig) -> int:
+    spec_config = vllm_config.speculative_config
+    if spec_config is None:
+        return 1
+    num_speculative_tokens = int(spec_config.num_speculative_tokens or 0)
+    multiplier = 2 if spec_config.parallel_drafting else 1
+    return 1 + multiplier * num_speculative_tokens
+
+
+def _is_speculative_decode_batch(
+    common_attn_metadata: "CommonAttentionMetadata",
+    max_speculative_decode_query_len: int,
+) -> bool:
+    is_prefilling = getattr(common_attn_metadata, "is_prefilling", None)
+    return (
+        max_speculative_decode_query_len > 1
+        and 1 < common_attn_metadata.max_query_len <= max_speculative_decode_query_len
+        and is_prefilling is not None
+        and not bool(torch.any(is_prefilling[: common_attn_metadata.num_reqs]))
+    )
 
 
 class B12xMLASparseBackend(AttentionBackend):
@@ -273,6 +299,7 @@ class B12xMLASparseMetadata(AttentionMetadata):
     selector_state_is_fresh: torch.Tensor | None = None
     selector_num_accepted_tokens: torch.Tensor | None = None
     selector_is_prefilling: torch.Tensor | None = None
+    is_spec_decode: bool = False
 
 
 class B12xMLASparseMetadataBuilder(
@@ -332,6 +359,9 @@ class B12xMLASparseMetadataBuilder(
             threshold,
             supports_spec_as_decode=True,
             supports_dcp_with_varlen=True,
+        )
+        self._max_speculative_decode_query_len = _max_speculative_decode_query_len(
+            vllm_config
         )
 
     def _stage_glm_next_selector_metadata(
@@ -484,6 +514,10 @@ class B12xMLASparseMetadataBuilder(
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
 
         metadata.cache_seq_lens_per_token = per_token_lens
+        metadata.is_spec_decode = _is_speculative_decode_batch(
+            common,
+            self._max_speculative_decode_query_len,
+        )
         if metadata.num_prefills:
             prefill_start = metadata.num_decodes
             prefill_end = prefill_start + metadata.num_prefills + 1
@@ -659,6 +693,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 )
         self._max_tokens = max_tokens
         self._max_seqs = max_seqs
+        self._max_speculative_decode_query_len = _max_speculative_decode_query_len(
+            vllm_config
+        )
+        self._decode_max_rows = min(
+            max_tokens,
+            max_seqs * self._max_speculative_decode_query_len,
+        )
         self._kv_dtype = torch.uint8
         kernel_page_size = (
             int(vllm_config.cache_config.block_size) if self._is_glm_next else 64
@@ -679,17 +720,18 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             return
 
         def make_plan(mode: str):
+            max_rows = self._decode_max_rows if mode == "decode" else self._max_tokens
             caps_kwargs = dict(
                 device=torch.device("cuda", torch.accelerator.current_device_index()),
                 num_q_heads=self._input_num_heads,
-                max_q_rows=self._max_tokens,
+                max_q_rows=max_rows,
                 max_width=self._topk_tokens,
                 dtype=torch.bfloat16,
                 kv_dtype=self._kv_dtype,
                 head_dim=self._q_head_dim,
                 v_head_dim=self.kv_lora_rank,
                 mode=mode,
-                max_batch=self._max_tokens,
+                max_batch=max_rows,
                 max_chunks_per_row=max(1, (self._topk_tokens + 63) // 64),
                 page_size=kernel_page_size,
             )
@@ -702,6 +744,48 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._decode_plan = decode_plan
         self._extend_plan = extend_plan
         self._kernel_page_size = kernel_page_size
+        self._reserve_planned_workspaces()
+
+    def _workspace_specs(self, plan) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        q_spec = (
+            (self._max_tokens, self._input_num_heads, self._q_head_dim),
+            torch.bfloat16,
+        )
+        return (q_spec, *plan.shapes_and_dtypes())
+
+    @staticmethod
+    def _workspace_nbytes(
+        specs: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+    ) -> int:
+        return sum(
+            ((prod(shape) * dtype.itemsize + 255) // 256) * 256
+            for shape, dtype in specs
+        )
+
+    def _reserve_planned_workspaces(self) -> None:
+        if not is_workspace_manager_initialized():
+            return
+        plan_specs = (
+            self._workspace_specs(self._decode_plan),
+            self._workspace_specs(self._extend_plan),
+        )
+        largest_specs = max(plan_specs, key=self._workspace_nbytes)
+        current_workspace_manager().get_simultaneous(*largest_specs)
+
+    def _use_decode_plan(
+        self,
+        attn_metadata: B12xMLASparseMetadata,
+        num_tokens: int,
+    ) -> bool:
+        if attn_metadata.max_query_len <= 1:
+            return True
+        return (
+            attn_metadata.is_spec_decode
+            and attn_metadata.max_query_len <= self._max_speculative_decode_query_len
+            and num_tokens
+            <= attn_metadata.num_reqs * self._max_speculative_decode_query_len
+            and num_tokens <= self._decode_max_rows
+        )
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         if self._is_glm_next:
@@ -766,29 +850,26 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 f"cache={cache_page_size}, metadata={metadata_page_size}, "
                 f"plan={self._kernel_page_size}"
             )
+        num_tokens = int(q[0].shape[0] if isinstance(q, tuple) else q.shape[0])
         plan = (
-            self._decode_plan if attn_metadata.max_query_len <= 1 else self._extend_plan
-        )
-        q_spec = (
-            (self._max_tokens, self._input_num_heads, self._q_head_dim),
-            torch.bfloat16,
+            self._decode_plan
+            if self._use_decode_plan(attn_metadata, num_tokens)
+            else self._extend_plan
         )
         workspaces = current_workspace_manager().get_simultaneous(
-            q_spec, *plan.shapes_and_dtypes()
+            *self._workspace_specs(plan)
         )
         q_buffer = workspaces[0]
         scratch = workspaces[1:]
 
         if isinstance(q, tuple):
             q_nope, q_pe = q
-            num_tokens = int(q_nope.shape[0])
             q_all = q_buffer[:num_tokens]
             if int(q_pe.shape[-1]) == 0:
                 q_all.copy_(q_nope)
             else:
                 ops.concat_mla_q(q_nope, q_pe, q_all)
         else:
-            num_tokens = int(q.shape[0])
             q_all = q_buffer[:num_tokens]
             q_all.copy_(q)
 

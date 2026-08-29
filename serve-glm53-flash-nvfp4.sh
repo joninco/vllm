@@ -12,10 +12,23 @@ PORT="${PORT:-8001}"
 DEFAULT_DEVICE_IDS=8,9
 DEVICE_IDS="${DEVICE_IDS:-${DEFAULT_DEVICE_IDS}}"
 TP_SIZE="${TP_SIZE:-2}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.94}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-auto}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+if [[ -z "${MAX_NUM_BATCHED_TOKENS+x}" ]]; then
+  if [[ "${TP_SIZE}" == 2 ]]; then
+    MAX_NUM_BATCHED_TOKENS=2048
+  else
+    MAX_NUM_BATCHED_TOKENS=4096
+  fi
+fi
+if [[ -z "${KV_CACHE_MEMORY_BYTES+x}" ]]; then
+  if [[ "${TP_SIZE}" == 2 ]]; then
+    KV_CACHE_MEMORY_BYTES=2G
+  else
+    KV_CACHE_MEMORY_BYTES=
+  fi
+fi
 SPECULATOR="${SPECULATOR:-mtp}"
 DFLASH2_MODEL="${DFLASH2_MODEL:-incoai/GLM-5.3-Flash-DFlash2}"
 TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-}"
@@ -266,6 +279,11 @@ PY
   profiler_args=(--profiler-config "${profiler_config}")
 fi
 
+kv_cache_args=()
+if [[ -n "${KV_CACHE_MEMORY_BYTES}" ]]; then
+  kv_cache_args=(--kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}")
+fi
+
 command=(
   "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}"
   --served-model-name "${SERVED_MODEL_NAME}"
@@ -287,6 +305,7 @@ command=(
   --no-enable-flashinfer-autotune
   --load-format "${LOAD_FORMAT}"
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
+  "${kv_cache_args[@]}"
   --max-model-len "${MAX_MODEL_LEN}"
   --max-num-seqs "${MAX_NUM_SEQS}"
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
@@ -304,6 +323,13 @@ printf 'Launching %s as %s directly on devices %s\n' \
 printf 'Serving NVFP4 routed experts through B12X W4A16 (BF16 activations)\n' >&2
 printf 'Speculator: %s (%s draft tokens)\n' \
   "${SPECULATOR}" "${NUM_SPECULATIVE_TOKENS}" >&2
+if [[ -n "${KV_CACHE_MEMORY_BYTES}" ]]; then
+  printf 'K/V cache: %s per GPU; max batched tokens: %s\n' \
+    "${KV_CACHE_MEMORY_BYTES}" "${MAX_NUM_BATCHED_TOKENS}" >&2
+else
+  printf 'K/V cache: auto at %.2f GPU utilization; max batched tokens: %s\n' \
+    "${GPU_MEMORY_UTILIZATION}" "${MAX_NUM_BATCHED_TOKENS}" >&2
+fi
 if [[ -n "${TORCH_PROFILE_DIR}" ]]; then
   printf 'Torch CPU+CUDA profiling enabled; traces: %s\n' \
     "${TORCH_PROFILE_DIR}" >&2

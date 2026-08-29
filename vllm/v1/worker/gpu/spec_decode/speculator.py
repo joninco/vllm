@@ -199,6 +199,13 @@ class DraftModelSpeculator(BaseSpeculator):
                 type(self.model).__name__,
             )
 
+    def update_max_model_len(self, max_model_len: int) -> None:
+        self.max_model_len = int(max_model_len)
+        self.draft_max_seq_len = self.max_model_len
+        update_model_len = getattr(self.model, "update_max_model_len", None)
+        if update_model_len is not None:
+            update_model_len(self.max_model_len)
+
     def set_eplb_state(self, eplb_state: EplbState) -> None:
         """Inject EPLB state after construction."""
         self.eplb_state = eplb_state

@@ -35,6 +35,8 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
     B12xMLASparseMetadata,
     B12xMLASparseMetadataBuilder,
+    _is_speculative_decode_batch,
+    _max_speculative_decode_query_len,
     _selected_index_block_stride_rows,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import _remap_tiling
@@ -370,6 +372,11 @@ def test_b12x_glm5_next_cache_writer_ignores_empty_rope() -> None:
 def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> None:
     planned: list[SimpleNamespace] = []
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "is_workspace_manager_initialized",
+        lambda: False,
+    )
 
     class FakeCaps(SimpleNamespace):
         def __init__(self, **kwargs):
@@ -390,6 +397,8 @@ def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> 
     impl._input_num_heads = 64
     impl._max_tokens = 4096
     impl._max_seqs = 4
+    impl._max_speculative_decode_query_len = 6
+    impl._decode_max_rows = 24
     impl._topk_tokens = 2051
     impl._kv_dtype = torch.uint8
     impl._q_head_dim = 512
@@ -409,8 +418,114 @@ def test_b12x_glm5_next_cache_bind_replans_aligned_manager_page(monkeypatch) -> 
         ("extend", 2304),
     ]
     assert [(caps.max_q_rows, caps.max_batch) for caps in planned] == [
+        (24, 24),
         (4096, 4096),
-        (4096, 4096),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("parallel_drafting", "expected_query_len"),
+    [(False, 6), (True, 11)],
+)
+def test_b12x_sparse_mla_bounds_speculative_decode_query_len(
+    parallel_drafting: bool,
+    expected_query_len: int,
+) -> None:
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=5,
+            parallel_drafting=parallel_drafting,
+        )
+    )
+
+    assert _max_speculative_decode_query_len(config) == expected_query_len
+
+
+@pytest.mark.parametrize(
+    ("max_query_len", "is_prefilling", "expected"),
+    [
+        (1, [False, False], False),
+        (6, [False, False], True),
+        (6, [False, True], False),
+        (7, [False, False], False),
+    ],
+)
+def test_b12x_sparse_mla_identifies_only_speculative_verifier_batches(
+    max_query_len: int,
+    is_prefilling: list[bool],
+    expected: bool,
+) -> None:
+    common = SimpleNamespace(
+        num_reqs=2,
+        max_query_len=max_query_len,
+        is_prefilling=torch.tensor(is_prefilling),
+    )
+
+    assert _is_speculative_decode_batch(common, 6) is expected
+
+
+@pytest.mark.parametrize(
+    ("max_query_len", "is_spec_decode", "num_tokens", "expected_decode"),
+    [
+        (1, False, 4, True),
+        (6, True, 24, True),
+        (6, False, 24, False),
+        (6, True, 25, False),
+        (7, True, 24, False),
+    ],
+)
+def test_b12x_sparse_mla_routes_only_planned_decode_rows(
+    max_query_len: int,
+    is_spec_decode: bool,
+    num_tokens: int,
+    expected_decode: bool,
+) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_speculative_decode_query_len = 6
+    impl._decode_max_rows = 24
+    metadata = SimpleNamespace(
+        num_reqs=4,
+        max_query_len=max_query_len,
+        is_spec_decode=is_spec_decode,
+    )
+
+    assert impl._use_decode_plan(metadata, num_tokens) is expected_decode
+
+
+def test_b12x_sparse_mla_reserves_largest_planned_workspace(monkeypatch) -> None:
+    reservations: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
+    manager = SimpleNamespace(
+        get_simultaneous=lambda *specs: reservations.append(specs)
+    )
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "is_workspace_manager_initialized",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        b12x_mla_sparse,
+        "current_workspace_manager",
+        lambda: manager,
+    )
+
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_tokens = 64
+    impl._input_num_heads = 8
+    impl._q_head_dim = 512
+    impl._decode_plan = SimpleNamespace(
+        shapes_and_dtypes=lambda: (((32,), torch.uint8),)
+    )
+    impl._extend_plan = SimpleNamespace(
+        shapes_and_dtypes=lambda: (((512,), torch.uint8),)
+    )
+
+    impl._reserve_planned_workspaces()
+
+    assert reservations == [
+        (
+            ((64, 8, 512), torch.bfloat16),
+            ((512,), torch.uint8),
+        )
     ]
 
 
@@ -419,6 +534,7 @@ def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
     builder.requires_glm_next_selector_metadata = True
     builder.supports_draft_decode_metadata_update = True
     builder.dcp_world_size = 1
+    builder._max_speculative_decode_query_len = 6
     builder._capture_default_state_slot_ids = torch.arange(4, dtype=torch.int32)
     builder._capture_state_slot_ids = torch.empty(4, dtype=torch.int32)
     builder._capture_state_is_fresh = torch.ones(4, dtype=torch.bool)

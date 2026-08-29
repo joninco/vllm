@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
 )
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
 from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_module
@@ -213,6 +214,29 @@ def test_glm5next_mtp_uses_collapsed_hidden_size() -> None:
 
     assert speculator.hidden_size == 4096
     assert speculator.hidden_states.shape == (8, 4096)
+
+
+def test_model_runner_propagates_auto_fit_length_to_draft_model() -> None:
+    draft_model = Mock()
+    speculator = object.__new__(_TestSpeculator)
+    speculator.model = draft_model
+    speculator.max_model_len = 1024
+    speculator.draft_max_seq_len = 1024
+
+    target_model = Mock()
+    runner = object.__new__(GPUModelRunner)
+    runner.model = target_model
+    runner.speculator = speculator
+    runner.req_states = SimpleNamespace(max_model_len=1024)
+
+    runner.update_max_model_len(216_576)
+
+    assert runner.max_model_len == 216_576
+    assert runner.req_states.max_model_len == 216_576
+    assert speculator.max_model_len == 216_576
+    assert speculator.draft_max_seq_len == 216_576
+    target_model.update_max_model_len.assert_called_once_with(216_576)
+    draft_model.update_max_model_len.assert_called_once_with(216_576)
 
 
 def test_mtp_speculator_rolls_back_qsa_anchor_around_lookahead() -> None:
