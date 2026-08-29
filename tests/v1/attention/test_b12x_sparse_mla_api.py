@@ -636,6 +636,7 @@ def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
     builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
     builder.requires_glm_next_selector_metadata = True
     builder.supports_draft_decode_metadata_update = True
+    builder._ckv_gather_requested = False
     builder.dcp_world_size = 1
     builder._max_speculative_decode_query_len = 6
     builder._capture_default_state_slot_ids = torch.arange(4, dtype=torch.int32)
@@ -734,7 +735,11 @@ def test_glm_selector_metadata_builder_stages_padded_rows_and_capture(
     monkeypatch.setattr(
         SparseMLACommonMetadataBuilder,
         "build",
-        lambda *args, **kwargs: SimpleNamespace(),
+        lambda *args, **kwargs: SimpleNamespace(
+            num_prefills=0,
+            num_decode_tokens=0,
+            is_spec_decode=False,
+        ),
     )
     builder = _bare_glm_selector_metadata_builder()
     common = SimpleNamespace(
@@ -810,7 +815,11 @@ def test_glm_selector_metadata_builder_requires_complete_runtime_state(
     monkeypatch.setattr(
         SparseMLACommonMetadataBuilder,
         "build",
-        lambda *args, **kwargs: SimpleNamespace(),
+        lambda *args, **kwargs: SimpleNamespace(
+            num_prefills=0,
+            num_decode_tokens=0,
+            is_spec_decode=False,
+        ),
     )
     builder = _bare_glm_selector_metadata_builder()
     common = SimpleNamespace(
