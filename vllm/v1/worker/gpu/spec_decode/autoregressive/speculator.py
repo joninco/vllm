@@ -26,6 +26,17 @@ from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 logger = init_logger(__name__)
 
 
+def _sparse_full_capture_request_sizes(max_num_reqs: int) -> frozenset[int]:
+    """Return power-of-two request capacities, including the configured maximum."""
+    request_sizes = []
+    request_size = 1
+    while request_size < max_num_reqs:
+        request_sizes.append(request_size)
+        request_size *= 2
+    request_sizes.append(max_num_reqs)
+    return frozenset(request_sizes)
+
+
 class AutoRegressiveSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
@@ -139,11 +150,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # Initialize cudagraph manager for draft prefill (draft position 0).
+        full_capture_request_sizes = _sparse_full_capture_request_sizes(
+            self.max_num_reqs
+        )
         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
             cudagraph_mode,
             self.num_speculative_steps + 1,
+            full_capture_request_sizes=full_capture_request_sizes,
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.

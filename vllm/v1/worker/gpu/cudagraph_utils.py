@@ -114,6 +114,7 @@ class CudaGraphManager:
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        full_capture_request_sizes: frozenset[int] | None = None,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -123,6 +124,7 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        self.full_capture_request_sizes = full_capture_request_sizes
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -254,6 +256,11 @@ class CudaGraphManager:
                         rounded_num_tokens > max_decode_tokens
                         or rounded_num_tokens > max_cg_capture_size
                         or rounded_num_reqs > self.max_num_reqs
+                    ):
+                        continue
+                    if (
+                        self.full_capture_request_sizes is not None
+                        and rounded_num_reqs not in self.full_capture_request_sizes
                     ):
                         continue
 
