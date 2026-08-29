@@ -15,11 +15,13 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
+from vllm.utils.b12x import get_b12x_bf16_vocab_projection
 from vllm.utils.flashinfer import has_flashinfer
 
 logger = init_logger(__name__)
@@ -72,6 +74,8 @@ class LogitsProcessor(PluggableLayer):
         scale: float = 1.0,
         logits_as_input: bool = False,
         soft_cap: float | None = None,
+        *,
+        lm_head: torch.nn.Module | None = None,
     ) -> None:
         """
         Args:
@@ -93,6 +97,46 @@ class LogitsProcessor(PluggableLayer):
         # required for RL training-inference consistency.
         model_config = get_current_vllm_config().model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
+        kernel_config = get_current_vllm_config().kernel_config
+        self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
+        self._b12x_vocab_projection_plan = None
+        self.use_b12x_vocab_projection = bool(
+            kernel_config.linear_backend == "b12x"
+            and self._b12x_vocab_projection is not None
+            and self._b12x_vocab_projection.is_supported()
+        )
+        if lm_head is not None:
+            self.prepare_b12x_vocab_projection(lm_head)
+
+    def prepare_b12x_vocab_projection(
+        self,
+        lm_head: torch.nn.Module,
+    ) -> None:
+        """Resolve the immutable b12x vocabulary plan before execution."""
+        if (
+            not self.use_b12x_vocab_projection
+            or not isinstance(lm_head, VocabParallelEmbedding)
+            or not isinstance(
+                lm_head.quant_method,
+                (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+            )
+            or lm_head.weight.ndim != 2
+            or lm_head.weight.dtype != torch.bfloat16
+            or not lm_head.weight.is_cuda
+            or not lm_head.weight.is_contiguous()
+        ):
+            return
+        projection = self._b12x_vocab_projection
+        assert projection is not None
+        out_features, in_features = lm_head.weight.shape
+        self._b12x_vocab_projection_plan = projection.plan(
+            projection.Caps(
+                device=lm_head.weight.device,
+                max_tokens=1,
+                in_features=in_features,
+                out_features=out_features,
+            )
+        )
 
     def forward(
         self,
@@ -140,6 +184,37 @@ class LogitsProcessor(PluggableLayer):
     ) -> torch.Tensor:
         """Project hidden states through the lm_head, honoring head_dtype."""
         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
+            if (
+                self.use_b12x_vocab_projection
+                and embedding_bias is None
+                and isinstance(
+                    lm_head.quant_method,
+                    (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+                )
+            ):
+                planned = self._b12x_vocab_projection_plan
+                flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                if (
+                    planned is not None
+                    and flat.shape[0] == 1
+                    and tuple(lm_head.weight.shape)
+                    == (
+                        planned.caps.out_features,
+                        planned.caps.in_features,
+                    )
+                ):
+                    logger.info_once(
+                        "Using the profile-backed b12x BF16 vocabulary projection."
+                    )
+                    projection = self._b12x_vocab_projection
+                    assert projection is not None
+                    binding = projection.bind(
+                        planned,
+                        source=flat,
+                        weight=lm_head.weight,
+                    )
+                    logits = projection.run(binding)
+                    return logits.reshape(*hidden_states.shape[:-1], -1)
             return lm_head.quant_method.apply(
                 lm_head, hidden_states, bias=embedding_bias
             )

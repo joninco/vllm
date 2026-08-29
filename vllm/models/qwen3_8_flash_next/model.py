@@ -558,7 +558,10 @@ class Qwen3_8FlashNextForCausalLM(
             config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            lm_head=self.lm_head,
+        )
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )

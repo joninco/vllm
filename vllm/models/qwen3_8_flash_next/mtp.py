@@ -477,7 +477,10 @@ class Qwen3_8FlashNextMTP(
         else:
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            lm_head=self.lm_head,
+        )
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
