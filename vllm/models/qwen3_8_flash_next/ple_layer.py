@@ -31,6 +31,7 @@ from vllm.platforms import current_platform
 from vllm.utils.b12x import (
     get_b12x_ple,
     get_b12x_ple_embedding,
+    get_b12x_scratch_buffers,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -230,10 +231,10 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 self.ngram_embedding.mapped_host_nbytes / (1 << 30),
             )
 
-        scratch_spec = self._plan.scratch_specs()[0]
+        (scratch,) = get_b12x_scratch_buffers(self._plan)
         self.register_buffer(
             "_scratch",
-            torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
+            scratch,
             persistent=False,
         )
         self.register_buffer(
@@ -740,13 +741,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             torch.zeros(1, dtype=torch.int32, device=device),
             persistent=False,
         )
-        provisional = self._make_plan(max_state_slots=1)
-        scratch_spec = provisional.scratch_specs()[0]
-        self.register_buffer(
-            "_scratch",
-            torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
-            persistent=False,
-        )
+        self.register_buffer("_scratch", None, persistent=False)
         self._plan = None
         self._binding = None
         self.kv_cache = (torch.tensor([]),)
@@ -785,9 +780,11 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 f"{tuple(conv_state.shape)}"
             )
         plan = self._make_plan(max_state_slots=conv_state.shape[0])
+        (scratch,) = get_b12x_scratch_buffers(plan)
+        self._scratch = scratch
         self._plan = plan
         self._binding = plan.bind(
-            scratch=self._scratch,
+            scratch=scratch,
             residual=self._residual,
             key=self._key,
             value=self._value,
@@ -809,6 +806,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
     def unbind_kv_cache(self) -> None:
         self._binding = None
         self._plan = None
+        self._scratch = None
         super().unbind_kv_cache()
 
     @property

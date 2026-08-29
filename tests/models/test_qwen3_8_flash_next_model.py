@@ -44,6 +44,15 @@ class _RecordingPlan:
         self.bind_kwargs = kwargs
         return self.binding
 
+    def scratch_specs(self):
+        return (
+            SimpleNamespace(
+                shape=(1,),
+                dtype=torch.uint8,
+                device=torch.device("cpu"),
+            ),
+        )
+
 
 def _allocate_aligned_mamba_cache(
     *,

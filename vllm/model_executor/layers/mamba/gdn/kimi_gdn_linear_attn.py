@@ -24,7 +24,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
-from vllm.utils.b12x import get_b12x_gdn_decode
+from vllm.utils.b12x import get_b12x_gdn_decode, get_b12x_scratch_buffers
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from ...linear import (
@@ -412,12 +412,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             torch.zeros(1, dtype=torch.int32, device=device),
             persistent=False,
         )
-        scratch_spec = provisional.scratch_specs()[0]
-        self.register_buffer(
-            "_b12x_kda_scratch",
-            torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
-            persistent=False,
-        )
+        self.register_buffer("_b12x_kda_scratch", None, persistent=False)
 
     def _make_b12x_kda_plan(self, max_state_slots: int):
         api = self._b12x_kda_api
@@ -449,10 +444,12 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
         recurrent_state = self.kv_cache[1]
         plan = self._make_b12x_kda_plan(max_state_slots=recurrent_state.shape[0])
+        (scratch,) = get_b12x_scratch_buffers(plan)
+        self._b12x_kda_scratch = scratch
         self._b12x_kda_plan = plan
         self._b12x_kda_binding = api.bind_kda(
             plan,
-            scratch=self._b12x_kda_scratch,
+            scratch=scratch,
             mixed_qkv=self._b12x_kda_mixed_qkv,
             raw_g=self._b12x_kda_raw_g,
             raw_beta=self._b12x_kda_raw_beta,
@@ -472,6 +469,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     def unbind_kv_cache(self) -> None:
         self._b12x_kda_binding = None
         self._b12x_kda_plan = None
+        self._b12x_kda_scratch = None
         super().unbind_kv_cache()
 
     def rearrange_mixed_qkv(

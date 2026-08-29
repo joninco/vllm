@@ -158,6 +158,26 @@ def b12x_warmup_token_counts(
     return tuple(sorted(counts))
 
 
+def get_b12x_scratch_buffers(plan: Any) -> list[torch.Tensor]:
+    """Return caller-owned scratch buffers for a planned b12x operation."""
+    specs = tuple(plan.scratch_specs())
+    if not specs:
+        return []
+
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    if is_workspace_manager_initialized():
+        return current_workspace_manager().get_simultaneous(
+            *((spec.shape, spec.dtype) for spec in specs)
+        )
+    return [
+        torch.empty(spec.shape, dtype=spec.dtype, device=spec.device) for spec in specs
+    ]
+
+
 def _same_packed_layout(current: Any, replacement: Any) -> bool:
     if type(current) is not type(replacement):
         return False

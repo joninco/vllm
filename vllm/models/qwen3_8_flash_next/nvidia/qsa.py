@@ -25,7 +25,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import HAS_TRITON, tl, triton
-from vllm.utils.b12x import get_b12x_qsa
+from vllm.utils.b12x import get_b12x_qsa, get_b12x_scratch_buffers
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -1078,12 +1078,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
                 kv_dtype=self.kv_cache_kernel_dtype,
             )
         )
-        scratch_spec = plan.scratch_specs()[0]
-        scratch = torch.empty(
-            scratch_spec.shape,
-            dtype=scratch_spec.dtype,
-            device=kv_cache.device,
-        )
+        (scratch,) = get_b12x_scratch_buffers(plan)
         cos_sin = self.rotary_emb.cos_sin_cache
         rope_cos, rope_sin = cos_sin.chunk(2, dim=-1)
         expected_rope_width = int(self.rotary_emb.rotary_dim) // 2

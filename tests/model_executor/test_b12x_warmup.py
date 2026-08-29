@@ -19,6 +19,46 @@ from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.utils.b12x import B12xWarmupUnit, b12x_warmup_token_counts
 
 
+def test_b12x_scratch_uses_shared_workspace(monkeypatch) -> None:
+    import vllm.v1.worker.workspace as workspace
+
+    shared = torch.empty(32, dtype=torch.uint8)
+    requests: list[tuple[object, ...]] = []
+
+    def get_simultaneous(*specs: object) -> list[torch.Tensor]:
+        requests.append(specs)
+        return [shared]
+
+    manager = SimpleNamespace(get_simultaneous=get_simultaneous)
+    plan = SimpleNamespace(
+        scratch_specs=lambda: (
+            SimpleNamespace(shape=(32,), dtype=torch.uint8, device=torch.device("cpu")),
+        )
+    )
+    monkeypatch.setattr(workspace, "is_workspace_manager_initialized", lambda: True)
+    monkeypatch.setattr(workspace, "current_workspace_manager", lambda: manager)
+
+    (scratch,) = b12x_utils.get_b12x_scratch_buffers(plan)
+    assert scratch is shared
+    assert requests == [(((32,), torch.uint8),)]
+
+
+def test_b12x_scratch_allocates_without_workspace_manager(monkeypatch) -> None:
+    import vllm.v1.worker.workspace as workspace
+
+    plan = SimpleNamespace(
+        scratch_specs=lambda: (
+            SimpleNamespace(shape=(17,), dtype=torch.uint8, device=torch.device("cpu")),
+        )
+    )
+    monkeypatch.setattr(workspace, "is_workspace_manager_initialized", lambda: False)
+
+    (scratch,) = b12x_utils.get_b12x_scratch_buffers(plan)
+    assert scratch.shape == (17,)
+    assert scratch.dtype == torch.uint8
+    assert scratch.device == torch.device("cpu")
+
+
 @pytest.mark.parametrize(
     ("getter_name", "module_name"),
     [

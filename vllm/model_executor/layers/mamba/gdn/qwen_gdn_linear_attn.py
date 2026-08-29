@@ -59,7 +59,7 @@ from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
-from vllm.utils.b12x import get_b12x_gdn_decode
+from vllm.utils.b12x import get_b12x_gdn_decode, get_b12x_scratch_buffers
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -630,12 +630,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             torch.zeros(1, dtype=torch.int32, device=device),
             persistent=False,
         )
-        scratch_spec = provisional.scratch_specs()[0]
-        self.register_buffer(
-            "_b12x_scratch",
-            torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
-            persistent=False,
-        )
+        self.register_buffer("_b12x_scratch", None, persistent=False)
 
     def _make_b12x_gdn_plan(self, max_state_slots: int):
         api = self._b12x_gdn_api
@@ -665,9 +660,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
         recurrent_state = self.kv_cache[1]
         plan = self._make_b12x_gdn_plan(max_state_slots=recurrent_state.shape[0])
+        (scratch,) = get_b12x_scratch_buffers(plan)
+        self._b12x_scratch = scratch
         self._b12x_plan = plan
         self._b12x_binding = plan.bind(
-            scratch=self._b12x_scratch,
+            scratch=scratch,
             mixed_qkv=self._b12x_mixed_qkv,
             a=self._b12x_a,
             b=self._b12x_b,
@@ -687,6 +684,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def unbind_kv_cache(self) -> None:
         self._b12x_binding = None
         self._b12x_plan = None
+        self._b12x_scratch = None
         super().unbind_kv_cache()
 
     def _fused_gdn_decode_unsupported_reason(

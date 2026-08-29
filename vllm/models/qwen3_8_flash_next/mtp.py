@@ -34,7 +34,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.b12x import get_b12x_mtp_feedback
+from vllm.utils.b12x import get_b12x_mtp_feedback, get_b12x_scratch_buffers
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .config import Qwen3_8FlashNextTextConfig
@@ -67,16 +67,27 @@ def _remap_ignored_layers(
     ignored_layers: list[str],
     mtp_start_layer_idx: int,
 ) -> list[str]:
-    remapped: list[str] = []
-    for name in ignored_layers:
-        if name.startswith("mtp."):
-            name = re.sub(
-                r"(?<=\.layers\.)\d+",
-                lambda match: str(mtp_start_layer_idx + int(match.group(0))),
-                name,
-            )
-        remapped.append(name)
-    return remapped
+    return [_remap_mtp_layer_name(name, mtp_start_layer_idx) for name in ignored_layers]
+
+
+def _remap_mtp_layer_name(name: str, mtp_start_layer_idx: int) -> str:
+    if not name.startswith("mtp."):
+        return name
+    return re.sub(
+        r"(?<=\.layers\.)\d+",
+        lambda match: str(mtp_start_layer_idx + int(match.group(0))),
+        name,
+    )
+
+
+def _remap_mtp_quantized_layers(
+    quantized_layers: dict[str, dict[str, Any]],
+    mtp_start_layer_idx: int,
+) -> dict[str, dict[str, Any]]:
+    return {
+        _remap_mtp_layer_name(name, mtp_start_layer_idx): layer_config
+        for name, layer_config in quantized_layers.items()
+    }
 
 
 def _remap_mtp_weight_name(name: str) -> str | None:
@@ -117,6 +128,14 @@ def _make_draft_vllm_config(
     draft_quant_config = get_draft_quant_config(vllm_config)
     if draft_quant_config is not None:
         configure_quant_config(draft_quant_config, Qwen3_8FlashNextMTP)
+        quantized_layers = getattr(draft_quant_config, "quantized_layers", None)
+        if quantized_layers:
+            draft_quant_config.quantized_layers = (  # type: ignore[attr-defined]
+                _remap_mtp_quantized_layers(
+                    quantized_layers,
+                    mtp_start_layer_idx,
+                )
+            )
         for attribute in ("ignored_layers", "exclude_modules"):
             names = getattr(draft_quant_config, attribute, None)
             if names:
@@ -246,10 +265,10 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             dtype=torch.bfloat16,
         )
         self._feedback_plan = _mtp_api().plan(caps)
-        scratch_spec = self._feedback_plan.scratch_specs()[0]
+        (feedback_scratch,) = get_b12x_scratch_buffers(self._feedback_plan)
         self.register_buffer(
             "_feedback_scratch",
-            torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=device),
+            feedback_scratch,
             persistent=False,
         )
         factory = dict(dtype=torch.bfloat16, device=device)

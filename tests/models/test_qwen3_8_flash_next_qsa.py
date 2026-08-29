@@ -189,7 +189,7 @@ def test_qsa_main_cache_views_reinterpret_fp8_storage() -> None:
     )
 
 
-def test_qsa_bind_preserves_context_plan_with_smaller_profile_cache(
+def test_qsa_bind_uses_shared_workspace_with_smaller_profile_cache(
     monkeypatch,
 ) -> None:
     actual_pages = 2
@@ -212,6 +212,7 @@ def test_qsa_bind_preserves_context_plan_with_smaller_profile_cache(
     )
     bind_kwargs: dict[str, Any] = {}
     planned_caps: list[SimpleNamespace] = []
+    shared_scratch = torch.empty(32, dtype=torch.uint8)
     binding = object()
 
     class FakePlan:
@@ -232,6 +233,11 @@ def test_qsa_bind_preserves_context_plan_with_smaller_profile_cache(
         plan=plan,
     )
     monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: fake_qsa)
+    monkeypatch.setattr(
+        qsa_module,
+        "get_b12x_scratch_buffers",
+        lambda _plan: [shared_scratch],
+    )
     monkeypatch.setattr(
         qsa_module,
         "qsa_compressed_cache_view",
@@ -301,6 +307,7 @@ def test_qsa_bind_preserves_context_plan_with_smaller_profile_cache(
     assert main_k_cache.shape[0] < caps.num_main_cache_pages
     assert compressed_cache.shape[0] < caps.num_compressed_cache_pages
     assert owner._qsa_binding is binding
+    assert bind_kwargs["scratch"] is shared_scratch
 
     owner.unbind_kv_cache()
 

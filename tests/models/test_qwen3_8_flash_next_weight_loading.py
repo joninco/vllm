@@ -15,6 +15,7 @@ from vllm.models.qwen3_8_flash_next.model import (
 from vllm.models.qwen3_8_flash_next.mtp import (
     Qwen3_8FlashNextMTP,
     Qwen3_8FlashNextMultiTokenPredictor,
+    _remap_mtp_quantized_layers,
     _remap_mtp_weight_name,
 )
 from vllm.models.qwen3_8_flash_next.ple_layer import (
@@ -57,6 +58,18 @@ def test_mtp_qsa_scale_uses_runtime_module_index() -> None:
         "model.layers.0.self_attn._k_scale"
     )
     assert _remap_qsa_cache_scale_name(remapped, frozenset({48})) == remapped
+
+
+def test_mtp_quantized_layers_use_runtime_module_index() -> None:
+    quantized_layers = {
+        "mtp.layers.0.mlp.experts": {"quant_algo": "W4A16_NVFP4"},
+        "model.visual.blocks.0.mlp.linear_fc2": {"quant_algo": "NVFP4"},
+    }
+
+    assert _remap_mtp_quantized_layers(quantized_layers, 48) == {
+        "mtp.layers.48.mlp.experts": {"quant_algo": "W4A16_NVFP4"},
+        "model.visual.blocks.0.mlp.linear_fc2": {"quant_algo": "NVFP4"},
+    }
 
 
 class _PLELoaderAudit(nn.Module):
