@@ -69,6 +69,8 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     data_parallel_size: int = 1,
     num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
+    adaptive_speculative_tokens_window: int | None = None,
+    adaptive_speculative_tokens_initial: int | None = None,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
@@ -158,6 +160,16 @@ def create_scheduler(
             spec_kwargs["prompt_lookup_min"] = 1
         speculative_config = SpeculativeConfig(**spec_kwargs)
         speculative_config.parallel_drafting = parallel_drafting
+        if adaptive_speculative_tokens_window is not None:
+            # Scheduler tests use the local ngram fixture to avoid loading a
+            # draft model, then exercise the model-backed control path.
+            speculative_config.method = "mtp"
+            speculative_config.adaptive_speculative_tokens_window = (
+                adaptive_speculative_tokens_window
+            )
+            speculative_config.adaptive_speculative_tokens_initial = (
+                adaptive_speculative_tokens_initial
+            )
 
     ec_transfer_config = (
         ECTransferConfig(

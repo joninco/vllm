@@ -474,6 +474,17 @@ class SpeculativeConfig:
     inclusive batch-size range.
     """
 
+    adaptive_speculative_tokens_window: int | None = Field(default=None, ge=1)
+    """Number of speculative verification steps to average before adapting
+    the speculative-token count from accepted draft lengths. ``None`` disables
+    acceptance-length adaptation. ``num_speculative_tokens`` remains the upper
+    bound."""
+
+    adaptive_speculative_tokens_initial: int | None = Field(default=None, ge=1)
+    """Initial speculative-token count for acceptance-length adaptation.
+    Defaults to ``num_speculative_tokens`` and requires
+    ``adaptive_speculative_tokens_window``."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
@@ -1130,6 +1141,36 @@ class SpeculativeConfig:
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
 
+        if (
+            self.adaptive_speculative_tokens_initial is not None
+            and self.adaptive_speculative_tokens_window is None
+        ):
+            raise ValueError(
+                "adaptive_speculative_tokens_initial requires "
+                "adaptive_speculative_tokens_window."
+            )
+
+        if self.adaptive_speculative_tokens_window is not None:
+            unsupported_methods = {
+                "ngram",
+                "ngram_gpu",
+                "suffix",
+                "custom_class",
+            }
+            if self.method in unsupported_methods:
+                raise ValueError(
+                    "adaptive_speculative_tokens_window is only supported with "
+                    "model-backed speculative decoding methods."
+                )
+            if (
+                self.target_model_config is not None
+                and self.target_model_config.is_diffusion
+            ):
+                raise ValueError(
+                    "adaptive_speculative_tokens_window is not supported with "
+                    "diffusion models."
+                )
+
         if self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided
             if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
@@ -1487,6 +1528,16 @@ class SpeculativeConfig:
         if self.method != "dspark" and self.enable_adaptive_verification:
             raise ValueError("Adaptive verification only supported with DSpark")
 
+        if (
+            self.adaptive_speculative_tokens_initial is not None
+            and self.num_speculative_tokens is not None
+            and self.adaptive_speculative_tokens_initial > self.num_speculative_tokens
+        ):
+            raise ValueError(
+                "adaptive_speculative_tokens_initial must not exceed "
+                "num_speculative_tokens."
+            )
+
         return self
 
     def _validate_suffix_decoding(self):
@@ -1832,8 +1883,17 @@ class SpeculativeConfig:
     def use_dspark(self) -> bool:
         return self.method == "dspark"
 
-    def uses_dynamic_speculative_decoding(self) -> bool:
+    def uses_batch_size_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
+
+    def uses_acceptance_length_adaptation(self) -> bool:
+        return self.adaptive_speculative_tokens_window is not None
+
+    def uses_dynamic_speculative_decoding(self) -> bool:
+        return (
+            self.uses_batch_size_dynamic_speculative_decoding()
+            or self.uses_acceptance_length_adaptation()
+        )
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

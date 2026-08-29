@@ -62,6 +62,9 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.dynamic.acceptance_length import (
+    BatchSizeAcceptanceLengthController,
+)
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -264,12 +267,28 @@ class Scheduler(SchedulerInterface):
         # reserve between a chunk boundary and the prefill end.
         self.num_prefill_lookahead = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self.acceptance_length_controller: (
+            BatchSizeAcceptanceLengthController | None
+        ) = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
+                )
+            if (
+                observation_window := (
+                    speculative_config.adaptive_speculative_tokens_window
+                )
+            ) is not None:
+                self.acceptance_length_controller = BatchSizeAcceptanceLengthController(
+                    max_num_spec_tokens=self.num_spec_tokens,
+                    observation_window=observation_window,
+                    initial_num_spec_tokens=(
+                        speculative_config.adaptive_speculative_tokens_initial
+                    ),
+                    num_spec_tokens_by_batch_size=self.dynamic_sd_lookup,
                 )
             self.use_eagle = speculative_config.use_eagle()
             if self.use_eagle:
@@ -959,7 +978,11 @@ class Scheduler(SchedulerInterface):
                     # preserve full cudagraph for this step.
                     # Not for diffusion where draft tokens can't be padded.
                     if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        (
+                            self.num_spec_tokens > 0
+                            and self.dynamic_sd_lookup is None
+                            and self.acceptance_length_controller is None
+                        )
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and (scheduled_running_reqs and not prefill_scheduled)
@@ -1282,10 +1305,15 @@ class Scheduler(SchedulerInterface):
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
-        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
-            ]
+        batch_size = len(num_scheduled_tokens)
+        if self.acceptance_length_controller is not None and batch_size > 0:
+            num_spec_tokens_to_schedule = (
+                self.acceptance_length_controller.num_spec_tokens_for_batch_size(
+                    batch_size
+                )
+            )
+        elif self.dynamic_sd_lookup is not None and batch_size > 0:
+            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[batch_size]
 
         scheduled_encoder_input_stats = None
         if (
@@ -1823,6 +1851,9 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        adaptive_num_drafts = 0
+        adaptive_num_draft_tokens = 0
+        adaptive_num_accepted_tokens = 0
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1866,6 +1897,10 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+                if self.acceptance_length_controller is not None:
+                    adaptive_num_drafts += 1
+                    adaptive_num_draft_tokens += num_draft_tokens
+                    adaptive_num_accepted_tokens += num_accepted
                 # Rejections roll back num_computed_tokens (and, under async
                 # scheduling, num_output_placeholders, which covers the spec
                 # tokens). A stale rejection count predates the preemption
@@ -2074,6 +2109,41 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        batch_size = len(num_scheduled_tokens)
+        if self.acceptance_length_controller is not None and batch_size > 0:
+            update = self.acceptance_length_controller.observe_batch(
+                batch_size=batch_size,
+                num_drafts=adaptive_num_drafts,
+                num_draft_tokens=adaptive_num_draft_tokens,
+                num_accepted_tokens=adaptive_num_accepted_tokens,
+            )
+            if (
+                update is not None
+                and update.previous_num_spec_tokens != update.num_spec_tokens
+            ):
+                logger.debug(
+                    "Adaptive speculative depth for batch size %d changed "
+                    "from %d to %d (mean accepted drafts: %.2f, mean "
+                    "attempted drafts: %.2f, window: %d steps).",
+                    batch_size,
+                    update.previous_num_spec_tokens,
+                    update.num_spec_tokens,
+                    update.mean_num_accepted_tokens,
+                    update.mean_num_draft_tokens,
+                    self.acceptance_length_controller.observation_window,
+                )
+
+        if spec_decoding_stats is not None:
+            spec_decoding_stats.current_num_spec_tokens = (
+                self.acceptance_length_controller.num_spec_tokens_for_batch_size(
+                    batch_size
+                )
+                if self.acceptance_length_controller is not None
+                else scheduler_output.resolve_num_spec_tokens_to_schedule(
+                    self.num_spec_tokens
+                )
+            )
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:

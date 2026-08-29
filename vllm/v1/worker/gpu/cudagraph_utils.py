@@ -208,23 +208,46 @@ class CudaGraphManager:
         speculative_config = self.vllm_config.speculative_config
         if (
             speculative_config
-            and speculative_config.uses_dynamic_speculative_decoding()
+            and speculative_config.uses_acceptance_length_adaptation()
+            and self.decode_query_len >= self.vllm_config.num_speculative_tokens
         ):
-            num_spec_per_batch_size = (
-                speculative_config.num_speculative_tokens_per_batch_size
-            )
-            # uses_dynamic_speculative_decoding() guarantees this is set.
-            assert num_spec_per_batch_size is not None
             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
             # _per_step. Recover num_new_sampled_tokens_per_step
             # from the values the manager already has.
             num_new_sampled_tokens_per_step = (
                 self.decode_query_len - self.vllm_config.num_speculative_tokens
             )
-            # Each entry is (range_start, range_end, num_speculative_tokens).
+            num_spec_per_batch_size = (
+                speculative_config.num_speculative_tokens_per_batch_size
+            )
+            if num_spec_per_batch_size is None:
+                reachable_depths = range(1, self.vllm_config.num_speculative_tokens + 1)
+            else:
+                caps = {entry[2] for entry in num_spec_per_batch_size}
+                max_cap = min(max(caps), self.vllm_config.num_speculative_tokens)
+                reachable_depths = range(0 if 0 in caps else 1, max_cap + 1)
             decode_query_lens = [
-                x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
+                depth + num_new_sampled_tokens_per_step for depth in reachable_depths
             ]
+        elif (
+            speculative_config
+            and speculative_config.uses_batch_size_dynamic_speculative_decoding()
+            and self.decode_query_len >= self.vllm_config.num_speculative_tokens
+        ):
+            num_spec_per_batch_size = (
+                speculative_config.num_speculative_tokens_per_batch_size
+            )
+            assert num_spec_per_batch_size is not None
+            num_new_sampled_tokens_per_step = (
+                self.decode_query_len - self.vllm_config.num_speculative_tokens
+            )
+            decode_query_lens = sorted(
+                {
+                    min(entry[2], self.vllm_config.num_speculative_tokens)
+                    + num_new_sampled_tokens_per_step
+                    for entry in num_spec_per_batch_size
+                }
+            )
         else:
             decode_query_lens = [self.decode_query_len]
 

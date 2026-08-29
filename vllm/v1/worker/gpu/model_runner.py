@@ -149,7 +149,10 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     get_max_chunk_logits,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
-from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+from vllm.v1.worker.gpu.spec_decode.utils import (
+    DraftTokensHandler,
+    limit_draft_tokens,
+)
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -1775,6 +1778,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
+            num_spec_tokens_to_schedule=(
+                scheduler_output.resolve_num_spec_tokens_to_schedule(
+                    self.num_speculative_steps
+                )
+            ),
         )
 
         if not self.is_last_pp_rank:
@@ -1799,6 +1807,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1894,7 +1905,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        draft_tokens_for_next_step: torch.Tensor | None = None
+        if self.speculator is not None and num_spec_tokens_to_schedule > 0:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -1917,20 +1929,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.next_prefill_tokens,
                     self.sampler.sampling_states.temperature.gpu,
                     self.sampler.sampling_states.seeds.gpu,
+                    num_speculative_tokens=num_spec_tokens_to_schedule,
                     mm_inputs=mm_inputs,
                 )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+                draft_tokens = limit_draft_tokens(
+                    draft_tokens,
+                    num_spec_tokens_to_schedule,
+                    self.num_speculative_steps,
+                )
+            num_draft_tokens = draft_tokens.shape[1]
+            if num_draft_tokens > 0:
+                self.req_states.draft_tokens[
+                    input_batch.idx_mapping, :num_draft_tokens
+                ] = draft_tokens
+                draft_tokens_for_next_step = self.req_states.draft_tokens[
+                    input_batch.idx_mapping, :num_draft_tokens
+                ]
+            else:
+                draft_tokens_for_next_step = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+        elif self.speculator is not None:
+            draft_tokens_for_next_step = self.req_states.draft_tokens[
+                input_batch.idx_mapping, :0
+            ]
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                (
+                    draft_tokens_for_next_step
+                    if draft_tokens_for_next_step is not None
+                    else self.req_states.draft_tokens[input_batch.idx_mapping]
+                ),
             )
 
         # Post-step KV connector related operations.
@@ -2064,6 +2099,7 @@ class ExecuteModelState(NamedTuple):
     finished_req_ids: set[str]
     ec_connector_output: ECConnectorOutput | None
     routed_experts: RoutedExpertsTensors | None
+    num_spec_tokens_to_schedule: int
 
 
 class BatchReqState(NamedTuple):

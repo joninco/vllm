@@ -127,6 +127,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.use_fused_multi_step_decode = False
             return
 
+        if self.speculative_config.uses_dynamic_speculative_decoding():
+            self.use_fused_multi_step_decode = False
+            return
+
         if not self.advance_draft_positions:
             self.use_fused_multi_step_decode = True
             return
@@ -250,19 +254,28 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
+        num_speculative_tokens: int | None = None,
         num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        if num_speculative_tokens is None:
+            num_speculative_tokens = self.num_speculative_steps
+        if not 1 <= num_speculative_tokens <= self.num_speculative_steps:
+            raise ValueError(
+                "num_speculative_tokens must be between 1 and "
+                f"{self.num_speculative_steps}, got {num_speculative_tokens}."
+            )
+
         num_tokens = input_batch.num_tokens
         num_tokens_padded = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
-            max_seq_len + self.num_speculative_steps, self.max_model_len
+            max_seq_len + num_speculative_tokens, self.max_model_len
         )
 
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
@@ -346,7 +359,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
         self.on_prefill_end(num_reqs)
 
-        if self.num_speculative_steps == 1:
+        if num_speculative_tokens == 1:
             # Early exit.
             return self.draft_tokens[:num_reqs, :1]
 
@@ -375,24 +388,30 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         self.on_multi_step_decode_begin(num_reqs)
-        # Generate the remaining num_speculative_steps - 1 draft tokens.
-        decode_fn = (
-            self._fused_multi_step_decode
-            if self.use_fused_multi_step_decode
-            else self._multi_step_decode
-        )
+        # Generate the remaining draft tokens.
         try:
-            decode_fn(
-                num_reqs,
-                dummy_run and skip_attn_for_dummy_run,
-                decode_batch_desc,
-                num_tokens_across_dp,
-                input_batch.seq_lens_cpu_upper_bound,
-            )
+            if self.use_fused_multi_step_decode:
+                assert num_speculative_tokens == self.num_speculative_steps
+                self._fused_multi_step_decode(
+                    num_reqs,
+                    dummy_run and skip_attn_for_dummy_run,
+                    decode_batch_desc,
+                    num_tokens_across_dp,
+                    input_batch.seq_lens_cpu_upper_bound,
+                )
+            else:
+                self._multi_step_decode(
+                    num_reqs,
+                    dummy_run and skip_attn_for_dummy_run,
+                    decode_batch_desc,
+                    num_tokens_across_dp,
+                    input_batch.seq_lens_cpu_upper_bound,
+                    num_speculative_tokens,
+                )
         finally:
             self.on_multi_step_decode_end(num_reqs)
 
-        return self.draft_tokens[:num_reqs]
+        return self.draft_tokens[:num_reqs, :num_speculative_tokens]
 
     @torch.inference_mode()
     def _run_model(
@@ -526,14 +545,17 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
         seq_lens_cpu_upper_bound: torch.Tensor,
+        num_speculative_tokens: int | None = None,
     ) -> None:
+        if num_speculative_tokens is None:
+            num_speculative_tokens = self.num_speculative_steps
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
 
         attn_metadata = None
         slot_mappings_by_layer = None
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, num_speculative_tokens):
             # Rebuild every step when positions advance, or just once
             # on the first step when positions are constant (Gemma4 MTP).
             if not skip_attn and (self.advance_draft_positions or step == 1):
