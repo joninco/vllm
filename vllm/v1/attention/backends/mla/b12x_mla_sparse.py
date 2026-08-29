@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass, replace
 from math import prod
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -1095,6 +1095,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
         self._module = module
         self._kernel_page_size = 0
+        self._kernel_page_size_finalized = not self._is_glm_next
         self._set_kernel_page_size(kernel_page_size)
         self.supports_quant_query_input = False
 
@@ -1142,7 +1143,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._kernel_page_size = kernel_page_size
         self._reserve_planned_workspaces()
 
-    def _workspace_specs(self, plan) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+    def _base_workspace_specs(
+        self, plan
+    ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         q_spec = (
             (self._max_tokens, self._input_num_heads, self._q_head_dim),
             torch.bfloat16,
@@ -1162,8 +1165,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if not is_workspace_manager_initialized():
             return
         plan_specs = (
-            self._workspace_specs(self._decode_plan),
-            self._workspace_specs(self._extend_plan),
+            self._base_workspace_specs(self._decode_plan),
+            self._base_workspace_specs(self._extend_plan),
         )
         largest_specs = max(plan_specs, key=self._workspace_nbytes)
         current_workspace_manager().get_simultaneous(*largest_specs)
@@ -1183,6 +1186,81 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             and num_tokens <= self._decode_max_rows
         )
 
+    def _workspace_specs(
+        self,
+        plan: Any,
+        *,
+        input_num_heads: int,
+        include_ckv: bool,
+    ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        q_spec = (
+            (self._max_tokens, input_num_heads, self._q_head_dim),
+            torch.bfloat16,
+        )
+        ckv_specs = (
+            (
+                (self._ckv_local_capacity, _GLM_NEXT_CACHE_RECORD_BYTES),
+                torch.uint8,
+            ),
+            (
+                (
+                    self.dcp_world_size * self._ckv_local_capacity,
+                    _GLM_NEXT_CACHE_RECORD_BYTES,
+                ),
+                torch.uint8,
+            ),
+        )
+        return (
+            q_spec,
+            *plan.shapes_and_dtypes(),
+            *(ckv_specs if include_ckv else ()),
+        )
+
+    def _reserve_attention_workspaces(self) -> None:
+        if not self._ckv_gather_enabled:
+            return
+        assert self._ckv_extend_plan is not None
+        manager = current_workspace_manager()
+        for plan, input_num_heads, include_ckv in (
+            (self._decode_plan, self._input_num_heads, False),
+            (self._extend_plan, self._input_num_heads, False),
+            (self._ckv_extend_plan, self.num_heads, True),
+        ):
+            manager.reserve_all(
+                *self._workspace_specs(
+                    plan,
+                    input_num_heads=input_num_heads,
+                    include_ckv=include_ckv,
+                )
+            )
+
+    def finalize_kv_cache_geometry(self, kernel_page_size: int) -> None:
+        """Finalize kernel plans and workspace memory before KV profiling.
+
+        GLM5Next hybrid cache alignment resolves the physical page size after
+        model construction. Full-CKV gather workspace depends on that value,
+        so every execution slot must be sized while the memory profiler can
+        still subtract the allocation from the KV-cache budget.
+
+        Args:
+            kernel_page_size: Resolved physical KV-cache page size in tokens.
+
+        Raises:
+            RuntimeError: If an established page size is changed.
+        """
+        if not self._is_glm_next:
+            return
+        if self._kernel_page_size_finalized:
+            if kernel_page_size != self._kernel_page_size:
+                raise RuntimeError(
+                    "B12X GLM5Next KV-cache page size is immutable after "
+                    f"finalization: {self._kernel_page_size} != {kernel_page_size}."
+                )
+            return
+        self._set_kernel_page_size(kernel_page_size)
+        self._reserve_attention_workspaces()
+        self._kernel_page_size_finalized = True
+
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         if self._is_glm_next:
             if kv_cache.ndim != 3 or int(kv_cache.shape[-1]) != 528:
@@ -1192,7 +1270,20 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     f"shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}, "
                     f"dtype={kv_cache.dtype}"
                 )
-            self._set_kernel_page_size(int(kv_cache.shape[1]))
+            cache_page_size = int(kv_cache.shape[1])
+            if getattr(self, "_kernel_page_size_finalized", False):
+                if cache_page_size != self._kernel_page_size:
+                    raise RuntimeError(
+                        "B12X GLM5Next bound cache does not match the finalized "
+                        f"page size: {cache_page_size} != {self._kernel_page_size}."
+                    )
+                return
+            if self._ckv_gather_enabled:
+                raise RuntimeError(
+                    "B12X GLM5Next full-CKV gather requires page geometry "
+                    "finalization before KV-cache memory profiling."
+                )
+            self._set_kernel_page_size(cache_page_size)
 
     def do_kv_cache_update(
         self,
@@ -1236,6 +1327,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             return False
         return (
             self._ckv_gather_enabled
+            and getattr(self, "_kernel_page_size_finalized", False)
             and attn_metadata.dcp_ckv_gather_eligible
             and attn_metadata.num_decode_tokens == 0
             and num_tokens == attn_metadata.num_actual_tokens
@@ -1338,33 +1430,14 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 else self._extend_plan
             )
         input_num_heads = self.num_heads if use_ckv_gather else self._input_num_heads
-        q_spec = (
-            (self._max_tokens, input_num_heads, self._q_head_dim),
-            torch.bfloat16,
+        workspace_specs = self._workspace_specs(
+            plan,
+            input_num_heads=input_num_heads,
+            include_ckv=use_ckv_gather,
         )
-        plan_specs = plan.shapes_and_dtypes()
-        ckv_specs = (
-            (
-                (
-                    (self._ckv_local_capacity, _GLM_NEXT_CACHE_RECORD_BYTES),
-                    torch.uint8,
-                ),
-                (
-                    (
-                        self.dcp_world_size * self._ckv_local_capacity,
-                        _GLM_NEXT_CACHE_RECORD_BYTES,
-                    ),
-                    torch.uint8,
-                ),
-            )
-            if use_ckv_gather
-            else ()
-        )
-        workspaces = current_workspace_manager().get_simultaneous(
-            q_spec, *plan_specs, *ckv_specs
-        )
+        workspaces = current_workspace_manager().get_simultaneous(*workspace_specs)
         q_buffer = workspaces[0]
-        scratch_end = 1 + len(plan_specs)
+        scratch_end = len(workspace_specs) - (2 if use_ckv_gather else 0)
         scratch = workspaces[1:scratch_end]
 
         if isinstance(q, tuple):
