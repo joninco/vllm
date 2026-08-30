@@ -1282,6 +1282,14 @@ def _get_per_layer_spec(
     return spec
 
 
+def _contains_glm5_next_mla(kv_cache_specs: Iterable[KVCacheSpec]) -> bool:
+    """Return whether the cache specifications contain GLM-5.3 target MLA."""
+    return any(
+        isinstance(spec, MLAAttentionSpec) and spec.model_version == "glm5_next"
+        for spec in kv_cache_specs
+    )
+
+
 def _get_kv_cache_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
@@ -1294,7 +1302,15 @@ def _get_kv_cache_bytes_per_block(
         for group in kv_cache_groups
     )
     assert bytes_per_block > 0
-    if os.getenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE") is not None:
+    contains_glm5_next_mla = _contains_glm5_next_mla(
+        _get_per_layer_spec(group, layer_name)
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    )
+    if (
+        os.getenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE") is not None
+        and contains_glm5_next_mla
+    ):
         # GLM-5.3 stores two 64-row by 132-byte FP8 C4 index pages in the
         # target MLA page tail when the target block contains 512 tokens.
         # The block-outermost pool stride must preserve the index-page unit
@@ -1911,9 +1927,9 @@ def get_kv_cache_groups(
     }
 
     split_target_block_size = os.getenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE")
-    is_glm5_next_split_cache = split_target_block_size is not None and any(
-        isinstance(spec, MLAAttentionSpec) and spec.model_version == "glm5_next"
-        for spec in filtered_spec.values()
+    is_glm5_next_split_cache = (
+        split_target_block_size is not None
+        and _contains_glm5_next_mla(filtered_spec.values())
     )
     if is_glm5_next_split_cache:
         if hidden_specs:
