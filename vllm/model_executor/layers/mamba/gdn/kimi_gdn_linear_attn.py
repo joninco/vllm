@@ -26,6 +26,7 @@ from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.b12x import get_b12x_gdn_decode, get_b12x_scratch_buffers
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.worker.workspace import current_workspace_manager
 
 from ...linear import (
     ColumnParallelLinear,
@@ -43,6 +44,81 @@ from ..ops.gather_initial_states import gather_initial_states
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
+
+
+def is_flashkda_supported(
+    head_dim: int,
+    dtype: torch.dtype,
+    lower_bound: float | None,
+) -> bool:
+    """Return whether FlashKDA supports the layer's prefill contract."""
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    return (
+        capability is not None
+        and capability.major in (9, 10, 12)
+        and head_dim == 128
+        and dtype == torch.bfloat16
+        and lower_bound is not None
+    )
+
+
+def _flashkda_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    final_state: torch.Tensor,
+    workspace: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run packed bounded-gate KDA prefill into caller-owned buffers."""
+    import vllm._flashkda_C  # noqa: F401
+
+    torch.ops._flashkda_C.fwd(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g.contiguous(),
+        beta,
+        q.shape[-1] ** -0.5,
+        out,
+        workspace,
+        A_log.contiguous(),
+        dt_bias.view(-1, q.shape[-1]).contiguous(),
+        lower_bound,
+        initial_state.contiguous(),
+        final_state,
+        cu_seqlens.contiguous(),
+    )
+    return out, final_state
+
+
+def resolve_kda_prefill_backend(
+    backend: str,
+    head_dim: int,
+    dtype: torch.dtype,
+    lower_bound: float | None,
+) -> str:
+    """Resolve the packed KDA prefill implementation for one server."""
+    if backend not in ("auto", "triton", "flashkda"):
+        raise ValueError(f"Unsupported KDA prefill backend: {backend}")
+    supported = is_flashkda_supported(head_dim, dtype, lower_bound)
+    if backend == "flashkda" and not supported:
+        raise RuntimeError(
+            "FlashKDA requires CUDA SM90/SM10x/SM12x, bfloat16, "
+            "head_dim=128, and a bounded KDA gate."
+        )
+    if supported and backend != "triton":
+        return "flashkda"
+    return "triton"
 
 
 def a_log_weight_loader(
@@ -285,11 +361,34 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             if isinstance(additional_config, dict)
             else "auto"
         )
-        backend = "triton" if backend == "auto" else backend
-        assert backend == "triton", (
-            "The shared Kimi GDN layer only supports the Triton KDA "
-            f"prefill backend, got {backend!r}."
+        self.kda_prefill_backend = resolve_kda_prefill_backend(
+            backend,
+            self.head_dim,
+            vllm_config.model_config.dtype,
+            self.gate_lower_bound,
         )
+        self._flashkda_buffer_specs: (
+            tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
+        ) = None
+        if self.kda_prefill_backend == "flashkda":
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            max_sequences = vllm_config.scheduler_config.max_num_seqs
+            heads, head_dim = self.local_num_heads, self.head_dim
+            import vllm._flashkda_C  # noqa: F401
+
+            workspace_size = torch.ops._flashkda_C.get_workspace_size(
+                max_tokens,
+                heads,
+                max_sequences,
+            )
+            self._flashkda_buffer_specs = (
+                ((1, max_tokens, heads, head_dim), self.model_config.dtype),
+                (
+                    (max_sequences, heads, head_dim, head_dim),
+                    self.get_state_dtype()[1],
+                ),
+                ((workspace_size,), torch.uint8),
+            )
         if not self.use_full_rank_gate:
             self.g_a_proj = ReplicatedLinear(
                 self.hidden_size,
@@ -871,25 +970,54 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     prefill_state_indices,
                     prefill_has_initial_state,
                 )
-                (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
-                ) = chunk_kda_with_fused_gate(
-                    q=q_ns,
-                    k=k_ns,
-                    v=v_ns,
-                    raw_g=g1_ns,
-                    raw_beta=beta_ns,
-                    A_log=self.A_log,
-                    g_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=prefill_query_start_loc,
-                    chunk_indices=m.chunk_indices,
-                    chunk_offsets=m.chunk_offsets,
-                )
+                if self.kda_prefill_backend == "flashkda":
+                    assert self.gate_lower_bound is not None
+                    assert self._flashkda_buffer_specs is not None
+                    assert prefill_query_start_loc is not None
+                    workspace_out, final_state, workspace = (
+                        current_workspace_manager().get_simultaneous(
+                            *self._flashkda_buffer_specs
+                        )
+                    )
+                    flashkda_out = workspace_out[:, : q_ns.shape[1]]
+                    (
+                        core_attn_out_non_spec,
+                        last_recurrent_state,
+                    ) = _flashkda_prefill(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        g=g1_ns,
+                        beta=beta_ns,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=initial_state,
+                        cu_seqlens=prefill_query_start_loc,
+                        out=flashkda_out,
+                        final_state=final_state[: initial_state.shape[0]],
+                        workspace=workspace,
+                    )
+                else:
+                    (
+                        core_attn_out_non_spec,
+                        last_recurrent_state,
+                    ) = chunk_kda_with_fused_gate(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        g_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=prefill_query_start_loc,
+                        chunk_indices=m.chunk_indices,
+                        chunk_offsets=m.chunk_offsets,
+                    )
                 # Init cache
                 recurrent_state[prefill_state_indices] = last_recurrent_state
 
