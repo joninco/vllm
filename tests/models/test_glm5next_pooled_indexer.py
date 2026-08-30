@@ -124,10 +124,23 @@ def test_glm53_selector_prefill_lengths_do_not_require_attention_backend() -> No
         num_decode_tokens=1,
         prefill=None,
         prefill_query_lens_cpu=torch.tensor([3], dtype=torch.int32),
+        prefill_seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
     )
 
     assert metadata.prefill is None
     assert metadata.prefill_query_lens_cpu.tolist() == [3]
+    assert metadata.prefill_seq_lens_cpu is not None
+    assert metadata.prefill_seq_lens_cpu.tolist() == [8]
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "expected_pages"),
+    [(0, 1), (3, 1), (4, 1), (259, 1), (260, 2), (32768, 128)],
+)
+def test_glm53_active_index_pages_cover_completed_pools(
+    seq_len: int, expected_pages: int
+) -> None:
+    assert Glm5NextPooledIndexer._active_index_page_count(seq_len) == expected_pages
 
 
 def test_glm53_packed_c4_metadata_uses_parent_stride() -> None:
@@ -208,7 +221,8 @@ def test_glm53_decode_table_capacity_uses_batched_token_limit() -> None:
     indexer.max_tokens = 128
     indexer.max_seqs = 16
     indexer.max_model_len = 4096
-    indexer.indexer_op = SimpleNamespace(max_model_len=0)
+    indexer.dcp_world_size = 1
+    indexer.indexer_op = SimpleNamespace(max_model_len=4096 // 4)
 
     indexer.bind_main_kv_cache(main)
 
