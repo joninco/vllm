@@ -551,6 +551,7 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
     layer._flashkda_buffer_specs = (
         ((1, 4, 1, 1), torch.float32),
         ((1, 1, 1, 1), torch.float32),
+        ((1, 1, 1, 1), torch.float32),
         ((1,), torch.uint8),
     )
     layer.A_log = torch.ones(1)
