@@ -776,6 +776,78 @@ def test_b12x_moe_warmup_runs_each_planner_regime_once(
     assert launched_tokens == planned_tokens
 
 
+def test_b12x_moe_live_prefill_uses_registered_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experts = B12xExperts(
+        make_dummy_moe_config(
+            num_experts=4,
+            experts_per_token=2,
+            hidden_dim=128,
+            intermediate_size=64,
+            max_num_tokens=2048,
+        ),
+        _quant_config("mxfp4", None),
+    )
+    experts._prepared_experts = SimpleNamespace(
+        plan=object(),
+        num_experts=4,
+        hidden_size=128,
+        intermediate_size=64,
+        w1_fp4=torch.empty(0),
+    )
+    layer = SimpleNamespace(
+        activation=MoEActivation.SILU,
+        apply_router_weight_on_input=False,
+    )
+    experts.get_b12x_warmup_unit(
+        layer,
+        (1, 4, 128, 2048),
+        torch.bfloat16,
+    )
+
+    caps_seen = []
+
+    class FakeCaps:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    def fake_plan(caps):
+        caps_seen.append(caps)
+        return object()
+
+    extension = SimpleNamespace(Caps=FakeCaps, plan=fake_plan)
+    monkeypatch.setattr(b12x, "_require_b12x_fused_moe", lambda: extension)
+
+    prefill_plan = experts._plan(
+        tokens=571,
+        topk=2,
+        activation=MoEActivation.SILU,
+    )
+    assert (
+        experts._plan(
+            tokens=777,
+            topk=2,
+            activation=MoEActivation.SILU,
+        )
+        is prefill_plan
+    )
+    experts._plan(
+        tokens=128,
+        topk=2,
+        activation=MoEActivation.SILU,
+    )
+
+    assert [caps.max_tokens for caps in caps_seen] == [2048, 128]
+    assert [caps.core_token_counts for caps in caps_seen] == [(2048,), (128,)]
+    with pytest.raises(ValueError, match="exceeds the configured prefill capacity"):
+        experts._plan(
+            tokens=2049,
+            topk=2,
+            activation=MoEActivation.SILU,
+        )
+
+
 def test_b12x_moe_reload_reprepares_current_parameters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

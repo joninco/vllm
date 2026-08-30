@@ -219,6 +219,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._source_parameters_released = False
         self._unit_scales: dict[torch.device, torch.Tensor] = {}
         self._plans: dict[tuple[int, int, MoEActivation, bool], Any] = {}
+        self._prefill_capacity = max(int(moe_config.max_num_tokens), 1)
+        self._plan_capacities = {1, self._prefill_capacity}
         self._apply_router_weight_on_input = False
 
     def _unit_scale(self, device: torch.device, num_experts: int) -> torch.Tensor:
@@ -512,6 +514,24 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             )
         return self._prepared_experts
 
+    def _register_plan_capacities(self, token_counts: Iterable[int]) -> None:
+        capacities = {int(count) for count in token_counts if int(count) > 0}
+        self._plan_capacities.update(capacities)
+        if capacities:
+            self._prefill_capacity = max(self._prefill_capacity, max(capacities))
+            self._plan_capacities.add(self._prefill_capacity)
+
+    def _plan_capacity(self, tokens: int) -> int:
+        tokens = max(int(tokens), 1)
+        if tokens > self._prefill_capacity:
+            raise ValueError(
+                f"live MoE token count {tokens} exceeds the configured prefill "
+                f"capacity {self._prefill_capacity}"
+            )
+        if tokens in self._plan_capacities:
+            return tokens
+        return self._prefill_capacity
+
     def moe_problem_size(
         self,
         a1: torch.Tensor,
@@ -540,9 +560,10 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool = False,
     ) -> Any:
         fused_moe = _require_b12x_fused_moe()
+        capacity = self._plan_capacity(tokens)
 
         key = (
-            max(int(tokens), 1),
+            capacity,
             int(topk),
             activation,
             bool(apply_router_weight_on_input),
@@ -581,6 +602,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         output_dtype: torch.dtype,
     ) -> B12xWarmupUnit:
         assert output_dtype == self.moe_config.in_dtype
+        self._register_plan_capacities(token_counts)
         prepared = self._prepared()
         activation = layer.activation
         limit, alpha, beta = self._swiglu_params(activation)
@@ -618,6 +640,8 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         token_counts: Iterable[int],
     ) -> int:
         """Compile one representative launch for every planned regime."""
+        token_counts = tuple(int(count) for count in token_counts if int(count) > 0)
+        self._register_plan_capacities(token_counts)
         activation = layer.activation
         dtype = self.moe_config.in_dtype
         topk = int(self.moe_config.experts_per_token)
@@ -626,7 +650,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         prepared = self._prepared()
         device = prepared.w1_fp4.device
         launch_tokens: dict[tuple[Any, ...], int] = {}
-        for tokens in sorted({int(count) for count in token_counts if int(count) > 0}):
+        for tokens in sorted(set(token_counts)):
             execution_plan = _b12x_moe_execution_plan(
                 tokens=tokens,
                 topk=topk,
