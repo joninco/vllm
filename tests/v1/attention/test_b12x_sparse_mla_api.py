@@ -1083,6 +1083,8 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
     output = torch.empty((3, 4), dtype=torch.int32)
     scores = torch.empty((3, 4), dtype=torch.float32)
     b12x_indexer._run_paged_topk(
+        module=module,
+        plan=plan,
         q=torch.empty((3, 16, 128), dtype=torch.float8_e4m3fn),
         weights=torch.empty((3, 16, 1), dtype=torch.float32),
         kv_cache=torch.empty((4, 64, 132), dtype=torch.uint8),
@@ -1111,7 +1113,6 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
         (slice(1, 2), slice(0, 1)),
         (slice(2, 3), slice(0, 1)),
     ]
-    assert calls["caps"]["source_layout"] == "paged"
     assert calls["bind"]["output_physical_slots"] is False
     assert calls["run"]["out_indices"] is output
     assert torch.count_nonzero(output != 11) == 0
@@ -1131,4 +1132,80 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
     indexer._reserve_profile_workspace(
         torch.empty((2, 64, 128), dtype=torch.float8_e4m3fn)
     )
+    assert calls["caps"]["source_layout"] == "paged"
     assert calls["caps"]["max_page_table_width"] == 1024
+
+
+def test_b12x_dsa_indexer_reuses_plans_and_rebinds_shared_workspace(
+    monkeypatch,
+) -> None:
+    calls = {"plan": 0, "workspace": 0, "bind": 0, "run": 0}
+
+    def bind(**kwargs):
+        calls["bind"] += 1
+        return SimpleNamespace(route="packed_contiguous")
+
+    plan = SimpleNamespace(
+        route="packed_contiguous",
+        shapes_and_dtypes=lambda: (((64,), torch.uint8),),
+        bind=bind,
+    )
+
+    def make_plan(_caps):
+        calls["plan"] += 1
+        return plan
+
+    def index_topk_fp8(**kwargs):
+        calls["run"] += 1
+        kwargs["out_indices"].fill_(7)
+
+    module = SimpleNamespace(
+        Caps=lambda **kwargs: SimpleNamespace(**kwargs),
+        SOURCE_LAYOUT_PAGED="paged",
+        PAGED_INDEX_PAGE_SIZE=64,
+        plan=make_plan,
+        index_topk_fp8=index_topk_fp8,
+    )
+
+    class Workspace:
+        def get_simultaneous(self, *shapes_and_dtypes):
+            calls["workspace"] += 1
+            return [
+                torch.empty(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes
+            ]
+
+    workspace = Workspace()
+    monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
+    monkeypatch.setattr(
+        b12x_indexer,
+        "current_workspace_manager",
+        lambda: workspace,
+    )
+
+    indexer = b12x_indexer.B12xC4SparseIndexer(
+        SimpleNamespace(),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=4,
+        head_dim=128,
+        max_model_len=128,
+        max_total_seq_len=128,
+        topk_indices_buffer=torch.empty((3, 4), dtype=torch.int32),
+        skip_k_cache_insert=True,
+        compress_ratio=4,
+    )
+    inputs = {
+        "q": torch.empty((3, 16, 128), dtype=torch.float8_e4m3fn),
+        "weights": torch.empty((3, 16, 1), dtype=torch.float32),
+        "kv_cache": torch.empty((4, 64, 132), dtype=torch.uint8),
+        "seq_lens": torch.full((3,), 128, dtype=torch.int32),
+        "block_table": torch.zeros((3, 2), dtype=torch.int32),
+        "output": torch.empty((3, 4), dtype=torch.int32),
+        "shared_page_table": True,
+    }
+
+    indexer.run_paged_topk(**inputs)
+    indexer.run_paged_topk(**inputs)
+
+    assert calls == {"plan": 1, "workspace": 2, "bind": 2, "run": 2}
+    assert torch.count_nonzero(inputs["output"] != 7) == 0

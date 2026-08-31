@@ -187,6 +187,8 @@ def _assert_prefill_route(obj: object) -> None:
 
 def _run_paged_topk(
     *,
+    module: Any,
+    plan: Any,
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -199,19 +201,6 @@ def _run_paged_topk(
     topk: int,
     shared_page_table: bool,
 ) -> None:
-    module = _require_b12x_indexer()
-    plan = module.plan(
-        module.Caps(
-            device=q.device,
-            source_layout=module.SOURCE_LAYOUT_PAGED,
-            num_q_heads=int(q.shape[1]),
-            max_q_rows=max(int(q.shape[0]), 1),
-            max_page_table_width=max(int(block_table.shape[1]), 1),
-            topk=int(topk),
-            mode="prefill" if shared_page_table else "decode",
-            shared_page_table=shared_page_table,
-        )
-    )
     if shared_page_table:
         _assert_prefill_route(plan)
     scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
@@ -272,14 +261,49 @@ class B12xC4SparseIndexer(nn.Module):
             )
         if topk_indices_buffer is None:
             raise ValueError("B12x C4 indexing requires a top-k output buffer.")
-        _require_b12x_indexer()
+        self._b12x_indexer = _require_b12x_indexer()
         self.k_cache = k_cache
         self.topk_tokens = int(topk_tokens)
         self.max_model_len = int(max_model_len)
         self.topk_indices_buffer = topk_indices_buffer
+        self._b12x_plans: dict[tuple[object, ...], Any] = {}
+
+    def _plan_paged_topk(
+        self,
+        *,
+        q: torch.Tensor,
+        block_table: torch.Tensor,
+        shared_page_table: bool,
+    ) -> Any:
+        key = (
+            q.device,
+            int(q.shape[1]),
+            max(int(q.shape[0]), 1),
+            max(int(block_table.shape[1]), 1),
+            bool(shared_page_table),
+        )
+        plan = self._b12x_plans.get(key)
+        if plan is None:
+            module = self._b12x_indexer
+            plan = module.plan(
+                module.Caps(
+                    device=q.device,
+                    source_layout=module.SOURCE_LAYOUT_PAGED,
+                    num_q_heads=int(q.shape[1]),
+                    max_q_rows=max(int(q.shape[0]), 1),
+                    max_page_table_width=max(int(block_table.shape[1]), 1),
+                    topk=self.topk_tokens,
+                    mode="prefill" if shared_page_table else "decode",
+                    shared_page_table=shared_page_table,
+                )
+            )
+            if shared_page_table:
+                _assert_prefill_route(plan)
+            self._b12x_plans[key] = plan
+        return plan
 
     def _reserve_profile_workspace(self, q: torch.Tensor) -> None:
-        module = _require_b12x_indexer()
+        module = self._b12x_indexer
         q_rows = max(int(q.shape[0]), 1)
         page_table_width = max(
             1,
@@ -333,6 +357,12 @@ class B12xC4SparseIndexer(nn.Module):
             )
         output.fill_(-1)
         _run_paged_topk(
+            module=self._b12x_indexer,
+            plan=self._plan_paged_topk(
+                q=q,
+                block_table=block_table,
+                shared_page_table=shared_page_table,
+            ),
             q=q,
             weights=weights,
             kv_cache=kv_cache,
@@ -399,6 +429,12 @@ class B12xC4SparseIndexer(nn.Module):
                 )
                 output.fill_(-1)
                 _run_paged_topk(
+                    module=self._b12x_indexer,
+                    plan=self._plan_paged_topk(
+                        q=q_chunk,
+                        block_table=block_table,
+                        shared_page_table=True,
+                    ),
                     q=q_chunk,
                     weights=weights_chunk,
                     kv_cache=self.k_cache.kv_cache,
@@ -432,6 +468,12 @@ class B12xC4SparseIndexer(nn.Module):
             output.fill_(-1)
             active_width = getattr(decode, "active_width", None)
             _run_paged_topk(
+                module=self._b12x_indexer,
+                plan=self._plan_paged_topk(
+                    q=q_quant[:num_tokens],
+                    block_table=block_table[:num_tokens],
+                    shared_page_table=False,
+                ),
                 q=q_quant[:num_tokens].contiguous(),
                 weights=weights[:num_tokens].contiguous(),
                 kv_cache=self.k_cache.kv_cache,
