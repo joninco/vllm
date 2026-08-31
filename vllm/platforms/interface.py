@@ -800,13 +800,29 @@ class Platform:
 
         # Compute attention page size for 1 token
         if model_config.use_mla:
-            attn_page_size_1_token = MLAAttentionSpec(
+            mla_spec = MLAAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
+                cache_dtype_str=cache_config.cache_dtype,
                 kv_quant_mode=kv_quant_mode,
-            ).page_size_bytes
+            )
+            # Most MLA cache formats are at least as large as the dense
+            # latent proxy above, so the materialized specs can safely pad
+            # Mamba up later. GLM5Next's packed NVFP4 record is smaller. Use
+            # the backend-published record width here so the manager chooses
+            # a large enough attention block before it fixes the Mamba page.
+            if cache_config.cache_dtype == "nvfp4_ds_mla":
+                with set_current_vllm_config(vllm_config):
+                    customized_mla_spec = backend_cls.customize_spec(mla_spec)
+                assert isinstance(customized_mla_spec, MLAAttentionSpec)
+                mla_spec = customized_mla_spec
+            # Hybrid sizing needs the unaligned per-token row. Page alignment
+            # is applied after the manager block size is known.
+            attn_page_size_1_token = (
+                mla_spec.state_content_size_bytes + mla_spec.page_tail_bytes_per_token
+            )
         elif cache_config.cache_dtype.startswith("turboquant_"):
             # TQ has a packed K|V layout; the standard FullAttentionSpec
             # formula over-sizes it and trips unify_kv_cache_spec_page_size

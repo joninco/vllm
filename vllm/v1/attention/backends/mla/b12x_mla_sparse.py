@@ -48,7 +48,9 @@ if TYPE_CHECKING:
 
 _GLM_NEXT_MODEL_TYPES = frozenset(("glm5_next", "glm5_next_text"))
 _GLM_NEXT_CACHE_RECORD_BYTES = 528
+_GLM_NEXT_NVFP4_CACHE_RECORD_BYTES = 304
 _GLM_NEXT_INDEX_TAIL_BYTES_PER_TOKEN = 132 // 4
+_GLM_NEXT_INDEX_PAGE_BYTES = 64 * 132
 
 
 def _is_glm_next_config(hf_config: object | None) -> bool:
@@ -146,6 +148,7 @@ class B12xMLASparseBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_ds_mla",
+        "nvfp4_ds_mla",
     ]
 
     @staticmethod
@@ -178,9 +181,15 @@ class B12xMLASparseBackend(AttentionBackend):
                 "B12X GLM5Next sparse MLA requires head_size=512, got "
                 f"{spec.head_size}."
             )
+        record_bytes = (
+            _GLM_NEXT_NVFP4_CACHE_RECORD_BYTES
+            if spec.cache_dtype_str == "nvfp4_ds_mla"
+            else _GLM_NEXT_CACHE_RECORD_BYTES
+        )
         return replace(
             spec,
-            state_content_bytes=_GLM_NEXT_CACHE_RECORD_BYTES,
+            state_content_bytes=record_bytes,
+            alignment=_GLM_NEXT_INDEX_PAGE_BYTES,
             page_tail_bytes_per_token=_GLM_NEXT_INDEX_TAIL_BYTES_PER_TOKEN,
             model_version="glm5_next",
         )
@@ -244,6 +253,8 @@ class B12xMLASparseBackend(AttentionBackend):
                 if dcp_error := _glm_next_dcp_error(vllm_config):
                     return dcp_error
                 return None
+            if kv_cache_dtype == "nvfp4_ds_mla":
+                return "B12X nvfp4_ds_mla is supported only for GLM5Next"
             if head_size != 576:
                 return "B12X sparse MLA requires head_size=576"
             if int(getattr(hf_config, "kv_lora_rank", 0)) != 512:
@@ -657,11 +668,21 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 raise ValueError("B12X sparse MLA requires head_size=576.")
         if self.topk_indices_buffer is None:
             raise ValueError("B12X sparse MLA requires a top-k index buffer.")
-        if kv_cache_dtype != "fp8_ds_mla":
+        uses_nvfp4_cache = kv_cache_dtype == "nvfp4_ds_mla"
+        if kv_cache_dtype != "fp8_ds_mla" and not (
+            self._is_glm_next and uses_nvfp4_cache
+        ):
             raise ValueError(
-                "B12X sparse MLA requires the packed fp8_ds_mla KV cache; "
+                "B12X sparse MLA requires a packed fp8_ds_mla or "
+                "nvfp4_ds_mla KV cache; "
                 f"got kv_cache_dtype={kv_cache_dtype!r}."
             )
+        self._uses_nvfp4_cache = uses_nvfp4_cache
+        self._cache_record_bytes = (
+            _GLM_NEXT_NVFP4_CACHE_RECORD_BYTES
+            if self._uses_nvfp4_cache
+            else _GLM_NEXT_CACHE_RECORD_BYTES
+        )
 
         module = get_b12x_sparse_mla()
         if module is None:
@@ -789,10 +810,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         if self._is_glm_next:
-            if kv_cache.ndim != 3 or int(kv_cache.shape[-1]) != 528:
+            if (
+                kv_cache.ndim != 3
+                or int(kv_cache.shape[-1]) != self._cache_record_bytes
+            ):
                 raise ValueError(
                     "B12X GLM5Next cache must have shape "
-                    "[pages, page_size, 528], got "
+                    f"[pages, page_size, {self._cache_record_bytes}], got "
                     f"shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}, "
                     f"dtype={kv_cache.dtype}"
                 )
@@ -931,6 +955,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         )
         if self._model_type is not None:
             run_kwargs["model_type"] = self._model_type
+        if self._uses_nvfp4_cache:
+            run_kwargs.update(
+                scale_format=2,
+                fp8_rope=False,
+                latent_scale_per_token=True,
+            )
         result = run(**run_kwargs)
         if self.need_to_return_lse_for_decode:
             output, lse = result

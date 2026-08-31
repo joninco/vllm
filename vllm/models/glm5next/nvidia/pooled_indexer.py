@@ -46,7 +46,6 @@ _SELECTION_WIDTH = 2051
 _INDEX_CACHE_WIDTH = 132
 _INDEX_PAGE_SIZE = 64
 _INDEX_PAGE_BYTES = _INDEX_PAGE_SIZE * _INDEX_CACHE_WIDTH
-_MLA_RECORD_BYTES = 528
 
 
 class Glm5NextPooledIndexer(nn.Module):
@@ -267,22 +266,25 @@ class Glm5NextPooledIndexer(nn.Module):
         if (
             main_cache.ndim != 3
             or main_cache.dtype != torch.uint8
-            or int(main_cache.shape[-1]) != _MLA_RECORD_BYTES
+            or int(main_cache.shape[-1]) <= 0
         ):
-            raise ValueError("GLM MLA cache must be uint8 [pages, block, 528]")
-        pages, block_size, _ = map(int, main_cache.shape)
+            raise ValueError("GLM MLA cache must be uint8 [pages, block, record_bytes]")
+        pages, block_size, record_bytes = map(int, main_cache.shape)
         if pages <= 0 or block_size % (_POOL_SIZE * _INDEX_PAGE_SIZE):
             raise ValueError(
                 "GLM MLA pages must contain a whole number of 64-pool C4 pages"
             )
-        if tuple(map(int, main_cache.stride()[1:])) != (_MLA_RECORD_BYTES, 1):
+        if tuple(map(int, main_cache.stride()[1:])) != (record_bytes, 1):
             raise ValueError("GLM MLA cache records must be contiguous within a page")
 
         subpages_per_parent = block_size // (_POOL_SIZE * _INDEX_PAGE_SIZE)
         parent_stride_bytes = int(main_cache.stride(0))
-        semantic_page_bytes = block_size * _MLA_RECORD_BYTES
+        semantic_page_bytes = block_size * record_bytes
+        index_tail_offset_bytes = (
+            (semantic_page_bytes + _INDEX_PAGE_BYTES - 1) // _INDEX_PAGE_BYTES
+        ) * _INDEX_PAGE_BYTES
         index_tail_bytes = subpages_per_parent * _INDEX_PAGE_BYTES
-        if parent_stride_bytes < semantic_page_bytes + index_tail_bytes:
+        if parent_stride_bytes < index_tail_offset_bytes + index_tail_bytes:
             raise ValueError("GLM MLA cache page does not contain its FP8 index tail")
         if parent_stride_bytes % _INDEX_PAGE_BYTES:
             raise ValueError(
@@ -295,7 +297,7 @@ class Glm5NextPooledIndexer(nn.Module):
                 "GLM virtual C4 page IDs exceed the int32 page-table range"
             )
 
-        tail_offset = int(main_cache.storage_offset()) + semantic_page_bytes
+        tail_offset = int(main_cache.storage_offset()) + index_tail_offset_bytes
         tail_end = (
             tail_offset + max_virtual_page * _INDEX_PAGE_BYTES + _INDEX_PAGE_BYTES
         )
