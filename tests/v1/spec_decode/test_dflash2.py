@@ -1,14 +1,66 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv, _score_edges
+from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
+
+
+def test_dflash_loader_honors_draft_load_config(monkeypatch):
+    draft_load_config = object()
+    draft_model_config = SimpleNamespace(hf_config=SimpleNamespace())
+    speculative_config = SimpleNamespace(
+        attention_backend=None,
+        draft_load_config=draft_load_config,
+        draft_model_config=draft_model_config,
+        kv_cache_dtype=None,
+    )
+    vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(),
+        cache_config=SimpleNamespace(),
+        speculative_config=speculative_config,
+    )
+    loaded = SimpleNamespace(model=SimpleNamespace())
+    captured = {}
+
+    def fake_replace(config, **changes):
+        values = vars(config).copy()
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    def fake_get_model(**kwargs):
+        captured.update(kwargs)
+        return loaded
+
+    monkeypatch.setattr(dflash_utils, "replace", fake_replace)
+    monkeypatch.setattr(dflash_utils, "get_model", fake_get_model)
+    monkeypatch.setattr(
+        dflash_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=2),
+    )
+    monkeypatch.setattr(
+        "vllm.compilation.backends.set_model_tag",
+        lambda _tag: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_dflash.dflash_target_rope_is_neox_style",
+        lambda _model: None,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_dflash.dflash_has_any_non_causal",
+        lambda _config: True,
+    )
+
+    assert dflash_utils.load_dflash_model(SimpleNamespace(), vllm_config) is loaded
+    assert captured["load_config"] is draft_load_config
 
 
 def test_dflash_reset_attn_releases_cache_layout_state():
