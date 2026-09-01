@@ -383,7 +383,17 @@ class Glm5NextPooledIndexer(nn.Module):
         num_prefills: int,
         num_decode_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Return the direct physical selection produced for pure decode."""
+        """Return the direct physical selection produced for pure decode.
+
+        Args:
+            num_tokens: Number of active token rows.
+            num_prefills: Number of prefill requests.
+            num_decode_tokens: Number of decode token rows.
+
+        Returns:
+            Physical selected slots and active counts, or ``None`` when direct
+            selection is unavailable for the current batch geometry.
+        """
         if (
             not self._emit_physical_selection
             or self.dcp_world_size != 1
