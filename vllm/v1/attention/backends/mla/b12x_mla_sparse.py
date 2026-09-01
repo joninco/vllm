@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass, replace
 from math import prod
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 import numpy as np
 import torch
@@ -59,6 +59,17 @@ _GLM_NEXT_INDEX_PAGE_BYTES = 64 * 132
 _GLM_DSA_NVFP4_CACHE_RECORD_BYTES = 368
 
 logger = init_logger(__name__)
+
+
+@runtime_checkable
+class B12xPhysicalSelectionProvider(Protocol):
+    def get_b12x_physical_selection(
+        self,
+        *,
+        num_tokens: int,
+        num_prefills: int,
+        num_decode_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None: ...
 
 
 def _is_glm_next_config(hf_config: object | None) -> bool:
@@ -140,14 +151,15 @@ def _selected_index_block_stride_rows(
     kv_cache: torch.Tensor,
     *,
     block_size: int,
-    is_glm_next: bool,
 ) -> int:
-    if is_glm_next:
-        # GLM_NEXT selected indices are physical token slots. The b12x kernel
-        # applies the cache's byte page stride itself.
-        return block_size
-    record_width = int(kv_cache.shape[-1])
-    return int(kv_cache.stride(0)) // record_width
+    # B12X selected indices are physical token slots. The kernel applies the
+    # cache's byte page stride when it addresses the selected page.
+    if int(kv_cache.shape[1]) != block_size:
+        raise ValueError(
+            "B12X sparse MLA cache page size does not match attention metadata: "
+            f"cache={int(kv_cache.shape[1])}, metadata={block_size}"
+        )
+    return block_size
 
 
 def _max_speculative_decode_query_len(vllm_config: VllmConfig) -> int:
@@ -1093,6 +1105,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         hf_config = vllm_config.model_config.hf_text_config
         self._is_glm_next = _is_glm_next_config(hf_config)
         self._is_glm_dsa = _is_glm_dsa_config(hf_config)
+        self._physical_selection_provider = (
+            indexer if isinstance(indexer, B12xPhysicalSelectionProvider) else None
+        )
         self.supports_mtp_with_cp_non_trivial_interleave_size = self._is_glm_next
         if self._is_glm_next:
             if recipe_error := _glm_next_recipe_error(hf_config):
@@ -1629,39 +1644,53 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             ).contiguous()
             torch.minimum(active_counts, cache_seq_lens, out=active_counts)
             _mask_page_table_after_nsa_len(selected_indices, active_counts)
-        elif self.dcp_world_size > 1:
-            block_stride_rows = _selected_index_block_stride_rows(
-                kv_c_and_k_pe_cache,
-                block_size=attn_metadata.block_size,
-                is_glm_next=self._is_glm_next,
-            )
-            selected_indices, active_counts = triton_filter_and_convert_dcp_index(
-                attn_metadata.req_id_per_token[:num_tokens],
-                attn_metadata.block_table,
-                topk_indices,
-                dcp_size=self.dcp_world_size,
-                dcp_rank=self.dcp_rank,
-                cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),
-                BLOCK_SIZE=attn_metadata.block_size,
-                BLOCK_STRIDE_ROWS=block_stride_rows,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-                return_valid_counts=True,
-            )
         else:
-            block_stride_rows = _selected_index_block_stride_rows(
-                kv_c_and_k_pe_cache,
-                block_size=attn_metadata.block_size,
-                is_glm_next=self._is_glm_next,
+            physical_selection = (
+                self._physical_selection_provider.get_b12x_physical_selection(
+                    num_tokens=num_tokens,
+                    num_prefills=int(attn_metadata.num_prefills),
+                    num_decode_tokens=int(attn_metadata.num_decode_tokens),
+                )
+                if self._physical_selection_provider is not None
+                else None
             )
-            selected_indices, active_counts = triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token[:num_tokens],
-                attn_metadata.block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                BLOCK_STRIDE_ROWS=block_stride_rows,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-                return_valid_counts=True,
-            )
+            if physical_selection is not None:
+                selected_indices, active_counts = physical_selection
+            elif self.dcp_world_size > 1:
+                block_stride_rows = _selected_index_block_stride_rows(
+                    kv_c_and_k_pe_cache,
+                    block_size=attn_metadata.block_size,
+                )
+                selected_indices, active_counts = triton_filter_and_convert_dcp_index(
+                    attn_metadata.req_id_per_token[:num_tokens],
+                    attn_metadata.block_table,
+                    topk_indices,
+                    dcp_size=self.dcp_world_size,
+                    dcp_rank=self.dcp_rank,
+                    cp_kv_cache_interleave_size=(
+                        attn_metadata.cp_kv_cache_interleave_size
+                    ),
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    BLOCK_STRIDE_ROWS=block_stride_rows,
+                    NUM_TOPK_TOKENS=topk_indices.shape[1],
+                    return_valid_counts=True,
+                )
+            else:
+                block_stride_rows = _selected_index_block_stride_rows(
+                    kv_c_and_k_pe_cache,
+                    block_size=attn_metadata.block_size,
+                )
+                selected_indices, active_counts = (
+                    triton_convert_req_index_to_global_index(
+                        attn_metadata.req_id_per_token[:num_tokens],
+                        attn_metadata.block_table,
+                        topk_indices,
+                        BLOCK_SIZE=attn_metadata.block_size,
+                        BLOCK_STRIDE_ROWS=block_stride_rows,
+                        NUM_TOPK_TOKENS=topk_indices.shape[1],
+                        return_valid_counts=True,
+                    )
+                )
 
         if not use_ckv_gather:
             cache_seq_lens = attn_metadata.cache_seq_lens_per_token

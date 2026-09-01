@@ -274,11 +274,13 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
     assert unidentified == probe
     assert packed_by_glm_backend.state_content_bytes == 528
     assert packed_by_glm_backend.page_size_padded is None
-    assert packed_by_glm_backend.page_size_bytes == 64 * (528 + 33)
+    assert packed_by_glm_backend.page_tail_bytes_per_token == 132 // 4
+    assert packed_by_glm_backend.page_size_bytes == 64 * (528 + 132 // 4)
     assert packed_by_glm_backend.model_version == "glm5_next"
     assert packed.state_content_bytes == 528
     assert packed.page_size_padded is None
-    assert packed.page_size_bytes == 64 * (528 + 33)
+    assert packed.page_tail_bytes_per_token == 132 // 4
+    assert packed.page_size_bytes == 64 * (528 + 132 // 4)
     assert packed.model_version == "glm5_next"
     assert packed_without_config_context == packed
     assert layouts == (KVCacheLayout.BLHNC,)
@@ -634,20 +636,12 @@ def test_b12x_glm5_next_rejects_recipe_drift(monkeypatch) -> None:
     ]
 
 
-def test_b12x_glm5_next_selected_indices_use_physical_slots() -> None:
+def test_b12x_glm5_next_ckv_source_layout() -> None:
     storage = torch.empty((2 * 37888,), dtype=torch.uint8)
     cache = torch.as_strided(
         storage,
         size=(2, 64, 528),
         stride=(37888, 528, 1),
-    )
-    assert (
-        _selected_index_block_stride_rows(
-            cache,
-            block_size=64,
-            is_glm_next=True,
-        )
-        == 64
     )
     assert _is_glm_next_ckv_source_layout(cache, page_size=64, record_bytes=528)
     assert not _is_glm_next_ckv_source_layout(
@@ -741,6 +735,15 @@ def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
             torch.empty((4, 304), dtype=torch.uint8),
             torch.empty((8, 304), dtype=torch.uint8),
         )
+
+
+@pytest.mark.parametrize("record_bytes", [528, 656])
+def test_b12x_selected_indices_use_physical_slots(record_bytes: int) -> None:
+    storage = torch.empty((2, 2, 64, record_bytes), dtype=torch.uint8)
+    cache = storage[:, 0]
+
+    assert cache.stride(0) // record_bytes == 128
+    assert _selected_index_block_stride_rows(cache, block_size=64) == 64
 
 
 def test_sparse_index_remap_tiling_covers_glm5_next_width() -> None:
@@ -1557,6 +1560,7 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
 
     def index_topk_fp8(**kwargs):
         calls["run"] = kwargs
+        calls["output_before_run"] = kwargs["out_indices"].clone()
         kwargs["out_indices"].fill_(11)
 
     module = SimpleNamespace(
@@ -1569,7 +1573,7 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
     monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
     monkeypatch.setattr(b12x_indexer, "current_workspace_manager", lambda: _Workspace())
 
-    output = torch.empty((3, 4), dtype=torch.int32)
+    output = torch.full((3, 4), 37, dtype=torch.int32)
     scores = torch.empty((3, 4), dtype=torch.float32)
     b12x_indexer._run_paged_topk(
         module=module,
@@ -1580,7 +1584,6 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
         seq_lens=torch.full((3,), 128, dtype=torch.int32),
         block_table=torch.zeros((3, 2), dtype=torch.int32),
         schedule_metadata=None,
-        active_width=None,
         output=output,
         scores=scores,
         topk=4,
@@ -1588,6 +1591,8 @@ def test_b12x_dsa_indexer_uses_logical_slot_contract(monkeypatch) -> None:
     )
 
     assert calls["run"]["out_scores"] is scores
+    assert torch.count_nonzero(calls["output_before_run"] != 37) == 0
+    assert "active_width" not in calls["bind"]
 
     builder = object.__new__(b12x_indexer.DeepseekV4B12xIndexerMetadataBuilder)
     builder.prefill_k_rows = 32768
