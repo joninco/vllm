@@ -51,16 +51,22 @@ if TYPE_CHECKING:
 
 
 _GLM_NEXT_MODEL_TYPES = frozenset(("glm5_next", "glm5_next_text"))
+_GLM_DSA_MODEL_TYPES = frozenset(("glm_moe_dsa",))
 _GLM_NEXT_CACHE_RECORD_BYTES = 528
 _GLM_NEXT_NVFP4_CACHE_RECORD_BYTES = 304
 _GLM_NEXT_INDEX_TAIL_BYTES_PER_TOKEN = 132 // 4
 _GLM_NEXT_INDEX_PAGE_BYTES = 64 * 132
+_GLM_DSA_NVFP4_CACHE_RECORD_BYTES = 368
 
 logger = init_logger(__name__)
 
 
 def _is_glm_next_config(hf_config: object | None) -> bool:
     return getattr(hf_config, "model_type", None) in _GLM_NEXT_MODEL_TYPES
+
+
+def _is_glm_dsa_config(hf_config: object | None) -> bool:
+    return getattr(hf_config, "model_type", None) in _GLM_DSA_MODEL_TYPES
 
 
 def _current_hf_text_config() -> object | None:
@@ -75,6 +81,25 @@ def _is_glm_next_spec(spec: AttentionSpec) -> bool:
         return True
     hf_config = _current_hf_text_config()
     return hf_config is not None and _is_glm_next_config(hf_config)
+
+
+def _is_glm_dsa_spec(spec: AttentionSpec) -> bool:
+    if isinstance(spec, MLAAttentionSpec) and spec.model_version == "glm_moe_dsa":
+        return True
+    hf_config = _current_hf_text_config()
+    return hf_config is not None and _is_glm_dsa_config(hf_config)
+
+
+def _nvfp4_run_options(*, is_glm_next: bool) -> dict[str, bool | int]:
+    if is_glm_next:
+        # GLM5Next has no RoPE payload and stores one latent scale per token.
+        return {
+            "scale_format": 2,
+            "fp8_rope": False,
+            "latent_scale_per_token": True,
+        }
+    # GLM-5.2/5.3 DSA stores its 64-dimensional RoPE tail as E4M3.
+    return {"scale_format": 2, "fp8_rope": True}
 
 
 def _glm_next_recipe_error(hf_config: object) -> str | None:
@@ -434,12 +459,27 @@ class B12xMLASparseBackend(AttentionBackend):
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
-        if not _is_glm_next_spec(spec):
+        is_glm_next = _is_glm_next_spec(spec)
+        is_glm_dsa_nvfp4 = isinstance(spec, MLAAttentionSpec) and (
+            spec.cache_dtype_str == "nvfp4_ds_mla" and _is_glm_dsa_spec(spec)
+        )
+        if not is_glm_next and not is_glm_dsa_nvfp4:
             return spec
         if not isinstance(spec, MLAAttentionSpec):
             raise TypeError(
-                "B12X GLM5Next sparse MLA requires an MLAAttentionSpec, got "
+                "B12X GLM sparse MLA requires an MLAAttentionSpec, got "
                 f"{type(spec).__name__}."
+            )
+        if is_glm_dsa_nvfp4:
+            if spec.head_size != 576:
+                raise ValueError(
+                    "B12X GLM DSA NVFP4 sparse MLA requires head_size=576, got "
+                    f"{spec.head_size}."
+                )
+            return replace(
+                spec,
+                state_content_bytes=_GLM_DSA_NVFP4_CACHE_RECORD_BYTES,
+                model_version="glm_moe_dsa",
             )
         if spec.head_size != 512:
             raise ValueError(
@@ -515,8 +555,11 @@ class B12xMLASparseBackend(AttentionBackend):
                 if dcp_error := _glm_next_dcp_error(vllm_config):
                     return dcp_error
                 return None
-            if kv_cache_dtype == "nvfp4_ds_mla":
-                return "B12X nvfp4_ds_mla is supported only for GLM5Next"
+            if kv_cache_dtype == "nvfp4_ds_mla" and not _is_glm_dsa_config(hf_config):
+                return (
+                    "B12X nvfp4_ds_mla requires GLM5Next or the "
+                    "GLM-5.2/5.3 DSA architecture"
+                )
             if head_size != 576:
                 return "B12X sparse MLA requires head_size=576"
             if int(getattr(hf_config, "kv_lora_rank", 0)) != 512:
@@ -524,6 +567,17 @@ class B12xMLASparseBackend(AttentionBackend):
             if int(getattr(hf_config, "qk_rope_head_dim", 0)) != 64:
                 return "B12X sparse MLA requires qk_rope_head_dim=64"
         return None
+
+
+class B12xGLMDSAMLASparseBackend(B12xMLASparseBackend):
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        if not isinstance(spec, MLAAttentionSpec):
+            raise TypeError(
+                "B12X GLM DSA sparse MLA requires an MLAAttentionSpec, got "
+                f"{type(spec).__name__}."
+            )
+        return super().customize_spec(replace(spec, model_version="glm_moe_dsa"))
 
 
 class B12xGLM5NextMLASparseBackend(B12xMLASparseBackend):
@@ -1038,6 +1092,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         vllm_config = get_current_vllm_config()
         hf_config = vllm_config.model_config.hf_text_config
         self._is_glm_next = _is_glm_next_config(hf_config)
+        self._is_glm_dsa = _is_glm_dsa_config(hf_config)
         self.supports_mtp_with_cp_non_trivial_interleave_size = self._is_glm_next
         if self._is_glm_next:
             if recipe_error := _glm_next_recipe_error(hf_config):
@@ -1056,35 +1111,51 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if self.topk_indices_buffer is None:
             raise ValueError("B12X sparse MLA requires a top-k index buffer.")
         uses_nvfp4_cache = kv_cache_dtype == "nvfp4_ds_mla"
-        if kv_cache_dtype != "fp8_ds_mla" and not (
-            self._is_glm_next and uses_nvfp4_cache
+        self._uses_glm_dsa_nvfp4_cache = self._is_glm_dsa and uses_nvfp4_cache
+        if uses_nvfp4_cache and not (
+            self._is_glm_next or self._uses_glm_dsa_nvfp4_cache
         ):
+            raise ValueError(
+                "B12X nvfp4_ds_mla requires GLM5Next or the "
+                "GLM-5.2/5.3 DSA architecture."
+            )
+        if kv_cache_dtype not in ("fp8_ds_mla", "nvfp4_ds_mla"):
             raise ValueError(
                 "B12X sparse MLA requires a packed fp8_ds_mla or "
                 "nvfp4_ds_mla KV cache; "
                 f"got kv_cache_dtype={kv_cache_dtype!r}."
             )
         self._uses_nvfp4_cache = uses_nvfp4_cache
-        self._cache_record_bytes = (
-            _GLM_NEXT_NVFP4_CACHE_RECORD_BYTES
-            if self._uses_nvfp4_cache
-            else _GLM_NEXT_CACHE_RECORD_BYTES
-        )
+        if self._is_glm_next and self._uses_nvfp4_cache:
+            self._cache_record_bytes = _GLM_NEXT_NVFP4_CACHE_RECORD_BYTES
+        elif self._uses_glm_dsa_nvfp4_cache:
+            self._cache_record_bytes = _GLM_DSA_NVFP4_CACHE_RECORD_BYTES
+        else:
+            self._cache_record_bytes = _GLM_NEXT_CACHE_RECORD_BYTES
 
         module = get_b12x_sparse_mla()
         if module is None:
             raise RuntimeError("B12X sparse MLA requires `pip install vllm[b12x]`.")
         if not module.is_supported():
             raise RuntimeError("B12X sparse MLA is not supported on this device.")
-        for name in ("Caps", "plan", "run_decode", "run_extend"):
+        required_symbols = ["Caps", "plan", "run_decode", "run_extend"]
+        if self._uses_glm_dsa_nvfp4_cache:
+            required_symbols.append("concat_and_cache_nvfp4_mla_fp8_rope")
+        for name in required_symbols:
             getattr(module, name)
         self._run_decode = module.run_decode
         self._run_extend = module.run_extend
         self._model_type: int | None = None
+        self._concat_and_cache_nvfp4_mla_fp8_rope = None
         self._concat_and_cache_glm_next_mla = None
         if self._is_glm_next:
             self._model_type = int(module.ModelType.GLM_NEXT)
             self._concat_and_cache_glm_next_mla = module.concat_and_cache_glm_next_mla
+        elif self._uses_glm_dsa_nvfp4_cache:
+            self._model_type = int(module.ModelType.GLM_NSA)
+            self._concat_and_cache_nvfp4_mla_fp8_rope = (
+                module.concat_and_cache_nvfp4_mla_fp8_rope
+            )
 
         scheduler_config = vllm_config.scheduler_config
         max_tokens = int(scheduler_config.max_num_batched_tokens)
@@ -1295,6 +1366,17 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._kernel_page_size_finalized = True
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        if getattr(self, "_uses_glm_dsa_nvfp4_cache", False) and (
+            kv_cache.ndim != 3
+            or int(kv_cache.shape[-1]) != _GLM_DSA_NVFP4_CACHE_RECORD_BYTES
+            or kv_cache.dtype != torch.uint8
+        ):
+            raise ValueError(
+                "B12X GLM DSA NVFP4 cache must have shape "
+                f"[pages, page_size, {_GLM_DSA_NVFP4_CACHE_RECORD_BYTES}] "
+                "uint8, got "
+                f"shape={tuple(kv_cache.shape)}, dtype={kv_cache.dtype}."
+            )
         if self._is_glm_next:
             if (
                 kv_cache.ndim != 3
@@ -1330,6 +1412,18 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
     ) -> None:
+        if getattr(self, "_uses_glm_dsa_nvfp4_cache", False):
+            if kv_cache.numel() == 0:
+                return
+            assert self._concat_and_cache_nvfp4_mla_fp8_rope is not None
+            self._concat_and_cache_nvfp4_mla_fp8_rope(
+                kv_c_normed,
+                k_pe.squeeze(1),
+                kv_cache,
+                slot_mapping.flatten(),
+                k_scale,
+            )
+            return
         if not self._is_glm_next:
             return super().do_kv_cache_update(
                 kv_c_normed,
@@ -1592,11 +1686,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if self._model_type is not None:
             run_kwargs["model_type"] = self._model_type
         if self._uses_nvfp4_cache:
-            run_kwargs.update(
-                scale_format=2,
-                fp8_rope=False,
-                latent_scale_per_token=True,
-            )
+            run_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
         result = run(**run_kwargs)
         if self.need_to_return_lse_for_decode:
             output, lse = result

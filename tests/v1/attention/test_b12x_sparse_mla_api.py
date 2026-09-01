@@ -33,6 +33,7 @@ from vllm.v1.attention.backends.mla.b12x_indexer import B12xIndexerBackend
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xGLM5NextMLASparseBackend,
     B12xGLM5NextMLASparseMetadataBuilder,
+    B12xGLMDSAMLASparseBackend,
     B12xMLASparseBackend,
     B12xMLASparseImpl,
     B12xMLASparseMetadata,
@@ -73,6 +74,15 @@ def test_b12x_selector_routes_supported_attention_families() -> None:
     assert indexer_cls is B12xDeepseekV32Indexer
     assert backend_cls is B12xMLASparseBackend
 
+    config.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")
+    )
+    indexer_cls, backend_cls = _select_sparse_components(
+        config, None, DeepseekV32Indexer
+    )
+    assert indexer_cls is B12xDeepseekV32Indexer
+    assert backend_cls is B12xGLMDSAMLASparseBackend
+
 
 def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
     monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
@@ -109,6 +119,83 @@ def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
         _canonicalize_sparse_mla_kv_cache_dtype(B12xMLASparseBackend, "auto")
         == "fp8_ds_mla"
     )
+
+    with set_current_vllm_config(config):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=576,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="nvfp4_ds_mla",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == []
+
+
+def test_b12x_glm_dsa_nvfp4_cache_spec(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")
+        )
+    )
+    probe = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+    )
+
+    with set_current_vllm_config(config):
+        packed = B12xMLASparseBackend.customize_spec(probe)
+
+    assert packed.state_content_bytes == 368
+    assert packed.page_size_bytes == 64 * 368
+    assert packed.model_version == "glm_moe_dsa"
+    assert B12xMLASparseBackend.customize_spec(packed) == packed
+
+    packed_without_config = B12xGLMDSAMLASparseBackend.customize_spec(probe)
+    assert packed_without_config == packed
+
+
+def test_b12x_nvfp4_rejects_non_glm_dsa_architecture(monkeypatch) -> None:
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="deepseek_v32",
+                index_topk=2048,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+            )
+        )
+    )
+
+    with set_current_vllm_config(config):
+        invalid_reasons = B12xMLASparseBackend.validate_configuration(
+            head_size=576,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="nvfp4_ds_mla",
+            block_size=64,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == [
+        ("B12X nvfp4_ds_mla requires GLM5Next or the GLM-5.2/5.3 DSA architecture")
+    ]
 
 
 def test_b12x_dsa_requires_layer_compact_cache_layout() -> None:
@@ -180,7 +267,7 @@ def test_b12x_glm5_next_cache_spec_and_layout(monkeypatch) -> None:
             attn_type="decoder",
         )
         packed = B12xMLASparseBackend.customize_spec(probe)
-        layouts = B12xMLASparseBackend.supported_kv_cache_layouts()
+        layouts = B12xGLM5NextMLASparseBackend.supported_kv_cache_layouts()
     packed_without_config_context = B12xMLASparseBackend.customize_spec(packed)
 
     assert invalid_reasons == []
@@ -231,6 +318,29 @@ def test_b12x_glm5_next_binds_nvfp4_record_width(monkeypatch) -> None:
     assert planned == [64]
     with pytest.raises(ValueError, match="page_size, 304"):
         impl.bind_kv_cache(torch.empty((2, 64, 528), dtype=torch.uint8))
+
+
+def test_b12x_glm_dsa_binds_nvfp4_fp8_rope_record() -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = False
+    impl._uses_glm_dsa_nvfp4_cache = True
+
+    impl.bind_kv_cache(torch.empty((2, 64, 368), dtype=torch.uint8))
+
+    with pytest.raises(ValueError, match="page_size, 368"):
+        impl.bind_kv_cache(torch.empty((2, 64, 432), dtype=torch.uint8))
+
+
+def test_b12x_nvfp4_run_options_match_each_glm_record_abi() -> None:
+    assert b12x_mla_sparse._nvfp4_run_options(is_glm_next=False) == {
+        "scale_format": 2,
+        "fp8_rope": True,
+    }
+    assert b12x_mla_sparse._nvfp4_run_options(is_glm_next=True) == {
+        "scale_format": 2,
+        "fp8_rope": False,
+        "latent_scale_per_token": True,
+    }
 
 
 def test_packed_nvfp4_mla_dtype_bypasses_generic_layout_guard() -> None:
@@ -657,6 +767,36 @@ def test_b12x_glm5_next_cache_writer_ignores_empty_rope() -> None:
     )
 
     assert calls == [(kv_c, kv_cache, slots)]
+
+
+def test_b12x_glm_dsa_nvfp4_cache_writer_keeps_rope() -> None:
+    calls: list[tuple[torch.Tensor, ...]] = []
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_next = False
+    impl._uses_glm_dsa_nvfp4_cache = True
+    impl._concat_and_cache_nvfp4_mla_fp8_rope = lambda *args: calls.append(args)
+    kv_c = torch.empty((3, 512), dtype=torch.bfloat16)
+    k_pe = torch.empty((3, 1, 64), dtype=torch.bfloat16)
+    kv_cache = torch.empty((2, 64, 368), dtype=torch.uint8)
+    slots = torch.tensor([0, 64, -1], dtype=torch.int64)
+    scale = torch.ones((), dtype=torch.float32)
+
+    impl.do_kv_cache_update(
+        kv_c,
+        k_pe,
+        kv_cache,
+        slots,
+        "nvfp4_ds_mla",
+        scale,
+    )
+
+    assert len(calls) == 1
+    actual_kv_c, actual_k_pe, actual_cache, actual_slots, actual_scale = calls[0]
+    assert actual_kv_c is kv_c
+    assert torch.equal(actual_k_pe, k_pe.squeeze(1))
+    assert actual_cache is kv_cache
+    assert torch.equal(actual_slots, slots)
+    assert actual_scale is scale
 
 
 def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> None:

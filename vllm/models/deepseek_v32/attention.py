@@ -175,10 +175,18 @@ def _select_sparse_components(
     ):
         from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
         from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+            B12xGLMDSAMLASparseBackend,
             B12xMLASparseBackend,
         )
 
-        return B12xDeepseekV32Indexer, B12xMLASparseBackend
+        model_config = getattr(vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_text_config", None)
+        backend_cls = (
+            B12xGLMDSAMLASparseBackend
+            if getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+            else B12xMLASparseBackend
+        )
+        return B12xDeepseekV32Indexer, backend_cls
     return indexer_cls, attn_backend
 
 
