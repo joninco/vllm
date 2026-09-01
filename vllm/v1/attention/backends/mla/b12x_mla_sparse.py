@@ -262,7 +262,17 @@ def _global_causal_lens_for_ckv_gather(
     req_id_per_token: torch.Tensor,
     num_actual_tokens: int,
 ) -> torch.Tensor:
-    """Return each query token's causal length in the gathered global cache."""
+    """Compute each query token's causal length in the gathered global cache.
+
+    Args:
+        global_seq_lens: Global cache sequence length for each request.
+        query_start_loc: Start offset of each request's query chunk.
+        req_id_per_token: Request identifier for each query token.
+        num_actual_tokens: Number of active query tokens.
+
+    Returns:
+        Causal cache length for each active query token.
+    """
     num_reqs = global_seq_lens.shape[0]
     qsl = query_start_loc[: num_reqs + 1].to(torch.int32)
     req_ids = req_id_per_token[:num_actual_tokens].to(torch.int64)

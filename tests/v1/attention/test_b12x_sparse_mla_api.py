@@ -13,6 +13,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
     _canonicalize_sparse_mla_kv_cache_dtype,
     _maybe_view_mla_cache_as_fp8,
+    _uses_packed_sparse_mla_workspace,
 )
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonMetadataBuilder,
@@ -256,6 +257,24 @@ def test_plain_fp8_mla_cache_uses_native_fp8_forward_view(monkeypatch) -> None:
 
     assert forwarded.data_ptr() == cache.data_ptr()
     assert forwarded.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize(
+    ("resolved_cache_dtype", "expected"),
+    [
+        ("fp8_ds_mla", True),
+        ("nvfp4_ds_mla", True),
+        ("auto", False),
+        (None, False),
+    ],
+)
+def test_packed_workspace_uses_resolved_layer_cache_spec(
+    resolved_cache_dtype: str | None,
+    expected: bool,
+) -> None:
+    spec = SimpleNamespace(cache_dtype_str=resolved_cache_dtype)
+
+    assert _uses_packed_sparse_mla_workspace(spec) is expected
 
 
 def test_b12x_glm5_next_keeps_hybrid_manager_page_unsplit() -> None:

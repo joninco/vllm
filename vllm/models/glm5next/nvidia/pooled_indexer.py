@@ -261,7 +261,14 @@ class Glm5NextPooledIndexer(nn.Module):
 
     @staticmethod
     def _active_index_page_count(seq_len: int) -> int:
-        """Return FP8 C4 pages that can contain completed visible pools."""
+        """Return FP8 C4 pages that can contain completed visible pools.
+
+        Args:
+            seq_len: Visible sequence length in tokens.
+
+        Returns:
+            Number of index pages that may contain completed pools.
+        """
         completed_pools = seq_len // _POOL_SIZE
         return max(1, math.ceil(completed_pools / _INDEX_PAGE_SIZE))
 
