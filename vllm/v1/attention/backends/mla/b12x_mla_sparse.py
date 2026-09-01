@@ -151,12 +151,13 @@ def _is_glm_next_ckv_source_layout(
     kv_cache: torch.Tensor,
     *,
     page_size: int,
+    record_bytes: int,
 ) -> bool:
     return (
         kv_cache.dtype == torch.uint8
         and kv_cache.ndim == 3
-        and tuple(kv_cache.shape[1:]) == (page_size, _GLM_NEXT_CACHE_RECORD_BYTES)
-        and kv_cache.stride(1) == _GLM_NEXT_CACHE_RECORD_BYTES
+        and tuple(kv_cache.shape[1:]) == (page_size, record_bytes)
+        and kv_cache.stride(1) == record_bytes
         and kv_cache.stride(2) == 1
     )
 
@@ -1217,13 +1218,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         )
         ckv_specs = (
             (
-                (self._ckv_local_capacity, _GLM_NEXT_CACHE_RECORD_BYTES),
+                (self._ckv_local_capacity, self._cache_record_bytes),
                 torch.uint8,
             ),
             (
                 (
                     self.dcp_world_size * self._ckv_local_capacity,
-                    _GLM_NEXT_CACHE_RECORD_BYTES,
+                    self._cache_record_bytes,
                 ),
                 torch.uint8,
             ),
@@ -1378,19 +1379,22 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if not self.uses_full_ckv_dcp(attn_metadata, attn_metadata.num_actual_tokens):
             raise RuntimeError("full CKV gather called for an ineligible batch")
         if not _is_glm_next_ckv_source_layout(
-            kv_cache, page_size=self._kernel_page_size
+            kv_cache,
+            page_size=self._kernel_page_size,
+            record_bytes=self._cache_record_bytes,
         ):
             raise ValueError(
-                "GLM5Next CKV gather requires native 528-byte records; "
+                "GLM5Next CKV gather requires native "
+                f"{self._cache_record_bytes}-byte records; "
                 f"got shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}"
             )
         expected_local_shape = (
             self._ckv_local_capacity,
-            _GLM_NEXT_CACHE_RECORD_BYTES,
+            self._cache_record_bytes,
         )
         expected_gathered_shape = (
             self.dcp_world_size * self._ckv_local_capacity,
-            _GLM_NEXT_CACHE_RECORD_BYTES,
+            self._cache_record_bytes,
         )
         if tuple(local_buffer.shape) != expected_local_shape:
             raise RuntimeError("CKV local workspace has an invalid shape")
@@ -1416,7 +1420,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             gathered_buffer[: self.dcp_world_size * padded_tokens].view(-1),
         )
         return gathered_buffer.view(
-            -1, self._kernel_page_size, _GLM_NEXT_CACHE_RECORD_BYTES
+            -1, self._kernel_page_size, self._cache_record_bytes
         )
 
     def forward_mqa(

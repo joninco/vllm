@@ -307,9 +307,7 @@ def test_b12x_glm5_next_nvfp4_aligns_hybrid_page_to_packed_record(
         state_content_bytes=656,
     )
     with set_current_vllm_config(config):
-        materialized = B12xGLM5NextMLASparseBackend.customize_spec(
-            materialized_probe
-        )
+        materialized = B12xGLM5NextMLASparseBackend.customize_spec(materialized_probe)
 
     assert config.cache_config.block_size == 3328
     assert config.cache_config.mamba_block_size == 3328
@@ -512,8 +510,98 @@ def test_b12x_glm5_next_selected_indices_use_physical_slots() -> None:
         )
         == 64
     )
-    assert _is_glm_next_ckv_source_layout(cache, page_size=64)
-    assert not _is_glm_next_ckv_source_layout(cache[:, :, ::2], page_size=64)
+    assert _is_glm_next_ckv_source_layout(cache, page_size=64, record_bytes=528)
+    assert not _is_glm_next_ckv_source_layout(
+        cache[:, :, ::2], page_size=64, record_bytes=528
+    )
+
+
+@pytest.mark.parametrize("record_bytes", [528, 304])
+def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
+    record_bytes: int,
+) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._max_tokens = 32
+    impl._q_head_dim = 512
+    impl._ckv_local_capacity = 128
+    impl.dcp_world_size = 4
+    impl._cache_record_bytes = record_bytes
+    plan = SimpleNamespace(shapes_and_dtypes=lambda: (((16,), torch.uint8),))
+
+    specs = impl._workspace_specs(plan, input_num_heads=8, include_ckv=True)
+
+    assert specs[-2:] == (
+        ((128, record_bytes), torch.uint8),
+        ((512, record_bytes), torch.uint8),
+    )
+
+
+@pytest.mark.parametrize("record_bytes", [528, 304])
+def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
+    monkeypatch: pytest.MonkeyPatch,
+    record_bytes: int,
+) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._kernel_page_size = 2
+    impl._ckv_local_capacity = 4
+    impl._cache_record_bytes = record_bytes
+    impl.dcp_world_size = 2
+    impl.uses_full_ckv_dcp = lambda *_: True
+
+    kv_cache = (
+        torch.arange(4 * record_bytes, dtype=torch.int64)
+        .to(torch.uint8)
+        .view(2, 2, record_bytes)
+    )
+    local_buffer = torch.full((4, record_bytes), 255, dtype=torch.uint8)
+    gathered_buffer = torch.empty((8, record_bytes), dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        num_actual_tokens=3,
+        dcp_local_total_tokens=3,
+        dcp_padded_total_tokens=4,
+        dcp_local_cu_seq_lens=torch.tensor([0, 3], dtype=torch.int32),
+        block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+        num_reqs=1,
+    )
+
+    def fake_cp_gather_cache(**kwargs: Any) -> None:
+        kwargs["dst"].copy_(kwargs["src_cache"].view(-1, record_bytes)[:3])
+
+    def fake_all_gather(_group: Any, src: torch.Tensor, dst: torch.Tensor) -> None:
+        dst.copy_(src.repeat(2))
+
+    monkeypatch.setattr(b12x_mla_sparse.ops, "cp_gather_cache", fake_cp_gather_cache)
+    monkeypatch.setattr(
+        b12x_mla_sparse, "_dcp_all_gather_current_stream", fake_all_gather
+    )
+    monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda: object())
+
+    gathered = impl._gather_full_ckv(kv_cache, metadata, local_buffer, gathered_buffer)
+
+    expected_rank = torch.cat(
+        (kv_cache.view(-1, record_bytes)[:3], torch.zeros((1, record_bytes))),
+        dim=0,
+    )
+    assert gathered.shape == (4, 2, record_bytes)
+    assert torch.equal(gathered.view(-1, record_bytes), expected_rank.repeat(2, 1))
+
+
+def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._kernel_page_size = 2
+    impl._ckv_local_capacity = 4
+    impl._cache_record_bytes = 304
+    impl.dcp_world_size = 2
+    impl.uses_full_ckv_dcp = lambda *_: True
+    metadata = SimpleNamespace(num_actual_tokens=1)
+
+    with pytest.raises(ValueError, match="requires native 304-byte records"):
+        impl._gather_full_ckv(
+            torch.empty((2, 2, 528), dtype=torch.uint8),
+            metadata,
+            torch.empty((4, 304), dtype=torch.uint8),
+            torch.empty((8, 304), dtype=torch.uint8),
+        )
 
 
 def test_sparse_index_remap_tiling_covers_glm5_next_width() -> None:
