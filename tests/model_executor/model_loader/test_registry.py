@@ -71,6 +71,16 @@ def test_default_loader_accepts_instanttensor_zero_copy():
     assert loader.instanttensor_copy is False
 
 
+def test_default_loader_accepts_local_instanttensor_loading():
+    loader = DefaultModelLoader(
+        LoadConfig(
+            load_format="instanttensor",
+            model_loader_extra_config={"instanttensor_distributed": False},
+        )
+    )
+    assert loader.instanttensor_distributed is False
+
+
 @pytest.mark.parametrize("value", [0, "false", None])
 def test_default_loader_rejects_non_bool_instanttensor_copy(value):
     with pytest.raises(ValueError, match="instanttensor_copy must be a bool"):
@@ -78,6 +88,17 @@ def test_default_loader_rejects_non_bool_instanttensor_copy(value):
             LoadConfig(
                 load_format="instanttensor",
                 model_loader_extra_config={"instanttensor_copy": value},
+            )
+        )
+
+
+@pytest.mark.parametrize("value", [0, "false", None])
+def test_default_loader_rejects_non_bool_instanttensor_distributed(value):
+    with pytest.raises(ValueError, match="instanttensor_distributed must be a bool"):
+        DefaultModelLoader(
+            LoadConfig(
+                load_format="instanttensor",
+                model_loader_extra_config={"instanttensor_distributed": value},
             )
         )
 

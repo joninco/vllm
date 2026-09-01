@@ -1208,6 +1208,7 @@ def instanttensor_weights_iterator(
     use_tqdm_on_load: bool,
     weight_name_prefixes: Sequence[str] | None = None,
     copy: bool = True,
+    distributed: bool = True,
     *,
     indexed_tensor_files: dict[str, str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -1233,7 +1234,11 @@ def instanttensor_weights_iterator(
         # Entering here only in unit tests where the world group is not initialized.
         process_group = None
     else:
-        process_group = world_group.device_group if world_group.world_size > 1 else None
+        process_group = (
+            world_group.device_group
+            if distributed and world_group.world_size > 1
+            else None
+        )
 
     device = current_platform.current_device()
     configured_buffer_size = os.getenv("INSTANTTENSOR_BUFFER_SIZE")

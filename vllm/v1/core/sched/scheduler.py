@@ -344,10 +344,25 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        glm5_next_mtp_has_independent_draft_state = (
+            speculative_config is not None
+            and speculative_config.method == "mtp"
+            and speculative_config.draft_model_config is not None
+            and "Glm5NextMTPModel"
+            in (speculative_config.draft_model_config.hf_config.architectures or ())
+        )
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
-            # TODO: support spec decoding
-            and not self.use_eagle
+            # DFlash and GLM-5.3 MTP keep draft attention state independently
+            # from the target GDN recurrent state. Publishing a target GDN
+            # checkpoint therefore does not mutate draft KV. Prefix-cache
+            # lookup still drops and re-prefills the lookahead-dependent MTP
+            # draft tail through the EAGLE group policy.
+            and (
+                not self.use_eagle
+                or (speculative_config is not None and speculative_config.use_dflash())
+                or glm5_next_mtp_has_independent_draft_state
+            )
             and all(
                 not isinstance(group.kv_cache_spec, MambaSpec)
                 or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
@@ -446,7 +461,20 @@ class Scheduler(SchedulerInterface):
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
         # to the boundary. A block too wide for one chunk advances sub-block
         # and re-aligns at the next boundary.
-        if end < prefill_end and not use_internal_checkpoint:
+        checkpoint_covers_prompt_tail = (
+            use_internal_checkpoint and end >= request.num_prompt_tokens
+        )
+        if (
+            end < prefill_end
+            and not checkpoint_covers_prompt_tail
+            and (
+                not use_internal_checkpoint
+                # DFlash reserves draft input slots, so its target-token budget
+                # is not necessarily block aligned. Keep intermediate target
+                # chunks aligned; only the prompt tail uses the checkpoint.
+                or self.use_eagle
+            )
+        ):
             max_prefill_tokens = self.max_num_scheduled_tokens
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
@@ -557,11 +585,18 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # On a throttled cadence step, defer prefill compute only when this
+        # decision can schedule decode work. Pipeline-parallel async requests
+        # can be temporarily ineligible; admitting prefill in that case avoids
+        # an empty model-executor step.
+        has_eligible_decode = any(
+            not request.is_prefill_chunk
+            and self.current_step >= request.next_decode_eligible_step
+            for request in self.running
+        )
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+        ) and has_eligible_decode
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -593,8 +628,8 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if defer_prefills and request.is_prefill_chunk:
-                # DP prefill balancing: defer this in-progress prefill chunk to a
-                # cadence-aligned step; decodes still run to fill this step.
+                # Defer this in-progress chunk to a cadence-aligned step;
+                # decodes still run to fill this step.
                 req_index += 1
                 continue
 

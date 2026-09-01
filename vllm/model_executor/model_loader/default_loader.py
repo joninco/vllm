@@ -89,6 +89,7 @@ class DefaultModelLoader(BaseModelLoader):
         allowed_keys = {
             "enable_multithread_load",
             "instanttensor_copy",
+            "instanttensor_distributed",
             "num_threads",
             "enable_weights_track",
         }
@@ -124,12 +125,21 @@ class DefaultModelLoader(BaseModelLoader):
                 "instanttensor_copy must be a bool, got "
                 f"{type(self.instanttensor_copy).__name__}"
             )
+        self.instanttensor_distributed = extra_config.get(
+            "instanttensor_distributed", True
+        )
+        if not isinstance(self.instanttensor_distributed, bool):
+            raise ValueError(
+                "instanttensor_distributed must be a bool, got "
+                f"{type(self.instanttensor_distributed).__name__}"
+            )
         if (
-            "instanttensor_copy" in extra_config
+            {"instanttensor_copy", "instanttensor_distributed"} & extra_config.keys()
             and load_config.load_format != "instanttensor"
         ):
             raise ValueError(
-                "instanttensor_copy is only supported with load_format='instanttensor'"
+                "InstantTensor options are only supported with "
+                "load_format='instanttensor'"
             )
 
         # The multi-thread loader ignores safetensors_load_strategy, so reject
@@ -314,6 +324,7 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.use_tqdm_on_load,
                     weight_name_prefixes=source.weight_name_prefixes,
                     copy=self.instanttensor_copy,
+                    distributed=self.instanttensor_distributed,
                     indexed_tensor_files=indexed_tensor_files,
                 )
             else:

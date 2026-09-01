@@ -46,7 +46,6 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
@@ -93,6 +92,7 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
+    normalize_model_token_inputs,
 )
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
@@ -551,9 +551,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         block_sizes = []
         max_num_blocks_per_group = []
+        group_cp_sizes = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
+            group_cp_sizes.append(
+                1 if getattr(spec, "dcp_replicated", False) else self.dcp_size
+            )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(
@@ -611,6 +615,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            group_cp_sizes=group_cp_sizes,
         )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,
@@ -1670,9 +1675,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     inputs_embeds = self.model_state.prepare_inputs_embeds(
                         scheduled_encoder_inputs, input_batch, self.req_states
                     )
-            if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
-                input_ids = None
-
         model_inputs = {
             "input_ids": input_ids,
             "positions": input_batch.positions,
@@ -1682,6 +1684,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        normalize_model_token_inputs(self.model, model_inputs)
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             model_inputs["input_ids"] = None

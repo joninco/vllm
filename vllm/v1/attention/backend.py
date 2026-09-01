@@ -69,6 +69,10 @@ class AttentionBackend(ABC):
     # Does attention's forward() include kv cache update?
     forward_includes_kv_cache_update: bool = True
 
+    # Whether metadata builders and kernels can execute a DCP-replicated cache
+    # group as a local DCP1 operation inside a larger DCP world.
+    supports_dcp_replicated: ClassVar[bool] = False
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(1)]
@@ -984,6 +988,10 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     """MLA attention implementation with forward_mqa and forward_mha methods."""
 
     supports_pcp: bool = True
+
+    def uses_full_ckv_dcp(self, attn_metadata: T, num_tokens: int) -> bool:
+        """Whether this call attends a transient globally gathered DCP cache."""
+        return False
 
     @abstractmethod
     def __init__(
