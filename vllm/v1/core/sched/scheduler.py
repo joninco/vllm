@@ -585,11 +585,18 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # On a throttled cadence step, defer prefill compute only when this
+        # decision can schedule decode work. Pipeline-parallel async requests
+        # can be temporarily ineligible; admitting prefill in that case avoids
+        # an empty model-executor step.
+        has_eligible_decode = any(
+            not request.is_prefill_chunk
+            and self.current_step >= request.next_decode_eligible_step
+            for request in self.running
+        )
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+        ) and has_eligible_decode
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -621,8 +628,8 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if defer_prefills and request.is_prefill_chunk:
-                # DP prefill balancing: defer this in-progress prefill chunk to a
-                # cadence-aligned step; decodes still run to fill this step.
+                # Defer this in-progress chunk to a cadence-aligned step;
+                # decodes still run to fill this step.
                 req_index += 1
                 continue
 

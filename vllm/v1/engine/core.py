@@ -590,9 +590,29 @@ class EngineCore:
             eco.scheduler_stats.iteration_details = iteration_details
 
     def _should_throttle_prefills(self) -> bool:
-        """Whether to defer new prefills this step (DP prefill balancing).
-        Overridden by the DP engine core; never throttles otherwise."""
-        return False
+        """Defer prefills on non-cadence steps in a non-DP engine.
+
+        ``Scheduler.current_step`` counts completed scheduling decisions. A
+        value divisible by the configured interval therefore releases prefill
+        work on the next decision, including the first decision after startup.
+        The data-parallel engine overrides this method with a counter that is
+        synchronized across DP ranks.
+        """
+        interval = self.vllm_config.scheduler_config.prefill_schedule_interval
+        if interval <= 1:
+            return False
+        current_step = getattr(self.scheduler, "current_step", None)
+        if (
+            not isinstance(current_step, int)
+            or isinstance(current_step, bool)
+            or current_step < 0
+        ):
+            raise RuntimeError(
+                "prefill_schedule_interval greater than one requires "
+                "scheduler.current_step to be a non-negative integer that "
+                "advances once per schedule() call"
+            )
+        return current_step % interval != 0
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
