@@ -6,6 +6,7 @@ import functools
 import os
 import platform
 import sys
+from dataclasses import replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -934,7 +935,16 @@ class Platform:
             cache_config.mamba_block_size = cache_config.block_size
 
         # Pad mamba page size to exactly match attention page size
-        attn_page_size = cache_config.block_size * attn_page_size_1_token
+        if model_config.use_mla and cache_config.cache_dtype == "nvfp4_ds_mla":
+            materialized_mla_spec = replace(
+                mla_spec, block_size=cache_config.block_size
+            )
+            with set_current_vllm_config(vllm_config):
+                attn_page_size = backend_cls.customize_spec(
+                    materialized_mla_spec
+                ).page_size_bytes
+        else:
+            attn_page_size = cache_config.block_size * attn_page_size_1_token
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:

@@ -292,9 +292,23 @@ def test_b12x_glm5_next_nvfp4_aligns_hybrid_page_to_packed_record(
 
     Platform._align_hybrid_block_size(config, B12xGLM5NextMLASparseBackend)
 
+    materialized_probe = MLAAttentionSpec(
+        block_size=config.cache_config.block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+        state_content_bytes=656,
+    )
+    with set_current_vllm_config(config):
+        materialized = B12xGLM5NextMLASparseBackend.customize_spec(
+            materialized_probe
+        )
+
     assert config.cache_config.block_size == 3328
     assert config.cache_config.mamba_block_size == 3328
-    assert config.cache_config.mamba_page_size_padded == 3328 * (304 + 33)
+    assert materialized.page_size_bytes == 1_123_584
+    assert config.cache_config.mamba_page_size_padded == materialized.page_size_bytes
 
 
 def test_b12x_glm5_next_rejects_unaligned_dcp(monkeypatch) -> None:
