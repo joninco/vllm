@@ -64,11 +64,12 @@ Segment = tuple[str, int, int]  # (name, ptr, bytes)
 
 
 def _platform_enabled() -> bool:
+    """Disable-only override: the feature never turns on without CUDA."""
+    if not torch.cuda.is_available():
+        return False
     raw = os.getenv("VLLM_GLM53_L2_PREFETCH")
     if raw is not None:
         return raw != "0"
-    if not torch.cuda.is_available():
-        return False
     return torch.cuda.get_device_capability() == (12, 0)
 
 
@@ -355,8 +356,11 @@ def issue(plan: L2PrefetchPlan | None, num_tokens: int) -> None:
 
 
 def join_all() -> None:
-    if ENABLED:
-        L2Prefetcher.get(None).join()
+    """Rejoin every pending prefetch side stream (no-op when nothing was issued)."""
+    if not ENABLED:
+        return
+    for inst in list(L2Prefetcher._instances.values()):
+        inst.join()
 
 
 __all__ = [

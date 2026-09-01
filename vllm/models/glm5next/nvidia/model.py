@@ -936,6 +936,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
 
+        # Rejoin the L2 prefetch side stream once per forward, before any
+        # early return, so a CUDA-graph capture never ends with a forked
+        # side stream (capture safety on every PP rank).
+        _l2pf.join_all()
+
         if not get_pp_group().is_last_rank:
             # Pipeline parallelism is rejected because post/comb are the
             # deferred mHC state and must be propagated across rank boundaries.
@@ -945,9 +950,6 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-
-        # Rejoin the L2 prefetch side stream once per forward (capture safety).
-        _l2pf.join_all()
 
         hidden_states = self.norm(hidden_states)
         if aux_hidden_states:
