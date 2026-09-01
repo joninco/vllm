@@ -585,8 +585,8 @@ class Glm5NextDecoderLayer(nn.Module):
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
 
-        # L2 prefetch window B: all-reduce + mHC + routing chain leave device memory idle.
-        if _l2pf.ENABLED:
+        # L2 prefetch window B (fallback issue point when no pre-reduce hook).
+        if _l2pf.ENABLED and not getattr(self, "_l2pf_hooked_b", False):
             _l2pf.issue(self._l2pf_plan_b, x.shape[0])
 
         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
@@ -611,8 +611,8 @@ class Glm5NextDecoderLayer(nn.Module):
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
         # the next layer's fused pre, returning the state.
-        # L2 prefetch window C: MoE all-reduce + next mHC leave device memory idle.
-        if _l2pf.ENABLED:
+        # L2 prefetch window C (fallback issue point when no pre-reduce hook).
+        if _l2pf.ENABLED and not getattr(self, "_l2pf_hooked_c", False):
             _l2pf.issue(self._l2pf_plan_c, x.shape[0])
 
         if self.layer_idx == self.num_hidden_layers - 1:
@@ -662,6 +662,20 @@ class Glm5NextDecoderLayer(nn.Module):
             plan_c, dropped = _l2pf.make_plan(rest, _l2pf.BUDGET_C, device)
             self._l2pf_plan_b = plan_b
             self._l2pf_plan_c = plan_c
+            # Fire windows B/C before the all-reduces (+10 us of idle window
+            # each): hooks on this layer's o_proj and on the MoE runner (or the
+            # dense MLP's down_proj).  The in-forward issue points below stay
+            # as the fallback when a hook target is missing.
+            self._l2pf_hooked_b = False
+            self._l2pf_hooked_c = False
+            o_proj = getattr(self.self_attn, "o_proj", None)
+            if o_proj is not None and plan_b is not None and getattr(o_proj, "reduce_results", False):
+                object.__setattr__(o_proj, "_l2_prefetch_pre_reduce_hook", lambda n, p=plan_b: _l2pf.issue(p, n))
+                self._l2pf_hooked_b = True
+            target_c = self.mlp.experts if self._mlp_is_moe else getattr(self.mlp, "down_proj", None)
+            if target_c is not None and plan_c is not None:
+                object.__setattr__(target_c, "_l2_prefetch_pre_reduce_hook", lambda n, p=plan_c: _l2pf.issue(p, n))
+                self._l2pf_hooked_c = True
             # Window A fires inside the attention layer, right after its first
             # projection (hook in the shared KDA / MLA layers).
             target = self.self_attn.mla_attn if is_mla else self.self_attn

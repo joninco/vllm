@@ -22,8 +22,9 @@ skipped there.
 Windows per decoder layer (C1, M=8):
   A  inside attention after the first projection: this layer's o_proj
      (optionally + a head slice of the next layer's first projection)
-  B  after the attention output: router weight + next layer's first projection
-  C  after the MoE all-reduce: the remainder
+  B  before the attention-output all-reduce: router weight + next layer's
+     first projection
+  C  before the MoE all-reduce: the remainder
 
 Environment:
   VLLM_GLM53_L2_PREFETCH=0            disable (default: on for SM120)
@@ -54,8 +55,10 @@ def _mb(name: str, default: str) -> int:
 
 
 BUDGET_A = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MB", "20")
-BUDGET_B = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_B_MB", "35")
-BUDGET_C = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_C_MB", "20")
+# Windows B/C fire *before* the all-reduces (hooks in RowParallelLinear and the
+# MoE runner), which adds the reduction time to each idle window.
+BUDGET_B = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_B_MB", "50")
+BUDGET_C = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_C_MB", "15")
 BUDGET_A_MLA = _mb("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MLA_MB", "36")
 # Measured neutral-to-negative on C1 (fills overlap the KDA core); off by default.
 A_NEXT_BYTES = _mb("VLLM_GLM53_L2_PREFETCH_A_NEXT_MB", "0")
