@@ -211,6 +211,7 @@ def test_b12x_glm5_next_binds_nvfp4_record_width(monkeypatch) -> None:
     impl = object.__new__(B12xMLASparseImpl)
     impl._is_glm_next = True
     impl._cache_record_bytes = 304
+    impl._ckv_gather_enabled = False
     planned: list[int] = []
     monkeypatch.setattr(impl, "_set_kernel_page_size", planned.append)
 
@@ -639,6 +640,7 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
 def test_b12x_glm5_next_full_ckv_bind_requires_geometry_finalization() -> None:
     impl = object.__new__(B12xMLASparseImpl)
     impl._is_glm_next = True
+    impl._cache_record_bytes = 528
     impl._ckv_gather_enabled = True
     impl._kernel_page_size_finalized = False
 
