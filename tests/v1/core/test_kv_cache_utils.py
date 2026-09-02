@@ -2596,8 +2596,9 @@ def test_dflash_draft_cache_partition_is_pp1_only():
                 attention_backend="FLASH_ATTN",
             ),
             model_config=SimpleNamespace(
-                get_num_layers=lambda parallel_config,
-                target_layers=target_layers: target_layers
+                get_num_layers=lambda parallel_config, target_layers=target_layers: (
+                    target_layers
+                )
             ),
             parallel_config=SimpleNamespace(
                 pipeline_parallel_size=pipeline_parallel_size
