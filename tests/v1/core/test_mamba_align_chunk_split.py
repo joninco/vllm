@@ -206,6 +206,7 @@ def test_glm_mtp_checkpoint_joins_unaligned_prompt_tail(
             allow_speculative_checkpoints=True,
         )
         == 3648
+    )
 
 
 def test_dflash_does_not_back_off_last_cache_position() -> None:
