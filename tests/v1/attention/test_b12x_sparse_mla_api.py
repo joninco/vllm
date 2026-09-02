@@ -23,7 +23,7 @@ from vllm.models.deepseek_v32.attention import (
     _select_sparse_components,
 )
 from vllm.models.deepseek_v32.b12x import B12xDeepseekV32Indexer
-from vllm.platforms.interface import DeviceCapability
+from vllm.platforms.interface import DeviceCapability, Platform
 from vllm.v1.attention.backends.b12x import B12xPagedAttentionBackend
 from vllm.v1.attention.backends.mla import b12x_indexer as generic_b12x_indexer
 from vllm.v1.attention.backends.mla import b12x_mla_sparse
