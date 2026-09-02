@@ -34,9 +34,9 @@ NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
 DSPARK_DRAFT_ATTENTION_BACKEND="${DSPARK_DRAFT_ATTENTION_BACKEND:-auto}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.82}"
 B12X_POLICY_MODE="${B12X_POLICY_MODE:-auto}"
-# All-reduce transport between the two ranks: roce (b12x.comm.roce one-shot
+# All-reduce transport between the two ranks: rocenante (b12x.comm.roce one-shot
 # RDMA, VLLM_ENABLE_ROCE_ALLREDUCE=1) or nccl.
-ALLREDUCE="${ALLREDUCE:-roce}"
+ALLREDUCE="${ALLREDUCE:-rocenante}"
 ROCE_ALLREDUCE_MAX_SIZE="${ROCE_ALLREDUCE_MAX_SIZE:-2MB}"
 ROCE_ALLGATHER_MAX_SIZE="${ROCE_ALLGATHER_MAX_SIZE:-16MB}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
@@ -53,7 +53,7 @@ Usage: $0 [launcher options] [-- vLLM options]
 Launch DeepSeek-V4-Flash with DSpark speculative decoding and TP=2 across
 tachyon and luxon through the Spark cluster launcher (one native vLLM rank per
 node, management LAN for bootstrap, both RoCE rails on the direct ConnectX-7
-link). ALLREDUCE=roce (default) routes the TP all-reduces and the logits
+link). ALLREDUCE=rocenante (default) routes the TP all-reduces and the logits
 all-gather to the b12x one-shot RoCE collectives; ALLREDUCE=nccl keeps NCCL.
 
 Launcher options:
@@ -86,9 +86,9 @@ while (($#)); do
 done
 
 case "${ALLREDUCE}" in
-  roce|nccl) ;;
+  rocenante|nccl) ;;
   *)
-    echo "ALLREDUCE must be roce or nccl; got '${ALLREDUCE}'" >&2
+    echo "ALLREDUCE must be rocenante or nccl; got '${ALLREDUCE}'" >&2
     exit 2
     ;;
 esac
@@ -294,7 +294,7 @@ cluster_args=(
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
   --env "NCCL_IB_SUBNET_AWARE_ROUTING=1"
 )
-if [[ "${ALLREDUCE}" == roce ]]; then
+if [[ "${ALLREDUCE}" == rocenante ]]; then
   # b12x.comm.roce: B12X_ROCE_HCA falls back to the per-node NCCL_IB_HCA the
   # launcher sets, the GID index to NCCL_IB_GID_INDEX; the proxy .so is built
   # once into the mounted vLLM cache.
