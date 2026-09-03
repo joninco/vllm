@@ -5,17 +5,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ROOT="${VLLM_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 B12X_ROOT="${B12X_ROOT:-/home/luke/projects/b12x}"
+NCCL_ROOT="${NCCL_ROOT:-/home/luke/projects/nccl-2.30.7}"
+NCCL_LIB="${NCCL_LIB:-${NCCL_ROOT}/build/lib/libnccl.so.2.30.7}"
 SPARK_ROOT="${SPARK_ROOT:-/home/luke/projects/spark-vllm-docker}"
 CLUSTER_LAUNCHER="${CLUSTER_LAUNCHER:-${SPARK_ROOT}/launch-cluster.sh}"
 HEAD_IP="${HEAD_IP:-192.168.42.223}"
-WORKER_IP="${WORKER_IP:-192.168.42.110}"
+LUXON_IP="${LUXON_IP:-192.168.42.110}"
+GRAVITON_IP="${GRAVITON_IP:-192.168.42.55}"
+CHRONITON_IP="${CHRONITON_IP:-192.168.42.78}"
+WORKER_IPS=("${LUXON_IP}" "${GRAVITON_IP}" "${CHRONITON_IP}")
+NODE_IPS="${HEAD_IP},${LUXON_IP},${GRAVITON_IP},${CHRONITON_IP}"
 ETH_IF="${ETH_IF:-enP7s7}"
 IB_IF="${IB_IF:-rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1}"
-HEAD_IB_IF="${HEAD_IB_IF:-rocep1s0f1,roceP2p1s0f1}"
-WORKER_IB_IF="${WORKER_IB_IF:-rocep1s0f0,roceP2p1s0f0}"
+NCCL_IB_HCA="${NCCL_IB_HCA:-=rocep1s0f0:1:0:0,roceP2p1s0f0:1:0:1,rocep1s0f1:1:1:0,roceP2p1s0f1:1:1:1}"
 NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}"
-MASTER_PORT="${MASTER_PORT:-29655}"
-CONTAINER_NAME="${CONTAINER_NAME:-vllm_ds4_flash_dspark_tp2}"
+MASTER_PORT="${MASTER_PORT:-29656}"
+CONTAINER_NAME="${CONTAINER_NAME:-vllm_ds4_flash_dspark_tp4}"
 IMAGE_NAME="${IMAGE_NAME:-vllm-node-eugr-20260712:latest}"
 CONTAINER_MEMORY_GB="${CONTAINER_MEMORY_GB:-108}"
 CONTAINER_MEMORY_SWAP_GB="${CONTAINER_MEMORY_SWAP_GB:-112}"
@@ -34,11 +39,6 @@ NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
 DSPARK_DRAFT_ATTENTION_BACKEND="${DSPARK_DRAFT_ATTENTION_BACKEND:-auto}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.82}"
 B12X_POLICY_MODE="${B12X_POLICY_MODE:-auto}"
-# All-reduce transport between the two ranks: rocenante (b12x.comm.roce one-shot
-# RDMA, VLLM_ENABLE_ROCE_ALLREDUCE=1) or nccl.
-ALLREDUCE="${ALLREDUCE:-rocenante}"
-ROCE_ALLREDUCE_MAX_SIZE="${ROCE_ALLREDUCE_MAX_SIZE:-2MB}"
-ROCE_ALLGATHER_MAX_SIZE="${ROCE_ALLGATHER_MAX_SIZE:-16MB}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 sync_code=0
@@ -50,25 +50,23 @@ usage() {
   cat <<EOF
 Usage: $0 [launcher options] [-- vLLM options]
 
-Launch DeepSeek-V4-Flash with DSpark speculative decoding and TP=2 across
-tachyon and luxon through the Spark cluster launcher (one native vLLM rank per
-node, management LAN for bootstrap, both RoCE rails on the direct ConnectX-7
-link). ALLREDUCE=rocenante (default) routes the TP all-reduces and the logits
-all-gather to the b12x one-shot RoCE collectives; ALLREDUCE=nccl keeps NCCL.
+Launch DeepSeek-V4-Flash with DSpark speculative decoding and TP=4 across
+tachyon, luxon, graviton, and chroniton through the Spark cluster launcher.
+The launcher runs one native vLLM rank per node, uses the management LAN for
+bootstrap, and uses NCCL across both physical links of the ConnectX-7 ring.
 
 Launcher options:
-  --sync-code   Mirror local vllm/ and b12x/ runtime packages to the worker.
-  --check       Validate both nodes and Spark networking without launching.
+  --sync-code   Mirror local vllm/ and b12x/ runtime packages to all workers.
+  --check       Validate all four nodes and Spark networking without launching.
   --detach      Run the head rank in the background; use docker logs to follow it.
   --no-spec     Plain decode: no DSpark drafter (same as NUM_SPECULATIVE_TOKENS=0).
   --spec N      DSpark with N speculative tokens (same as NUM_SPECULATIVE_TOKENS=N).
   -h, --help    Show this help.
 
-Environment overrides include ALLREDUCE, HEAD_IP, WORKER_IP, MODEL_ID,
-MODEL_REVISION, HF_CACHE, MAX_MODEL_LEN, MAX_NUM_SEQS, NUM_SPECULATIVE_TOKENS,
-KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION, B12X_ROOT, B12X_POLICY_MODE,
-ROCE_ALLREDUCE_MAX_SIZE, ROCE_ALLGATHER_MAX_SIZE, IMAGE_NAME and
-CONTAINER_MEMORY_GB.
+Environment overrides include HEAD_IP, LUXON_IP, GRAVITON_IP, CHRONITON_IP,
+MODEL_ID, MODEL_REVISION, HF_CACHE, MAX_MODEL_LEN, MAX_NUM_SEQS,
+NUM_SPECULATIVE_TOKENS, KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION,
+B12X_ROOT, NCCL_ROOT, B12X_POLICY_MODE, IMAGE_NAME and CONTAINER_MEMORY_GB.
 EOF
 }
 
@@ -97,13 +95,6 @@ while (($#)); do
   esac
 done
 
-case "${ALLREDUCE}" in
-  rocenante|nccl) ;;
-  *)
-    echo "ALLREDUCE must be rocenante or nccl; got '${ALLREDUCE}'" >&2
-    exit 2
-    ;;
-esac
 case "${B12X_POLICY_MODE}" in
   auto|heuristic-only|preplanned-only) ;;
   *)
@@ -132,7 +123,12 @@ case "${DSPARK_DRAFT_ATTENTION_BACKEND}" in
 esac
 
 snapshot="${HF_CACHE}/hub/models--${MODEL_ID//\//--}/snapshots/${MODEL_REVISION}"
-for path in "${VLLM_ROOT}" "${B12X_ROOT}" "${HF_CACHE}" "${CLUSTER_LAUNCHER}"; do
+for path in \
+  "${VLLM_ROOT}" \
+  "${B12X_ROOT}" \
+  "${NCCL_ROOT}" \
+  "${HF_CACHE}" \
+  "${CLUSTER_LAUNCHER}"; do
   if [[ "${path}" == *[[:space:]]* ]]; then
     echo "Spark bind-mount paths cannot contain whitespace: ${path}" >&2
     exit 2
@@ -156,8 +152,12 @@ if [[ ! -f "${VLLM_ROOT}/vllm/__init__.py" ]]; then
   echo "Local vLLM source tree not found under ${VLLM_ROOT}" >&2
   exit 1
 fi
-if [[ ! -f "${B12X_ROOT}/b12x/comm/roce/roce_oneshot.py" ]]; then
-  echo "b12x under ${B12X_ROOT} lacks b12x.comm.roce (RoCEnante)" >&2
+if [[ ! -f "${B12X_ROOT}/b12x/__init__.py" ]]; then
+  echo "Local b12x source tree not found under ${B12X_ROOT}" >&2
+  exit 1
+fi
+if [[ ! -f "${NCCL_LIB}" ]]; then
+  echo "Patched NCCL library not found: ${NCCL_LIB}" >&2
   exit 1
 fi
 
@@ -166,40 +166,47 @@ ssh_opts=(
   -o ConnectTimeout=5
   -o StrictHostKeyChecking=no
 )
-if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" true; then
-  echo "Passwordless SSH to worker ${WORKER_IP} failed." >&2
-  exit 1
-fi
+for worker_ip in "${WORKER_IPS[@]}"; do
+  if ! ssh "${ssh_opts[@]}" "${worker_ip}" true; then
+    echo "Passwordless SSH to worker ${worker_ip} failed." >&2
+    exit 1
+  fi
+done
 
 if ((sync_code)); then
-  echo "Mirroring vLLM runtime source to ${WORKER_IP}..."
-  rsync -a --delete \
-    --exclude='__pycache__/' \
-    --exclude='*.py[co]' \
-    "${VLLM_ROOT}/vllm/" \
-    "${WORKER_IP}:${VLLM_ROOT}/vllm/"
-  echo "Mirroring b12x runtime source to ${WORKER_IP}..."
-  rsync -a --delete \
-    --exclude='__pycache__/' \
-    --exclude='*.py[co]' \
-    "${B12X_ROOT}/b12x/" \
-    "${WORKER_IP}:${B12X_ROOT}/b12x/"
+  for worker_ip in "${WORKER_IPS[@]}"; do
+    echo "Mirroring vLLM runtime source to ${worker_ip}..."
+    rsync -a --delete \
+      --exclude='__pycache__/' \
+      --exclude='*.py[co]' \
+      "${VLLM_ROOT}/vllm/" \
+      "${worker_ip}:${VLLM_ROOT}/vllm/"
+    echo "Mirroring b12x runtime source to ${worker_ip}..."
+    rsync -a --delete \
+      --exclude='__pycache__/' \
+      --exclude='*.py[co]' \
+      "${B12X_ROOT}/b12x/" \
+      "${worker_ip}:${B12X_ROOT}/b12x/"
+  done
 fi
 
 remote_files=(
   "${PYTHON_BIN}"
   "${VLLM_BIN}"
   "${VLLM_ROOT}/vllm/__init__.py"
-  "${B12X_ROOT}/b12x/comm/roce/roce_oneshot.py"
+  "${B12X_ROOT}/b12x/__init__.py"
+  "${NCCL_LIB}"
   "${snapshot}/config.json"
 )
-for path in "${remote_files[@]}"; do
-  printf -v remote_path '%q' "${path}"
-  if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" "test -e ${remote_path}"; then
-    echo "Required worker path is missing: ${WORKER_IP}:${path}" >&2
-    echo "Rerun with --sync-code, or copy the model snapshot." >&2
-    exit 1
-  fi
+for worker_ip in "${WORKER_IPS[@]}"; do
+  for path in "${remote_files[@]}"; do
+    printf -v remote_path '%q' "${path}"
+    if ! ssh "${ssh_opts[@]}" "${worker_ip}" "test -e ${remote_path}"; then
+      echo "Required worker path is missing: ${worker_ip}:${path}" >&2
+      echo "Rerun with --sync-code, or copy the model snapshot." >&2
+      exit 1
+    fi
+  done
 done
 
 runtime_digest() {
@@ -222,27 +229,32 @@ remote_digest_command="LC_ALL=C find ${remote_vllm} ${remote_b12x} \
   ! -path '*/__pycache__/*' ! -name '*.py[co]' -print0 \
   | sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1"
 local_digest="$(runtime_digest)"
-worker_digest="$(
-  ssh "${ssh_opts[@]}" "${WORKER_IP}" "${remote_digest_command}"
-)"
-if [[ "${local_digest}" != "${worker_digest}" ]]; then
-  echo "vLLM/b12x runtime source differs on ${WORKER_IP}." >&2
-  echo "Rerun with --sync-code so both TP ranks execute identical code." >&2
-  exit 1
-fi
+for worker_ip in "${WORKER_IPS[@]}"; do
+  worker_digest="$(
+    ssh "${ssh_opts[@]}" "${worker_ip}" "${remote_digest_command}"
+  )"
+  if [[ "${local_digest}" != "${worker_digest}" ]]; then
+    echo "vLLM/b12x runtime source differs on ${worker_ip}." >&2
+    echo "Rerun with --sync-code so all TP ranks execute identical code." >&2
+    exit 1
+  fi
+done
 
 if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
   echo "Docker image is missing locally: ${IMAGE_NAME}" >&2
   exit 1
 fi
-if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" \
-  "docker image inspect ${IMAGE_NAME} >/dev/null 2>&1"; then
-  echo "Docker image is missing on ${WORKER_IP}: ${IMAGE_NAME}" >&2
-  exit 1
-fi
+for worker_ip in "${WORKER_IPS[@]}"; do
+  if ! ssh "${ssh_opts[@]}" "${worker_ip}" \
+    "docker image inspect ${IMAGE_NAME} >/dev/null 2>&1"; then
+    echo "Docker image is missing on ${worker_ip}: ${IMAGE_NAME}" >&2
+    exit 1
+  fi
+done
 
 mount_args="-v ${VLLM_ROOT}:${VLLM_ROOT}"
 mount_args+=" -v ${B12X_ROOT}:${B12X_ROOT}"
+mount_args+=" -v ${NCCL_ROOT}:${NCCL_ROOT}:ro"
 mount_args+=" -v ${HF_CACHE}:${HF_CACHE}:ro"
 if [[ -n "${VLLM_SPARK_EXTRA_DOCKER_ARGS:-}" ]]; then
   mount_args+=" ${VLLM_SPARK_EXTRA_DOCKER_ARGS}"
@@ -250,13 +262,15 @@ fi
 export VLLM_SPARK_EXTRA_DOCKER_ARGS="${mount_args}"
 
 cluster_args=(
-  --nodes "${HEAD_IP},${WORKER_IP}"
+  --nodes "${NODE_IPS}"
   -t "${IMAGE_NAME}"
   --name "${CONTAINER_NAME}"
   --eth-if "${ETH_IF}"
   --ib-if "${IB_IF}"
-  --node-ib-if "${HEAD_IP}=${HEAD_IB_IF}"
-  --node-ib-if "${WORKER_IP}=${WORKER_IB_IF}"
+  --node-ib-if "${HEAD_IP}=${IB_IF}"
+  --node-ib-if "${LUXON_IP}=${IB_IF}"
+  --node-ib-if "${GRAVITON_IP}=${IB_IF}"
+  --node-ib-if "${CHRONITON_IP}=${IB_IF}"
   --master-port "${MASTER_PORT}"
   --nccl-debug "${NCCL_DEBUG}"
   --no-ray
@@ -296,29 +310,36 @@ cluster_args=(
   --env "B12X_MOE_FORCE_A8=1"
   --env "B12X_POLICY_MODE=${B12X_POLICY_MODE}"
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
+  --env "VLLM_ENABLE_ROCE_ALLREDUCE=0"
   --env "INSTANTTENSOR_BACKEND=BUFFERED"
   --env "INSTANTTENSOR_BUFFER_SIZE=67108864"
   --env "INSTANTTENSOR_CHUNK_SIZE=8388608"
   --env "INSTANTTENSOR_CONCURRENCY=1"
   --env "INSTANTTENSOR_IO_DEPTH=3"
   --env "NCCL_NET_PLUGIN=none"
+  --env "LD_PRELOAD=${NCCL_LIB}"
+  --env "VLLM_NCCL_SO_PATH=${NCCL_LIB}"
+  --env "NCCL_SKIP_TREE_CONNECT=1"
+  --env "NCCL_FORCE_RANK_ORDER_RING=1"
+  --env "NCCL_NET=IB"
+  --env "NCCL_IB_DISABLE=0"
+  --env "NCCL_IB_HCA=${NCCL_IB_HCA}"
   --env "NCCL_IB_GID_INDEX=3"
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
+  --env "NCCL_NET_MERGE_POLICY=RAIL"
+  --env "NCCL_NET_MERGE_LEVEL=SYS"
+  --env "NCCL_IB_SUBNET_PREFIX_LEN=30"
   --env "NCCL_IB_SUBNET_AWARE_ROUTING=1"
+  --env "NCCL_ALGO=Ring"
+  --env "NCCL_PROTO=LL,LL128,Simple"
+  --env "NCCL_MIN_NCHANNELS=4"
+  --env "NCCL_MAX_NCHANNELS=4"
+  --env "NCCL_CROSS_NIC=1"
+  --env "NCCL_CUMEM_ENABLE=0"
+  --env "NCCL_RUNTIME_CONNECT=1"
+  --env "NCCL_P2P_LEVEL=SYS"
+  --env "NCCL_IGNORE_CPU_AFFINITY=1"
 )
-if [[ "${ALLREDUCE}" == rocenante ]]; then
-  # b12x.comm.roce: B12X_ROCE_HCA falls back to the per-node NCCL_IB_HCA the
-  # launcher sets, the GID index to NCCL_IB_GID_INDEX; the proxy .so is built
-  # once into the mounted vLLM cache.
-  cluster_args+=(
-    --env "VLLM_ENABLE_ROCE_ALLREDUCE=1"
-    --env "VLLM_ROCE_ALLREDUCE_MAX_SIZE=${ROCE_ALLREDUCE_MAX_SIZE}"
-    --env "VLLM_ROCE_ALLGATHER_MAX_SIZE=${ROCE_ALLGATHER_MAX_SIZE}"
-    --env "B12X_ROCE_CACHE_DIR=/root/.cache/vllm/b12x-roce"
-  )
-else
-  cluster_args+=(--env "VLLM_ENABLE_ROCE_ALLREDUCE=0")
-fi
 
 if ((check_only)); then
   exec "${CLUSTER_LAUNCHER}" "${cluster_args[@]}" --check-config
@@ -360,8 +381,9 @@ vllm_command=(
   --host 0.0.0.0
   --port "${PORT}"
   --trust-remote-code
-  --tensor-parallel-size 2
+  --tensor-parallel-size 4
   --decode-context-parallel-size 1
+  --disable-custom-all-reduce
   --kv-cache-dtype fp8
   --block-size 256
   --load-format instanttensor
@@ -398,8 +420,8 @@ else
   spec_summary="plain decode, no drafter"
 fi
 cat <<BANNER
-Launching ${SERVED_MODEL_NAME} TP=2 on ${HEAD_IP} + ${WORKER_IP}
-  all-reduce:      ${ALLREDUCE}
+Launching ${SERVED_MODEL_NAME} TP=4 on ${NODE_IPS}
+  all-reduce:      NCCL over the four-node RoCE ring
   speculation:     ${spec_summary}
   max seqs:        ${MAX_NUM_SEQS} (cudagraph capture up to ${max_cudagraph_capture_size})
   context / KV:    ${MAX_MODEL_LEN} tokens, ${KV_CACHE_MEMORY_BYTES} bytes
