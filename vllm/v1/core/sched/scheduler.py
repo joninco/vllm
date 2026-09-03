@@ -566,12 +566,15 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
-        dspark_draft_tokens = (
-            spec.num_speculative_tokens if spec is not None and spec.use_dspark() else 0
-        )
+        separate_draft_input_tokens = 0
+        if spec is not None:
+            if spec.use_dflash():
+                separate_draft_input_tokens = 1 + spec.num_speculative_tokens
+            elif spec.use_dspark():
+                separate_draft_input_tokens = spec.num_speculative_tokens
         draft_slots = (
             spec.max_num_new_slots_for_drafting
-            if spec is not None and not spec.use_dspark()
+            if spec is not None and separate_draft_input_tokens == 0
             else 0
         )
         input_budget = self.scheduler_config.max_num_batched_tokens
@@ -610,7 +613,10 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            if input_budget <= draft_slots or draft_input_budget < dspark_draft_tokens:
+            if (
+                input_budget <= draft_slots
+                or draft_input_budget < separate_draft_input_tokens
+            ):
                 break
 
             if (
@@ -747,7 +753,7 @@ class Scheduler(SchedulerInterface):
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
-                            draft_input_budget += dspark_draft_tokens
+                            draft_input_budget += separate_draft_input_tokens
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -786,7 +792,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
-            draft_input_budget -= dspark_draft_tokens
+            draft_input_budget -= separate_draft_input_tokens
             req_index += 1
 
             # Speculative decode related.
@@ -839,7 +845,7 @@ class Scheduler(SchedulerInterface):
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if (
                     input_budget <= draft_slots
-                    or draft_input_budget < dspark_draft_tokens
+                    or draft_input_budget < separate_draft_input_tokens
                 ):
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
@@ -1227,7 +1233,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
-                draft_input_budget -= dspark_draft_tokens
+                draft_input_budget -= separate_draft_input_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
