@@ -60,6 +60,8 @@ Launcher options:
   --sync-code   Mirror local vllm/ and b12x/ runtime packages to the worker.
   --check       Validate both nodes and Spark networking without launching.
   --detach      Run the head rank in the background; use docker logs to follow it.
+  --no-spec     Plain decode: no DSpark drafter (same as NUM_SPECULATIVE_TOKENS=0).
+  --spec N      DSpark with N speculative tokens (same as NUM_SPECULATIVE_TOKENS=N).
   -h, --help    Show this help.
 
 Environment overrides include ALLREDUCE, HEAD_IP, WORKER_IP, MODEL_ID,
@@ -75,6 +77,16 @@ while (($#)); do
     --sync-code) sync_code=1; shift ;;
     --check) check_only=1; shift ;;
     --detach) detach=1; shift ;;
+    --no-spec) NUM_SPECULATIVE_TOKENS=0; shift ;;
+    --spec)
+      if (($# < 2)); then
+        echo "--spec requires a token count" >&2
+        exit 2
+      fi
+      NUM_SPECULATIVE_TOKENS=$2
+      shift 2
+      ;;
+    --spec=*) NUM_SPECULATIVE_TOKENS=${1#*=}; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; vllm_args=("$@"); break ;;
     *)
@@ -380,5 +392,19 @@ vllm_command=(
 )
 vllm_command+=("${speculative_args[@]}")
 vllm_command+=("${vllm_args[@]}")
+
+if ((NUM_SPECULATIVE_TOKENS > 0)); then
+  spec_summary="DSpark, ${NUM_SPECULATIVE_TOKENS} speculative tokens"
+else
+  spec_summary="plain decode, no drafter"
+fi
+cat <<BANNER
+Launching ${SERVED_MODEL_NAME} TP=2 on ${HEAD_IP} + ${WORKER_IP}
+  all-reduce:      ${ALLREDUCE}
+  speculation:     ${spec_summary}
+  max seqs:        ${MAX_NUM_SEQS} (cudagraph capture up to ${max_cudagraph_capture_size})
+  context / KV:    ${MAX_MODEL_LEN} tokens, ${KV_CACHE_MEMORY_BYTES} bytes
+  b12x policy:     ${B12X_POLICY_MODE} (B12X_ROOT=${B12X_ROOT})
+BANNER
 
 exec "${CLUSTER_LAUNCHER}" "${cluster_args[@]}" exec "${vllm_command[@]}"
