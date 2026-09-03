@@ -865,8 +865,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         # extrapolated total. FULL and PIECEWISE share one pool here just as
         # they share the global pool at runtime, so the overlap is not
         # double-counted.
-        num_full_graphs = len(manager._capture_descs.get(CUDAGraphMode.FULL, []))
-        full_estimate = _extrapolate_full_graph_memory(mem_samples, num_full_graphs)
+        full_graph_descs = manager._capture_descs.get(CUDAGraphMode.FULL, [])
+        full_estimate = _extrapolate_full_graph_memory(mem_samples, full_graph_descs)
         return max(measured - sum(mem_samples) + full_estimate, 0)
     finally:
         compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
@@ -899,15 +899,30 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         _teardown_profiling_state(runner)
 
 
-def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:
-    """Extrapolate the total FULL capture cost from samples of the largest
-    graphs. The first capture allocates the pool baseline; later graphs mostly
-    reuse it, so the second sample is taken as the per-graph cost."""
-    if not mem_samples:
+def _extrapolate_full_graph_memory(
+    mem_samples: list[int],
+    graph_descs: list[BatchExecutionDescriptor],
+) -> int:
+    """Project unsampled FULL graph costs from their descriptor token counts."""
+    if not mem_samples or not graph_descs:
         return 0
-    first_capture = mem_samples[0]
-    per_graph = max(mem_samples[1], _MIN_PER_GRAPH_BYTES) if len(mem_samples) > 1 else 0
-    return first_capture + (total_graphs - 1) * per_graph
+    assert len(mem_samples) <= len(graph_descs)
+
+    estimate = mem_samples[0] + sum(
+        max(sample, _MIN_PER_GRAPH_BYTES) for sample in mem_samples[1:]
+    )
+    if len(mem_samples) == len(graph_descs) or len(mem_samples) < 2:
+        return estimate
+
+    reference_desc = graph_descs[len(mem_samples) - 1]
+    reference_cost = max(mem_samples[-1], _MIN_PER_GRAPH_BYTES)
+    reference_tokens = reference_desc.num_tokens
+    for desc in graph_descs[len(mem_samples) :]:
+        scaled_cost = (
+            reference_cost * desc.num_tokens + reference_tokens - 1
+        ) // reference_tokens
+        estimate += max(scaled_cost, _MIN_PER_GRAPH_BYTES)
+    return estimate
 
 
 def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
