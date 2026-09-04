@@ -3483,6 +3483,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.acceptance_length_controller = None
     scheduler.recompute_kv_load_failures = False
     scheduler.defer_block_free = False
+    scheduler.acceptance_length_controller = None
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
 
