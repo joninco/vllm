@@ -144,6 +144,25 @@ class TestNonStreaming:
         assert json.loads(result.tool_calls[0].function.arguments) == EXPECTED_ARGS
         assert result.content is None
 
+    def test_missing_arg_value_end_keeps_tool_end_as_data(
+        self, parser, mock_request, tools
+    ):
+        mock_request.tools = tools
+        output = (
+            f"{THINK_END}{TOOL_CALL_START}record_value"
+            f"{ARG_KEY_START}value{ARG_KEY_END}{ARG_VALUE_START}unterminated"
+            f"{TOOL_CALL_END}after"
+        )
+
+        result = parser.extract_tool_calls(output, mock_request)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert json.loads(result.tool_calls[0].function.arguments) == {
+            "value": f"unterminated{TOOL_CALL_END}after"
+        }
+        assert result.content is None
+
 
 class TestStreaming:
     @pytest.mark.parametrize("split", ["tags", "chars"])
