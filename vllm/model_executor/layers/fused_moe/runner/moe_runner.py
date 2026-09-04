@@ -609,6 +609,15 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
+            # Queue shared-expert work before the routed launch. The auxiliary
+            # stream join remains after routing, preserving overlap with the
+            # router while preventing a resident routed grid from starting
+            # until shared-expert CTAs have released the SMs.
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
+
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
                 topk_weights=topk_weights,
@@ -617,10 +626,11 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input=shared_experts_input,
             )
 
-        self._maybe_apply_shared_experts(
-            shared_experts_input,
-            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-        )
+        if self.routed_experts.quant_method.is_monolithic:
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
