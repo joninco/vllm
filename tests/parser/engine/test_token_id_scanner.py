@@ -199,6 +199,18 @@ class TestHoldbackTextRecovery:
         assert isinstance(result[1], PreLexedTerminal)
         assert result[1].terminal == "THINK_START"
 
+    def test_reconstructed_text_matches_suffix(self, scanner):
+        result = scanner.scan(
+            delta_text=f"regular{CHANNEL_END} held regular{CHANNEL_END}",
+            delta_token_ids=[REGULAR_TOKEN_ID, CHANNEL_END_ID],
+        )
+
+        assert result == [
+            TextChunk(f"regular{CHANNEL_END} held "),
+            TextChunk("regular", ("regular",), 1),
+            PreLexedTerminal("THINK_END", CHANNEL_END_ID, CHANNEL_END),
+        ]
+
     def test_multi_token_batch_special_in_middle(self, scanner, tokenizer):
         """Multi-token batch with special token in the middle."""
         tok_a = 201
