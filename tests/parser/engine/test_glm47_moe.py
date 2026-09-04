@@ -90,7 +90,7 @@ def parser(mock_tokenizer, tools):
 
 
 def _tag_chunks(output: str) -> list[str]:
-    """Split output so every tag is its own chunk, like GLM's tokenizer."""
+    """Split output at every GLM tag boundary."""
     chunks: list[str] = []
     offset = 0
     while offset < len(output):
