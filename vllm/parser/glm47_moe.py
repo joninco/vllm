@@ -11,8 +11,8 @@ and tool calls may have no arguments.
 
 A literal tag inside an argument value has the same token ID as the
 structural tag, so position is the only signal: ``</tool_call>`` is
-structural only between arguments, and ``</arg_value>`` is structural only
-when the next non-whitespace text is ``<arg_key>`` or ``</tool_call>``.
+structural only outside an argument value, and ``</arg_value>`` is structural
+only when the next non-whitespace text is ``<arg_key>`` or ``</tool_call>``.
 """
 
 from __future__ import annotations

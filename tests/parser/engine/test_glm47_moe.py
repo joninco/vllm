@@ -163,6 +163,25 @@ class TestNonStreaming:
         }
         assert result.content is None
 
+    def test_last_arg_value_end_drops_trailing_malformed_text(
+        self, parser, mock_request, tools
+    ):
+        mock_request.tools = tools
+        output = (
+            f"{THINK_END}{TOOL_CALL_START}record_value"
+            f"{ARG_KEY_START}value{ARG_KEY_END}{ARG_VALUE_START}Beijing"
+            f"{ARG_VALUE_END} stray {TOOL_CALL_END}after"
+        )
+
+        result = parser.extract_tool_calls(output, mock_request)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert json.loads(result.tool_calls[0].function.arguments) == {
+            "value": "Beijing"
+        }
+        assert result.content is None
+
 
 class TestStreaming:
     @pytest.mark.parametrize("split", ["tags", "chars"])
