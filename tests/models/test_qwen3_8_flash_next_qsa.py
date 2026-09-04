@@ -390,7 +390,7 @@ def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
 def test_qsa_selects_the_smallest_sufficient_prefill_context_plan() -> None:
     owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
     owner.max_decode_rows = 6
-    owner.max_seq_len = 64
+    owner.max_seq_len = 63
     binding_32 = object()
     binding_64 = object()
     table_32 = torch.empty(2, 4, dtype=torch.int32)
@@ -404,7 +404,7 @@ def test_qsa_selects_the_smallest_sufficient_prefill_context_plan() -> None:
     assert owner._qsa_binding_for_workload(rows=7, max_seq_len=20).binding is binding_32
     assert owner._qsa_binding_for_workload(rows=7, max_seq_len=40).binding is binding_64
     with pytest.raises(ValueError, match="exceeds the configured limit"):
-        owner._qsa_binding_for_workload(rows=7, max_seq_len=65)
+        owner._qsa_binding_for_workload(rows=7, max_seq_len=64)
 
 
 def test_qsa_prefill_dispatches_through_the_b12x_transaction(monkeypatch) -> None:

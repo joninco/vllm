@@ -1442,6 +1442,11 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
             raise RuntimeError("b12x QSA was not bound to its cache")
         if rows <= self.max_decode_rows:
             return self._qsa_prefill_bindings[-1]
+        if max_seq_len > self.max_seq_len:
+            raise ValueError(
+                f"QSA sequence length {max_seq_len} exceeds the configured limit "
+                f"{self.max_seq_len}"
+            )
         for context in self._qsa_prefill_bindings:
             if max_seq_len <= context.max_seq_len:
                 return context
