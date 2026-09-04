@@ -92,6 +92,8 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
+    _init_minimal_kv_cache_for_profiling,
+    _teardown_profiling_state,
     normalize_model_token_inputs,
 )
 from vllm.v1.worker.gpu.cudagraph_utils import (
@@ -697,6 +699,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        single_request_prefill: bool = False,
+        profile_all_kv_cache_groups: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -705,8 +709,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Create a dummy scheduler output.
-        num_reqs = min(num_tokens, self.max_num_reqs)
+        num_reqs = 1 if single_request_prefill else min(num_tokens, self.max_num_reqs)
         if uniform_decode:
+            assert not single_request_prefill
             # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
             # and for spec-decode with MTP we want to make sure the dummy runs use
             # 1+num_speculative_tokens we use max here, this will likely be eventually
@@ -754,6 +759,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_attn_for_dummy_run=skip_attn,
                 is_profile=is_profile,
                 context_len=context_len,
+                profile_all_kv_cache_groups=profile_all_kv_cache_groups,
             )
         self.kv_connector.set_disabled(False)
 
@@ -875,6 +881,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
         gc.collect()
+
+    @torch.inference_mode()
+    def profile_glm_dcp_attention(self) -> None:
+        """Measure the GLM DCP query-gather peak before KV cache sizing.
+
+        The general activation profile deliberately skips attention and splits
+        its token budget across many requests. A GLM sparse-MLA prefill can put
+        the complete scheduler budget in one request, causing the DCP query
+        all-gather to require substantially more temporary memory. Bind a
+        minimal split cache, execute that shape, then release all temporary
+        cache and backend state before production cache allocation.
+        """
+        if (
+            self.model_config.architecture != "Glm5NextForConditionalGeneration"
+            or self.dcp_size <= 1
+        ):
+            return
+
+        _init_minimal_kv_cache_for_profiling(self)
+        try:
+            self._dummy_run(
+                self.max_num_tokens,
+                context_len=self.dcp_size * self.cp_interleave,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+                profile_all_kv_cache_groups=True,
+            )
+            torch.accelerator.synchronize()
+        finally:
+            _teardown_profiling_state(self)
 
     def post_kv_cache_wake_up(self) -> None:
         self.block_tables.init_block_table_layout_tensors()
@@ -1507,6 +1544,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        profile_all_kv_cache_groups: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
@@ -1627,7 +1665,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             assert block_tables is not None
             attn_groups = self.attn_groups
-            if dummy_run and is_profile:
+            if dummy_run and is_profile and not profile_all_kv_cache_groups:
                 # Mamba layers take a cheap warmup path with no metadata;
                 # attention metadata is still built so those kernels tune.
                 attn_groups = [
