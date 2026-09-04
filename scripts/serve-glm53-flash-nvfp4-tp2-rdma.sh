@@ -17,7 +17,8 @@ HEAD_IB_IF="${HEAD_IB_IF:-rocep1s0f1,roceP2p1s0f1}"
 WORKER_IB_IF="${WORKER_IB_IF:-rocep1s0f0,roceP2p1s0f0}"
 NCCL_IB_MERGE_NICS="${NCCL_IB_MERGE_NICS:-1}"
 MASTER_PORT="${MASTER_PORT:-29653}"
-CONTAINER_NAME="${CONTAINER_NAME:-vllm_glm53_flash_mtp_tp2}"
+SPECULATOR="${SPECULATOR:-mtp}"
+CONTAINER_NAME="${CONTAINER_NAME:-vllm_glm53_flash_${SPECULATOR}_tp2}"
 IMAGE_NAME="${IMAGE_NAME:-vllm-node-eugr-20260712:latest}"
 CONTAINER_MEMORY_GB="${CONTAINER_MEMORY_GB:-108}"
 CONTAINER_MEMORY_SWAP_GB="${CONTAINER_MEMORY_SWAP_GB:-112}"
@@ -25,13 +26,30 @@ CONTAINER_MEMORY_SWAP_GB="${CONTAINER_MEMORY_SWAP_GB:-112}"
 PYTHON_BIN="${PYTHON_BIN:-${VLLM_ROOT}/.venv/bin/python}"
 VLLM_BIN="${VLLM_BIN:-${VLLM_ROOT}/.venv/bin/vllm}"
 MODEL_PATH="${MODEL_PATH:-/data/models/GLM-5.3-Flash-4p67}"
+DFLASH2_MODEL_ID="${DFLASH2_MODEL_ID:-incoai/GLM-5.3-Flash-DFlash2}"
+HF_HUB_CACHE="${HF_HUB_CACHE:-/data/cache/huggingface/hub}"
+DFLASH2_MODEL_PATH="${DFLASH2_MODEL_PATH:-}"
+if [[ -z "${DFLASH2_MODEL_PATH}" ]]; then
+  dflash2_cache_dir="${HF_HUB_CACHE}/models--${DFLASH2_MODEL_ID//\//--}"
+  dflash2_revision=$(cat "${dflash2_cache_dir}/refs/main" 2>/dev/null || true)
+  if [[ -n "${dflash2_revision}" \
+      && -d "${dflash2_cache_dir}/snapshots/${dflash2_revision}" ]]; then
+    DFLASH2_MODEL_PATH="${dflash2_cache_dir}/snapshots/${dflash2_revision}"
+  else
+    DFLASH2_MODEL_PATH="/data/models/GLM-5.3-Flash-DFlash2"
+  fi
+fi
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-zai-org/GLM-5.3-Flash}"
 PORT="${PORT:-8001}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-10G}"
-NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
+case "${SPECULATOR}" in
+  dflash2) default_num_speculative_tokens=7 ;;
+  *) default_num_speculative_tokens=5 ;;
+esac
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-${default_num_speculative_tokens}}"
 MTP_MOE_BACKEND="${MTP_MOE_BACKEND:-humming}"
 MTP_ATTENTION_BACKEND="${MTP_ATTENTION_BACKEND:-B12X}"
 KDA_PREFILL_BACKEND="${KDA_PREFILL_BACKEND:-b12x}"
@@ -47,7 +65,7 @@ TORCH_PROFILE_WITH_MEMORY="${TORCH_PROFILE_WITH_MEMORY:-0}"
 TORCH_PROFILE_WITH_STACK="${TORCH_PROFILE_WITH_STACK:-0}"
 TORCH_PROFILE_WITH_FLOPS="${TORCH_PROFILE_WITH_FLOPS:-0}"
 TORCH_PROFILE_USE_GZIP="${TORCH_PROFILE_USE_GZIP:-1}"
-TORCH_PROFILE_DEFAULT_DIR="${VLLM_ROOT}/.profiles/glm53-tp2-mtp/torch"
+TORCH_PROFILE_DEFAULT_DIR="${VLLM_ROOT}/.profiles/glm53-tp2-${SPECULATOR}/torch"
 TORCH_PROFILE_MAX_ITERATIONS=4
 
 sync_code=0
@@ -72,14 +90,14 @@ usage() {
   cat <<EOF
 Usage: $0 [launcher options] [-- vLLM options]
 
-Launch GLM-5.3-Flash with native MTP and TP=2 across tachyon and luxon. The
-Spark cluster launcher starts one native vLLM rank per node, uses the
+Launch GLM-5.3-Flash with MTP or DFlash2 and TP=2 across tachyon and luxon.
+The Spark cluster launcher starts one native vLLM rank per node, uses the
 management LAN for bootstrap, and combines the two RoCE rails on their direct
 ConnectX-7 link in NCCL. No external scheduler is used.
 
 Launcher options:
   --sync-code   Mirror local vllm/ and b12x/ runtime packages to luxon.
-  --sync-model  Rsync the target model, including its MTP checkpoint, to luxon.
+  --sync-model  Rsync the target model and selected external draft to luxon.
   --check       Validate both nodes and Spark networking without launching.
   --detach      Run the head rank in the background; use docker logs to follow it.
   --torch-profile [DIR]
@@ -98,10 +116,13 @@ Launcher options:
                 Write uncompressed trace files.
   -h, --help    Show this help.
 
-Environment overrides include MODEL_PATH, MAX_MODEL_LEN, MTP_MOE_BACKEND,
-KDA_PREFILL_BACKEND, ATTENTION_BACKEND, MOE_BACKEND, LINEAR_BACKEND,
-KV_CACHE_MEMORY_BYTES, HEAD_IP, WORKER_IP, ETH_IF, IB_IF, IMAGE_NAME,
-CONTAINER_MEMORY_GB, and NUM_SPECULATIVE_TOKENS.
+Set SPECULATOR=dflash2 to use the external DFlash2 draft with seven draft
+tokens. DFLASH2_MODEL_PATH selects its local checkpoint.
+
+Environment overrides include MODEL_PATH, SPECULATOR, DFLASH2_MODEL_PATH,
+MAX_MODEL_LEN, MTP_MOE_BACKEND, KDA_PREFILL_BACKEND, ATTENTION_BACKEND,
+MOE_BACKEND, LINEAR_BACKEND, KV_CACHE_MEMORY_BYTES, HEAD_IP, WORKER_IP,
+ETH_IF, IB_IF, IMAGE_NAME, CONTAINER_MEMORY_GB, and NUM_SPECULATIVE_TOKENS.
 EOF
 }
 
@@ -192,6 +213,14 @@ TORCH_PROFILE_WITH_FLOPS=$(bool_value \
 TORCH_PROFILE_USE_GZIP=$(bool_value \
   TORCH_PROFILE_USE_GZIP "${TORCH_PROFILE_USE_GZIP}")
 
+case "${SPECULATOR}" in
+  mtp|dflash2) ;;
+  *)
+    echo "SPECULATOR must be mtp or dflash2; got '${SPECULATOR}'" >&2
+    exit 2
+    ;;
+esac
+
 case "${B12X_POLICY_MODE}" in
   auto|heuristic-only|preplanned-only) ;;
   *)
@@ -221,11 +250,26 @@ if [[ ! "${NUM_SPECULATIVE_TOKENS}" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-for path in \
-  "${VLLM_ROOT}" \
-  "${B12X_ROOT}" \
-  "${MODEL_PATH}" \
-  "${CLUSTER_LAUNCHER}"; do
+dflash2_enabled=0
+if [[ "${SPECULATOR}" == dflash2 ]] && ((NUM_SPECULATIVE_TOKENS > 0)); then
+  dflash2_enabled=1
+fi
+
+DFLASH2_MOUNT_ROOT="${DFLASH2_MODEL_PATH}"
+if [[ "${DFLASH2_MODEL_PATH}" == */snapshots/* ]]; then
+  DFLASH2_MOUNT_ROOT="${DFLASH2_MODEL_PATH%%/snapshots/*}"
+fi
+
+bind_paths=(
+  "${VLLM_ROOT}"
+  "${B12X_ROOT}"
+  "${MODEL_PATH}"
+  "${CLUSTER_LAUNCHER}"
+)
+if ((dflash2_enabled)); then
+  bind_paths+=("${DFLASH2_MOUNT_ROOT}")
+fi
+for path in "${bind_paths[@]}"; do
   if [[ "${path}" == *[[:space:]]* ]]; then
     echo "Spark bind-mount paths cannot contain whitespace: ${path}" >&2
     exit 2
@@ -246,6 +290,11 @@ if [[ ! -x "${VLLM_BIN}" ]]; then
 fi
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "Local model config not found: ${MODEL_PATH}/config.json" >&2
+  exit 1
+fi
+if ((dflash2_enabled)) && [[ ! -f "${DFLASH2_MODEL_PATH}/config.json" ]]; then
+  echo "Local DFlash2 config not found: ${DFLASH2_MODEL_PATH}/config.json" >&2
+  echo "Set DFLASH2_MODEL_PATH to a local ${DFLASH2_MODEL_ID} snapshot." >&2
   exit 1
 fi
 if [[ ! -f "${VLLM_ROOT}/vllm/__init__.py" ]]; then
@@ -351,6 +400,13 @@ if ((sync_model)); then
   rsync -a --partial --info=progress2 \
     "${MODEL_PATH}/" \
     "${WORKER_IP}:${MODEL_PATH}/"
+  if ((dflash2_enabled)); then
+    prepare_remote_dir "${DFLASH2_MODEL_PATH}"
+    echo "Rsyncing the DFlash2 draft to ${WORKER_IP}:${DFLASH2_MODEL_PATH}..."
+    rsync -aL --partial --info=progress2 \
+      "${DFLASH2_MODEL_PATH}/" \
+      "${WORKER_IP}:${DFLASH2_MODEL_PATH}/"
+  fi
 fi
 
 remote_files=(
@@ -360,6 +416,9 @@ remote_files=(
   "${B12X_ROOT}/b12x/__init__.py"
   "${MODEL_PATH}/config.json"
 )
+if ((dflash2_enabled)); then
+  remote_files+=("${DFLASH2_MODEL_PATH}/config.json")
+fi
 for path in "${remote_files[@]}"; do
   printf -v remote_path '%q' "${path}"
   if ! ssh "${ssh_opts[@]}" "${WORKER_IP}" "test -e ${remote_path}"; then
@@ -413,6 +472,9 @@ fi
 mount_args="-v ${VLLM_ROOT}:${VLLM_ROOT}"
 mount_args+=" -v ${B12X_ROOT}:${B12X_ROOT}"
 mount_args+=" -v ${MODEL_PATH}:${MODEL_PATH}:ro"
+if ((dflash2_enabled)); then
+  mount_args+=" -v ${DFLASH2_MOUNT_ROOT}:${DFLASH2_MOUNT_ROOT}:ro"
+fi
 if [[ -n "${VLLM_SPARK_EXTRA_DOCKER_ARGS:-}" ]]; then
   mount_args+=" ${VLLM_SPARK_EXTRA_DOCKER_ARGS}"
 fi
@@ -470,9 +532,21 @@ fi
 
 speculative_args=()
 if ((NUM_SPECULATIVE_TOKENS > 0)); then
-  speculative_config=$(printf \
-    '{"method":"mtp","num_speculative_tokens":%s,"moe_backend":"%s","attention_backend":"%s"}' \
-    "${NUM_SPECULATIVE_TOKENS}" "${MTP_MOE_BACKEND}" "${MTP_ATTENTION_BACKEND}")
+  case "${SPECULATOR}" in
+    mtp)
+      speculative_config=$(printf \
+        '{"method":"mtp","num_speculative_tokens":%s,"moe_backend":"%s","attention_backend":"%s"}' \
+        "${NUM_SPECULATIVE_TOKENS}" \
+        "${MTP_MOE_BACKEND}" \
+        "${MTP_ATTENTION_BACKEND}")
+      ;;
+    dflash2)
+      speculative_config=$(printf \
+        '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}' \
+        "${DFLASH2_MODEL_PATH}" \
+        "${NUM_SPECULATIVE_TOKENS}")
+      ;;
+  esac
   speculative_args=(--speculative-config "${speculative_config}")
 fi
 
@@ -513,4 +587,8 @@ vllm_command=(
 vllm_command+=("${profiler_args[@]}")
 vllm_command+=("${vllm_args[@]}")
 
+echo "Speculator: ${SPECULATOR} (${NUM_SPECULATIVE_TOKENS} draft tokens)"
+if ((dflash2_enabled)); then
+  echo "DFlash2 draft: ${DFLASH2_MODEL_PATH}"
+fi
 exec "${CLUSTER_LAUNCHER}" "${cluster_args[@]}" exec "${vllm_command[@]}"
