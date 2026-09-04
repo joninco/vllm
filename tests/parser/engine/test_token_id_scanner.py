@@ -9,6 +9,7 @@ import pytest
 from vllm.parser.engine.events import EventType
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 from vllm.parser.engine.token_id_scanner import (
+    DROP_TERMINAL,
     PreLexedTerminal,
     TextChunk,
     TokenIDScanner,
@@ -1015,3 +1016,58 @@ class TestRebuildFromAnchorsCascadingDeferral:
         assert bare_scanner._deferred_post_text == "more"
         assert len(bare_scanner._deferred_terminals) == 1
         assert bare_scanner._deferred_terminals[0].terminal == "THINK_END"
+
+
+class TestStopStrippedTrailingDrop:
+    """Serving strips the stop token's text but keeps its ID in the delta."""
+
+    DROP_TEXT = "<|observation|>"
+    DROP_ID = 112
+    TEXT_ID = 201
+    BODY_ID = 202
+    BODY = (
+        "record_value<arg_key>value</arg_key><arg_value>"
+        "</tool_call> and <tool_call></arg_value>"
+    )
+
+    def _scanner(self) -> TokenIDScanner:
+        tok = MagicMock()
+        tok.decode.side_effect = lambda ids: {
+            self.TEXT_ID: "prefix",
+            self.BODY_ID: self.BODY,
+            TOOL_START_ID: TOOL_START,
+            TOOL_END_ID: TOOL_END,
+            self.DROP_ID: self.DROP_TEXT,
+        }[ids[0]]
+        return TokenIDScanner(
+            {
+                TOOL_START_ID: "TOOL_START",
+                TOOL_END_ID: "TOOL_END",
+                self.DROP_ID: DROP_TERMINAL,
+            },
+            tok,
+        )
+
+    def test_anchors_stay_on_structural_tokens(self):
+        scanner = self._scanner()
+        ids = [self.TEXT_ID, TOOL_START_ID, self.BODY_ID, TOOL_END_ID, self.DROP_ID]
+        text = f"prefix{TOOL_START}{self.BODY}{TOOL_END}"
+
+        items = scanner.scan(text, ids)
+
+        assert items == [
+            TextChunk("prefix", ("prefix",), 1),
+            PreLexedTerminal("TOOL_START", TOOL_START_ID, TOOL_START),
+            TextChunk(self.BODY, (self.BODY,), 1),
+            PreLexedTerminal("TOOL_END", TOOL_END_ID, TOOL_END),
+        ]
+        assert scanner.flush_pending() == [
+            PreLexedTerminal(DROP_TERMINAL, self.DROP_ID, self.DROP_TEXT)
+        ]
+
+    def test_text_token_count_is_kept(self):
+        scanner = self._scanner()
+
+        items = scanner.scan("prefix", [self.TEXT_ID, self.DROP_ID])
+
+        assert items == [TextChunk("prefix", ("prefix",), 1)]
