@@ -64,6 +64,7 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
     runner = SimpleNamespace(
         max_model_len=max_model_len,
         is_encoder_decoder=False,
+        dcp_size=dcp_size,
         vllm_config=vllm_config,
     )
 
