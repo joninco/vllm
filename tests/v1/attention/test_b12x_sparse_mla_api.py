@@ -39,10 +39,12 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseImpl,
     B12xMLASparseMetadata,
     B12xMLASparseMetadataBuilder,
+    _ckv_rank_token_alignment,
     _global_causal_lens_for_ckv_gather,
     _is_glm_next_ckv_source_layout,
     _is_speculative_decode_batch,
     _max_speculative_decode_query_len,
+    _round_up_ckv_rank_tokens,
     _selected_index_block_stride_rows,
     _use_b12x_full_ckv_gather,
 )
@@ -825,6 +827,26 @@ def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
             torch.empty((4, 304), dtype=torch.uint8),
             torch.empty((8, 304), dtype=torch.uint8),
         )
+
+
+@pytest.mark.parametrize(
+    ("page_size", "dcp_world_size", "alignment"),
+    [(2048, 4, 512), (2048, 2, 1024), (512, 4, 128), (512, 3, 512)],
+)
+def test_full_ckv_rank_alignment_only_pads_the_concatenated_cache_to_pages(
+    page_size: int,
+    dcp_world_size: int,
+    alignment: int,
+) -> None:
+    assert _ckv_rank_token_alignment(page_size, dcp_world_size) == alignment
+    padded = _round_up_ckv_rank_tokens(
+        1025,
+        page_size=page_size,
+        dcp_world_size=dcp_world_size,
+    )
+    assert padded >= 1025
+    assert padded % alignment == 0
+    assert padded * dcp_world_size % page_size == 0
 
 
 @pytest.mark.parametrize("record_bytes", [528, 656])
