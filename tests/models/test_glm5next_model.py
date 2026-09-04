@@ -603,7 +603,6 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
     layer.model_config = SimpleNamespace(dtype=torch.float32)
     layer._b12x_prefill_api = None
     layer._b12x_prefill_plan = None
-    layer._b12x_prefill_scratch = None
     layer._b12x_prefill_max_tokens = 4
     layer._b12x_prefill_max_seqs = 2
     if prefill_backend == "b12x":
@@ -679,10 +678,6 @@ def test_glm5next_kda_splits_mixed_decode_prefill_batch(
             return outputs
 
     workspace_manager = FakeWorkspaceManager()
-    if prefill_backend == "b12x":
-        (layer._b12x_prefill_scratch,) = workspace_manager.get_simultaneous(
-            ((16,), torch.uint8)
-        )
 
     def fake_gather(state, indices, has_initial_state):
         calls["prefill_state_indices"] = indices.clone()
@@ -931,7 +926,7 @@ def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
         )
     )
     layer._b12x_prefill_plan = plan
-    layer._b12x_prefill_scratch = torch.empty(
+    scratch = torch.empty(
         plan.scratch_specs()[0].shape, dtype=torch.uint8, device=device
     )
     layer._b12x_prefill_num_seqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -947,7 +942,6 @@ def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
     got_pool = pool.clone()
     out = torch.zeros(tokens, heads, head_dim, dtype=torch.bfloat16, device=device)
     layer._run_b12x_kda_prefill(
-        scratch=layer._b12x_prefill_scratch,
         q=q,
         k=k,
         v=v,
@@ -958,6 +952,7 @@ def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
         has_initial_state=initial_mask,
         checkpoint=None,
         recurrent_state=got_pool,
+        scratch=scratch,
         output=out,
     )
     torch.accelerator.synchronize(device)

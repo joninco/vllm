@@ -355,12 +355,15 @@ class _B12xKdaPrefillWarmup:
 
         def compile() -> None:
             plan = layer._b12x_prefill_plan
-            scratch = layer._b12x_prefill_scratch
             api = layer._b12x_prefill_api
-            if plan is None or scratch is None or api is None:
+            if plan is None or api is None:
                 # The pool is bound after the memory-profiling pass; the
                 # post-allocation warmup compiles this layer.
                 return
+            scratch_buffers = get_b12x_scratch_buffers(plan)
+            scratch = (
+                scratch_buffers[0] if len(scratch_buffers) == 1 else scratch_buffers
+            )
             caps = plan.caps
             device = caps.device
             heads, head_dim = caps.heads, caps.head_dim
@@ -605,7 +608,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._initialize_b12x_kda_decode(vllm_config)
         self._b12x_prefill_api: Any | None = None
         self._b12x_prefill_plan = None
-        self._b12x_prefill_scratch = None
         self._initialize_b12x_kda_prefill(vllm_config)
         self.o_proj = RowParallelLinear(
             self.projection_size,
@@ -696,12 +698,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         super().bind_kv_cache(kv_cache)
         if self._b12x_prefill_api is not None:
-            prefill_plan = self._make_b12x_kda_prefill_plan(
+            self._b12x_prefill_plan = self._make_b12x_kda_prefill_plan(
                 max_state_slots=int(self.kv_cache[1].shape[0])
             )
-            self._b12x_prefill_plan = prefill_plan
-            prefill_scratch, _ = self._get_b12x_prefill_workspace()
-            self._b12x_prefill_scratch = prefill_scratch
         api = self._b12x_kda_api
         if api is None:
             return
@@ -715,7 +714,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_kda_plan = None
         self._b12x_kda_scratch = None
         self._b12x_prefill_plan = None
-        self._b12x_prefill_scratch = None
         super().unbind_kv_cache()
 
     def _initialize_b12x_kda_prefill(self, vllm_config: VllmConfig) -> None:
@@ -826,7 +824,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         an initial state name the null slot and start from zero.
 
         Args:
-            scratch: Workspace that is simultaneously live with ``output``.
+            scratch: Caller-owned workspace disjoint from ``output``.
             q: Live packed query rows, ``[tokens, heads, head_dim]``.
             k: Live packed key rows.
             v: Live packed value rows.
@@ -840,7 +838,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             output: Destination rows, ``[tokens, heads, head_dim]``.
 
         Raises:
-            RuntimeError: If the KDA prefill plan or scratch is unavailable.
+            RuntimeError: If the KDA prefill plan is unavailable.
             ValueError: If the live batch exceeds the planned capacity.
         """
         api = self._b12x_prefill_api
