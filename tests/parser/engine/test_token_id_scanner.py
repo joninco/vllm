@@ -1022,9 +1022,12 @@ class TestStopStrippedTrailingDrop:
     """Serving strips the stop token's text but keeps its ID in the delta."""
 
     DROP_TEXT = "<|observation|>"
+    DROP_TEXT_2 = "<|user|>"
     DROP_ID = 112
+    DROP_ID_2 = 113
     TEXT_ID = 201
     BODY_ID = 202
+    AFTER_ID = 203
     BODY = (
         "record_value<arg_key>value</arg_key><arg_value>"
         "</tool_call> and <tool_call></arg_value>"
@@ -1035,15 +1038,18 @@ class TestStopStrippedTrailingDrop:
         tok.decode.side_effect = lambda ids: {
             self.TEXT_ID: "prefix",
             self.BODY_ID: self.BODY,
+            self.AFTER_ID: "after",
             TOOL_START_ID: TOOL_START,
             TOOL_END_ID: TOOL_END,
             self.DROP_ID: self.DROP_TEXT,
+            self.DROP_ID_2: self.DROP_TEXT_2,
         }[ids[0]]
         return TokenIDScanner(
             {
                 TOOL_START_ID: "TOOL_START",
                 TOOL_END_ID: "TOOL_END",
                 self.DROP_ID: DROP_TERMINAL,
+                self.DROP_ID_2: DROP_TERMINAL,
             },
             tok,
         )
@@ -1071,3 +1077,42 @@ class TestStopStrippedTrailingDrop:
         items = scanner.scan("prefix", [self.TEXT_ID, self.DROP_ID])
 
         assert items == [TextChunk("prefix", ("prefix",), 1)]
+
+    def test_holdback_prefix_is_preserved(self):
+        scanner = self._scanner()
+
+        items = scanner.scan("holdback prefix", [self.TEXT_ID, self.DROP_ID])
+
+        assert items == [
+            TextChunk("holdback "),
+            TextChunk("prefix", ("prefix",), 1),
+        ]
+        assert scanner.flush_pending() == [
+            PreLexedTerminal(DROP_TERMINAL, self.DROP_ID, self.DROP_TEXT)
+        ]
+
+    def test_multiple_drops_flush_in_order(self):
+        scanner = self._scanner()
+
+        items = scanner.scan(
+            "prefix",
+            [self.TEXT_ID, self.DROP_ID, self.DROP_ID_2],
+        )
+
+        assert items == [TextChunk("prefix", ("prefix",), 1)]
+        assert scanner.flush_pending() == [
+            PreLexedTerminal(DROP_TERMINAL, self.DROP_ID, self.DROP_TEXT),
+            PreLexedTerminal(DROP_TERMINAL, self.DROP_ID_2, self.DROP_TEXT_2),
+        ]
+
+    def test_deferred_drop_resolves_on_next_delta(self):
+        scanner = self._scanner()
+        scanner.scan("prefix", [self.TEXT_ID, self.DROP_ID])
+
+        items = scanner.scan(self.DROP_TEXT + "after", [self.AFTER_ID])
+
+        assert items == [
+            PreLexedTerminal(DROP_TERMINAL, self.DROP_ID, self.DROP_TEXT),
+            TextChunk("after", ("after",), 1),
+        ]
+        assert scanner._deferred_terminals == []
