@@ -42,6 +42,7 @@ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
+    KVConnectorBlockState,
     NewRequestData,
     ScheduledEncoderInputStats,
     SchedulerOutput,
@@ -71,6 +72,55 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _build_kv_connector_block_state(
+    kv_cache_config: KVCacheConfig,
+    kv_cache_manager: KVCacheManager,
+    request_ids: Iterable[str],
+    partial_tail_offloads: dict[str, list[tuple[int, int, int]]] | None,
+    retention_interval: int | None,
+) -> KVConnectorBlockState:
+    """Snapshot exact source blocks for connector stores in this step."""
+    current_block_ids = {
+        req_id: kv_cache_manager.get_block_ids(req_id) for req_id in request_ids
+    }
+    boundary_state_offloads = {
+        req_id: list(entries)
+        for req_id, entries in (partial_tail_offloads or {}).items()
+    }
+    if retention_interval is not None and retention_interval > 0:
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, MambaSpec):
+                continue
+            if retention_interval % spec.block_size != 0:
+                raise ValueError(
+                    "prefix_cache_retention_interval must be divisible by "
+                    f"Mamba block size: {retention_interval=} {spec.block_size=}"
+                )
+            blocks_per_boundary = retention_interval // spec.block_size
+            for req_id, grouped_ids in current_block_ids.items():
+                if group_id >= len(grouped_ids):
+                    continue
+                entries = boundary_state_offloads.setdefault(req_id, [])
+                existing = {
+                    (entry_group, boundary_tokens)
+                    for entry_group, _, boundary_tokens in entries
+                }
+                for block_index in range(
+                    blocks_per_boundary - 1,
+                    len(grouped_ids[group_id]),
+                    blocks_per_boundary,
+                ):
+                    block_id = grouped_ids[group_id][block_index]
+                    boundary_tokens = (block_index + 1) * spec.block_size
+                    if block_id > 0 and (group_id, boundary_tokens) not in existing:
+                        entries.append((group_id, block_id, boundary_tokens))
+    return KVConnectorBlockState(
+        block_ids=current_block_ids,
+        boundary_state_offloads=boundary_state_offloads,
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -257,6 +307,7 @@ class Scheduler(SchedulerInterface):
         )
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self.drop_last_prefix_cache_block = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         # Positions past the computed tokens that the drafter reads mid-prefill.
@@ -291,6 +342,9 @@ class Scheduler(SchedulerInterface):
                     num_spec_tokens_by_batch_size=self.dynamic_sd_lookup,
                 )
             self.use_eagle = speculative_config.use_eagle()
+            self.drop_last_prefix_cache_block = (
+                speculative_config.use_eagle_preserves_target_kv_cache()
+            )
             if self.use_eagle:
                 self.num_prefill_lookahead = (
                     self.num_spec_tokens
@@ -307,7 +361,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.drop_last_prefix_cache_block,
             num_prefill_lookahead=self.num_prefill_lookahead,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
@@ -443,11 +497,13 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
-        # The last block-aligned position whose state can be cached. With
-        # Eagle, FullAttn prunes the last matching block, so back off one
-        # block to avoid a Mamba cache miss.
+        # The last block-aligned position whose state can be cached.
+        # Eagle-family drafters pollute the target's last matching
+        # full-attention block with their lookahead KV write, so back off one
+        # block to avoid a Mamba cache miss. DFlash/DSpark draft from their own
+        # KV cache and never write target blocks.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
-        if self.use_eagle:
+        if self.drop_last_prefix_cache_block:
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
@@ -1318,6 +1374,7 @@ class Scheduler(SchedulerInterface):
         # pin); the manager drops stale entries when the request's blocks are
         # popped for free.
         pending_partial_tail_offloads = None
+        kv_connector_block_state = None
         if (
             self.connector is not None
             and self.vllm_config.kv_transfer_config is not None
@@ -1325,6 +1382,13 @@ class Scheduler(SchedulerInterface):
         ):
             pending_partial_tail_offloads = (
                 self.kv_cache_manager.take_partial_tail_offloads() or None
+            )
+            kv_connector_block_state = _build_kv_connector_block_state(
+                self.kv_cache_config,
+                self.kv_cache_manager,
+                num_scheduled_tokens,
+                pending_partial_tail_offloads,
+                self.cache_config.prefix_cache_retention_interval,
             )
 
         kv_cache_block_copies, cow_retained_blocks = (
@@ -1378,6 +1442,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
+            kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )

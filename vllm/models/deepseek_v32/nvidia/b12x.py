@@ -13,7 +13,17 @@ from vllm.v1.attention.backends.mla.b12x_indexer import (
     B12xIndexerCache,
     B12xSparseIndexer,
 )
-from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseBackend
+from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
+    B12xGLMDSAMLASparseBackend,
+    B12xMLASparseBackend,
+)
+
+
+def _get_sparse_mla_backend(vllm_config: VllmConfig) -> type[B12xMLASparseBackend]:
+    hf_config = vllm_config.model_config.hf_text_config
+    if getattr(hf_config, "model_type", None) == "glm_moe_dsa":
+        return B12xGLMDSAMLASparseBackend
+    return B12xMLASparseBackend
 
 
 class B12xDSAIndexer(DeepseekV32Indexer):
@@ -64,8 +74,12 @@ class DeepseekV32B12xAttention(DeepseekV32Attention):
             config,
             prefix,
             topk_indices_buffer,
-            attn_backend=B12xMLASparseBackend,
+            attn_backend=_get_sparse_mla_backend(vllm_config),
         )
 
 
-__all__ = ["B12xDSAIndexer", "DeepseekV32B12xAttention"]
+__all__ = [
+    "B12xDSAIndexer",
+    "DeepseekV32B12xAttention",
+    "_get_sparse_mla_backend",
+]
