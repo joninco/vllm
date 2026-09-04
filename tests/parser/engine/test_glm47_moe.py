@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GLM-4.7 parser tests for tool delimiters that appear inside argument values.
-
-GLM tokenizes a literal ``</tool_call>`` or ``</arg_value>`` inside an
-argument value to the same token ID as the structural tag, so the parser
-can only tell them apart by position: ``</tool_call>`` is structural only
-between arguments, and ``</arg_value>`` is structural only when the next
-non-whitespace text is ``<arg_key>`` or ``</tool_call>``.
-"""
+"""Regression tests for GLM delimiters inside argument values."""
 
 import json
 
