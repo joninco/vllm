@@ -7,9 +7,11 @@ import importlib.util
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass, fields, is_dataclass
 from types import ModuleType
-from typing import Any
+from typing import Any, Literal
 
 import torch
+
+import vllm.envs as envs
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,12 @@ class B12xWarmupUnit:
     name: str
     key: Hashable
     compile: Callable[[], None]
+
+
+def get_b12x_dense_activation_mode(recipe: Literal["nvfp4", "mxfp8"]) -> str:
+    """Resolve the dense precision override once when loading a layer."""
+    override = getattr(envs, f"VLLM_B12X_{recipe.upper()}_ACTIVATION_MODE")
+    return override if override is not None else envs.VLLM_B12X_DENSE_ACTIVATION_MODE
 
 
 _HAS_B12X = importlib.util.find_spec("b12x") is not None

@@ -109,6 +109,8 @@ def test_b12x_warmup_token_counts_cover_serving_regimes() -> None:
                 weight_scale=torch.empty((128, 8), dtype=torch.float8_e4m3fn),
                 input_global_scale_inv=torch.tensor(2.0),
                 alpha=torch.tensor(0.25),
+                b12x_activation_mode="auto",
+                b12x_bf16_input_supported=True,
             ),
             "NVFP4",
         ),
@@ -144,7 +146,8 @@ def test_b12x_warmup_units_cover_token_counts(
     unit.compile()
 
     assert unit.name == name
-    assert [args[0].shape[0] for args in calls] == [1, 8]
+    source_index = 1 if kernel_cls is B12xNvFp4LinearKernel else 0
+    assert [args[source_index].shape[0] for args in calls] == [1, 8]
     assert unit.key[-1] == torch.bfloat16
 
 
@@ -152,17 +155,15 @@ def test_b12x_mxfp8_warmup_unit(monkeypatch) -> None:
     import vllm.model_executor.kernels.linear.mxfp8.b12x as b12x_mod
 
     calls = []
+
+    def mm(source, weight, **kwargs):
+        calls.append(((source, weight), kwargs))
+        return source.new_empty((source.shape[0], weight.out_features))
+
     monkeypatch.setattr(
         b12x_mod,
-        "_import_b12x_mxfp8",
-        lambda: SimpleNamespace(
-            mm=lambda *args, **kwargs: calls.append((args, kwargs))
-        ),
-    )
-    monkeypatch.setattr(
-        b12x_mod,
-        "current_stream",
-        lambda: SimpleNamespace(cuda_stream=object()),
+        "_import_b12x_blockscaled",
+        lambda: SimpleNamespace(mm=mm),
     )
     packed_weight = SimpleNamespace(
         in_features=128,
@@ -170,7 +171,11 @@ def test_b12x_mxfp8_warmup_unit(monkeypatch) -> None:
         out_features=256,
         weight=SimpleNamespace(values=torch.empty(1)),
     )
-    layer = SimpleNamespace(b12x_mxfp8_packed_weight=packed_weight)
+    layer = SimpleNamespace(
+        b12x_mxfp8_packed_weight=packed_weight,
+        b12x_activation_mode="auto",
+        b12x_bf16_input_supported=True,
+    )
     kernel = object.__new__(B12xMxfp8LinearKernel)
 
     unit = kernel.get_b12x_warmup_unit(layer, (1, 8), torch.float16)
