@@ -126,10 +126,6 @@ export VLLM_QWEN3_8_FLASH_NEXT_OVERLAP="${VLLM_QWEN3_8_FLASH_NEXT_OVERLAP:-1}"
 export VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT="${VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT:-1}"
 export VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH="${VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH:-1}"
 export B12X_POLICY_MODE
-export INSTANTTENSOR_BACKEND="${INSTANTTENSOR_BACKEND:-BUFFERED}"
-export INSTANTTENSOR_BUFFER_SIZE="${INSTANTTENSOR_BUFFER_SIZE:-1342177280}"
-export INSTANTTENSOR_CONCURRENCY="${INSTANTTENSOR_CONCURRENCY:-1}"
-export INSTANTTENSOR_IO_DEPTH="${INSTANTTENSOR_IO_DEPTH:-3}"
 
 speculative_config=$(printf \
   '{"method":"mtp","num_speculative_tokens":%s}' \
@@ -184,8 +180,7 @@ command=(
   --kv-cache-dtype fp8
   --quantization modelopt_mixed
   --block-size 16
-  --load-format instanttensor
-  --model-loader-extra-config '{"instanttensor_copy":false}'
+  --load-format fastsafetensors
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
   --max-model-len "${MAX_MODEL_LEN}"
   --max-num-seqs "${MAX_NUM_SEQS}"
