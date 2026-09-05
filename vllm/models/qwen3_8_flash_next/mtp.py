@@ -501,7 +501,11 @@ class Qwen3_8FlashNextMTP(
         self.quant_config = vllm_config.quant_config
         super().__init__()
         self.has_own_lm_head = envs.VLLM_MTP_NVFP4_LM_HEAD
-        if self.has_own_lm_head and config.tie_word_embeddings:
+        if (
+            self.has_own_lm_head
+            and envs.is_set("VLLM_MTP_NVFP4_LM_HEAD")
+            and config.tie_word_embeddings
+        ):
             raise ValueError("NVFP4 draft head requires untied word embeddings")
         self.config = config
         self.model = Qwen3_8FlashNextMultiTokenPredictor(
@@ -517,6 +521,7 @@ class Qwen3_8FlashNextMTP(
                 prefix=maybe_prefix(prefix, "lm_head"),
                 lm_head_quantization="nvfp4" if self.has_own_lm_head else None,
             )
+            self.has_own_lm_head = self.lm_head.runtime_lm_head_quantization == "nvfp4"
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:

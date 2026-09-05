@@ -64,7 +64,55 @@ def test_runtime_mxfp8_rejects_quantized_checkpoint(monkeypatch, mxfp8_head_conf
         ParallelLMHead(256, 128, quant_config=quant_config, disable_tp=True)
 
 
-@pytest.mark.parametrize("use_a16", [False, True])
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("recipe", ["mxfp8", "nvfp4"])
+@pytest.mark.parametrize(
+    "fallback", ["dtype", "shape", "backend", "platform", "tied", "quantized"]
+)
+def test_runtime_lm_head_defaults_preserve_ineligible_heads(
+    monkeypatch, mxfp8_head_config, recipe, fallback
+):
+    """Automatic quantization must preserve unsupported checkpoint/head paths."""
+    from vllm.model_executor.layers import vocab_parallel_embedding as vocab
+
+    for name in ("VLLM_MXFP8_LM_HEAD", "VLLM_MTP_NVFP4_LM_HEAD", "VLLM_LM_HEAD_A16"):
+        monkeypatch.delenv(name, raising=False)
+    mxfp8_head_config.kernel_config.linear_backend = "b12x"
+    mxfp8_head_config.model_config.hf_text_config = SimpleNamespace(
+        tie_word_embeddings=fallback == "tied"
+    )
+    if fallback in ("tied", "quantized"):
+        monkeypatch.setattr(
+            vocab, "_supports_default_lm_head_quantization", lambda *a: True
+        )
+    if fallback == "backend":
+        mxfp8_head_config.kernel_config.linear_backend = "cutlass"
+    if fallback == "platform":
+        monkeypatch.setattr(vocab.current_platform, "is_cuda", lambda: False)
+    existing = SimpleNamespace(create_weights=lambda *args, **kwargs: None)
+    quant_config = (
+        SimpleNamespace(get_quant_method=lambda *a, **kw: existing)
+        if fallback == "quantized"
+        else None
+    )
+    dtype = torch.float16 if fallback == "dtype" else torch.bfloat16
+    head = ParallelLMHead(
+        256,
+        64 if fallback == "shape" else 128,
+        params_dtype=dtype,
+        disable_tp=True,
+        quant_config=quant_config,
+        lm_head_quantization="nvfp4" if recipe == "nvfp4" else None,
+    )
+    assert head.runtime_lm_head_quantization is None
+    if fallback == "quantized":
+        assert head.quant_method is existing
+    else:
+        assert isinstance(head.quant_method, UnquantizedEmbeddingMethod)
+        assert head.weight.dtype == dtype
+
+
+@pytest.mark.parametrize("use_a16", [False, True, None])
 def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
     monkeypatch, mxfp8_head_config, use_a16
 ):
@@ -80,8 +128,17 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
 
     if not current_platform.is_device_capability_family(120):
         pytest.skip("Requires b12x on SM120/SM121")
-    monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
-    monkeypatch.setenv("VLLM_LM_HEAD_A16", str(int(use_a16)))
+    if use_a16 is None:
+        for name in (
+            "VLLM_MXFP8_LM_HEAD",
+            "VLLM_LM_HEAD_A16",
+            "VLLM_MTP_NVFP4_LM_HEAD",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        use_a16 = True
+    else:
+        monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
+        monkeypatch.setenv("VLLM_LM_HEAD_A16", str(int(use_a16)))
     mxfp8_head_config.kernel_config.linear_backend = "b12x"
     torch.manual_seed(42)
     weight = torch.randn(256, 128, dtype=torch.bfloat16, device="cuda") * 0.02
@@ -153,7 +210,7 @@ def test_draft_nvfp4_head_preserves_verifier_and_dynamic_graph_scales(
     )
 
 
-@pytest.mark.parametrize("use_a16", [False, True])
+@pytest.mark.parametrize("use_a16", [False, True, None])
 def test_runtime_mxfp8_b12x_shard_loading_and_graph(
     monkeypatch, mxfp8_head_config, use_a16
 ):
@@ -170,8 +227,17 @@ def test_runtime_mxfp8_b12x_shard_loading_and_graph(
     if not current_platform.is_device_capability_family(120) or b12x is None:
         pytest.skip("Requires b12x on SM120/SM121")
 
-    monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
-    monkeypatch.setenv("VLLM_LM_HEAD_A16", str(int(use_a16)))
+    if use_a16 is None:
+        for name in (
+            "VLLM_MXFP8_LM_HEAD",
+            "VLLM_LM_HEAD_A16",
+            "VLLM_MTP_NVFP4_LM_HEAD",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        use_a16 = True
+    else:
+        monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
+        monkeypatch.setenv("VLLM_LM_HEAD_A16", str(int(use_a16)))
     mxfp8_head_config.kernel_config.linear_backend = "b12x"
     monkeypatch.setattr(
         vocab_parallel_embedding, "get_tensor_model_parallel_rank", lambda: 1

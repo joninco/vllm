@@ -181,7 +181,8 @@ def test_glm5next_mtp_resolves_mapped_mxfp8_projection() -> None:
 
 def test_glm5next_mtp_selects_only_draft_checkpoint_weights() -> None:
     mtp = SimpleNamespace(
-        config=SimpleNamespace(num_hidden_layers=45, num_nextn_predict_layers=1)
+        config=SimpleNamespace(num_hidden_layers=45, num_nextn_predict_layers=1),
+        has_own_lm_head=False,
     )
 
     assert Glm5NextMTP._checkpoint_weight_name_prefixes(mtp) == (
@@ -190,6 +191,77 @@ def test_glm5next_mtp_selects_only_draft_checkpoint_weights() -> None:
         "model.layers.45.",
         "layers.45.",
     )
+
+
+@pytest.fixture
+def glm_mtp_head_loader(monkeypatch):
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from vllm.models.glm5next.nvidia import mtp as mtp_module
+
+    monkeypatch.setattr(
+        mtp_module, "fused_moe_make_expert_params_mapping", lambda *a, **kw: []
+    )
+    model = Glm5NextMTP.__new__(Glm5NextMTP)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        num_hidden_layers=45,
+        num_nextn_predict_layers=1,
+        n_routed_experts=0,
+        mla_nope=False,
+    )
+    model.has_own_lm_head = True
+    layer = torch.nn.Module()
+    layer.shared_head = torch.nn.Module()
+    layer.shared_head.head = torch.nn.Linear(4, 8, bias=False)
+    layer.shared_head.head.weight.weight_loader = default_weight_loader
+    layer.shared_head.norm = torch.nn.LayerNorm(4, bias=False)
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleDict({"45": layer})
+    model.model.mtp_start_layer_idx = 45
+    model.model.num_mtp_layers = 1
+    return model
+
+
+@pytest.mark.parametrize("draft_order", [None, "before", "after"])
+@pytest.mark.parametrize("target_prefix", ["", "model.language_model."])
+def test_glm5next_mtp_loads_target_head_fallback_and_prefers_draft_weights(
+    glm_mtp_head_loader, draft_order, target_prefix
+) -> None:
+    model = glm_mtp_head_loader
+    target = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    draft = target + 100
+    head_name = "model.layers.45.shared_head.head.weight"
+    weights = [
+        ("model.language_model.layers.45.shared_head.norm.weight", torch.ones(4)),
+        (f"{target_prefix}lm_head.weight", target),
+    ]
+    if draft_order is not None:
+        weights.insert(
+            0 if draft_order == "before" else len(weights), (head_name, draft)
+        )
+
+    loaded = model.load_weights(weights)
+
+    assert head_name in loaded
+    torch.testing.assert_close(
+        model.model.layers["45"].shared_head.head.weight,
+        target if draft_order is None else draft,
+    )
+    assert f"{target_prefix}lm_head." in model._checkpoint_weight_name_prefixes()
+
+
+@pytest.mark.parametrize("missing_head", [False, True])
+def test_glm5next_mtp_requires_both_draft_layer_and_head_weights(
+    glm_mtp_head_loader, missing_head
+) -> None:
+    weights = (
+        [("model.layers.45.shared_head.norm.weight", torch.ones(4))]
+        if missing_head
+        else [("lm_head.weight", torch.ones(8, 4))]
+    )
+    match = "requires an unquantized" if missing_head else "layer 45 weights missing"
+    with pytest.raises(ValueError, match=match):
+        glm_mtp_head_loader.load_weights(weights)
 
 
 def test_glm5next_mtp_preserves_position_zero_embedding() -> None:
@@ -1206,7 +1278,12 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     assert captured_caps["kda_metadata_validation"] == "trusted"
 
 
-def test_b12x_kda_binds_live_invocations_and_shares_metadata(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "speculative,uniform", [(False, False), (True, False), (True, True)]
+)
+def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
+    monkeypatch, speculative: bool, uniform: bool
+) -> None:
     calls: dict[str, list] = {"bind": [], "run": []}
 
     class FakeApi:
@@ -1252,53 +1329,60 @@ def test_b12x_kda_binds_live_invocations_and_shares_metadata(monkeypatch) -> Non
         return layer
 
     layers = [make_layer(), make_layer()]
-    metadata = object()
     mixed_qkv = torch.arange(6, dtype=torch.float32).view(2, 3)
     raw_g = torch.ones(2, 1, 1)
     raw_beta = torch.ones(2, 1)
     z = torch.ones(2, 1, 1)
     outputs = [torch.empty(2, 1, 1), torch.empty(2, 1, 1)]
-    state_indices = torch.tensor([[3], [4]], dtype=torch.int32)
+    state_indices = [
+        torch.tensor([[3], [4]], dtype=torch.int32),
+        torch.tensor([[13], [14]], dtype=torch.int32),
+    ]
     query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+    accepted = torch.tensor([2, 1], dtype=torch.int32) if speculative else None
 
-    for layer, output in zip(layers, outputs):
+    for layer, output, indices in zip(layers, outputs, state_indices):
         layer._run_b12x_kda_decode_post_conv(
-            metadata=metadata,
+            metadata=SimpleNamespace(is_uniform_spec_decode=uniform),
             mixed_qkv=mixed_qkv,
             raw_g=raw_g,
             raw_beta=raw_beta,
             z=z,
             output=output,
-            state_indices=state_indices,
-            query_start_loc=query_start_loc,
-            num_accepted_tokens=None,
+            state_indices=indices,
+            query_start_loc=query_start_loc.clone() if uniform else query_start_loc[:],
+            num_accepted_tokens=accepted[:] if accepted is not None else None,
             num_requests=2,
         )
 
     assert len(calls["bind"]) == 2
     assert len(calls["run"]) == 2
-    for binding, output in zip(calls["bind"], outputs):
+    for binding, output, indices in zip(calls["bind"], outputs, state_indices):
         assert binding.mixed_qkv is mixed_qkv
         assert binding.raw_g is raw_g
         assert binding.raw_beta is raw_beta
         assert binding.z is z
         assert binding.output is output
+        assert binding.state_indices.data_ptr() == indices.data_ptr()
     for (run_binding, _), bind_binding in zip(calls["run"], calls["bind"]):
         assert run_binding is bind_binding
     for name in (
         "query_start_loc",
         "num_accepted_tokens",
-        "state_indices",
         "num_seqs",
         "num_tokens",
     ):
         assert getattr(calls["bind"][0], name) is getattr(calls["bind"][1], name)
     assert torch.equal(
         layers[0]._b12x_kda_num_accepted_tokens,
-        torch.ones(2, dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32)
+        if speculative
+        else torch.ones(2, dtype=torch.int32),
     )
     assert layers[0]._b12x_kda_num_seqs.item() == 2
     assert layers[0]._b12x_kda_num_tokens.item() == 2
+    assert layers[1]._b12x_kda_num_seqs.item() == 0
+    assert layers[1]._b12x_kda_num_tokens.item() == 0
 
 
 @pytest.mark.parametrize("is_mtp_layer", [False, True])

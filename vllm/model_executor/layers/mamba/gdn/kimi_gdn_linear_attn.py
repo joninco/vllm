@@ -989,8 +989,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         """Execute B12X KDA after the convolution projection.
 
         Args:
-            metadata: Forward-context metadata used to share runtime-owned
-                packed metadata tensors across compatible layers.
+            metadata: Describes whether packed query boundaries are uniform.
             mixed_qkv: Live packed query, key, and value projection.
             raw_g: Live unactivated forget gate.
             raw_beta: Live unactivated update gate.
@@ -1030,17 +1029,16 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         cache = forward_context.additional_kwargs.setdefault(
             "b12x_kda_metadata_tensors", {}
         )
+        # Uniform builders own separate buffers with identical fixed boundaries.
         cache_key = (
-            id(metadata),
+            None if metadata.is_uniform_spec_decode else query_start_loc.data_ptr(),
+            num_accepted_tokens.data_ptr() if num_accepted_tokens is not None else None,
             num_tokens,
             num_requests,
-            state_columns,
-            plan.caps.max_state_slots,
         )
         bound_metadata = cache.get(cache_key)
         if bound_metadata is None:
             query_start_loc = query_start_loc[: num_requests + 1]
-            state_indices = state_indices[:num_requests, :state_columns]
             if num_accepted_tokens is None:
                 accepted_tokens = self._b12x_kda_num_accepted_tokens[:num_requests]
                 accepted_tokens.fill_(1)
@@ -1053,7 +1051,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             bound_metadata = (
                 query_start_loc,
                 accepted_tokens,
-                state_indices,
                 self._b12x_kda_num_seqs,
                 self._b12x_kda_num_tokens,
             )
@@ -1061,7 +1058,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         (
             query_start_loc,
             accepted_tokens,
-            state_indices,
             num_seqs,
             num_tokens_tensor,
         ) = bound_metadata
@@ -1079,7 +1075,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             recurrent_state=self.kv_cache[1],
             query_start_loc=query_start_loc,
             num_accepted_tokens=accepted_tokens,
-            state_indices=state_indices,
+            state_indices=state_indices[:num_requests, :state_columns],
             num_seqs=num_seqs,
             num_tokens=num_tokens_tensor,
             output=output,
