@@ -38,7 +38,7 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         ) and hasattr(draft_model.model, "restore_qsa_interval_starts")
         self.prefill_outputs_are_compact = hasattr(
             draft_model.model, "set_prefill_output_indices"
-        )
+        ) and getattr(draft_model.model, "supports_mtp_prefill_compaction", True)
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:

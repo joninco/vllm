@@ -85,8 +85,10 @@ def get_aligned_state_indices_multi_group_kernel(
         mask=(
             valid_group[:, None, None]
             & valid_row[None, :, None]
+            & (seq_lens[None, :, None] > 0)
             & valid_state_slot[None, None, :]
         ),
+        other=-1,
     )
     tl.store(
         state_indices_ptr

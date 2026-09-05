@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -244,6 +245,42 @@ def test_reinterpret_u64_as_i64_preserves_pointer_bits():
         ptr_tensor[idx] = _reinterpret_u64_as_i64(ptr)
 
     assert ptr_tensor.numpy().view(np.uint64).tolist() == ptrs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_aligned_state_indices_graph_replay_masks_padding_and_refreshes_blocks():
+    tables = [
+        torch.arange(16, dtype=torch.int32, device="cuda").view(4, 4) + group * 100
+        for group in range(2)
+    ]
+    indices = torch.empty((2, 4, 1), dtype=torch.int32, device="cuda")
+    ctx = SimpleNamespace(
+        is_initialized=True,
+        aligned_state_indices=indices,
+        block_table_ptrs=torch.tensor(
+            [_reinterpret_u64_as_i64(table.data_ptr()) for table in tables],
+            dtype=torch.int64,
+            device="cuda",
+        ),
+        block_table_stride_req=4,
+        block_size=16,
+        num_groups=2,
+    )
+    seq_lens = torch.tensor([16, 17, 0, 0], dtype=torch.int32, device="cuda")
+
+    def compute():
+        MambaSpecDecodeGPUContext.compute_aligned_state_indices(ctx, seq_lens, 4)
+
+    compute()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compute()
+    graph.replay()
+    assert indices[:, :, 0].tolist() == [[0, 5, -1, -1], [100, 105, -1, -1]]
+
+    seq_lens.copy_(torch.tensor([17, 0, 33, 0], dtype=torch.int32, device="cuda"))
+    graph.replay()
+    assert indices[:, :, 0].tolist() == [[1, -1, 10, -1], [101, -1, 110, -1]]
 
 
 def test_gpu_context_reinterprets_high_data_ptrs_for_int64_metadata():

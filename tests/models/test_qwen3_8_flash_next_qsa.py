@@ -387,6 +387,51 @@ def test_qsa_prefill_context_capacities_cover_the_configured_limit() -> None:
     )
 
 
+def test_qsa_warmup_runs_every_context_with_only_padded_requests(monkeypatch) -> None:
+    caps = SimpleNamespace(
+        device=torch.device("cpu"),
+        q_heads=2,
+        kv_heads=1,
+        head_dim=16,
+        index_heads=2,
+        index_head_dim=8,
+        position_axes=3,
+        max_batch=2,
+        main_page_size=16,
+        selection_width=8,
+        kv_dtype=torch.bfloat16,
+    )
+    contexts = tuple(
+        SimpleNamespace(
+            max_seq_len=capacity,
+            binding=SimpleNamespace(plan=SimpleNamespace(caps=caps)),
+        )
+        for capacity in (32, 64)
+    )
+    layer = SimpleNamespace(
+        _qsa_prefill_bindings=contexts, max_tokens=10, max_speculative_tokens=2
+    )
+    calls = []
+
+    def run(binding, **inputs):
+        calls.append(binding)
+        assert inputs["query"].shape == (8, 2, 16)
+        assert inputs["index_query"].shape == (8, 2, 8)
+        assert inputs["raw_index_key"].shape == (8, 8)
+        assert inputs["rope_positions"].shape == (8, 3)
+        assert (inputs["request_ids"] == -1).all()
+        assert (inputs["query_positions"] == -1).all()
+        assert not inputs["sequence_lengths"].any()
+        assert not inputs["query_start_loc"].any()
+
+    monkeypatch.setattr(qsa_module, "get_b12x_qsa", lambda: SimpleNamespace(run=run))
+    unit = qsa_module._B12xQSAWarmup().get_b12x_warmup_unit(
+        layer, (1, 8), torch.bfloat16
+    )
+    unit.compile()
+    assert calls == [context.binding for context in contexts]
+
+
 def test_qsa_selects_the_smallest_sufficient_prefill_context_plan() -> None:
     owner = Qwen3_8FlashNextQSAAttention.__new__(Qwen3_8FlashNextQSAAttention)
     owner.max_decode_rows = 6

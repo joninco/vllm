@@ -11,6 +11,7 @@ from typing import Any, ClassVar, cast
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -34,7 +35,9 @@ from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
+    aux_stream,
     canonicalize_singleton_dim_strides,
+    current_stream,
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
@@ -161,8 +164,52 @@ class _B12xQSAWarmup:
             qsa = get_b12x_qsa()
             if qsa is None:
                 raise RuntimeError("b12x QSA disappeared before kernel warmup")
+            caps = live_contexts[-1].binding.plan.caps
+            device = caps.device
+            # Padded requests compile the transaction without touching live caches.
+            inputs = {
+                "query": torch.zeros(
+                    (prefill_rows, caps.q_heads, caps.head_dim),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "index_query": torch.zeros(
+                    (prefill_rows, caps.index_heads, caps.index_head_dim),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "raw_index_key": torch.zeros(
+                    (prefill_rows, caps.index_head_dim),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "request_ids": torch.full(
+                    (prefill_rows,), -1, dtype=torch.int32, device=device
+                ),
+                "query_positions": torch.full(
+                    (prefill_rows,), -1, dtype=torch.int64, device=device
+                ),
+                "rope_positions": torch.full(
+                    (prefill_rows, caps.position_axes),
+                    -1,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                "sequence_lengths": torch.zeros(
+                    caps.max_batch, dtype=torch.int32, device=device
+                ),
+                "query_start_loc": torch.zeros(
+                    caps.max_batch + 1, dtype=torch.int32, device=device
+                ),
+                "num_accepted_tokens": torch.ones(
+                    caps.max_batch, dtype=torch.int32, device=device
+                ),
+                "is_prefilling": torch.zeros(
+                    caps.max_batch, dtype=torch.bool, device=device
+                ),
+            }
             for context in live_contexts:
-                qsa.prewarm(context.binding, rows=prefill_rows)
+                qsa.run(context.binding, **inputs)
 
         return B12xWarmupUnit(
             name="QSA prefill",
@@ -764,6 +811,9 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
 
         self.config = config
         self.layer_id = int(layer_id)
+        self.overlap_input_projections = envs.VLLM_QWEN3_8_FLASH_NEXT_OVERLAP
+        if self.overlap_input_projections:
+            aux_stream()
         self.hidden_size = int(config.hidden_size)
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = int(config.num_attention_heads)
@@ -1588,9 +1638,19 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        if self.overlap_input_projections:
+            qkv, index_qk = torch.ops.vllm.qwen3_8_flash_next_qsa_input_projections(
+                hidden_states,
+                self.qkv_proj.output_size_per_partition,
+                self.indexer.index_qk_proj.output_size,
+                _encode_layer_name(self.layer_name),
+            )
+            index_query, raw_index_key = self.indexer.split_projection(index_qk)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         query, key, value, gate = self._project_qkv_gate(qkv, positions)
-        index_query, raw_index_key = self.indexer.project(hidden_states)
+        if not self.overlap_input_projections:
+            index_query, raw_index_key = self.indexer.project(hidden_states)
         num_tokens = int(hidden_states.shape[0])
         query = query.view(num_tokens, self.num_heads, self.head_dim)
         key = key.view(num_tokens, self.num_kv_heads, self.head_dim)
@@ -1622,6 +1682,50 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         gated = output.flatten(-2) * torch.sigmoid(gate)
         projected, _ = self.o_proj(gated)
         return projected
+
+
+def _qsa_input_projections(
+    hidden_states: torch.Tensor,
+    qkv_size: int,
+    index_size: int,
+    layer_name: LayerNameType,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    if hidden_states.shape[0] > 16 or not torch.cuda.is_current_stream_capturing():
+        qkv, _ = layer.qkv_proj(hidden_states)
+        index_qk, _ = layer.indexer.index_qk_proj(hidden_states)
+        return qkv, index_qk
+
+    stream = aux_stream()
+    assert stream is not None
+    main_stream = current_stream()
+    stream.wait_stream(main_stream)
+    hidden_states.record_stream(stream)
+    with torch.cuda.stream(stream):
+        index_qk, _ = layer.indexer.index_qk_proj(hidden_states)
+    qkv, _ = layer.qkv_proj(hidden_states)
+    main_stream.wait_stream(stream)
+    index_qk.record_stream(main_stream)
+    return qkv, index_qk
+
+
+def _qsa_input_projections_fake(
+    hidden_states: torch.Tensor,
+    qkv_size: int,
+    index_size: int,
+    layer_name: LayerNameType,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        hidden_states.new_empty((*hidden_states.shape[:-1], qkv_size)),
+        hidden_states.new_empty((*hidden_states.shape[:-1], index_size)),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen3_8_flash_next_qsa_input_projections",
+    op_func=_qsa_input_projections,
+    fake_impl=_qsa_input_projections_fake,
+)
 
 
 def qwen3_8_flash_next_qsa_with_output(

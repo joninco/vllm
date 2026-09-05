@@ -193,6 +193,12 @@ if TYPE_CHECKING:
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
+    VLLM_MXFP8_LM_HEAD: bool = False
+    VLLM_LM_HEAD_A16: bool = False
+    VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = False
+    VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = False
+    VLLM_MTP_NVFP4_LM_HEAD: bool = False
+    VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
@@ -1645,6 +1651,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MXFP8_ACTIVATION_MODE": env_with_choices(
         "VLLM_B12X_MXFP8_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
+    ),
+    # Quantize unquantized ParallelLMHead shards to MXFP8 during weight loading.
+    "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "0"))),
+    # Preserve BF16 activations in runtime-quantized NVFP4/MXFP8 LM heads.
+    "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "0"))),
+    "VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT", "0"))
+    ),
+    "VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH", "0"))
+    ),
+    "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "0"))
+    ),
+    # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
+    "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "0"))
     ),
     # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
     # query replication plus the per-rank LSE combine and is opt-in while the
