@@ -329,6 +329,75 @@ def test_b12x_glm_dsa_binds_nvfp4_fp8_rope_record() -> None:
         impl.bind_kv_cache(torch.empty((2, 64, 432), dtype=torch.uint8))
 
 
+@pytest.mark.parametrize(
+    ("model_type", "kv_cache_dtype", "record_bytes"),
+    [
+        ("glm_moe_dsa", "fp8_ds_mla", 656),
+        ("deepseek_v32", "fp8_ds_mla", 656),
+        ("glm5_next_text", "fp8_ds_mla", 528),
+        ("glm_moe_dsa", "nvfp4_ds_mla", 368),
+        ("glm5_next_text", "nvfp4_ds_mla", 304),
+    ],
+)
+def test_b12x_sparse_mla_constructor_uses_planned_cache_width(
+    monkeypatch, model_type: str, kv_cache_dtype: str, record_bytes: int
+) -> None:
+    sparse_mla = pytest.importorskip("b12x.attention.sparse_mla")
+    is_glm_next = model_type == "glm5_next_text"
+    config = _glm5_next_config()
+    hf_config = config.model_config.hf_text_config
+    hf_config.model_type = model_type
+    hf_config.qk_nope_head_dim = 256 if is_glm_next else 192
+    hf_config.qk_rope_head_dim = 0 if is_glm_next else 64
+    config.cache_config.block_size = 64
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=2)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.attention.sparse_mla_attention."
+        "get_tensor_model_parallel_world_size",
+        lambda: 8,
+    )
+    monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: sparse_mla)
+    monkeypatch.setattr(
+        b12x_mla_sparse, "is_workspace_manager_initialized", lambda: False
+    )
+    monkeypatch.setattr(sparse_mla, "is_supported", lambda: True)
+    # Resolve the real cache contract without compiling GPU kernels.
+    monkeypatch.setattr(
+        sparse_mla,
+        "plan",
+        lambda caps: SimpleNamespace(caps=caps, layout=SimpleNamespace(nbytes=256)),
+    )
+    topk_width = hf_config.index_topk + (
+        hf_config.index_kpool - 1 if is_glm_next else 0
+    )
+    with set_current_vllm_config(config):
+        impl = B12xMLASparseImpl(
+            num_heads=8,
+            head_size=512 + hf_config.qk_rope_head_dim,
+            scale=256**-0.5,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype=kv_cache_dtype,
+            logits_soft_cap=None,
+            attn_type="decoder",
+            kv_sharing_target_layer_name=None,
+            q_lora_rank=2048,
+            kv_lora_rank=512,
+            qk_nope_head_dim=hf_config.qk_nope_head_dim,
+            qk_rope_head_dim=hf_config.qk_rope_head_dim,
+            qk_head_dim=256,
+            v_head_dim=256,
+            kv_b_proj=None,
+            topk_indices_buffer=torch.empty((16, topk_width), dtype=torch.int32),
+        )
+
+    assert impl._cache_record_bytes == record_bytes
+    assert impl._decode_plan.caps.cache_record_bytes == record_bytes
+    assert impl._extend_plan.caps.cache_record_bytes == record_bytes
+
+
 def test_b12x_nvfp4_run_options_match_each_glm_record_abi() -> None:
     assert b12x_mla_sparse._nvfp4_run_options(is_glm_next=False) == {
         "scale_format": 2,
@@ -932,6 +1001,7 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
     class FakeCaps(SimpleNamespace):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
+            self.cache_record_bytes = 528
             self.layout = SimpleNamespace(nbytes=256)
 
         def shapes_and_dtypes(self):
@@ -943,7 +1013,11 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
         @staticmethod
         def plan(caps):
             planned.append(caps)
-            return caps
+            return SimpleNamespace(
+                caps=caps,
+                layout=caps.layout,
+                shapes_and_dtypes=caps.shapes_and_dtypes,
+            )
 
     impl = object.__new__(B12xMLASparseImpl)
     impl._is_glm_next = True

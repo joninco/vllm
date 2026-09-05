@@ -154,7 +154,21 @@ def test_mla_preallocates_absorbed_weights_before_dequantization(
     assert "b12x_warmup_provider" not in layer._modules
 
 
-def test_b12x_dsa_indexer_owns_prefill_width_cap(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("max_model_len", "page_table_width"),
+    [
+        (64, 2),
+        (129, 4),
+        (4096, 64),
+        (999936, 15624),
+        (999937, 15626),
+        (1000000, 15626),
+        (1000001, 15626),
+    ],
+)
+def test_b12x_dsa_indexer_owns_prefill_width_cap(
+    monkeypatch, max_model_len: int, page_table_width: int
+) -> None:
     module = SimpleNamespace(
         Caps=lambda **kwargs: SimpleNamespace(**kwargs),
         plan=lambda caps: SimpleNamespace(caps=caps),
@@ -176,8 +190,8 @@ def test_b12x_dsa_indexer_owns_prefill_width_cap(monkeypatch) -> None:
             scale_fmt="ue8m0",
             topk_tokens=4,
             head_dim=128,
-            max_model_len=4096,
-            max_total_seq_len=4096,
+            max_model_len=max_model_len,
+            max_total_seq_len=max_model_len,
             topk_indices_buffer=torch.empty((8, 4), dtype=torch.int32),
             skip_k_cache_insert=True,
             num_q_heads=16,
@@ -186,7 +200,11 @@ def test_b12x_dsa_indexer_owns_prefill_width_cap(monkeypatch) -> None:
 
     torch.testing.assert_close(
         indexer.active_width_cap,
-        torch.tensor([4096], dtype=torch.int32),
+        torch.tensor([max_model_len], dtype=torch.int32),
+    )
+    assert all(
+        plan.caps.max_page_table_width == page_table_width
+        for plan in (*indexer._decode_plans.values(), *indexer._prefill_plans.values())
     )
     assert all(
         plan.caps.output_index_space == "physical"

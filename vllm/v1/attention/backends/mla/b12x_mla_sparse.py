@@ -1164,12 +1164,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 f"got kv_cache_dtype={kv_cache_dtype!r}."
             )
         self._uses_nvfp4_cache = uses_nvfp4_cache
-        if self._is_glm_next and self._uses_nvfp4_cache:
-            self._cache_record_bytes = _GLM_NEXT_NVFP4_CACHE_RECORD_BYTES
-        elif self._uses_glm_dsa_nvfp4_cache:
-            self._cache_record_bytes = _GLM_DSA_NVFP4_CACHE_RECORD_BYTES
-        else:
-            self._cache_record_bytes = _GLM_NEXT_CACHE_RECORD_BYTES
 
         module = get_b12x_sparse_mla()
         if module is None:
@@ -1283,11 +1277,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 caps_kwargs["model_type"] = self._model_type
             if self._uses_nvfp4_cache:
                 caps_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
-            caps_kwargs["cache_record_bytes"] = self._cache_record_bytes
             return self._module.plan(self._module.Caps(**caps_kwargs))
 
         decode_plan = make_plan("decode")
         extend_plan = make_plan("extend")
+        self._cache_record_bytes = int(decode_plan.caps.cache_record_bytes)
         self._decode_plan = decode_plan
         self._extend_plan = extend_plan
         self._ckv_extend_plan = (
