@@ -385,19 +385,35 @@ def test_glm5next_fp8_dequantizer_yields_to_mxfp8_projection() -> None:
     assert not pending
 
 
-def test_glm5next_dequantizes_mxfp8_selector_head_projection() -> None:
+@pytest.mark.parametrize("scale_first", [False, True])
+@pytest.mark.parametrize("reuse_buffer", [False, True])
+@pytest.mark.parametrize("quantization", ["mxfp8", "block_fp8"])
+def test_glm5next_dequantizes_buffered_attention_projections(
+    scale_first: bool, reuse_buffer: bool, quantization: str
+) -> None:
+    """Paired tensors must survive a streaming loader reusing its buffers."""
     layer_prefix = "layers.3.self_attn"
-    parameter_name = f"{layer_prefix}.indexer.weights_proj.weight"
+    if quantization == "mxfp8":
+        projection = "indexer.weights_proj"
+        target = projection
+        scale_name = "weight_scale"
+        scale = torch.full((1, 1), 128, dtype=torch.uint8)
+    else:
+        projection = "q_a_proj"
+        target = "fused_qkv_a_proj"
+        scale_name = "weight_scale_inv"
+        scale = torch.full((1, 1), 2.0, dtype=torch.float32)
+    parameter_name = f"{layer_prefix}.{target}.weight"
     param = torch.nn.Parameter(torch.empty((1, 32), dtype=torch.bfloat16))
 
-    def weight_loader(param, loaded_weight) -> None:
+    def weight_loader(param, loaded_weight, shard_id=None) -> None:
         param.data.copy_(loaded_weight)
 
     param.weight_loader = weight_loader
     weight = (
         torch.arange(32, dtype=torch.float32).reshape(1, 32).to(torch.float8_e4m3fn)
     )
-    scale = torch.full((1, 1), 127, dtype=torch.uint8)
+    expected = weight.to(torch.bfloat16) * 2
 
     class FakeModel(torch.nn.Module):
         config = SimpleNamespace(
@@ -413,16 +429,23 @@ def test_glm5next_dequantizes_mxfp8_selector_head_projection() -> None:
         def named_parameters(self):
             return iter([(parameter_name, param)])
 
-    loaded_params = Glm5NextModel.load_weights(
-        FakeModel(),
-        [
-            (f"{layer_prefix}.indexer.weights_proj.weight", weight),
-            (f"{layer_prefix}.indexer.weights_proj.weight_scale", scale),
-        ],
-    )
+    pairs = [
+        (f"{layer_prefix}.{projection}.weight", weight),
+        (f"{layer_prefix}.{projection}.{scale_name}", scale),
+    ]
+    if scale_first:
+        pairs.reverse()
+
+    def weights():
+        for name, tensor in pairs:
+            yield name, tensor
+            if reuse_buffer:
+                tensor.zero_()
+
+    loaded_params = Glm5NextModel.load_weights(FakeModel(), weights())
 
     assert loaded_params == {parameter_name}
-    torch.testing.assert_close(param, weight.to(torch.bfloat16))
+    torch.testing.assert_close(param, expected)
 
 
 @pytest.mark.parametrize(
@@ -1041,7 +1064,10 @@ def test_glm5next_b12x_kda_prefill_matches_the_triton_chunk_path() -> None:
     assert torch.equal(got_pool[untouched], pool[untouched])
 
 
-def test_glm5next_b12x_prefill_requests_a_checkpoint_block() -> None:
+@pytest.mark.parametrize("request_boundaries", [False, True])
+def test_glm5next_b12x_prefill_requests_a_checkpoint_block(
+    request_boundaries: bool,
+) -> None:
     layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
     torch.nn.Module.__init__(layer)
     spec = SimpleNamespace(num_prefill_checkpoint_blocks=0)
@@ -1064,8 +1090,12 @@ def test_glm5next_b12x_prefill_requests_a_checkpoint_block() -> None:
                 "replace",
                 lambda base, **kwargs: SimpleNamespace(**kwargs),
             )
-            resolved = layer.get_kv_cache_spec(None)
-        assert resolved.num_prefill_checkpoint_blocks == expected, backend
+            resolved = layer.get_kv_cache_spec(
+                SimpleNamespace(use_request_boundary_checkpoints=request_boundaries)
+            )
+        assert resolved.num_prefill_checkpoint_blocks == (
+            0 if request_boundaries else expected
+        ), backend
 
 
 def test_glm5next_alone_opts_into_b12x_kda_decode() -> None:

@@ -1560,7 +1560,8 @@ def _try_load_fp8_attn_proj(
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
-    entry["weight" if is_weight else "scale"] = tensor
+    # Streaming loaders can recycle the source before the paired tensor arrives.
+    entry["weight" if is_weight else "scale"] = tensor.clone()
     if "weight" not in entry or "scale" not in entry:
         return True
 
@@ -1611,7 +1612,8 @@ def _try_load_mxfp8_bf16_attn_proj(
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault("indexer_weights", {})
-    entry["weight" if is_weight else "scale"] = tensor
+    # Streaming loaders can recycle the source before the paired tensor arrives.
+    entry["weight" if is_weight else "scale"] = tensor.clone()
     if "weight" not in entry or "scale" not in entry:
         return True
 

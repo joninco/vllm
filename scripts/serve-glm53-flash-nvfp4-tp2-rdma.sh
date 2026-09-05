@@ -454,6 +454,43 @@ for path in "${remote_files[@]}"; do
   fi
 done
 
+model_metadata_script=$(cat <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+digests = {}
+for name in ("config.json", "model.safetensors.index.json"):
+    path = root / name
+    if path.is_file():
+        canonical = json.dumps(json.loads(path.read_text()), sort_keys=True)
+        digests[name] = hashlib.sha256(canonical.encode()).hexdigest()
+    else:
+        digests[name] = None
+print(json.dumps(digests, sort_keys=True))
+PY
+)
+
+check_model_metadata() {
+  local model_dir=$1 local_metadata worker_metadata remote_command
+  local_metadata=$("${PYTHON_BIN}" -c "${model_metadata_script}" "${model_dir}")
+  printf -v remote_command '%q -c %q %q' \
+    "${PYTHON_BIN}" "${model_metadata_script}" "${model_dir}"
+  worker_metadata=$(ssh "${ssh_opts[@]}" "${WORKER_IP}" "${remote_command}")
+  if [[ "${local_metadata}" != "${worker_metadata}" ]]; then
+    echo "Model configuration or weight index differs on ${WORKER_IP}: ${model_dir}" >&2
+    echo "Rerun with --sync-model so both TP ranks use matching model metadata." >&2
+    exit 1
+  fi
+}
+
+check_model_metadata "${MODEL_PATH}"
+if ((dflash2_enabled)); then
+  check_model_metadata "${DFLASH2_MODEL_PATH}"
+fi
+
 runtime_digest() {
   LC_ALL=C find \
     "${VLLM_ROOT}/vllm" \
