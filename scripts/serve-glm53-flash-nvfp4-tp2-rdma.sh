@@ -45,6 +45,8 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-10G}"
+VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE="${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE:-512}"
+VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE="${VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE:-512}"
 case "${SPECULATOR}" in
   dflash2) default_num_speculative_tokens=7 ;;
   *) default_num_speculative_tokens=5 ;;
@@ -58,6 +60,9 @@ MOE_BACKEND="${MOE_BACKEND:-b12x}"
 LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 B12X_POLICY_MODE="${B12X_POLICY_MODE:-auto}"
+ALLREDUCE="${ALLREDUCE:-rocenante}"
+ROCE_ALLREDUCE_MAX_SIZE="${ROCE_ALLREDUCE_MAX_SIZE:-2MB}"
+ROCE_ALLGATHER_MAX_SIZE="${ROCE_ALLGATHER_MAX_SIZE:-16MB}"
 NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-}"
 TORCH_PROFILE_RECORD_SHAPES="${TORCH_PROFILE_RECORD_SHAPES:-0}"
@@ -93,7 +98,9 @@ Usage: $0 [launcher options] [-- vLLM options]
 Launch GLM-5.3-Flash with MTP or DFlash2 and TP=2 across tachyon and luxon.
 The Spark cluster launcher starts one native vLLM rank per node, uses the
 management LAN for bootstrap, and combines the two RoCE rails on their direct
-ConnectX-7 link in NCCL. No external scheduler is used.
+ConnectX-7 link. ALLREDUCE=rocenante (default) routes supported TP collectives
+through b12x one-shot RoCE; ALLREDUCE=nccl keeps the existing NCCL path. No
+external scheduler is used.
 
 Launcher options:
   --sync-code   Mirror local vllm/ and b12x/ runtime packages to luxon.
@@ -122,7 +129,10 @@ tokens. DFLASH2_MODEL_PATH selects its local checkpoint.
 Environment overrides include MODEL_PATH, SPECULATOR, DFLASH2_MODEL_PATH,
 MAX_MODEL_LEN, MTP_MOE_BACKEND, KDA_PREFILL_BACKEND, ATTENTION_BACKEND,
 MOE_BACKEND, LINEAR_BACKEND, KV_CACHE_MEMORY_BYTES, HEAD_IP, WORKER_IP,
-ETH_IF, IB_IF, IMAGE_NAME, CONTAINER_MEMORY_GB, and NUM_SPECULATIVE_TOKENS.
+ETH_IF, IB_IF, ALLREDUCE, ROCE_ALLREDUCE_MAX_SIZE,
+ROCE_ALLGATHER_MAX_SIZE, VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE,
+VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE, IMAGE_NAME, CONTAINER_MEMORY_GB, and
+NUM_SPECULATIVE_TOKENS.
 EOF
 }
 
@@ -217,6 +227,14 @@ case "${SPECULATOR}" in
   mtp|dflash2) ;;
   *)
     echo "SPECULATOR must be mtp or dflash2; got '${SPECULATOR}'" >&2
+    exit 2
+    ;;
+esac
+
+case "${ALLREDUCE}" in
+  rocenante|nccl) ;;
+  *)
+    echo "ALLREDUCE must be rocenante or nccl; got '${ALLREDUCE}'" >&2
     exit 2
     ;;
 esac
@@ -507,6 +525,8 @@ cluster_args=(
   --env "TRANSFORMERS_OFFLINE=1"
   --env "VLLM_PLUGINS="
   --env "VLLM_SSM_CONV_STATE_LAYOUT=DS"
+  --env "VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE=${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE}"
+  --env "VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE=${VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE}"
   --env "VLLM_USE_AOT_COMPILE=1"
   --env "VLLM_USE_MEGA_AOT_ARTIFACT=1"
   --env "VLLM_USE_V2_MODEL_RUNNER=1"
@@ -522,6 +542,19 @@ cluster_args=(
   --env "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS}"
   --env "NCCL_IB_SUBNET_AWARE_ROUTING=1"
 )
+
+allreduce_args=()
+if [[ "${ALLREDUCE}" == rocenante ]]; then
+  cluster_args+=(
+    --env "VLLM_ENABLE_ROCE_ALLREDUCE=1"
+    --env "VLLM_ROCE_ALLREDUCE_MAX_SIZE=${ROCE_ALLREDUCE_MAX_SIZE}"
+    --env "VLLM_ROCE_ALLGATHER_MAX_SIZE=${ROCE_ALLGATHER_MAX_SIZE}"
+    --env "B12X_ROCE_CACHE_DIR=/root/.cache/vllm/b12x-roce"
+  )
+else
+  cluster_args+=(--env "VLLM_ENABLE_ROCE_ALLREDUCE=0")
+  allreduce_args+=(--disable-custom-all-reduce)
+fi
 
 if ((check_only)); then
   exec "${CLUSTER_LAUNCHER}" "${cluster_args[@]}" --check-config
@@ -542,7 +575,7 @@ if ((NUM_SPECULATIVE_TOKENS > 0)); then
       ;;
     dflash2)
       speculative_config=$(printf \
-        '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}' \
+        '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard","draft_load_config":{"load_format":"instanttensor","model_loader_extra_config":{"instanttensor_copy":true,"instanttensor_distributed":false}}}' \
         "${DFLASH2_MODEL_PATH}" \
         "${NUM_SPECULATIVE_TOKENS}")
       ;;
@@ -558,7 +591,7 @@ vllm_command=(
   --tensor-parallel-size 2
   --pipeline-parallel-size 1
   --decode-context-parallel-size 1
-  --disable-custom-all-reduce
+  "${allreduce_args[@]}"
   --mamba-cache-mode align
   --enable-prefix-caching
   --enable-chunked-prefill
@@ -566,7 +599,7 @@ vllm_command=(
   --kv-cache-dtype fp8
   --quantization modelopt_mixed
   --attention-backend "${ATTENTION_BACKEND}"
-  --block-size 256
+  --block-size "${VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE}"
   --moe-backend "${MOE_BACKEND}"
   --linear-backend "${LINEAR_BACKEND}"
   --no-enable-flashinfer-autotune
@@ -587,6 +620,7 @@ vllm_command=(
 vllm_command+=("${profiler_args[@]}")
 vllm_command+=("${vllm_args[@]}")
 
+echo "All-reduce: ${ALLREDUCE}"
 echo "Speculator: ${SPECULATOR} (${NUM_SPECULATIVE_TOKENS} draft tokens)"
 if ((dflash2_enabled)); then
   echo "DFlash2 draft: ${DFLASH2_MODEL_PATH}"
