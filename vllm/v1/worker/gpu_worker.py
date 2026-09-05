@@ -141,7 +141,6 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
-
 class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
     """An asynchronous output whose completion is followed by the RoCEnante check."""
 
@@ -930,6 +929,11 @@ class Worker(WorkerBase):
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
 
+    def wait_for_boundary_checkpoint_copies(self) -> None:
+        state = getattr(self.model_runner, "boundary_checkpoint_state", None)
+        if state is not None:
+            state.wait_for_copies()
+
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
@@ -1102,9 +1106,7 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self._b12x_roce_guarded(
-            self.model_runner.sample_tokens(grammar_output)
-        )
+        return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
         """The RoCEnante health check of the TP communicator, if one is active.

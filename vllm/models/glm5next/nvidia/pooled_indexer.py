@@ -192,10 +192,17 @@ class Glm5NextPooledIndexer(nn.Module):
             compress_ratio=_POOL_SIZE,
         )
 
+        speculative_config = vllm_config.speculative_config
+        num_speculative_tokens = (
+            speculative_config.num_speculative_tokens if speculative_config else 0
+        ) or 0
+        tail_capacity = (
+            math.ceil((_POOL_SIZE + num_speculative_tokens) / _POOL_SIZE) * _POOL_SIZE
+        )
         self.register_buffer(
             "_tail",
             torch.empty(
-                (self.max_seqs, 2, _POOL_SIZE, _INDEX_HEAD_DIM),
+                (self.max_seqs, 2, tail_capacity, _INDEX_HEAD_DIM),
                 dtype=torch.bfloat16,
                 device=device,
             ),
@@ -649,6 +656,9 @@ class Glm5NextPooledIndexer(nn.Module):
 
     def snapshot_speculative_interval_starts(self) -> None:
         self._tail_snapshot.copy_(self._tail)
+
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        return (self._tail,)
 
     def restore_speculative_interval_starts(self) -> None:
         self._tail.copy_(self._tail_snapshot)

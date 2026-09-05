@@ -162,6 +162,15 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             self.qsa_state_is_fresh_gpu[req_index].fill_(True)
             self.qsa_committed_num_accepted_tokens_gpu[req_index].fill_(1)
 
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.qsa_state_is_fresh_gpu,
+            self.qsa_committed_num_accepted_tokens_gpu,
+        )
+
+    def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
+        return self.qsa_committed_num_accepted_tokens_gpu
+
     def _prepare_qsa_state(
         self,
         input_batch: InputBatch,

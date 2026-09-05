@@ -444,6 +444,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             spec,
             num_prefill_checkpoint_blocks=int(
                 self.kda_prefill_backend in ("flashkda", "b12x")
+                and not vllm_config.use_request_boundary_checkpoints
             ),
         )
 

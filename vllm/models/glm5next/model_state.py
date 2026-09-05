@@ -125,7 +125,11 @@ class Glm5NextModelState(MambaHybridModelState):
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         prefix_length = int(new_req_data.num_computed_tokens)
-        if self.uses_pooled_selector and prefix_length % self.selector_pool_size != 0:
+        if (
+            self.uses_pooled_selector
+            and prefix_length % self.selector_pool_size != 0
+            and new_req_data.boundary_checkpoint is None
+        ):
             raise ValueError(
                 "GLM5Next pooled selector cannot resume a fresh request from "
                 f"num_computed_tokens={prefix_length}; the prefix length must be "
@@ -143,6 +147,15 @@ class Glm5NextModelState(MambaHybridModelState):
         if self.uses_pooled_selector:
             self.selector_state_is_fresh_gpu.fill_(True)
             self.selector_committed_num_accepted_tokens_gpu.fill_(1)
+
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.selector_state_is_fresh_gpu,
+            self.selector_committed_num_accepted_tokens_gpu,
+        )
+
+    def get_recurrent_checkpoint_acceptance(self) -> torch.Tensor:
+        return self.selector_committed_num_accepted_tokens_gpu
 
     def _prepare_selector_state(
         self,

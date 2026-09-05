@@ -717,6 +717,7 @@ class EngineCore:
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
+        self._wait_for_boundary_checkpoint_copies(model_output)
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -733,6 +734,12 @@ class EngineCore:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    def _wait_for_boundary_checkpoint_copies(
+        self, model_output: ModelRunnerOutput
+    ) -> None:
+        if model_output.boundary_checkpoint_tokens is not None:
+            self.model_executor.collective_rpc("wait_for_boundary_checkpoint_copies")
 
     def step_with_batch_queue(
         self,
@@ -824,6 +831,7 @@ class EngineCore:
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
+        self._wait_for_boundary_checkpoint_copies(model_output)
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output

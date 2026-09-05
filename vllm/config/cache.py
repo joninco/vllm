@@ -69,6 +69,7 @@ def _get_prefix_cache_retention_interval() -> int | None:
 
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
+RecurrentCheckpointPolicy = Literal["auto", "aligned", "request_boundaries"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
@@ -164,6 +165,13 @@ class CacheConfig:
     retain periodic checkpoints at the specified interval, which must be a
     multiple of the scheduler block size. ``None`` retains checkpoints densely.
     Applies only to sliding-window and Mamba cache groups."""
+    recurrent_checkpoint_policy: RecurrentCheckpointPolicy = "auto"
+    """Retention policy for reusable recurrent state. ``request_boundaries``
+    retains the completed prompt and committed response endpoint, disabling
+    intermediate reusable checkpoints. ``aligned`` preserves block-aligned
+    retention. ``auto`` selects request boundaries for supported configurations
+    and aligned retention otherwise. Temporary speculative rollback state is
+    independent of this policy."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
@@ -272,6 +280,7 @@ class CacheConfig:
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
+            "recurrent_checkpoint_policy",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "mamba_page_size_padded",

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
 else:
@@ -31,6 +32,7 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+    BoundaryCheckpoint = object
 
 
 @dataclass
@@ -48,6 +50,8 @@ class NewRequestData:
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+    boundary_checkpoint: BoundaryCheckpoint | None = None
+    boundary_checkpoint_blocks: tuple[tuple[int, ...], ...] | None = None
 
     @classmethod
     def from_request(
@@ -75,6 +79,8 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            boundary_checkpoint=request.boundary_checkpoint,
+            boundary_checkpoint_blocks=request.boundary_checkpoint_blocks,
         )
 
     @property
@@ -259,6 +265,8 @@ class SchedulerOutput:
     free_encoder_mm_hashes: list[str]
 
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
+    # This batch samples saved final hidden states without a target forward.
+    boundary_logits_only: bool = False
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

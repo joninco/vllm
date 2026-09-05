@@ -1089,8 +1089,21 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
     def snapshot_speculative_interval_starts(self) -> None:
         self._raw_interval_start_snapshot.copy_(self._raw_interval_start_positions)
 
+    def get_recurrent_checkpoint_tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self._raw_k_ring,
+            self._raw_logical_positions,
+            self._raw_rope_positions,
+            self._raw_interval_start_positions,
+        )
+
     def restore_speculative_interval_starts(self) -> None:
         self._raw_interval_start_positions.copy_(self._raw_interval_start_snapshot)
+
+    def set_recurrent_checkpoint_anchor(
+        self, slot: int, anchor: torch.Tensor | int
+    ) -> None:
+        self._raw_interval_start_positions[slot] = anchor
 
     def _project_qkv_gate(
         self,

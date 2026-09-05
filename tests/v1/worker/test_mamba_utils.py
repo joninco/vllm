@@ -901,6 +901,60 @@ def _run_gpu_postprocess(
     torch.accelerator.synchronize()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_boundary_checkpoint_copies_only_selected_committed_states(monkeypatch):
+    """Prompt/response copies respect request slots and speculative rollback."""
+    monkeypatch.setattr(
+        "vllm.v1.worker.mamba_utils.is_conv_state_dim_first", lambda: False
+    )
+    cfg = _TestConfig()
+    device = torch.device("cuda")
+    names = ["layer_0", "layer_1"]
+    config = _make_kv_cache_config(cfg, names)
+    conv_ref, temporal_ref, conv, temporal, _, context = _make_dual_states(
+        cfg, names, device
+    )
+    ctx = _make_gpu_ctx(cfg, config, device)
+
+    def t(values):
+        return torch.tensor(values, device=device, dtype=torch.int32)
+
+    tables = t([[1, 2, 3, 4, 5, 6], [14, 15, 16, 17, 18, 19]])
+    ctx.initialize_from_forward_context(config, context, _COPY_FUNCS, [tables])
+    destinations = torch.zeros((8, 2, 1), device=device, dtype=torch.int32)
+    destinations[3, :, 0] = t([20, 21])
+    destinations[1, :, 0] = t([22, 23])
+    idx = t([3, 1])
+    states = t([0, 1, 0, 0, 0, 0, 0, 0])
+    capture = t([[7, 9], [0, 23]])
+    bias = t([[0, 2], [0, 1]])
+
+    def copy():
+        ctx.checkpoint_request_boundaries(idx, states, capture, bias, destinations)
+
+    copy()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        copy()
+    graph.replay()
+    for layer in range(len(names)):
+        for dst, src, shift in ((20, 1, 0), (21, 1, 2), (23, 15, 1)):
+            torch.testing.assert_close(
+                conv[layer][dst, : cfg.conv_width - shift],
+                conv_ref[layer][src, shift:],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                temporal[layer][dst],
+                temporal_ref[layer][src + shift],
+                rtol=0,
+                atol=0,
+            )
+        torch.testing.assert_close(conv[layer][22], conv_ref[layer][22])
+        torch.testing.assert_close(temporal[layer][22], temporal_ref[layer][22])
+
+
 @pytest.mark.skipif(not torch.accelerator.is_available(), reason="accelerator required")
 class TestPostprocessMambaFusedKernel:
     """Tests for postprocess_mamba_fused_kernel comparing GPU vs CPU paths."""

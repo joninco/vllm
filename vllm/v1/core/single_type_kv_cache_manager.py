@@ -138,6 +138,16 @@ class SingleTypeKVCacheManager(ABC):
             and num_local_computed_tokens % self.block_size != 0
         )
 
+    def prepare_boundary_replay(self, request_id: str, num_tokens: int) -> None:
+        """Protect a full tail page whose last row will be replayed by MTP."""
+        assert num_tokens > 0 and num_tokens % self.block_size == 0
+        block_idx = num_tokens // self.block_size - 1
+        self._partial_hit_reqs[request_id] = (
+            block_idx,
+            self.req_to_blocks[request_id][block_idx],
+        )
+        self.num_cached_block[request_id] = block_idx
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -1720,6 +1730,11 @@ class MambaManager(SingleTypeKVCacheManager):
         retention_interval: int | None = None,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
+        if request.use_boundary_checkpoints:
+            # Keep transient running/rollback blocks private. Boundary bundles
+            # publish their own immutable state copies after GPU completion.
+            self.num_cached_block[request.request_id] = num_tokens // self.block_size
+            return
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":

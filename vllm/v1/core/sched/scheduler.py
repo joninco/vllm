@@ -380,6 +380,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
+            enable_boundary_checkpoints=vllm_config.use_request_boundary_checkpoints,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -538,6 +539,10 @@ class Scheduler(SchedulerInterface):
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
+        if request.use_boundary_checkpoints:
+            # Running-state migration still happens in the worker, but these
+            # requests do not publish intermediate block-aligned checkpoints.
+            return num_new_tokens
         # Split only during prefill: `request.num_tokens - 1` extends this to
         # resumed requests replaying their output tokens.
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
@@ -1208,6 +1213,7 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
+                boundary_logits_only = False
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -1218,6 +1224,12 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    boundary_logits_only = (
+                        request.boundary_checkpoint is not None
+                        and num_new_local_computed_tokens == request.num_tokens
+                    )
+                    if boundary_logits_only and num_scheduled_tokens:
+                        break
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -1357,6 +1369,8 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if boundary_logits_only:
+                        num_new_tokens = 1
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1611,6 +1625,12 @@ class Scheduler(SchedulerInterface):
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
 
+                if boundary_logits_only:
+                    token_budget = 0
+                    if micro_prefill_budget_remaining is not None:
+                        micro_prefill_budget_remaining = 0
+                    break
+
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
@@ -1817,6 +1837,13 @@ class Scheduler(SchedulerInterface):
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
+            boundary_logits_only=bool(
+                new_reqs_data
+                and new_reqs_data[0].boundary_checkpoint is not None
+                and new_reqs_data[0].prefill_token_ids is not None
+                and new_reqs_data[0].num_computed_tokens
+                == len(new_reqs_data[0].prefill_token_ids)
+            ),
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
@@ -2087,7 +2114,8 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            request.num_computed_tokens += num_scheduled_token
+            if not scheduler_output.boundary_logits_only:
+                request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
@@ -2688,6 +2716,17 @@ class Scheduler(SchedulerInterface):
                     )
 
             finish_reason = None
+            captures = model_runner_output.boundary_checkpoint_tokens
+            if captures is not None and not output_is_stale:
+                prompt_boundary, response_boundary = captures[req_index]
+                if prompt_boundary:
+                    self.kv_cache_manager.publish_boundary_checkpoint(
+                        request, prompt_boundary, is_response=False
+                    )
+                if stopped and response_boundary:
+                    self.kv_cache_manager.publish_boundary_checkpoint(
+                        request, response_boundary, is_response=True
+                    )
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.

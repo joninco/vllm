@@ -25,6 +25,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.boundary_checkpoint import BoundaryCheckpointCache
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
@@ -51,6 +52,39 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_full_boundary_hit_preserves_async_speculative_decode_token_count():
+    """Sampling saved logits must not advance the processed-token frontier."""
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_v2_model_runner=True,
+        async_scheduling=True,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+    )
+    manager = scheduler.kv_cache_manager
+    manager.boundary_checkpoints = BoundaryCheckpointCache(manager.block_pool)
+    producer, repeat = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["producer", "repeat"],
+    )
+    manager.get_computed_blocks(producer)
+    assert manager.allocate_slots(producer, 32) is not None
+    manager.publish_boundary_checkpoint(producer, 32, is_response=False)
+    manager.free(producer)
+    scheduler.add_request(repeat)
+
+    logits_step = scheduler.schedule()
+    assert logits_step.boundary_logits_only
+    assert logits_step.num_scheduled_tokens == {"repeat": 1}
+    assert repeat.num_computed_tokens == 32
+    assert repeat.num_output_placeholders == 1
+    decode_step = scheduler.schedule()
+    assert not decode_step.boundary_logits_only
+    assert decode_step.num_scheduled_tokens == {"repeat": 4}
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
