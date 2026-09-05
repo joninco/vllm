@@ -180,7 +180,8 @@ command=(
   --kv-cache-dtype fp8
   --quantization modelopt_mixed
   --block-size 16
-  --load-format fastsafetensors
+  --load-format safetensors
+  --safetensors-load-strategy lazy
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES}"
   --max-model-len "${MAX_MODEL_LEN}"
   --max-num-seqs "${MAX_NUM_SEQS}"

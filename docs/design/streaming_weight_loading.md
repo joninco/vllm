@@ -2,7 +2,9 @@
 
 Status: design, September 5, 2026. This document proposes an implementation;
 the new APIs, memory budget, and performance targets are not implemented.
-Implementation is paused while the launchers switch to fastsafetensors.
+Implementation is paused while the launchers switch to fastsafetensors, with
+lazy safetensors for the Qwen TP1 launcher because shard staging exhausted GB10
+memory in both pipelined and serial fastsafetensors trials.
 The InstantTensor copy/buffer overrides and oversized CPU fallback are removed;
 Qwen MTP now declares checkpoint prefixes to skip unrelated target shards.
 
