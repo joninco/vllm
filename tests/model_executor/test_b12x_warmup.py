@@ -271,7 +271,7 @@ def test_b12x_warmup_deduplicates_registered_and_completed_signatures(
     b12x_warmup(worker, [1, 2])
     b12x_warmup(worker, [1, 2, 3])
 
-    assert scans == 3
+    assert scans == 2
     assert calls == [
         ("first", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
         ("second", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),

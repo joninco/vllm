@@ -3,7 +3,7 @@
 """Warm b12x JIT kernels used by a loaded model."""
 
 from collections import Counter
-from collections.abc import Hashable, Iterable
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_WarmupSignature = tuple[tuple[int, ...], torch.dtype, frozenset[Hashable]]
+_WarmupSignature = tuple[tuple[int, ...], torch.dtype]
 
 
 def _collect_warmup_units(
@@ -83,6 +83,25 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         max_tokens=max_tokens,
         cudagraph_capture_sizes=serving_sizes,
     )
+    # Memory profiling resolves B12X kernels before sizing the KV cache. The
+    # regular pre-capture warmup later requests the same static capacities in
+    # the same worker. Repeating those launches after KV allocation can require
+    # cold-start scratch that was intentionally excluded from the repeatable
+    # serving peak. The model is fully loaded before either call, so its exact
+    # capacity set and output dtype identify the worker-local request even when
+    # a provider resolves internal kernel state during the first warmup.
+    signature: _WarmupSignature = (token_counts, output_dtype)
+    completed: set[_WarmupSignature] = getattr(
+        worker, "_b12x_completed_warmup_signatures", set()
+    )
+    if signature in completed:
+        logger.info_once(
+            "Skipping repeated B12X warmup for capacities=%s and dtype=%s.",
+            token_counts,
+            output_dtype,
+        )
+        return
+
     units = tuple(
         _collect_warmup_units(
             worker.get_model(),
@@ -91,27 +110,6 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         )
     )
     if not units:
-        return
-
-    # Memory profiling resolves B12X kernels before sizing the KV cache. The
-    # regular pre-capture warmup later requests the same static capacities in
-    # the same worker. Repeating those launches after KV allocation can require
-    # cold-start scratch that was intentionally excluded from the repeatable
-    # serving peak. Include the exact capacity set, dtype, and provider keys so
-    # a genuinely different warmup request still executes.
-    signature: _WarmupSignature = (
-        token_counts,
-        output_dtype,
-        frozenset(unit.key for unit in units),
-    )
-    completed: set[_WarmupSignature] = getattr(
-        worker, "_b12x_completed_warmup_signatures", set()
-    )
-    if signature in completed:
-        logger.info_once(
-            "Skipping repeated B12X warmup for %d resolved kernel signature(s).",
-            len(units),
-        )
         return
 
     for name, count in _compile_warmup_units(units).items():
