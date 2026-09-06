@@ -3,7 +3,7 @@
 """Warm b12x JIT kernels used by a loaded model."""
 
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
+
+_WarmupSignature = tuple[tuple[int, ...], torch.dtype, frozenset[Hashable]]
 
 
 def _collect_warmup_units(
@@ -81,14 +83,42 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         max_tokens=max_tokens,
         cudagraph_capture_sizes=serving_sizes,
     )
-    units = _collect_warmup_units(
-        worker.get_model(),
+    units = tuple(
+        _collect_warmup_units(
+            worker.get_model(),
+            token_counts,
+            output_dtype,
+        )
+    )
+    if not units:
+        return
+
+    # Memory profiling resolves B12X kernels before sizing the KV cache. The
+    # regular pre-capture warmup later requests the same static capacities in
+    # the same worker. Repeating those launches after KV allocation can require
+    # cold-start scratch that was intentionally excluded from the repeatable
+    # serving peak. Include the exact capacity set, dtype, and provider keys so
+    # a genuinely different warmup request still executes.
+    signature: _WarmupSignature = (
         token_counts,
         output_dtype,
+        frozenset(unit.key for unit in units),
     )
+    completed: set[_WarmupSignature] = getattr(
+        worker, "_b12x_completed_warmup_signatures", set()
+    )
+    if signature in completed:
+        logger.info_once(
+            "Skipping repeated B12X warmup for %d resolved kernel signature(s).",
+            len(units),
+        )
+        return
+
     for name, count in _compile_warmup_units(units).items():
         logger.info_once(
             "Warmed up %d b12x %s kernel signature(s).",
             count,
             name,
         )
+    completed.add(signature)
+    vars(worker)["_b12x_completed_warmup_signatures"] = completed

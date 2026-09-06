@@ -212,7 +212,9 @@ def test_b12x_tensor_fp8_warmup_unit(monkeypatch) -> None:
     assert calls[0][1]["out_dtype"] == torch.bfloat16
 
 
-def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
+def test_b12x_warmup_deduplicates_registered_and_completed_signatures(
+    monkeypatch,
+) -> None:
     import vllm.model_executor.warmup.b12x_warmup as warmup_mod
 
     calls: list[tuple[str, tuple[int, ...], torch.dtype]] = []
@@ -266,13 +268,17 @@ def test_b12x_warmup_deduplicates_registered_signatures(monkeypatch) -> None:
     )
 
     b12x_warmup(worker, [1, 2])
+    b12x_warmup(worker, [1, 2])
+    b12x_warmup(worker, [1, 2, 3])
 
-    assert scans == 1
+    assert scans == 3
     assert calls == [
         ("first", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
         ("second", (1, 2, 4, 8, 16, 29, 32), torch.bfloat16),
+        ("first", (1, 2, 3, 4, 8, 16, 29, 32), torch.bfloat16),
+        ("second", (1, 2, 3, 4, 8, 16, 29, 32), torch.bfloat16),
     ]
-    assert synchronized == [True]
+    assert synchronized == [True, True]
 
 
 def test_b12x_dsa_indexer_warmup_unit_compiles_before_the_index_cache(
