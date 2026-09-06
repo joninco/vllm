@@ -1,12 +1,58 @@
 # Proposal: bounded streaming weight loading
 
-Status: design, September 5, 2026. This document proposes an implementation;
-the new APIs, memory budget, and performance targets are not implemented.
-Implementation is paused while the launchers switch to fastsafetensors, with
-lazy safetensors for the Qwen TP1 launcher because shard staging exhausted GB10
-memory in both pipelined and serial fastsafetensors trials.
+Status: C99 O_DIRECT transport and initial b12x vLLM adapter, September 6,
+2026. The adapter registers `--load-format b12x`, uses explicitly locked,
+CPU-addressable CUDA pools for final weights, and routes metadata-only source
+views through `vllm.model_executor.weight_transfer`. Selected payload ranges
+are read with O_DIRECT; buffered fallback and mmap input are not used. Existing
+model name routing, MTP prefix filtering, and quantization remain in place.
+Arbitrary source arithmetic and unsupported layouts fail explicitly. Native
+descriptor batches execute through eight persistent pthread readers by default
+(`io_threads`, 1–16). C owns range ordering, splitting, dispatch, and completion;
+Python retains destination and file owners through each batch. The aggregate
+target/draft transform budget below remains work to do.
+
+Allocation policy belongs to the loader. Layers mark weight factories with
+`allocate_weights(factory, ...)`; `weight_transfer` supplies the selected
+allocator. All other allocations use ordinary CUDA storage, including model
+construction and preparation workspaces. Shared weight storage is read-only
+during inference. The adapter rejects shared non-persistent buffers at load
+completion instead of silently placing runtime writes in host-mapped storage.
+
+For the validated GB10 decode configuration, opt in with the matching b12x
+package installed:
+
+```sh
+VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x \
+  --model-loader-extra-config '{"allocation":"pinned_wc","io_threads":8}'
+```
+
+`pinned_wc` combines mapped, pinned storage with write-combined CPU caching.
+`registered`, `pinned` and `managed` remain explicit allocation experiments.
+The adapter uses the standard vLLM checkpoint-shard progress format and honors
+the existing progress setting and rank-zero output. The initial
+adapter requires GPU host page tables and the native Torch CUDA allocator;
+vLLM sleep mode is unsupported. Aligned ranges read into final allocations;
+large misaligned ranges read into the same allocations and realign in place.
+Small edges use a fixed 8 MiB locked buffer per reader and an explicitly counted
+copy. BF16-to-FP32 expands backwards in the destination allocation in
+C99 without conversion scratch. Other contiguous casts use one reusable 8 MiB
+input allocation. Existing b12x preparation policies control weight reuse and
+packing; the adapter does not retain a duplicate packed representation.
+
+Checkpoint copy hooks can queue native descriptors. Online quantization,
+composed weight transforms, PLE scale validation and final preparation explicitly
+complete pending transfers before consuming values. Metadata-only layerwise
+probes retain Torch copy counting without submitting I/O. Scalar control metadata
+is read in coalesced spans instead of one disk operation per scalar.
+
+Logs distinguish physical I/O, direct destination bytes, alignment copies,
+conversions, and final shared parameter bytes. Custom uninstrumented copy sites
+and arbitrary quantization transients are not covered by those counters. They
+are not an end-to-end memory-bound claim. No serving default has been changed.
+
 The InstantTensor copy/buffer overrides and oversized CPU fallback are removed;
-Qwen MTP now declares checkpoint prefixes to skip unrelated target shards.
+Qwen MTP declares checkpoint prefixes to skip unrelated target shards.
 
 Replace the whole-tensor iterator on the fast path with a loader that reads
 selected checkpoint ranges into model-owned destinations. Implement a small
@@ -26,13 +72,14 @@ scale, although line count does not measure the effort of validating it.
 
 Much of its surface supports multiple I/O backends, collective loading, a
 safetensors-compatible tensor iterator, generic worker executors, and dynamic
-library bindings. Our first release needs Linux on aarch64/x86_64, CUDA, local
+library bindings. Our first target is Linux/aarch64 GB10, with CUDA, local
 files, explicit file ranges, bounded host staging, asynchronous copies into
 owned destinations, and correct completion/error handling. It does not need
 feature parity with every InstantTensor backend to serve Qwen and GLM here.
 
-Use a small native helper with a C ABI, ctypes bindings, liburing, and CUDA
-calls, following the existing `b12x.comm.roce` build/binding approach. Batch
+Use a small C99 native helper with positional file I/O and CUDA calls, following
+the cached host-compiler approach in `b12x.comm.roce`. The prototype creates
+owned DLPack capsules through the CPython C API without the PyTorch C++ ABI. Batch
 range submission and completion handling in native code. b12x plans generic
 transforms from the model requirements provided by vLLM. Reuse safetensors header validation
 where practical. A small threaded positional-read implementation can serve as
@@ -156,13 +203,59 @@ Storage aliases and asynchronous work make those approaches fragile.
 
 ## Native transport and synchronization
 
+### Allocate for direct reads on GB10
+
+The first question is whether final weights can use GPU-mapped host allocations.
+An ordinary CUDA allocation is not a valid CPU file-read destination merely
+because GB10 shares physical DRAM. However, a mapped host allocation exposes a
+CPU address for file reads and a GPU address for kernel access. The planned
+loader controls allocation, so it must investigate this option before assuming
+every weight needs an intermediate buffer and a host-to-device copy.
+
+For bytes already in their runtime layout, the candidate path is:
+
+```mermaid
+flowchart LR
+    F[Selected checkpoint ranges] -->|file reads| D[Final GPU-mapped weight storage]
+    D --> K[Inference kernels]
+```
+
+For conversion, read bounded mapped input tiles and have the GPU quantizer or
+packer consume those tiles directly, writing the final destination. This can
+avoid a separate GPU input-staging allocation even when the final destination
+uses ordinary CUDA memory. BF16 checkpoint bytes cannot simply be read into an
+MXFP8 or NVFP4 destination: conversion and its scale dependencies still apply.
+
+Qualify both the allocation/framework interface and the actual consuming
+kernels. In particular, wrapping mapped storage must not cause an implicit
+framework copy; TMA, dense/MoE kernels, embeddings, scales, and captured graphs
+must preserve correctness and inference throughput. Check large allocations
+and 64-bit addressing as well. Keep CPU/GPU aliases under one owner for the
+entire model and graph lifetime. Publish file-read completion before GPU use;
+do not permit CPU writes while inference reads the same ranges.
+
+Existing `create_weights` and `process_weights_after_loading` methods allocate
+and sometimes replace tensors. Converted adapters need allocation hooks for
+the chosen final representation and an explicit finalization step. Otherwise
+an ordinary `.to("cuda")`, whole-tensor quantization, or `pack_weight` call could
+silently restore the copies this design intends to eliminate. Initial support
+is startup loading; active in-place reload and rollback need a separate design.
+
+Buffered reads into the final address still involve the OS page cache. Test
+aligned direct I/O independently; reading into mapped host memory is not native
+GDS. NVIDIA limits Spark GDS to compatibility mode. The allocation qualification
+and candidate paths are specified in `b12x/docs/checkpoint-loading.md` in the
+companion checkout, with links to NVIDIA's allocation documentation.
+
+### Bounded transfer route
+
 The b12x transport accepts batches of explicit file ranges and
 caller-owned destinations, a supplied allocator/budget, and completion handles.
 InstantTensor's present `get_dl_tensor()` interface and whole-tensor ring layout
 cannot implement the required bound for oversized tensors and are not retained
 in the new API.
 
-The buffered path for an ordinary contiguous weight is:
+For a destination or transform that requires ordinary CUDA input storage, use:
 
 ```mermaid
 flowchart LR
@@ -187,12 +280,12 @@ drain/cancel reads and CUDA users before releasing their storage; never publish
 partially initialized weights. Mid-load retry must not silently replay
 non-idempotent transforms.
 
-Retain io_uring/buffered I/O as the first GB10 implementation, matching current
-launchers. Compare direct I/O under cold and warm cache conditions before
-changing the default. GDS can later target eligible final CUDA destinations
-without changing ownership semantics. Unified physical memory does not make
-arbitrary CPU and CUDA allocations interchangeable: a mapped-host optimization
-needs an explicit supported allocation strategy and separate measurement.
+Begin allocation/transport qualification with batched positional reads into
+declared destinations. Select a small native reader pool or io_uring from
+measurements, retaining the same range/completion ABI. Compare direct I/O under
+cold and warm cache conditions. Native GDS is a later option for platforms that
+support it; it is not the GB10 transport. Choose the mapped or CUDA destination
+per supported consumer during planning, independently of tensor size.
 
 ## Budget and large tensors
 
@@ -290,12 +383,14 @@ and destination routing, justified by topology measurements.
 
 ## Delivery and compatibility
 
-1. Add validated manifest/selection and exact Qwen draft filtering, extending
-   current loader tests. Establish cold/warm load baselines and ownership tests
-   against the installed loader. Keep the GLM clone repair.
+1. Qualify direct file reads into mapped final allocations and direct GPU
+   consumption of mapped conversion input on GB10. Test the real consuming
+   kernels and framework ownership before building the full scheduler. Exact
+   Qwen draft shard filtering and the GLM clone repair are already present.
 2. Build and test `b12x.loader`, its native range/destination helper, bounded
    allocator, event retirement, cancellation, and session. Add copy/slice/batched-scale
-   adapters and tile transforms for Qwen/GLM heads, MoE, PLE, and GLM attention.
+   adapters and tile transforms for Qwen heads, MoE, and PLE first; extend to
+   GLM TP2 after the GB10 TP1 path is qualified.
    Reuse existing numerical kernels where their interfaces permit bounded output.
 3. Integrate target/draft sessions and layerwise finalization; validate all
    required paths under memory pressure. Make the planned path the default for
