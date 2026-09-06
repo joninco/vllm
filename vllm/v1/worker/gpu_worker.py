@@ -546,6 +546,9 @@ class Worker(WorkerBase):
             and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         )
         capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+        first_profile_snapshot: MemorySnapshot | None = None
+        b12x_warmup_snapshot: MemorySnapshot | None = None
+        repeatable_profile_snapshot: MemorySnapshot | None = None
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -554,13 +557,16 @@ class Worker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+            first_profile_snapshot = MemorySnapshot(device=self.device)
             if profile_cudagraphs:
                 # KV sizing must use a repeatable serving peak. Resolve persistent
                 # B12X modules, discard cold-start high-water, then measure the
                 # same model profile again.
                 b12x_warmup(self, capture_sizes)
+                b12x_warmup_snapshot = MemorySnapshot(device=self.device)
                 torch.accelerator.reset_peak_memory_stats(self.device)
                 self.model_runner.profile_run()
+                repeatable_profile_snapshot = MemorySnapshot(device=self.device)
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -654,6 +660,43 @@ class Worker(WorkerBase):
             format_gib(torch_reserved_since_worker_init),
             format_gib(non_torch_since_worker_init),
         )
+        if (
+            first_profile_snapshot is not None
+            and b12x_warmup_snapshot is not None
+            and repeatable_profile_snapshot is not None
+        ):
+            stage_values: list[str] = []
+            for snapshot in (
+                first_profile_snapshot,
+                b12x_warmup_snapshot,
+                repeatable_profile_snapshot,
+                profile_result.after_profile,
+            ):
+                stage_values.extend(
+                    (
+                        format_gib(
+                            self.init_snapshot.free_memory - snapshot.free_memory
+                        ),
+                        format_gib(
+                            snapshot.torch_allocated
+                            - self.init_snapshot.torch_allocated
+                        ),
+                        format_gib(
+                            snapshot.torch_memory - self.init_snapshot.torch_memory
+                        ),
+                        format_gib(
+                            snapshot.non_torch_memory
+                            - self.init_snapshot.non_torch_memory
+                        ),
+                    )
+                )
+            logger.info_once(
+                "KV cache profiling stages (total/torch_allocated/torch_reserved/"
+                "non_torch GiB): first_profile=%s/%s/%s/%s, "
+                "b12x_warmup=%s/%s/%s/%s, repeatable_profile=%s/%s/%s/%s, "
+                "post_cleanup=%s/%s/%s/%s",
+                *stage_values,
+            )
         logger.info_once(
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),

@@ -83,6 +83,28 @@ def test_startup_plan_apply_gate(plan_env):
 def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
     """KV sizing must exclude cold-start peaks and retain graph headroom."""
     events: list[object] = []
+    snapshots = iter(
+        [
+            SimpleNamespace(
+                free_memory=84,
+                torch_allocated=7,
+                torch_memory=8,
+                non_torch_memory=2,
+            ),
+            SimpleNamespace(
+                free_memory=83,
+                torch_allocated=8,
+                torch_memory=9,
+                non_torch_memory=2,
+            ),
+            SimpleNamespace(
+                free_memory=82,
+                torch_allocated=9,
+                torch_memory=10,
+                non_torch_memory=2,
+            ),
+        ]
+    )
 
     def profile_cudagraph_memory():
         events.append("profile_cudagraph_memory")
@@ -138,6 +160,11 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
 
     monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
     monkeypatch.setattr(gpu_worker, "memory_profiling", fake_memory_profiling)
+    monkeypatch.setattr(
+        gpu_worker,
+        "MemorySnapshot",
+        lambda *, device: next(snapshots),
+    )
     monkeypatch.setattr(
         gpu_worker,
         "current_platform",
