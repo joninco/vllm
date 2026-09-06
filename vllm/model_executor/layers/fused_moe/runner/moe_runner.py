@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -43,6 +44,7 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
 )
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
+    SharedExpertsFromGateUp,
     SharedExpertsOrder,
 )
 from vllm.platforms import current_platform
@@ -53,6 +55,16 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+# Weight-first fused router + shared gate_up projection (b12x
+# ``gemm.weight_first_gemv``): run-time switch and staging depth, read once
+# per process. The projection stages its weight bricks in shared memory while
+# the preceding PCIe one-shot allreduce waits on the fabric (programmatic
+# dependent launch); the depth bounds the cp.async groups in flight per CTA
+# because unbounded staging competes with the peers' reads of this GPU's
+# memory and slows the allreduce.
+_WF_GATE_ENABLED = os.environ.get("VLLM_WF_GATE", "1") != "0"
+_WF_STAGE_DEPTH = int(os.environ.get("VLLM_WF_STAGE_DEPTH", "1"))
 
 
 def register_layer_for_moe_forward_op(
@@ -652,6 +664,73 @@ class MoERunner(MoERunnerInterface):
             else nullcontext()
         )
 
+    def _weight_first_projection(
+        self,
+        hidden_states: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ):
+        """The weight-first fused router + shared gate_up projection for this
+        call, or None when the path does not apply: disabled, the runner does
+        not hold both the gate and the shared experts, a latent-MoE input
+        transform (the shared experts consume a different tensor), the fused
+        shared-expert gate mode, more than 16 rows, or weights outside the
+        kernel contract. Built on the first call (after the weights are
+        loaded, before any CUDA-graph capture) regardless of the row count.
+        """
+        if (
+            not _WF_GATE_ENABLED
+            or self.gate is None
+            or self._shared_experts is None
+            or self._fse_fuse_gate
+            or shared_experts_input is not hidden_states
+        ):
+            return None
+        projection = self.__dict__.get("_wf_projection")
+        if projection is None:
+            projection = self._build_weight_first_projection()
+            self.__dict__["_wf_projection"] = projection
+        if projection is False or not projection.supports(hidden_states):
+            return None
+        return projection
+
+    def _build_weight_first_projection(self):
+        """Concatenate the router gate and the shared expert's gate_up
+        weights into one weight-first projection (the parameters become views
+        into the concatenated buffer) and wrap the shared-expert MLP so that
+        it consumes the projection's gate_up activation. Returns False when
+        the weights are outside the contract or b12x does not serve this
+        device."""
+        assert self.gate is not None and self._shared_experts is not None
+        try:
+            from b12x.gemm import weight_first_gemv
+
+            mlp = self._shared_experts._layer
+            gate_w = self.gate.weight
+            gate_up_w = mlp.gate_up_proj.weight
+            if (
+                getattr(self.gate, "bias", None) is not None
+                or getattr(mlp.gate_up_proj, "bias", None) is not None
+                or not weight_first_gemv.is_supported(gate_w.device)
+                or not weight_first_gemv.supports([gate_w, gate_up_w])
+            ):
+                return False
+            projection = weight_first_gemv.WeightFirstProjection(
+                [gate_w, gate_up_w], depth=_WF_STAGE_DEPTH, pdl=True
+            )
+            self._shared_experts._layer = SharedExpertsFromGateUp(mlp)
+            logger.info_once(
+                "Weight-first fused router + shared gate_up projection enabled "
+                "(N=%d, K=%d, brick %dx%d)",
+                projection.n,
+                projection.k,
+                projection.nt,
+                projection.kt,
+            )
+            return projection
+        except Exception as exc:  # noqa: BLE001
+            logger.warning_once("Weight-first router projection disabled: %s", exc)
+            return False
+
     def _maybe_sync_shared_experts_stream(
         self,
         shared_experts_input: torch.Tensor | None,
@@ -937,18 +1016,37 @@ class MoERunner(MoERunnerInterface):
         # TODO(bnell): this can be removed after MK migration is complete.
         self.routed_experts._ensure_moe_quant_config_init()
 
-        # Sync aux and main stream for shared expert multi-stream overlap.
-        self._maybe_sync_shared_experts_stream(shared_experts_input)
+        # Weight-first fused router + shared-expert gate_up projection: one
+        # brick GEMV whose CTAs stage both weights in shared memory during the
+        # preceding one-shot allreduce (programmatic dependent launch) and
+        # write the router logits and the gate_up activation. The
+        # shared-expert stream forks after it and starts at the activation.
+        # Decode shapes only (at most 16 rows).
+        projection = self._weight_first_projection(hidden_states, shared_experts_input)
+        if projection is not None:
+            assert self._shared_experts is not None
+            router_logits, gate_up = projection(hidden_states)
+            shared_layer = self._shared_experts._layer
+            shared_stream = self._shared_experts._stream
+            if shared_stream is not None:
+                # The activation is consumed on the shared-expert stream;
+                # keep its allocation from being reused until that use ends.
+                gate_up.record_stream(shared_stream)
+            shared_layer.gate_up = gate_up
+            self._maybe_sync_shared_experts_stream(shared_experts_input)
+        else:
+            # Sync aux and main stream for shared expert multi-stream overlap.
+            self._maybe_sync_shared_experts_stream(shared_experts_input)
 
-        # If the Runner holds the gate, apply it after the stream sync,
-        # so it can run overlapped with the
-        # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
-            if self._fse_fuse_gate:
-                self._maybe_fuse_gate_weights()
-                router_logits = F.linear(hidden_states, self._combined_gate_weight)
-            else:
-                router_logits, _ = self.gate(hidden_states)
+            # If the Runner holds the gate, apply it after the stream sync,
+            # so it can run overlapped with the
+            # NOTE: in future PR, MoE runner will always hold the gate.
+            if self.gate is not None:
+                if self._fse_fuse_gate:
+                    self._maybe_fuse_gate_weights()
+                    router_logits = F.linear(hidden_states, self._combined_gate_weight)
+                else:
+                    router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
