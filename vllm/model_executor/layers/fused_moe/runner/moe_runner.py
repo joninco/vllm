@@ -680,12 +680,45 @@ class MoERunner(MoERunnerInterface):
             result = result + zero_expert_output
         return result
 
+    @staticmethod
+    def _combine_expert_outputs(
+        shared_output: torch.Tensor,
+        fused_output: torch.Tensor,
+        output_buffer: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Combine expert branches, optionally into declared dead storage."""
+        if output_buffer is None:
+            return shared_output + fused_output
+        if torch.is_grad_enabled():
+            raise ValueError("MoE output storage reuse requires inference mode")
+        if (
+            output_buffer.shape != shared_output.shape
+            or output_buffer.shape != fused_output.shape
+            or output_buffer.dtype != shared_output.dtype
+            or output_buffer.dtype != fused_output.dtype
+            or output_buffer.device != shared_output.device
+            or output_buffer.device != fused_output.device
+            or not output_buffer.is_contiguous()
+        ):
+            raise ValueError(
+                "MoE output storage must match contiguous shared and routed outputs"
+            )
+        output_storage = output_buffer.untyped_storage().data_ptr()
+        if output_storage in {
+            shared_output.untyped_storage().data_ptr(),
+            fused_output.untyped_storage().data_ptr(),
+        }:
+            raise ValueError("MoE output storage must not alias an expert output")
+        torch.add(shared_output, fused_output, out=output_buffer)
+        return output_buffer
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
@@ -729,6 +762,18 @@ class MoERunner(MoERunnerInterface):
                 hidden_states,
             )
         )
+
+        if output_buffer is not None and (
+            not self.moe_config.skip_final_all_reduce
+            or self.routed_output_transform is not None
+            or og_hidden_dim_pre_xform is not None
+            or og_hidden_dim_post_xform is not None
+            or isinstance(self.router, ZeroExpertRouter)
+        ):
+            raise ValueError(
+                "MoE output storage reuse requires an unpadded shared-expert "
+                "path with a deferred final reduction"
+            )
 
         result = self._forward_entry(
             hidden_states,
@@ -782,8 +827,12 @@ class MoERunner(MoERunnerInterface):
         fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
-            result = shared_output + fused_output
+            result = self._combine_expert_outputs(
+                shared_output, fused_output, output_buffer
+            )
         else:
+            if output_buffer is not None:
+                raise ValueError("MoE output storage reuse requires shared experts")
             result = fused_output
 
         result = self._maybe_reduce_final_output(

@@ -163,7 +163,11 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
                 hidden_states, residual, self.post_attention_layernorm
             )
 
-        if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
+        if isinstance(self.mlp, DeepseekV2MoE) and self.mlp.can_reuse_input_as_output(
+            hidden_states
+        ):
+            hidden_states = self.mlp(hidden_states, output_buffer=hidden_states)
+        elif self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
             hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
         else:
             hidden_states = self.mlp(hidden_states)
