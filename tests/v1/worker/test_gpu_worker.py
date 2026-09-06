@@ -97,7 +97,13 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
         weights_memory=0,
         total_consumed=10,
         transient_peak_headroom=5,
-        after_profile=SimpleNamespace(free_memory=80),
+        before_profile=SimpleNamespace(free_memory=85),
+        after_profile=SimpleNamespace(
+            free_memory=80,
+            torch_allocated=8,
+            torch_memory=9,
+            non_torch_memory=3,
+        ),
         non_kv_cache_memory=10,
     )
 
@@ -111,7 +117,13 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
             gpu_memory_utilization=0.9,
         ),
         model_runner=model_runner,
-        init_snapshot=SimpleNamespace(free_memory=100, total_memory=100),
+        init_snapshot=SimpleNamespace(
+            free_memory=100,
+            total_memory=100,
+            torch_allocated=1,
+            torch_memory=1,
+            non_torch_memory=1,
+        ),
         requested_memory=90,
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(),

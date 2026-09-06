@@ -616,6 +616,24 @@ class Worker(WorkerBase):
             format_gib(free_gpu_memory - unrequested_memory),
         )
         logger.debug(profile_result)
+        initialized_before_profile = (
+            self.init_snapshot.free_memory - profile_result.before_profile.free_memory
+        )
+        retained_by_profile = (
+            profile_result.before_profile.free_memory
+            - profile_result.after_profile.free_memory
+        )
+        torch_allocated_since_worker_init = (
+            profile_result.after_profile.torch_allocated
+            - self.init_snapshot.torch_allocated
+        )
+        torch_reserved_since_worker_init = (
+            profile_result.after_profile.torch_memory - self.init_snapshot.torch_memory
+        )
+        non_torch_since_worker_init = (
+            profile_result.after_profile.non_torch_memory
+            - self.init_snapshot.non_torch_memory
+        )
         logger.info_once(
             "KV cache memory budget components: requested=%s GiB, weights=%s GiB, "
             "persistent_total=%s GiB, transient_peak=%s GiB, cudagraph=%s GiB",
@@ -624,6 +642,17 @@ class Worker(WorkerBase):
             format_gib(profile_result.total_consumed),
             format_gib(profile_result.transient_peak_headroom),
             format_gib(cudagraph_memory_estimate_applied),
+        )
+        logger.info_once(
+            "KV cache persistent memory detail: initialized_before_profile=%s GiB, "
+            "retained_by_profile=%s GiB, torch_allocated_since_worker_init=%s "
+            "GiB, torch_reserved_since_worker_init=%s GiB, "
+            "non_torch_since_worker_init=%s GiB",
+            format_gib(initialized_before_profile),
+            format_gib(retained_by_profile),
+            format_gib(torch_allocated_since_worker_init),
+            format_gib(torch_reserved_since_worker_init),
+            format_gib(non_torch_since_worker_init),
         )
         logger.info_once(
             "Available KV cache memory: %s GiB",
