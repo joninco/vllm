@@ -18,6 +18,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import B12xWarmupUnit, get_b12x_dsa_indexer
 from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backends.mla import b12x_topk_sort
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
     DeepSeekV32IndexerDecodeMetadata,
@@ -177,6 +178,20 @@ def _flatten_index_cache(kv_cache: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _plan_output_space(
+    output_physical_slots: bool, sort_selection: bool, q_rows: int
+) -> str:
+    """Index space an indexer plan of ``q_rows`` rows emits. Physical slots
+    come from the indexer itself unless the selection sort serves that row
+    count, in which case the plan emits logical positions for the sort to
+    convert (``b12x_topk_sort``)."""
+    if not output_physical_slots:
+        return "logical"
+    if sort_selection and b12x_topk_sort.active(q_rows):
+        return "logical"
+    return "physical"
+
+
 def _run_paged_topk(
     *,
     module: Any,
@@ -326,6 +341,14 @@ class B12xSparseIndexer(nn.Module):
         self.max_model_len = int(max_model_len)
         self.topk_indices_buffer = topk_indices_buffer
         self.output_physical_slots = bool(output_physical_slots)
+        # Deterministic selection order (b12x_topk_sort): plans whose row
+        # count is within the sort gate emit logical positions, which the
+        # sort rewrites ascending and converts to physical slots in place.
+        self.sort_selection = (
+            self.output_physical_slots
+            and b12x_topk_sort.ENABLED
+            and b12x_topk_sort.is_supported(topk_indices_buffer.device)
+        )
         self.active_width_cap = torch.full(
             (1,),
             self.max_model_len,
@@ -353,8 +376,8 @@ class B12xSparseIndexer(nn.Module):
                     topk=self.topk_tokens,
                     mode=mode,
                     max_batch=q_rows if mode == "decode" else max_num_seqs,
-                    output_index_space=(
-                        "physical" if self.output_physical_slots else "logical"
+                    output_index_space=_plan_output_space(
+                        self.output_physical_slots, self.sort_selection, q_rows
                     ),
                 )
             )
@@ -371,10 +394,16 @@ class B12xSparseIndexer(nn.Module):
             for rows in self._decode_plan_sizes
         }
         prefill_profile_rows = _prefill_profile_q_rows(max_q_rows)
+        prefill_plan_sizes = {prefill_profile_rows}
+        if self.sort_selection and 0 < b12x_topk_sort.MAX_TOKENS < prefill_profile_rows:
+            # Single-request prefill chunks within the sort gate (short
+            # prompts, short final chunks) sort through a logical plan.
+            prefill_plan_sizes.add(b12x_topk_sort.MAX_TOKENS)
+        self._prefill_plan_sizes = sorted(prefill_plan_sizes)
         self._prefill_plans = {
-            prefill_profile_rows: make_plan(mode="prefill", q_rows=prefill_profile_rows)
+            rows: make_plan(mode="prefill", q_rows=rows)
+            for rows in self._prefill_plan_sizes
         }
-        self._prefill_plan_sizes = [prefill_profile_rows]
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
@@ -403,6 +432,10 @@ class B12xSparseIndexer(nn.Module):
         plans[q_rows] = plan
         bisect.insort(plan_sizes, q_rows)
         return plan
+
+    def _sorts(self, plan: Any) -> bool:
+        """Whether ``plan`` emits logical positions that the sort converts."""
+        return self.sort_selection and plan.caps.output_index_space == "logical"
 
     def _reserve_profile_workspace(self) -> None:
         for plan in (*self._decode_plans.values(), *self._prefill_plans.values()):
@@ -481,6 +514,15 @@ class B12xSparseIndexer(nn.Module):
                     output=output,
                     scores=scores,
                 )
+                if self._sorts(plan):
+                    b12x_topk_sort.precompile(self.max_model_len, caps.device)
+                    b12x_topk_sort.sort_convert(
+                        output,
+                        cache_lengths,
+                        page_table,
+                        _INDEX_PAGE_SIZE,
+                        self.max_model_len,
+                    )
 
         plan_key = tuple(
             (
@@ -498,6 +540,7 @@ class B12xSparseIndexer(nn.Module):
                 self.topk_indices_buffer.device,
                 self.topk_tokens,
                 self.output_physical_slots,
+                self.sort_selection,
                 plan_key,
             ),
             compile=compile,
@@ -559,9 +602,10 @@ class B12xSparseIndexer(nn.Module):
                 block_table = chunk.block_table[:1, :active_pages].expand(
                     int(q_chunk.shape[0]), active_pages
                 )
+                plan = self._get_plan("prefill", int(q_chunk.shape[0]))
                 _run_paged_topk(
                     module=self._module,
-                    plan=self._get_plan("prefill", int(q_chunk.shape[0])),
+                    plan=plan,
                     q=q_chunk,
                     weights=weights_chunk,
                     kv_cache=self.k_cache.kv_cache,
@@ -571,6 +615,16 @@ class B12xSparseIndexer(nn.Module):
                     output=output,
                     scores=score_chunk,
                 )
+                if self._sorts(plan):
+                    # In line: prefill runs eagerly, and the selection is
+                    # read by the attention op that follows.
+                    b12x_topk_sort.sort_convert(
+                        output,
+                        seq_lens,
+                        block_table,
+                        _INDEX_PAGE_SIZE,
+                        self.max_model_len,
+                    )
                 if score_chunk is not None:
                     _merge_dcp_topk(
                         output,
@@ -597,18 +651,31 @@ class B12xSparseIndexer(nn.Module):
             num_tokens = metadata.num_decode_tokens
             output = self.topk_indices_buffer[:num_tokens, : self.topk_tokens]
             score_slice = scores[:num_tokens] if scores is not None else None
+            plan = self._get_plan("decode", num_tokens)
+            decode_seq_lens = seq_lens[:num_tokens]
+            decode_block_table = block_table[:num_tokens].contiguous()
             _run_paged_topk(
                 module=self._module,
-                plan=self._get_plan("decode", num_tokens),
+                plan=plan,
                 q=q_quant[:num_tokens].contiguous(),
                 weights=weights[:num_tokens].contiguous(),
                 kv_cache=self.k_cache.kv_cache,
-                seq_lens=seq_lens[:num_tokens],
-                block_table=block_table[:num_tokens].contiguous(),
+                seq_lens=decode_seq_lens,
+                block_table=decode_block_table,
                 active_width=getattr(decode, "active_width", None),
                 output=output,
                 scores=score_slice,
             )
+            if self._sorts(plan):
+                # Side stream inside full graphs; joined in the sparse MLA
+                # backend's forward_mqa before the selection is read.
+                b12x_topk_sort.sort_convert_async(
+                    output,
+                    decode_seq_lens,
+                    decode_block_table,
+                    _INDEX_PAGE_SIZE,
+                    self.max_model_len,
+                )
             if score_slice is not None:
                 _merge_dcp_topk(
                     output,
