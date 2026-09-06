@@ -516,6 +516,19 @@ class Worker(WorkerBase):
         """
         maybe_apply_startup_plan(self)
 
+        reserve_sampler_workspace = getattr(
+            self.model_runner, "reserve_sampler_workspace", None
+        )
+        sampler_workspace_bytes = (
+            reserve_sampler_workspace() if callable(reserve_sampler_workspace) else 0
+        )
+        if sampler_workspace_bytes:
+            logger.info_once(
+                "Reserved %s GiB of persistent native top-k/top-p sampler "
+                "workspace before KV cache sizing.",
+                format_gib(sampler_workspace_bytes),
+            )
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens

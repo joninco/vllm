@@ -110,8 +110,13 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
         events.append("profile_cudagraph_memory")
         return 0
 
+    def reserve_sampler_workspace():
+        events.append("reserve_sampler_workspace")
+        return 0
+
     model_runner = SimpleNamespace(
         model_memory_usage=0,
+        reserve_sampler_workspace=reserve_sampler_workspace,
         profile_run=lambda: events.append("profile_run"),
         profile_cudagraph_memory=profile_cudagraph_memory,
     )
@@ -189,6 +194,7 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
     available = gpu_worker.Worker.determine_available_memory(worker)
 
     assert events == [
+        "reserve_sampler_workspace",
         "profile_run",
         ("b12x_warmup", (8, 4)),
         ("reset_peak", "cuda:0"),
