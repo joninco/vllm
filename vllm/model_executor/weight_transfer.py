@@ -62,3 +62,10 @@ def flush_weight_transfers() -> None:
     flush = getattr(writer, "flush", None)
     if flush is not None:
         flush()
+
+
+def materialize_weight(source: torch.Tensor) -> torch.Tensor:
+    """Own checkpoint values needed by a numerical loading transform."""
+    writer = _writer.get()
+    materialize = getattr(writer, "materialize", None)
+    return materialize(source) if materialize is not None else source.clone()
