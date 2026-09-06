@@ -617,6 +617,15 @@ class Worker(WorkerBase):
         )
         logger.debug(profile_result)
         logger.info_once(
+            "KV cache memory budget components: requested=%s GiB, weights=%s GiB, "
+            "persistent_total=%s GiB, transient_peak=%s GiB, cudagraph=%s GiB",
+            format_gib(self.requested_memory),
+            format_gib(profile_result.weights_memory),
+            format_gib(profile_result.total_consumed),
+            format_gib(profile_result.transient_peak_headroom),
+            format_gib(cudagraph_memory_estimate_applied),
+        )
+        logger.info_once(
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),
         )

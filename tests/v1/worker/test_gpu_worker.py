@@ -94,6 +94,7 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
         profile_cudagraph_memory=profile_cudagraph_memory,
     )
     profile_result = SimpleNamespace(
+        weights_memory=0,
         total_consumed=10,
         transient_peak_headroom=5,
         after_profile=SimpleNamespace(free_memory=80),
