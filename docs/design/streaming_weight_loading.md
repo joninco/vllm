@@ -23,12 +23,12 @@ For the validated GB10 decode configuration, opt in with the matching b12x
 package installed:
 
 ```sh
-VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x \
-  --model-loader-extra-config '{"allocation":"pinned_wc","io_threads":8}'
+VLLM_PLUGINS=b12x_loader vllm serve MODEL --load-format b12x
 ```
 
-`pinned_wc` combines mapped, pinned storage with write-combined CPU caching.
-`registered`, `pinned` and `managed` remain explicit allocation experiments.
+The loader always uses mapped, pinned storage with write-combined CPU caching
+for weights. There is no serving `allocation` option; alternative mappings
+remain confined to b12x's allocation-qualification tools.
 The adapter uses the standard vLLM checkpoint-shard progress format and honors
 the existing progress setting and rank-zero output. The initial
 adapter requires GPU host page tables and the native Torch CUDA allocator;
@@ -49,7 +49,7 @@ is read in coalesced spans instead of one disk operation per scalar.
 Logs distinguish physical I/O, direct destination bytes, alignment copies,
 conversions, and final shared parameter bytes. Custom uninstrumented copy sites
 and arbitrary quantization transients are not covered by those counters. They
-are not an end-to-end memory-bound claim. No serving default has been changed.
+are not an end-to-end memory-bound claim.
 
 The InstantTensor copy/buffer overrides and oversized CPU fallback are removed;
 Qwen MTP declares checkpoint prefixes to skip unrelated target shards.
