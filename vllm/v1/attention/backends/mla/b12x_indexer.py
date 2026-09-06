@@ -192,6 +192,17 @@ def _plan_output_space(
     return "physical"
 
 
+def _plan_emits_physical_slots(plan: Any) -> bool:
+    """Whether an indexer plan writes physical cache slots. The scratch caps
+    a compiled plan carries record the choice as ``output_physical_slots``;
+    the API caps it was built from record it as ``output_index_space``."""
+    caps = plan.caps
+    physical = getattr(caps, "output_physical_slots", None)
+    if physical is None:
+        physical = getattr(caps, "output_index_space", "logical") == "physical"
+    return bool(physical)
+
+
 def _run_paged_topk(
     *,
     module: Any,
@@ -435,7 +446,7 @@ class B12xSparseIndexer(nn.Module):
 
     def _sorts(self, plan: Any) -> bool:
         """Whether ``plan`` emits logical positions that the sort converts."""
-        return self.sort_selection and plan.caps.output_index_space == "logical"
+        return self.sort_selection and not _plan_emits_physical_slots(plan)
 
     def _reserve_profile_workspace(self) -> None:
         for plan in (*self._decode_plans.values(), *self._prefill_plans.values()):

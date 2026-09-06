@@ -105,3 +105,20 @@ def test_graph_mode_sort_forks_and_joins(monkeypatch) -> None:
     b12x_topk_sort.join(device)
     assert not b12x_topk_sort._pending_devices
     torch.accelerator.synchronize(device)
+
+
+@pytest.mark.parametrize(
+    ("caps", "physical"),
+    [
+        (SimpleNamespace(output_physical_slots=True), True),
+        (SimpleNamespace(output_physical_slots=False), False),
+        (SimpleNamespace(output_index_space="physical"), True),
+        (SimpleNamespace(output_index_space="logical"), False),
+        (SimpleNamespace(), False),
+    ],
+)
+def test_plan_emits_physical_slots_reads_scratch_or_api_caps(caps, physical) -> None:
+    """A compiled plan carries scratch caps (``output_physical_slots``); the
+    API caps it was built from carry ``output_index_space``."""
+    plan = SimpleNamespace(caps=caps)
+    assert b12x_indexer._plan_emits_physical_slots(plan) is physical
