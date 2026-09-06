@@ -599,8 +599,22 @@ class Worker(WorkerBase):
         )
 
         self.total_consumed = profile_result.total_consumed
+        repeatable_allocator_headroom = profile_result.transient_peak_headroom
+        if repeatable_profile_snapshot is not None:
+            # KV allocation must leave enough physical capacity for the warmed
+            # eager profile to recreate its allocator-reserved high-water. Live
+            # allocations alone can understate that requirement when serving
+            # runs beside CUDA-graph private pools or fragmented free blocks.
+            repeatable_allocator_headroom = max(
+                repeatable_allocator_headroom,
+                repeatable_profile_snapshot.torch_memory
+                - profile_result.after_profile.torch_memory,
+            )
+        allocator_headroom_correction = (
+            repeatable_allocator_headroom - profile_result.transient_peak_headroom
+        )
         self.peak_activation_memory = (
-            profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied
+            repeatable_allocator_headroom + cudagraph_memory_estimate_applied
         )
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
@@ -620,6 +634,7 @@ class Worker(WorkerBase):
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - allocator_headroom_correction
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
@@ -655,11 +670,13 @@ class Worker(WorkerBase):
         )
         logger.info_once(
             "KV cache memory budget components: requested=%s GiB, weights=%s GiB, "
-            "persistent_total=%s GiB, transient_peak=%s GiB, cudagraph=%s GiB",
+            "persistent_total=%s GiB, transient_peak=%s GiB, "
+            "repeatable_allocator_headroom=%s GiB, cudagraph=%s GiB",
             format_gib(self.requested_memory),
             format_gib(profile_result.weights_memory),
             format_gib(profile_result.total_consumed),
             format_gib(profile_result.transient_peak_headroom),
+            format_gib(repeatable_allocator_headroom),
             format_gib(cudagraph_memory_estimate_applied),
         )
         logger.info_once(

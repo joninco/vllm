@@ -81,7 +81,7 @@ def test_startup_plan_apply_gate(plan_env):
 
 
 def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
-    """KV sizing must exclude cold-start peaks and retain graph headroom."""
+    """KV sizing must retain the warmed allocator and graph high-waters."""
     events: list[object] = []
     snapshots = iter(
         [
@@ -100,7 +100,7 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
             SimpleNamespace(
                 free_memory=82,
                 torch_allocated=9,
-                torch_memory=10,
+                torch_memory=16,
                 non_torch_memory=2,
             ),
         ]
@@ -201,4 +201,7 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
         "profile_run",
         "profile_cudagraph_memory",
     ]
-    assert available == 80
+    # The repeatable profile retained seven bytes above its cleanup state.
+    # Five are already covered by the live-allocation peak, leaving two bytes
+    # of allocator-reservation headroom to deduct from KV capacity.
+    assert available == 78
