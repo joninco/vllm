@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -114,6 +115,18 @@ def test_windows_gate_independently(
 
     assert l2_prefetch._active(num_tokens, l2_prefetch.MOE_WINDOW) is moe_expected
     assert l2_prefetch._active(num_tokens, l2_prefetch.ATTN_WINDOW) is attn_expected
+
+
+def test_default_program_counts() -> None:
+    """The input-projection window loads with 64 programs and the output
+    projection window with 32 unless the environment overrides them."""
+    assert (
+        int(os.environ.get("VLLM_L2_PREFETCH_CTAS", "64")) == l2_prefetch.NUM_PROGRAMS
+    )
+    assert (
+        int(os.environ.get("VLLM_L2_PREFETCH_ATTN_CTAS", "32"))
+        == l2_prefetch.ATTN_NUM_PROGRAMS
+    )
 
 
 def test_window_program_counts(monkeypatch: pytest.MonkeyPatch) -> None:

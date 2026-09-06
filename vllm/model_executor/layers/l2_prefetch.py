@@ -17,13 +17,23 @@ launch, so the traced graph is the same for every setting):
   (fused into this layer's input RMSNorm), this layer's fused query/key/value
   input projection, query output projection and, where the sparse indexer
   runs, its query projection. Gated by ``VLLM_L2_PREFETCH_MAX_TOKENS`` and
-  loaded by ``VLLM_L2_PREFETCH_CTAS`` programs.
+  loaded by ``VLLM_L2_PREFETCH_CTAS`` programs (64). With the weight-first
+  projection and the early all-reduce trigger, the projections that follow
+  the all-reduce start sooner than they did without them, and the loads
+  that are still running then overlap the sparse indexer and attention
+  kernels. Measured at four padded tokens on the eight-rank GLM-5.3 launch,
+  64 programs against 32 leave the indexer kernel at its unprefetched
+  duration (6.7 us against 11.5 us), keep the sparse attention kernel
+  within 0.7 us of it, and shorten the decode step by 0.16 ms; eight and
+  sixteen padded tokens and 30k-token contexts are faster or unchanged.
 - ``attn``: at the start of the attention block, ordered on the normalised
   block input, this layer's attention output projection (``o_proj``), which
   is consumed right after the attention kernels. Gated by
   ``VLLM_L2_PREFETCH_ATTN_MAX_TOKENS`` (the loads beside the attention kernels
   cost more than they save at larger row counts) and loaded by
-  ``VLLM_L2_PREFETCH_ATTN_CTAS`` programs. The router gate and shared-expert
+  ``VLLM_L2_PREFETCH_ATTN_CTAS`` programs (32; 64 programs load faster but
+  slow the small projection kernels they run beside, which costs more than
+  the attention kernel gains). The router gate and shared-expert
   weights that follow ``o_proj`` are not in this list: the weight-first
   projection stages them from memory while the attention-output all-reduce
   waits.
@@ -56,14 +66,14 @@ logger = init_logger(__name__)
 
 ENABLED = os.environ.get("VLLM_L2_PREFETCH", "1") == "1"
 MAX_TOKENS = int(os.environ.get("VLLM_L2_PREFETCH_MAX_TOKENS", "64"))
-NUM_PROGRAMS = int(os.environ.get("VLLM_L2_PREFETCH_CTAS", "32"))
+NUM_PROGRAMS = int(os.environ.get("VLLM_L2_PREFETCH_CTAS", "64"))
 WINDOWS = frozenset(
     window.strip()
     for window in os.environ.get("VLLM_L2_PREFETCH_WINDOWS", "moe,attn").split(",")
     if window.strip()
 )
 ATTN_MAX_TOKENS = int(os.environ.get("VLLM_L2_PREFETCH_ATTN_MAX_TOKENS", "8"))
-ATTN_NUM_PROGRAMS = int(os.environ.get("VLLM_L2_PREFETCH_ATTN_CTAS", str(NUM_PROGRAMS)))
+ATTN_NUM_PROGRAMS = int(os.environ.get("VLLM_L2_PREFETCH_ATTN_CTAS", "32"))
 MOE_WINDOW = "moe"
 ATTN_WINDOW = "attn"
 
