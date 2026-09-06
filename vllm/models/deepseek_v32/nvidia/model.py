@@ -48,13 +48,15 @@ from vllm.models.deepseek_v32.attention import DeepseekV32Attention
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from .b12x import DeepseekV32B12xAttention
+from .b12x import DeepseekV32B12xAttention, DeepseekV32B12xIndexerAttention
 from .glm52_low_latency_gemm import enable_glm52_low_latency_gemm
 
 
 def _get_attention_cls(vllm_config: VllmConfig) -> type[DeepseekV32Attention]:
     if vllm_config.attention_config.backend == AttentionBackendEnum.B12X:
         return DeepseekV32B12xAttention
+    if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+        return DeepseekV32B12xIndexerAttention
     return DeepseekV32Attention
 
 
