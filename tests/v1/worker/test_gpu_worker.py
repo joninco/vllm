@@ -80,14 +80,18 @@ def test_startup_plan_apply_gate(plan_env):
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
 
 
-def test_b12x_warmup_precedes_cudagraph_memory_profile(monkeypatch):
-    """B12X launch modules must be resolved before descriptor capture begins."""
-    events = []
+def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
+    """KV sizing must exclude cold-start peaks and retain graph headroom."""
+    events: list[object] = []
+
+    def profile_cudagraph_memory():
+        events.append("profile_cudagraph_memory")
+        return 0
 
     model_runner = SimpleNamespace(
         model_memory_usage=0,
         profile_run=lambda: events.append("profile_run"),
-        profile_cudagraph_memory=lambda: events.append("profile_cudagraph_memory") or 0,
+        profile_cudagraph_memory=profile_cudagraph_memory,
     )
     profile_result = SimpleNamespace(
         total_consumed=10,
@@ -110,6 +114,7 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(monkeypatch):
         requested_memory=90,
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(),
+        device="cuda:0",
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(
                 cudagraph_mode=gpu_worker.CUDAGraphMode.PIECEWISE,
@@ -131,6 +136,11 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(monkeypatch):
         lambda worker, sizes: events.append(("b12x_warmup", tuple(sizes))),
     )
     monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "reset_peak_memory_stats",
+        lambda device: events.append(("reset_peak", device)),
+    )
+    monkeypatch.setattr(
         gpu_worker,
         "reserve_mm_ipc_gpu_memory",
         lambda requested, *args: requested,
@@ -141,6 +151,8 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(monkeypatch):
     assert events == [
         "profile_run",
         ("b12x_warmup", (8, 4)),
+        ("reset_peak", "cuda:0"),
+        "profile_run",
         "profile_cudagraph_memory",
     ]
     assert available == 80

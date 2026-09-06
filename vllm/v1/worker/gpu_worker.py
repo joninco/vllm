@@ -141,7 +141,6 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
-
 class _B12xRoceCheckedAsyncOutput(AsyncModelRunnerOutput):
     """An asynchronous output whose completion is followed by the RoCEnante check."""
 
@@ -541,6 +540,13 @@ class Worker(WorkerBase):
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
 
+        compilation_config = self.vllm_config.compilation_config
+        profile_cudagraphs = (
+            current_platform.is_cuda_alike()
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        )
+        capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
@@ -548,6 +554,13 @@ class Worker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+            if profile_cudagraphs:
+                # KV sizing must use a repeatable serving peak. Resolve persistent
+                # B12X modules, discard cold-start high-water, then measure the
+                # same model profile again.
+                b12x_warmup(self, capture_sizes)
+                torch.accelerator.reset_peak_memory_stats(self.device)
+                self.model_runner.profile_run()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -556,18 +569,7 @@ class Worker(WorkerBase):
         # torch.cuda handle the live capture path already uses on ROCm.
         # XPU stays excluded (see #39977).
         cudagraph_memory_estimate = 0
-        if (
-            current_platform.is_cuda_alike()
-            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        ):
-            # Resolve B12X launch modules before the graph-memory profiler
-            # enters its descriptor capture loop. A disk-cache miss can run
-            # CUDA module initialization on first use, which is not a valid
-            # operation to introduce between breakable graph descriptors.
-            capture_sizes = list(
-                self.vllm_config.compilation_config.cudagraph_capture_sizes or []
-            )
-            b12x_warmup(self, capture_sizes)
+        if profile_cudagraphs:
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Respect the opt-in flag as originally designed.
@@ -1090,9 +1092,7 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self._b12x_roce_guarded(
-            self.model_runner.sample_tokens(grammar_output)
-        )
+        return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
         """The RoCEnante health check of the TP communicator, if one is active.
