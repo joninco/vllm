@@ -29,10 +29,12 @@ class _AttentionWrapper(nn.Module):
 
 
 class _Attention(nn.Module):
-    def __init__(self, *, skip_topk: bool) -> None:
+    def __init__(self, *, skip_topk: bool, o_proj: bool = True) -> None:
         super().__init__()
         self.fused_qkv_a_proj = _Linear()
         self.q_b_proj = _Linear()
+        if o_proj:
+            self.o_proj = _Linear()
         wrapper = _AttentionWrapper(skip_topk=skip_topk)
         self.indexer = wrapper.indexer
         self.skip_topk = wrapper.skip_topk
@@ -46,9 +48,9 @@ class _Mlp(nn.Module):
 
 
 class _DecoderLayer(nn.Module):
-    def __init__(self, *, moe: bool, skip_topk: bool) -> None:
+    def __init__(self, *, moe: bool, skip_topk: bool, o_proj: bool = True) -> None:
         super().__init__()
-        self.self_attn = _Attention(skip_topk=skip_topk)
+        self.self_attn = _Attention(skip_topk=skip_topk, o_proj=o_proj)
         self.mlp = _Mlp(moe=moe)
 
 
@@ -81,6 +83,46 @@ def test_active_requires_full_graph_or_capture(
     assert not l2_prefetch._active(17)
 
 
+@pytest.mark.parametrize(
+    ("windows", "num_tokens", "moe_expected", "attn_expected"),
+    [
+        (frozenset({"moe", "attn"}), 8, True, True),
+        (frozenset({"moe", "attn"}), 9, True, False),
+        (frozenset({"moe", "attn"}), 17, False, False),
+        (frozenset({"moe"}), 4, True, False),
+        (frozenset({"attn"}), 4, False, True),
+        (frozenset(), 4, False, False),
+    ],
+)
+def test_windows_gate_independently(
+    monkeypatch: pytest.MonkeyPatch,
+    windows: frozenset[str],
+    num_tokens: int,
+    moe_expected: bool,
+    attn_expected: bool,
+) -> None:
+    monkeypatch.setattr(l2_prefetch, "ENABLED", True)
+    monkeypatch.setattr(l2_prefetch, "MAX_TOKENS", 16)
+    monkeypatch.setattr(l2_prefetch, "ATTN_MAX_TOKENS", 8)
+    monkeypatch.setattr(l2_prefetch, "WINDOWS", windows)
+    monkeypatch.setattr(l2_prefetch, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        l2_prefetch,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL),
+    )
+
+    assert l2_prefetch._active(num_tokens, l2_prefetch.MOE_WINDOW) is moe_expected
+    assert l2_prefetch._active(num_tokens, l2_prefetch.ATTN_WINDOW) is attn_expected
+
+
+def test_window_program_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(l2_prefetch, "NUM_PROGRAMS", 32)
+    monkeypatch.setattr(l2_prefetch, "ATTN_NUM_PROGRAMS", 16)
+    assert l2_prefetch._window_num_programs(l2_prefetch.MOE_WINDOW) == 32
+    assert l2_prefetch._window_num_programs(l2_prefetch.ATTN_WINDOW) == 16
+
+
 def test_register_decoder_layers_attaches_fixed_next_layer_weights() -> None:
     layers = nn.ModuleList(
         [
@@ -106,6 +148,41 @@ def test_register_decoder_layers_attaches_fixed_next_layer_weights() -> None:
         layers[2].self_attn.fused_qkv_a_proj.weight,
         layers[2].self_attn.q_b_proj.weight,
     ]
+
+
+def test_register_decoder_layers_attaches_output_projection_per_layer() -> None:
+    layers = nn.ModuleList(
+        [
+            _DecoderLayer(moe=False, skip_topk=True),
+            _DecoderLayer(moe=True, skip_topk=False),
+            _DecoderLayer(moe=True, skip_topk=True, o_proj=False),
+        ]
+    )
+
+    l2_prefetch.register_attention_layers(layers, 0, len(layers))
+
+    # Every layer, including the first local one, loads its own o_proj; the
+    # router and shared-expert weights are not part of the list.
+    assert layers[0]._l2_prefetch_attn_weights == [layers[0].self_attn.o_proj.weight]
+    assert layers[1]._l2_prefetch_attn_weights == [layers[1].self_attn.o_proj.weight]
+    assert layers[2]._l2_prefetch_attn_weights is None
+    assert layers[0]._l2_prefetch_weights is None
+
+
+def test_issue_passes_window_to_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, str]] = []
+
+    def record(hidden_states, weights, sink, window):
+        calls.append((len(weights), window))
+
+    monkeypatch.setattr(torch.ops.vllm, "l2_weight_prefetch", record)
+    monkeypatch.setattr(l2_prefetch, "_sink", lambda device: None)
+    hidden_states = torch.empty(4, 8, dtype=torch.bfloat16)
+    cuda_like = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+    l2_prefetch.issue(cuda_like, [hidden_states], l2_prefetch.ATTN_WINDOW)
+    l2_prefetch.issue(cuda_like, [hidden_states, hidden_states])
+    l2_prefetch.issue(cuda_like, None, l2_prefetch.ATTN_WINDOW)
+    assert calls == [(1, "attn"), (2, "moe")]
 
 
 def test_issue_and_join_ignore_cpu_tensors(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,24 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Overlap GLM decode collectives with next-layer weight loads.
+"""Overlap GLM decode collectives and attention with weight loads into L2.
 
 Small tensor-parallel decode steps leave high-bandwidth memory underused while
-the final MoE or dense-MLP all-reduce waits on PCIe synchronization. This
-module uses that interval to stream the next decoder layer's BF16 attention
-projection weights into L2 on a side stream. The consumer does not wait for
-the prefetch: weights that have arrived are served from L2 and remaining
-weights are fetched from memory normally.
+collectives wait on PCIe synchronization and while the attention kernels run.
+This module uses those intervals to stream BF16 projection weights into L2 on
+a side stream. The consumer does not wait for the prefetch: weights that have
+arrived are served from L2 and remaining weights are fetched from memory
+normally.
+
+Two windows per decoder layer (``register_attention_layers`` attaches both
+target lists; ``VLLM_L2_PREFETCH_WINDOWS`` selects at run time which of them
+launch, so the traced graph is the same for every setting):
+
+- ``moe``: during the previous layer's MoE or dense-MLP output all-reduce
+  (fused into this layer's input RMSNorm), this layer's fused query/key/value
+  input projection, query output projection and, where the sparse indexer
+  runs, its query projection. Gated by ``VLLM_L2_PREFETCH_MAX_TOKENS`` and
+  loaded by ``VLLM_L2_PREFETCH_CTAS`` programs.
+- ``attn``: at the start of the attention block, ordered on the normalised
+  block input, this layer's attention output projection (``o_proj``), which
+  is consumed right after the attention kernels. Gated by
+  ``VLLM_L2_PREFETCH_ATTN_MAX_TOKENS`` (the loads beside the attention kernels
+  cost more than they save at larger row counts) and loaded by
+  ``VLLM_L2_PREFETCH_ATTN_CTAS`` programs. The router gate and shared-expert
+  weights that follow ``o_proj`` are not in this list: the weight-first
+  projection stages them from memory while the attention-output all-reduce
+  waits.
 
 The side stream is used only in full CUDA graphs whose padded token count is
-bounded by ``VLLM_L2_PREFETCH_MAX_TOKENS``. Every forward joins the side stream
-before returning, which closes the graph fork. Eager and piecewise-graph
-forwards only warm the Triton kernel; creating an event for every eager layer
-would retain driver allocations while the host runs ahead of the GPU.
+within the window's gate. Every forward joins the side stream once before
+returning, which closes the graph forks. Eager and piecewise-graph forwards
+only warm the Triton kernel; creating an event for every eager layer would
+retain driver allocations while the host runs ahead of the GPU.
 
 ``register_attention_layers`` must run during model construction. It attaches
-fixed weight lists to each decoder layer whose entry reduction can overlap the
-loads and allocates a persistent sink before graph tracing. Live request
-quantities never enter a compile or cache key.
+fixed weight lists to each decoder layer and allocates a persistent sink
+before graph tracing. Live request quantities never enter a compile or cache
+key.
 """
 
 from __future__ import annotations
@@ -38,6 +57,15 @@ logger = init_logger(__name__)
 ENABLED = os.environ.get("VLLM_L2_PREFETCH", "1") == "1"
 MAX_TOKENS = int(os.environ.get("VLLM_L2_PREFETCH_MAX_TOKENS", "64"))
 NUM_PROGRAMS = int(os.environ.get("VLLM_L2_PREFETCH_CTAS", "32"))
+WINDOWS = frozenset(
+    window.strip()
+    for window in os.environ.get("VLLM_L2_PREFETCH_WINDOWS", "moe,attn").split(",")
+    if window.strip()
+)
+ATTN_MAX_TOKENS = int(os.environ.get("VLLM_L2_PREFETCH_ATTN_MAX_TOKENS", "8"))
+ATTN_NUM_PROGRAMS = int(os.environ.get("VLLM_L2_PREFETCH_ATTN_CTAS", str(NUM_PROGRAMS)))
+MOE_WINDOW = "moe"
+ATTN_WINDOW = "attn"
 
 _BLOCK = 2048
 _UNROLL = 8
@@ -93,21 +121,36 @@ def _sink(device: torch.device) -> torch.Tensor:
     return value
 
 
-def _launch(weight: torch.Tensor, sink: torch.Tensor) -> None:
+def _launch(
+    weight: torch.Tensor, sink: torch.Tensor, num_programs: int = NUM_PROGRAMS
+) -> None:
     packed_weight = weight.view(-1).view(torch.int64)
-    _l2_prefetch_kernel[(NUM_PROGRAMS,)](
+    _l2_prefetch_kernel[(num_programs,)](
         packed_weight,
         packed_weight.numel(),
         sink,
         BLOCK=_BLOCK,
-        NPROG=NUM_PROGRAMS,
+        NPROG=num_programs,
         UNROLL=_UNROLL,
         num_warps=16,
     )
 
 
-def _active(num_tokens: int) -> bool:
-    if not ENABLED or num_tokens > MAX_TOKENS or not is_forward_context_available():
+def _window_max_tokens(window: str) -> int:
+    return ATTN_MAX_TOKENS if window == ATTN_WINDOW else MAX_TOKENS
+
+
+def _window_num_programs(window: str) -> int:
+    return ATTN_NUM_PROGRAMS if window == ATTN_WINDOW else NUM_PROGRAMS
+
+
+def _active(num_tokens: int, window: str = MOE_WINDOW) -> bool:
+    if (
+        not ENABLED
+        or window not in WINDOWS
+        or num_tokens > _window_max_tokens(window)
+        or not is_forward_context_available()
+    ):
         return False
     mode = get_forward_context().cudagraph_runtime_mode
     if mode == CUDAGraphMode.PIECEWISE:
@@ -116,10 +159,13 @@ def _active(num_tokens: int) -> bool:
 
 
 def _warm_up(weights: list[torch.Tensor], sink: torch.Tensor) -> None:
+    """Compile and load every program-count specialization outside any
+    capture (a first launch inside a capture fails)."""
     device_index = _device_index(sink.device)
     if device_index in _warmed_devices or torch.cuda.is_current_stream_capturing():
         return
-    _launch(weights[0], sink)
+    for num_programs in sorted({NUM_PROGRAMS, ATTN_NUM_PROGRAMS}):
+        _launch(weights[0], sink, num_programs)
     _warmed_devices.add(device_index)
 
 
@@ -127,8 +173,9 @@ def _prefetch_impl(
     hidden_states: torch.Tensor,
     weights: list[torch.Tensor],
     sink: torch.Tensor,
+    window: str,
 ) -> None:
-    if not _active(hidden_states.shape[0]):
+    if not _active(hidden_states.shape[0], window):
         _warm_up(weights, sink)
         return
 
@@ -136,14 +183,17 @@ def _prefetch_impl(
     main_stream = torch.cuda.current_stream(hidden_states.device)
     prefetch_stream = _stream(hidden_states.device)
     prefetch_stream.wait_stream(main_stream)
+    num_programs = _window_num_programs(window)
     with torch.cuda.stream(prefetch_stream):
         for weight in weights:
-            _launch(weight, sink)
+            _launch(weight, sink, num_programs)
     _pending_devices.add(device_index)
     logger.info_once(
-        "L2 attention-weight prefetch is active in full CUDA graphs "
-        "through %d padded tokens.",
-        MAX_TOKENS,
+        "L2 weight prefetch window %s is active in full CUDA graphs "
+        "through %d padded tokens (%d programs).",
+        window,
+        _window_max_tokens(window),
+        num_programs,
     )
 
 
@@ -151,6 +201,7 @@ def _prefetch_fake(
     hidden_states: torch.Tensor,
     weights: list[torch.Tensor],
     sink: torch.Tensor,
+    window: str,
 ) -> None:
     return None
 
@@ -181,13 +232,19 @@ direct_register_custom_op(
 )
 
 
-def issue(hidden_states: torch.Tensor, weights: list[torch.Tensor] | None) -> None:
-    """Issue a prefetch ordered after ``hidden_states`` when targets exist."""
+def issue(
+    hidden_states: torch.Tensor,
+    weights: list[torch.Tensor] | None,
+    window: str = MOE_WINDOW,
+) -> None:
+    """Issue a prefetch of ``window`` ordered after ``hidden_states`` when
+    targets exist."""
     if weights and hidden_states.device.type == "cuda":
         torch.ops.vllm.l2_weight_prefetch(
             hidden_states,
             weights,
             _sink(hidden_states.device),
+            window,
         )
 
 
@@ -215,19 +272,38 @@ def _bf16_weight(module: object, name: str) -> torch.Tensor | None:
 def register_attention_layers(layers: torch.nn.ModuleList, start: int, end: int) -> int:
     """Attach fixed attention projection weights to decoder layers.
 
-    Each local layer after the first receives its own fused query/key/value
-    input projection, query output projection, and sparse indexer query
-    projection when that layer computes an index selection. The preceding
-    layer leaves its MLP output unreduced, so these weights can load alongside
-    the entry fused all-reduce and RMSNorm. The returned count is the number of
-    decoder transitions with a non-empty target list.
+    ``moe`` window (``layer._l2_prefetch_weights``): each local layer after
+    the first receives its own fused query/key/value input projection, query
+    output projection, and sparse indexer query projection when that layer
+    computes an index selection. The preceding layer leaves its MLP output
+    unreduced, so these weights can load alongside the entry fused all-reduce
+    and RMSNorm.
+
+    ``attn`` window (``layer._l2_prefetch_attn_weights``): every local layer
+    receives its own attention output projection, loaded at the start of the
+    attention block so it is in L2 when the attention kernels finish.
+
+    Both attributes are set on every layer (``None`` where there is nothing
+    to load) whatever ``VLLM_L2_PREFETCH_WINDOWS`` selects. The returned count
+    is the number of decoder transitions with a non-empty ``moe`` target list.
     """
     target_count = 0
+    attn_count = 0
     for layer_index in range(start, end):
         layer = layers[layer_index]
         attention = getattr(layer, "self_attn", None)
         layer._l2_prefetch_weights = None
-        if attention is None or layer_index == start:
+        layer._l2_prefetch_attn_weights = None
+        if attention is None:
+            continue
+
+        o_proj = _bf16_weight(attention, "o_proj")
+        if o_proj is not None:
+            layer._l2_prefetch_attn_weights = [o_proj]
+            attn_count += 1
+            if o_proj.device.type == "cuda":
+                _sink(o_proj.device)
+        if layer_index == start:
             continue
 
         weights = [
@@ -247,7 +323,9 @@ def register_attention_layers(layers: torch.nn.ModuleList, start: int, end: int)
             _sink(targets[0].device)
 
     logger.info_once(
-        "Registered %d decoder transitions for L2 attention-weight prefetch.",
+        "Registered %d decoder transitions for the L2 attention-weight prefetch "
+        "and %d attention blocks for the output-projection prefetch.",
         target_count,
+        attn_count,
     )
     return target_count

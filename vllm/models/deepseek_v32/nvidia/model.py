@@ -147,7 +147,9 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             # The previous layer's MLP/MoE output is left un-reduced; fuse its
             # all-reduce into this input_layernorm.
             l2_prefetch.issue(
-                hidden_states, getattr(self, "_l2_prefetch_weights", None)
+                hidden_states,
+                getattr(self, "_l2_prefetch_weights", None),
+                l2_prefetch.MOE_WINDOW,
             )
             hidden_states, residual = fused_allreduce_rms_norm(
                 hidden_states, residual, self.input_layernorm
@@ -155,6 +157,13 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
+        # Load this layer's attention output projection into L2 beside the
+        # attention kernels; ordered on the normalised block input.
+        l2_prefetch.issue(
+            hidden_states,
+            getattr(self, "_l2_prefetch_attn_weights", None),
+            l2_prefetch.ATTN_WINDOW,
+        )
         # self_attn's o_proj runs reduce_results=False; reduce before RMSNorm.
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         if self.use_sequence_parallel:
