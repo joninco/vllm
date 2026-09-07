@@ -36,6 +36,16 @@ attention kernels wait for the prefetch. Eager forwards sort in line: a fork
 records an event per call, and events pending behind a host that runs ahead
 retain device memory.
 
+The fork retains its input tensors until the join. The indexer hands the
+sort a per-token page table that is a temporary of the indexer call (the
+per-request table repeated once per query token); the caching allocator
+returns that memory to the pool when the last Python reference drops, at the
+indexer's return, and orders its reuse only against the allocating stream.
+Without the retention, the next main-stream allocation between the fork and
+the join (the latent query projection's output) reuses the memory while the
+sort stream still reads it, and the sort emits slots from an overwritten
+table that the attention kernel then dereferences.
+
 ``VLLM_TOPK_SORT=0`` disables the sort and ``VLLM_TOPK_SORT_MAX_TOKENS``
 (default 8) bounds the row count that sorts. Both are read once per process
 and decide, at model construction, which indexer plans emit logical
@@ -59,7 +69,9 @@ ENABLED = os.environ.get("VLLM_TOPK_SORT", "1") != "0"
 #: do not pay for it. 0 sorts every row count.
 MAX_TOKENS = int(os.environ.get("VLLM_TOPK_SORT_MAX_TOKENS", "8"))
 
-_pending_devices: set[int] = set()
+#: Inputs of a forked sort, per device, held until ``join``; see the module
+#: docstring for why the references must outlive the caller's temporaries.
+_pending: dict[int, tuple[torch.Tensor, ...]] = {}
 _streams: dict[int, torch.cuda.Stream] = {}
 
 
@@ -145,7 +157,7 @@ def sort_convert_async(
     side.wait_stream(main)
     with torch.cuda.stream(side):
         sort_convert(indices, seq_lens, block_table, block_size, max_positions)
-    _pending_devices.add(_device_index(device))
+    _pending[_device_index(device)] = (indices, seq_lens, block_table)
     return indices
 
 
@@ -153,7 +165,9 @@ def join(device: torch.device) -> None:
     """Main-stream wait for a pending ``sort_convert_async``; a no-op when
     nothing is pending."""
     index = _device_index(device)
-    if index not in _pending_devices:
+    if index not in _pending:
         return
     torch.cuda.current_stream(device).wait_stream(_stream(device))
-    _pending_devices.remove(index)
+    # Released after the wait: a reuse of the temporaries by a later
+    # main-stream allocation is then ordered behind the sort.
+    del _pending[index]

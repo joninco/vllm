@@ -5,6 +5,7 @@ gate, the index space of the indexer plans, and the side-stream fork/join
 inside full CUDA graphs. The kernel is tested in the b12x repository; here
 the op is a recorded stand-in."""
 
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -83,7 +84,7 @@ def test_eager_sort_runs_in_line(monkeypatch) -> None:
     out = b12x_topk_sort.sort_convert_async(indices, seq_lens, table, 64, 4096)
     assert out is indices
     assert op.calls == [("sort", (4, 16), 64, 4096, 0)]
-    assert not b12x_topk_sort._pending_devices
+    assert not b12x_topk_sort._pending
     b12x_topk_sort.join(torch.device("cpu"))  # nothing pending: no-op
 
 
@@ -97,13 +98,20 @@ def test_graph_mode_sort_forks_and_joins(monkeypatch) -> None:
     seq_lens = torch.tensor([3, 4, 5, 6], dtype=torch.int32, device=device)
     table = torch.zeros(4, 2, dtype=torch.int32, device=device)
     main = torch.cuda.current_stream(device).cuda_stream
+    table_ref = weakref.ref(table)
     b12x_topk_sort.sort_convert_async(indices, seq_lens, table, 64, 4096)
     assert len(op.calls) == 1
     assert op.calls[0][-1] != main, "the sort must run on the side stream"
     assert op.calls[0][-1] == b12x_topk_sort._stream(device).cuda_stream
-    assert b12x_topk_sort._device_index(device) in b12x_topk_sort._pending_devices
+    assert b12x_topk_sort._device_index(device) in b12x_topk_sort._pending
+    # The caller's page table is a temporary: the fork must keep it alive
+    # until the join so that no main-stream allocation reuses its memory
+    # while the sort stream reads it.
+    del table
+    assert table_ref() is not None, "the fork must retain the page table"
     b12x_topk_sort.join(device)
-    assert not b12x_topk_sort._pending_devices
+    assert not b12x_topk_sort._pending
+    assert table_ref() is None, "the join must release the page table"
     torch.accelerator.synchronize(device)
 
 
