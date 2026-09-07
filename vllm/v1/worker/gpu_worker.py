@@ -723,6 +723,7 @@ class Worker(WorkerBase):
                 b12x_warmup_snapshot,
                 repeatable_profile_snapshot,
                 profile_result.after_profile,
+                final_profile_snapshot,
             ):
                 stage_values.extend(
                     (
@@ -746,7 +747,7 @@ class Worker(WorkerBase):
                 "KV cache profiling stages (total/torch_allocated/torch_reserved/"
                 "non_torch GiB): first_profile=%s/%s/%s/%s, "
                 "b12x_warmup=%s/%s/%s/%s, repeatable_profile=%s/%s/%s/%s, "
-                "post_cleanup=%s/%s/%s/%s",
+                "post_cleanup=%s/%s/%s/%s, post_cudagraph_profile=%s/%s/%s/%s",
                 *stage_values,
             )
         logger.info_once(
