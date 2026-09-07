@@ -202,6 +202,11 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
         lambda device: events.append(("reset_peak", device)),
     )
     monkeypatch.setattr(
+        gpu_worker.torch.accelerator,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+    monkeypatch.setattr(
         gpu_worker,
         "reserve_mm_ipc_gpu_memory",
         lambda requested, *args: requested,
@@ -209,6 +214,10 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
 
     available = gpu_worker.Worker.determine_available_memory(worker)
 
+    # The cached allocator blocks are released before the final snapshot, as
+    # the activation profile released them before its own after-profile
+    # snapshot, so only allocations retained after the CUDA-graph profile
+    # count as late persistent memory.
     assert events == [
         "reserve_sampler_workspace",
         "profile_run",
@@ -218,6 +227,7 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
         "profile_run",
         "profile_glm_dcp_attention",
         "profile_cudagraph_memory",
+        "empty_cache",
     ]
     # The repeatable profile retained seven bytes above its cleanup state.
     # Five are already covered by the live-allocation peak, leaving two bytes

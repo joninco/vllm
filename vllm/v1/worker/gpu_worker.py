@@ -603,7 +603,14 @@ class Worker(WorkerBase):
         # Backend and CUDA-graph profiling can initialize communication pools,
         # compiled modules, and other persistent device allocations after the
         # main activation profile. Include their retained footprint before the
-        # remaining memory is assigned to production KV cache storage.
+        # remaining memory is assigned to production KV cache storage. The
+        # activation profile measured ``after_profile`` after releasing the
+        # allocator's cached blocks; measure the final snapshot the same way,
+        # so that blocks the graph-memory profile left cached but free (its
+        # temporary graph pools) are not charged as persistent memory on top
+        # of the CUDA-graph estimate.
+        gc.collect()
+        torch.accelerator.empty_cache()
         final_profile_snapshot = MemorySnapshot(device=self.device)
         late_persistent_memory = max(
             profile_result.after_profile.free_memory
