@@ -1612,8 +1612,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
         assert self.topk_indices_buffer is not None
         # Inside full CUDA graphs the indexer sorts its selection on a side
-        # stream (b12x_topk_sort) while the KV-cache write and the query
-        # projection run here; the selection is read from this point on.
+        # stream (b12x_topk_sort) while the latent query projection and the
+        # query concatenation above run on this stream; the selection is read
+        # from this point on.
         b12x_topk_sort.join(self.topk_indices_buffer.device)
         topk_indices = self.topk_indices_buffer[:num_tokens]
         kv_cache_for_run = kv_c_and_k_pe_cache

@@ -21,13 +21,15 @@ Inside full CUDA graphs the decode-path sort runs on its own stream
 (``sort_convert_async``: the stream waits for the indexer and the sort is
 enqueued there; ``join`` makes the main stream wait for it). The join sits in
 the sparse MLA backend's ``forward_mqa`` right before the first read of the
-selection, after the KV-cache write and the query projections (which this
-model issues before the indexer) and after the query concatenation that
-``forward_mqa`` runs on the main stream between the indexer and the
-attention kernels; that concatenation and the launch latency of the sort are
-what the side stream hides. A join placed before the attention op would
-leave nothing to overlap: the captured chain would be linear and the driver
-would replay it on one stream. The sort stream is not the L2-prefetch side
+selection. The KV-cache write and the query projections of this model run
+before the indexer, so the main-stream work between the indexer and the
+attention kernels is the latent query projection (the W_UK batched matmul,
+which the attention module issues after the indexer launch on the bf16
+query path for this purpose) and the query concatenation that
+``forward_mqa`` runs; those two kernels are what hides the sort. A join
+placed before the attention op would leave nothing to overlap: the captured
+chain would be linear and the driver would replay it on one stream. The sort
+stream is not the L2-prefetch side
 stream: that one carries the output-projection prefetch, issued at the start
 of the attention block, and a sort enqueued behind it would make the
 attention kernels wait for the prefetch. Eager forwards sort in line: a fork
