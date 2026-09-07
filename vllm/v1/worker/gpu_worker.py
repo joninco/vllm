@@ -618,6 +618,13 @@ class Worker(WorkerBase):
             0,
         )
         self.total_consumed = profile_result.total_consumed + late_persistent_memory
+        # The CUDA-graph estimate is the free-memory drop across the profiling
+        # capture, so it already contains the allocations that capture left
+        # behind; when it is applied, charge only the retained memory beyond
+        # it, otherwise the retained memory would be deducted twice.
+        late_persistent_charge = max(
+            late_persistent_memory - cudagraph_memory_estimate_applied, 0
+        )
         repeatable_allocator_headroom = profile_result.transient_peak_headroom
         if repeatable_profile_snapshot is not None:
             # KV allocation must leave enough physical capacity for the warmed
@@ -652,7 +659,7 @@ class Worker(WorkerBase):
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
-            - late_persistent_memory
+            - late_persistent_charge
             - cudagraph_memory_estimate_applied
             - allocator_headroom_correction
         )

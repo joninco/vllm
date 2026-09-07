@@ -81,16 +81,27 @@ def test_startup_plan_apply_gate(plan_env):
 
 
 @pytest.mark.parametrize(
-    "final_free_memory,expected_available_memory",
-    [(80, 78), (75, 73)],
+    "final_free_memory,cudagraph_estimate,expected_available_memory",
+    [
+        # No late persistent memory, no graph estimate.
+        (80, 0, 78),
+        # Five bytes retained after the graph profile, charged in full.
+        (75, 0, 73),
+        # The graph estimate already covers three of the five retained bytes.
+        (75, 3, 73),
+        # The graph estimate covers every retained byte; only it is charged.
+        (75, 6, 72),
+    ],
 )
 def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     monkeypatch,
     final_free_memory,
+    cudagraph_estimate,
     expected_available_memory,
 ):
     """KV sizing must retain the warmed allocator and graph high-waters and
-    the persistent allocations made after the activation profile."""
+    the persistent allocations made after the activation profile, charging
+    the part of them inside the CUDA-graph estimate once."""
     events: list[object] = []
     snapshots = iter(
         [
@@ -123,7 +134,7 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
 
     def profile_cudagraph_memory():
         events.append("profile_cudagraph_memory")
-        return 0
+        return cudagraph_estimate
 
     def reserve_sampler_workspace():
         events.append("reserve_sampler_workspace")
