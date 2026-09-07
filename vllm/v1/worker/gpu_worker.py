@@ -570,6 +570,7 @@ class Worker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+            self.model_runner.profile_glm_dcp_attention()
             first_profile_snapshot = MemorySnapshot(device=self.device)
             if profile_cudagraphs:
                 # KV sizing must use a repeatable serving peak. Resolve persistent
@@ -579,6 +580,7 @@ class Worker(WorkerBase):
                 b12x_warmup_snapshot = MemorySnapshot(device=self.device)
                 torch.accelerator.reset_peak_memory_stats(self.device)
                 self.model_runner.profile_run()
+                self.model_runner.profile_glm_dcp_attention()
                 repeatable_profile_snapshot = MemorySnapshot(device=self.device)
 
         # Profile CUDA graph memory if graphs will be captured.
@@ -598,7 +600,17 @@ class Worker(WorkerBase):
             else 0
         )
 
-        self.total_consumed = profile_result.total_consumed
+        # Backend and CUDA-graph profiling can initialize communication pools,
+        # compiled modules, and other persistent device allocations after the
+        # main activation profile. Include their retained footprint before the
+        # remaining memory is assigned to production KV cache storage.
+        final_profile_snapshot = MemorySnapshot(device=self.device)
+        late_persistent_memory = max(
+            profile_result.after_profile.free_memory
+            - final_profile_snapshot.free_memory,
+            0,
+        )
+        self.total_consumed = profile_result.total_consumed + late_persistent_memory
         repeatable_allocator_headroom = profile_result.transient_peak_headroom
         if repeatable_profile_snapshot is not None:
             # KV allocation must leave enough physical capacity for the warmed
@@ -618,7 +630,7 @@ class Worker(WorkerBase):
         )
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
-        free_gpu_memory = profile_result.after_profile.free_memory
+        free_gpu_memory = final_profile_snapshot.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
         assert self.init_snapshot.free_memory >= free_gpu_memory, (
@@ -633,6 +645,7 @@ class Worker(WorkerBase):
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
+            - late_persistent_memory
             - cudagraph_memory_estimate_applied
             - allocator_headroom_correction
         )
@@ -670,11 +683,13 @@ class Worker(WorkerBase):
         )
         logger.info_once(
             "KV cache memory budget components: requested=%s GiB, weights=%s GiB, "
-            "persistent_total=%s GiB, transient_peak=%s GiB, "
-            "repeatable_allocator_headroom=%s GiB, cudagraph=%s GiB",
+            "persistent_total=%s GiB, late_persistent=%s GiB, "
+            "transient_peak=%s GiB, repeatable_allocator_headroom=%s GiB, "
+            "cudagraph=%s GiB",
             format_gib(self.requested_memory),
             format_gib(profile_result.weights_memory),
             format_gib(profile_result.total_consumed),
+            format_gib(late_persistent_memory),
             format_gib(profile_result.transient_peak_headroom),
             format_gib(repeatable_allocator_headroom),
             format_gib(cudagraph_memory_estimate_applied),
@@ -1030,6 +1045,11 @@ class Worker(WorkerBase):
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
+
+    def wait_for_boundary_checkpoint_copies(self) -> None:
+        state = getattr(self.model_runner, "boundary_checkpoint_state", None)
+        if state is not None:
+            state.wait_for_copies()
 
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()

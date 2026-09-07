@@ -27,6 +27,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     split_indexer_prefill_chunks,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.workspace import current_workspace_manager
 
 _INDEX_HEAD_DIM = 128
@@ -367,8 +368,9 @@ class B12xSparseIndexer(nn.Module):
             device=topk_indices_buffer.device,
         )
         max_q_rows = int(topk_indices_buffer.shape[0])
-        max_page_table_width = max(
-            1, (self.max_model_len + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE
+        max_page_table_width = get_block_table_width(
+            max(1, (self.max_model_len + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE),
+            _INDEX_PAGE_SIZE,
         )
         from vllm.config import get_current_vllm_config
 

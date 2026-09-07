@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+from copy import copy
 from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -101,6 +103,7 @@ class GDNAttentionMetadata:
     seq_lens: torch.Tensor | None = None
 
     prefill_checkpoint: GDNPrefillCheckpointMetadata | None = None
+    is_uniform_spec_decode: bool = False
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -108,6 +111,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     supports_update_block_table: bool = True
 
+    # Runner-owned stable storage, with NULL_BLOCK_ID in padded request rows.
     mamba_aligned_state_indices: torch.Tensor | None = None
 
     reorder_batch_threshold: int = 1
@@ -190,6 +194,91 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        self._decode_state_indices_source: torch.Tensor | None = None
+        self._decode_state_indices_view: torch.Tensor | None = None
+        self._reuse_spec_decode_inputs = envs.VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH
+        # Constant sources for the uniform spec-decode fast path. They are
+        # copied into the builder-owned graph buffers above, never handed to
+        # the layers directly: a full cudagraph captured from a uniform batch
+        # replays for a padded batch of the same size, which the generic path
+        # builds into those same buffers, so both paths must share addresses.
+        self._uniform_spec_masks_cpu = torch.ones(
+            self.decode_cudagraph_max_bs, dtype=torch.bool
+        )
+        self._uniform_spec_tokens = torch.arange(
+            self.decode_cudagraph_max_bs, dtype=torch.int32, device=device
+        )
+        self._uniform_spec_query_start = torch.arange(
+            self.decode_cudagraph_max_bs + 1, dtype=torch.int32, device=device
+        ) * (self.num_spec + 1)
+
+    def _can_reuse_spec_inputs(
+        self,
+        m: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None,
+    ) -> bool:
+        return (
+            self._reuse_spec_decode_inputs
+            and self.use_spec_decode
+            and self.use_full_cuda_graph
+            and self.vllm_config.cache_config.mamba_cache_mode == "align"
+            and self.mamba_aligned_state_indices is not None
+            and num_accepted_tokens is not None
+            and num_decode_draft_tokens_cpu is not None
+            and 0 < m.num_actual_tokens <= self.decode_cudagraph_max_bs
+            and m.num_actual_tokens == m.num_reqs * (self.num_spec + 1)
+            and bool(torch.all(num_decode_draft_tokens_cpu == self.num_spec))
+            and bool(torch.all(torch.diff(m.query_start_loc_cpu) == self.num_spec + 1))
+            and (m.is_prefilling is None or not bool(torch.any(m.is_prefilling)))
+        )
+
+    def _build_uniform_spec_decode(
+        self, m: CommonAttentionMetadata, num_accepted_tokens: torch.Tensor
+    ) -> GDNAttentionMetadata:
+        """Build an all-spec, uniform-window batch without any host-side work.
+
+        Everything the layers read is written into the builder-owned graph
+        buffers, exactly where the generic path writes it, so a full cudagraph
+        captured through either path replays correctly through the other.
+        """
+        num_reqs = m.num_reqs
+        num_tokens = m.num_actual_tokens
+        source = self.mamba_aligned_state_indices
+        assert source is not None
+        spec_state_indices = self.spec_state_indices_tensor[:num_reqs]
+        spec_state_indices.copy_(
+            source[:num_reqs, : self.num_spec + 1], non_blocking=True
+        )
+        spec_sequence_masks = self.spec_sequence_masks[:num_reqs]
+        spec_sequence_masks.fill_(True)
+        spec_token_indx = self.spec_token_indx[:num_tokens]
+        spec_token_indx.copy_(self._uniform_spec_tokens[:num_tokens], non_blocking=True)
+        spec_query_start_loc = self.spec_query_start_loc[: num_reqs + 1]
+        spec_query_start_loc.copy_(
+            self._uniform_spec_query_start[: num_reqs + 1], non_blocking=True
+        )
+        accepted = self.num_accepted_tokens[:num_reqs]
+        accepted.copy_(num_accepted_tokens[:num_reqs], non_blocking=True)
+        return GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=num_reqs,
+            num_spec_decode_tokens=num_tokens,
+            num_actual_tokens=num_tokens,
+            spec_query_start_loc=spec_query_start_loc,
+            spec_state_indices_tensor=spec_state_indices,
+            spec_sequence_masks=spec_sequence_masks,
+            spec_sequence_masks_cpu=self._uniform_spec_masks_cpu[:num_reqs],
+            spec_token_indx=spec_token_indx,
+            non_spec_token_indx=self.non_spec_token_indx[:0],
+            num_accepted_tokens=accepted,
+            num_reqs=num_reqs,
+            seq_lens=m.seq_lens,
+            is_uniform_spec_decode=True,
+        )
 
     def _get_state_indices(
         self,
@@ -207,6 +296,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
+        )
+
+    def _can_reuse_decode_inputs(self) -> bool:
+        return (
+            not self.use_spec_decode
+            and self.vllm_config.cache_config.mamba_cache_mode == "align"
+            and self.mamba_aligned_state_indices is not None
         )
 
     def _build_chunk_metadata(
@@ -260,6 +356,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+        if self._can_reuse_spec_inputs(
+            m, num_accepted_tokens, num_decode_draft_tokens_cpu
+        ):
+            assert num_accepted_tokens is not None
+            return self._build_uniform_spec_decode(m, num_accepted_tokens)
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
@@ -599,6 +700,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_prefills == 0
             and num_spec_decodes == 0
             and num_decodes <= self.decode_cudagraph_max_bs
+            and not self._can_reuse_decode_inputs()
         ):
             self.non_spec_state_indices_tensor[:num_decodes].copy_(
                 non_spec_state_indices_tensor, non_blocking=True
@@ -656,6 +758,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         del slot_mapping
         assert metadata.num_reqs > 0
         assert metadata.seq_lens is not None
+
+        if (
+            metadata.num_prefills == 0
+            and metadata.num_spec_decodes == 0
+            and self._can_reuse_decode_inputs()
+        ):
+            source = self.mamba_aligned_state_indices
+            assert source is not None
+            if (
+                self._decode_state_indices_source is not source
+                or self._decode_state_indices_view is None
+                or self._decode_state_indices_view.shape[0] != metadata.num_reqs
+            ):
+                self._decode_state_indices_source = source
+                self._decode_state_indices_view = source[: metadata.num_reqs, 0]
+            updated = copy(metadata)
+            updated.non_spec_state_indices_tensor = self._decode_state_indices_view
+            return updated
 
         state_indices = self._get_state_indices(
             blk_table,
@@ -753,6 +873,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and metadata.num_prefills == 0
             and metadata.num_spec_decodes == 0
             and metadata.num_decodes <= self.decode_cudagraph_max_bs
+            and not self._can_reuse_decode_inputs()
         ):
             self.non_spec_state_indices_tensor[: metadata.num_decodes].copy_(
                 non_spec_state_indices[: metadata.num_decodes], non_blocking=True

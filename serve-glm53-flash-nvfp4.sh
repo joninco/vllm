@@ -6,7 +6,7 @@ PYTHON_BIN="${PYTHON_BIN:-${SCRIPT_DIR}/.venv/bin/python}"
 
 MODEL_PATH="${MODEL_PATH:-/data/models/GLM-5.3-Flash-4p67}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-zai-org/GLM-5.3-Flash}"
-LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}"
+LOAD_FORMAT="${LOAD_FORMAT:-fastsafetensors}"
 LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8001}"
@@ -74,6 +74,11 @@ usage() {
     "                                Initial adaptive depth (default: 3)." \
     "  ADAPTIVE_SPECULATIVE_TOKENS_WINDOW=N" \
     "                                Verification steps per update (default: 32)." \
+    "  VLLM_MXFP8_LM_HEAD=1          Runtime MXFP8 verifier head (default: 1)." \
+    "  VLLM_LM_HEAD_A16=1           BF16 head activations (default: 1)." \
+    "  VLLM_MTP_NVFP4_LM_HEAD=1     Separate NVFP4 MTP head (default: 1)." \
+    "  VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH=1" \
+    "                                Reuse KDA decode metadata (default: 1)." \
     "" \
     "All other arguments are forwarded to vLLM. Equivalent environment" \
     "variables use the TORCH_PROFILE_* names declared at the top of the script."
@@ -248,15 +253,12 @@ export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-16}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export SAFETENSORS_FAST_GPU="${SAFETENSORS_FAST_GPU:-1}"
-export INSTANTTENSOR_BACKEND="${INSTANTTENSOR_BACKEND:-BUFFERED}"
-if [[ "${TP_SIZE}" == 2 ]]; then
-  export INSTANTTENSOR_BUFFER_SIZE="${INSTANTTENSOR_BUFFER_SIZE:-67108864}"
-  export INSTANTTENSOR_IO_DEPTH="${INSTANTTENSOR_IO_DEPTH:-3}"
-  export INSTANTTENSOR_CONCURRENCY="${INSTANTTENSOR_CONCURRENCY:-1}"
-  export INSTANTTENSOR_CHUNK_SIZE="${INSTANTTENSOR_CHUNK_SIZE:-8388608}"
-fi
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_B12X_MOE_FP4_FORCE_A16="${VLLM_B12X_MOE_FP4_FORCE_A16:-1}"
+export VLLM_MXFP8_LM_HEAD="${VLLM_MXFP8_LM_HEAD:-1}"
+export VLLM_LM_HEAD_A16="${VLLM_LM_HEAD_A16:-1}"
+export VLLM_MTP_NVFP4_LM_HEAD="${VLLM_MTP_NVFP4_LM_HEAD:-1}"
+export VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH="${VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH:-1}"
 
 speculative_args=()
 if ((NUM_SPECULATIVE_TOKENS > 0)); then
@@ -374,11 +376,6 @@ printf 'Launching %s as %s directly on devices %s\n' \
   "${MODEL_PATH}" "${SERVED_MODEL_NAME}" "${DEVICE_IDS}" >&2
 printf 'Serving NVFP4 routed experts through B12X W4A16 (BF16 activations)\n' >&2
 printf 'Linear backend: %s\n' "${LINEAR_BACKEND}" >&2
-if [[ "${LOAD_FORMAT}" == instanttensor && "${TP_SIZE}" == 2 ]]; then
-  printf 'InstantTensor staging: %s-byte GPU ceiling, depth %s, concurrency %s\n' \
-    "${INSTANTTENSOR_BUFFER_SIZE}" "${INSTANTTENSOR_IO_DEPTH}" \
-    "${INSTANTTENSOR_CONCURRENCY}" >&2
-fi
 printf 'Speculator: %s (%s draft tokens)\n' \
   "${SPECULATOR}" "${NUM_SPECULATIVE_TOKENS}" >&2
 if [[ "${SPECULATOR}" == mtp ]] \

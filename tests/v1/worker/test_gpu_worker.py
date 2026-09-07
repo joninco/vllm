@@ -80,8 +80,17 @@ def test_startup_plan_apply_gate(plan_env):
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
 
 
-def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
-    """KV sizing must retain the warmed allocator and graph high-waters."""
+@pytest.mark.parametrize(
+    "final_free_memory,expected_available_memory",
+    [(80, 78), (75, 73)],
+)
+def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
+    monkeypatch,
+    final_free_memory,
+    expected_available_memory,
+):
+    """KV sizing must retain the warmed allocator and graph high-waters and
+    the persistent allocations made after the activation profile."""
     events: list[object] = []
     snapshots = iter(
         [
@@ -103,6 +112,12 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
                 torch_memory=16,
                 non_torch_memory=2,
             ),
+            SimpleNamespace(
+                free_memory=final_free_memory,
+                torch_allocated=8,
+                torch_memory=9,
+                non_torch_memory=3,
+            ),
         ]
     )
 
@@ -118,6 +133,7 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
         model_memory_usage=0,
         reserve_sampler_workspace=reserve_sampler_workspace,
         profile_run=lambda: events.append("profile_run"),
+        profile_glm_dcp_attention=lambda: events.append("profile_glm_dcp_attention"),
         profile_cudagraph_memory=profile_cudagraph_memory,
     )
     profile_result = SimpleNamespace(
@@ -152,9 +168,9 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
             non_torch_memory=1,
         ),
         requested_memory=90,
+        device="cuda:0",
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(),
-        device="cuda:0",
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(
                 cudagraph_mode=gpu_worker.CUDAGraphMode.PIECEWISE,
@@ -196,12 +212,15 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(monkeypatch):
     assert events == [
         "reserve_sampler_workspace",
         "profile_run",
+        "profile_glm_dcp_attention",
         ("b12x_warmup", (8, 4)),
         ("reset_peak", "cuda:0"),
         "profile_run",
+        "profile_glm_dcp_attention",
         "profile_cudagraph_memory",
     ]
     # The repeatable profile retained seven bytes above its cleanup state.
     # Five are already covered by the live-allocation peak, leaving two bytes
-    # of allocator-reservation headroom to deduct from KV capacity.
-    assert available == 78
+    # of allocator-reservation headroom to deduct from KV capacity, plus the
+    # free memory retained after the activation profile.
+    assert available == expected_available_memory

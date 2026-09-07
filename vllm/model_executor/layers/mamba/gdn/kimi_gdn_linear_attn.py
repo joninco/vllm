@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -277,7 +278,7 @@ def _make_fused_conv1d_weight_loader(
         source_start = tp_rank * shard_size
         target_start = sum(sharded_dims[:loaded_shard_id])
         loaded_shard = loaded_weight[source_start : source_start + shard_size]
-        param.data[target_start : target_start + shard_size].copy_(loaded_shard)
+        copy_weight(param.data[target_start : target_start + shard_size], loaded_shard)
 
     return weight_loader
 
@@ -355,12 +356,15 @@ class _B12xKdaPrefillWarmup:
 
         def compile() -> None:
             plan = layer._b12x_prefill_plan
-            scratch = layer._b12x_prefill_scratch
             api = layer._b12x_prefill_api
-            if plan is None or scratch is None or api is None:
+            if plan is None or api is None:
                 # The pool is bound after the memory-profiling pass; the
                 # post-allocation warmup compiles this layer.
                 return
+            scratch_buffers = get_b12x_scratch_buffers(plan)
+            scratch = (
+                scratch_buffers[0] if len(scratch_buffers) == 1 else scratch_buffers
+            )
             caps = plan.caps
             device = caps.device
             heads, head_dim = caps.heads, caps.head_dim
@@ -441,6 +445,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             spec,
             num_prefill_checkpoint_blocks=int(
                 self.kda_prefill_backend in ("flashkda", "b12x")
+                and not vllm_config.use_request_boundary_checkpoints
             ),
         )
 
@@ -505,7 +510,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.f_b_proj",
         )
         self.dt_bias = nn.Parameter(
-            torch.empty(self.local_projection_size, dtype=torch.float32)
+            allocate_weights(
+                torch.empty, self.local_projection_size, dtype=torch.float32
+            )
         )
 
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
@@ -533,7 +540,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         self.A_log = nn.Parameter(
-            torch.empty(self.local_num_heads, dtype=torch.float32)
+            allocate_weights(torch.empty, self.local_num_heads, dtype=torch.float32)
         )
         set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
 
@@ -599,13 +606,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.g_b_proj",
             )
-        self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+        self.o_norm = allocate_weights(
+            FusedRMSNormGated, self.head_dim, activation="sigmoid"
+        )
         self._b12x_kda_api: Any | None = None
         self._b12x_kda_plan = None
         self._initialize_b12x_kda_decode(vllm_config)
         self._b12x_prefill_api: Any | None = None
         self._b12x_prefill_plan = None
-        self._b12x_prefill_scratch = None
         self._initialize_b12x_kda_prefill(vllm_config)
         self.o_proj = RowParallelLinear(
             self.projection_size,
@@ -696,12 +704,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         super().bind_kv_cache(kv_cache)
         if self._b12x_prefill_api is not None:
-            prefill_plan = self._make_b12x_kda_prefill_plan(
+            self._b12x_prefill_plan = self._make_b12x_kda_prefill_plan(
                 max_state_slots=int(self.kv_cache[1].shape[0])
             )
-            self._b12x_prefill_plan = prefill_plan
-            prefill_scratch, _ = self._get_b12x_prefill_workspace()
-            self._b12x_prefill_scratch = prefill_scratch
         api = self._b12x_kda_api
         if api is None:
             return
@@ -715,7 +720,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_kda_plan = None
         self._b12x_kda_scratch = None
         self._b12x_prefill_plan = None
-        self._b12x_prefill_scratch = None
         super().unbind_kv_cache()
 
     def _initialize_b12x_kda_prefill(self, vllm_config: VllmConfig) -> None:
@@ -826,7 +830,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         an initial state name the null slot and start from zero.
 
         Args:
-            scratch: Workspace that is simultaneously live with ``output``.
+            scratch: Caller-owned workspace disjoint from ``output``.
             q: Live packed query rows, ``[tokens, heads, head_dim]``.
             k: Live packed key rows.
             v: Live packed value rows.
@@ -840,7 +844,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             output: Destination rows, ``[tokens, heads, head_dim]``.
 
         Raises:
-            RuntimeError: If the KDA prefill plan or scratch is unavailable.
+            RuntimeError: If the KDA prefill plan is unavailable.
             ValueError: If the live batch exceeds the planned capacity.
         """
         api = self._b12x_prefill_api
@@ -991,8 +995,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         """Execute B12X KDA after the convolution projection.
 
         Args:
-            metadata: Forward-context metadata used to share runtime-owned
-                packed metadata tensors across compatible layers.
+            metadata: Describes whether packed query boundaries are uniform.
             mixed_qkv: Live packed query, key, and value projection.
             raw_g: Live unactivated forget gate.
             raw_beta: Live unactivated update gate.
@@ -1032,17 +1035,16 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         cache = forward_context.additional_kwargs.setdefault(
             "b12x_kda_metadata_tensors", {}
         )
+        # Uniform builders own separate buffers with identical fixed boundaries.
         cache_key = (
-            id(metadata),
+            None if metadata.is_uniform_spec_decode else query_start_loc.data_ptr(),
+            num_accepted_tokens.data_ptr() if num_accepted_tokens is not None else None,
             num_tokens,
             num_requests,
-            state_columns,
-            plan.caps.max_state_slots,
         )
         bound_metadata = cache.get(cache_key)
         if bound_metadata is None:
             query_start_loc = query_start_loc[: num_requests + 1]
-            state_indices = state_indices[:num_requests, :state_columns]
             if num_accepted_tokens is None:
                 accepted_tokens = self._b12x_kda_num_accepted_tokens[:num_requests]
                 accepted_tokens.fill_(1)
@@ -1055,7 +1057,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             bound_metadata = (
                 query_start_loc,
                 accepted_tokens,
-                state_indices,
                 self._b12x_kda_num_seqs,
                 self._b12x_kda_num_tokens,
             )
@@ -1063,7 +1064,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         (
             query_start_loc,
             accepted_tokens,
-            state_indices,
             num_seqs,
             num_tokens_tensor,
         ) = bound_metadata
@@ -1081,7 +1081,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             recurrent_state=self.kv_cache[1],
             query_start_loc=query_start_loc,
             num_accepted_tokens=accepted_tokens,
-            state_indices=state_indices,
+            state_indices=state_indices[:num_requests, :state_columns],
             num_seqs=num_seqs,
             num_tokens=num_tokens_tensor,
             output=output,
@@ -1101,6 +1101,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> None:
         num_tokens = hidden_states.size(0)
         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+        # Optional model-installed callback (e.g. GLM-5.3 L2 weight prefetch of
+        # o_proj while the small projections and the recurrence run).
+        _hook = getattr(self, "_l2_prefetch_hook", None)
+        if _hook is not None:
+            _hook(hidden_states.shape[0])
         if self.use_full_rank_gate:
             split_sizes = [
                 3 * self.local_projection_size,
