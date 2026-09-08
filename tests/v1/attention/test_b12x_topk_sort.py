@@ -63,6 +63,21 @@ def test_plan_output_space(monkeypatch, physical, sort_selection, rows, expected
     assert b12x_indexer._plan_output_space(physical, sort_selection, rows) == expected
 
 
+def test_is_supported_without_the_b12x_op(monkeypatch) -> None:
+    """An installed b12x without ``attention.topk_sort`` leaves the sort off
+    (the indexer then keeps its unsorted selection) instead of raising at
+    model construction."""
+
+    def missing_op():
+        raise ImportError("cannot import name 'topk_sort' from 'b12x.attention'")
+
+    monkeypatch.setattr(b12x_topk_sort, "ENABLED", True)
+    monkeypatch.setattr(b12x_topk_sort, "_op", missing_op)
+    assert b12x_topk_sort.is_supported(torch.device("cpu")) is False
+    monkeypatch.setattr(b12x_topk_sort, "ENABLED", False)
+    assert b12x_topk_sort.is_supported(torch.device("cpu")) is False
+
+
 def test_sorts_follows_the_plan_index_space(monkeypatch) -> None:
     indexer = b12x_indexer.B12xSparseIndexer.__new__(b12x_indexer.B12xSparseIndexer)
     indexer.sort_selection = True

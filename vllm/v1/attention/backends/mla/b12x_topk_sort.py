@@ -60,6 +60,9 @@ import torch
 
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 ENABLED = os.environ.get("VLLM_TOPK_SORT", "1") != "0"
 #: Largest row count (tokens of the step) that is sorted. The sort exists so
@@ -87,7 +90,16 @@ def _op():
 
 
 def is_supported(device: torch.device) -> bool:
-    return ENABLED and _op().is_supported(device)
+    """Whether the sort serves ``device``; False, with one warning, when the
+    installed b12x has no ``attention.topk_sort`` op, so the indexer keeps
+    its unsorted selection instead of failing at model construction."""
+    if not ENABLED:
+        return False
+    try:
+        return bool(_op().is_supported(device))
+    except (ImportError, AttributeError) as exc:
+        logger.warning_once("B12X selection sort disabled: %s", exc)
+        return False
 
 
 def precompile(max_positions: int, device: torch.device) -> None:
