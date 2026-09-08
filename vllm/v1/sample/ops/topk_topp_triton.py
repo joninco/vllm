@@ -21,7 +21,18 @@ _TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] 
 
 
 def _workspace_program_counts(device: torch.device, batch_size: int) -> tuple[int, int]:
-    """Return active and allocated Triton program rows for a batch."""
+    """Return active and allocated Triton program rows for a batch.
+
+    Args:
+        device: CUDA device whose streaming-multiprocessor count bounds the
+            program grid.
+        batch_size: Number of logits rows the sampler processes.
+
+    Returns:
+        ``(num_programs, allocated_rows)``: the programs launched for the batch
+        and the workspace rows allocated for them (the next power of two,
+        capped at the multiprocessor count). Both are zero for an empty batch.
+    """
     if batch_size <= 0:
         return 0, 0
     num_sm = num_compute_units(device.index)
@@ -43,7 +54,15 @@ def reserve_top_k_top_p_workspace(
     seeded, processed-logprobs, or speculative-sampling request from growing
     the process-wide cache after the remaining device memory belongs to KV.
 
-    Returns the total reserved buffer size in bytes.
+    Args:
+        device: CUDA device that owns the scratch buffer.
+        dtype: Element type of the sorted logits scratch.
+        vocab_size: Number of logits per row.
+        max_batch_size: Largest logits batch one sampling call can see.
+
+    Returns:
+        Total reserved buffer size in bytes; zero when no program row is
+        needed.
     """
     _, allocated_rows = _workspace_program_counts(device, max_batch_size)
     if allocated_rows == 0:

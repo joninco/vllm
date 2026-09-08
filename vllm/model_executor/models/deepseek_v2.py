@@ -463,7 +463,18 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def can_reuse_input_as_output(self, hidden_states: torch.Tensor) -> bool:
-        """Return whether a large consumed MoE input can hold its output."""
+        """Return whether a large consumed MoE input can hold its output.
+
+        Args:
+            hidden_states: MoE input whose storage the caller no longer needs
+                after the routed and shared experts have consumed it.
+
+        Returns:
+            True when the layer runs in inference mode without sequence
+            parallelism, has shared experts, skips the final all-reduce, has
+            no routed-output transform, and ``hidden_states`` is a contiguous
+            2-D tensor of at least ``_OUTPUT_REUSE_MIN_TOKENS`` rows.
+        """
         return bool(
             not torch.is_grad_enabled()
             and not self.is_sequence_parallel

@@ -54,6 +54,15 @@ _LL_BF16_WARMUP_M_RANGE = range(1, 17)
 
 
 def _is_flashinfer_backend(backend) -> bool:
+    """Return whether an attention backend class is the FlashInfer backend.
+
+    Args:
+        backend: Attention backend class of an attention group.
+
+    Returns:
+        True when the backend reports the name ``FLASHINFER``; False when it
+        reports another name or does not implement ``get_name``.
+    """
     try:
         return backend.get_name() == "FLASHINFER"
     except NotImplementedError:
@@ -61,6 +70,14 @@ def _is_flashinfer_backend(backend) -> bool:
 
 
 def _is_flashinfer_object(obj: object) -> bool:
+    """Return whether an object's class or module is named after FlashInfer.
+
+    Args:
+        obj: Any object; only its class name and module are inspected.
+
+    Returns:
+        True when ``flashinfer`` occurs in the class or module name.
+    """
     cls = obj.__class__
     return (
         "flashinfer" in cls.__name__.lower() or "flashinfer" in cls.__module__.lower()
@@ -73,6 +90,21 @@ def _contains_flashinfer_object(
     depth: int = 0,
     seen: set[int] | None = None,
 ) -> bool:
+    """Return whether a FlashInfer object is reachable from a module attribute.
+
+    Dicts, sequences, and plain objects are searched through their values and
+    instance attributes up to three levels deep. Nested ``nn.Module`` values
+    are not entered; ``_uses_flashinfer_model_kernels`` visits every module
+    itself.
+
+    Args:
+        obj: Attribute value to search.
+        depth: Current nesting level; the search stops at three.
+        seen: Object ids already visited, guarding against cycles.
+
+    Returns:
+        True when ``obj`` or a reachable value is a FlashInfer object.
+    """
     if obj is None or isinstance(obj, (str, bytes, int, float, bool, torch.Tensor)):
         return False
     if _is_flashinfer_object(obj):
@@ -105,6 +137,14 @@ def _contains_flashinfer_object(
 
 
 def _uses_flashinfer_attention(runner: "GPUModelRunner") -> bool:
+    """Return whether any attention group of the runner uses FlashInfer.
+
+    Args:
+        runner: Model runner whose attention groups are inspected.
+
+    Returns:
+        True when at least one attention group has the FlashInfer backend.
+    """
     attn_groups = getattr(runner, "attn_groups", None)
     return bool(
         attn_groups
@@ -117,6 +157,15 @@ def _uses_flashinfer_attention(runner: "GPUModelRunner") -> bool:
 
 
 def _uses_flashinfer_model_kernels(model: nn.Module) -> bool:
+    """Return whether a model holds FlashInfer kernels outside attention.
+
+    Args:
+        model: Loaded model whose modules and their attributes are inspected.
+
+    Returns:
+        True when a module is a FlashInfer object or holds one in its
+        non-module attributes.
+    """
     for module in model.modules():
         if _is_flashinfer_object(module):
             return True
@@ -130,6 +179,14 @@ def _uses_flashinfer_model_kernels(model: nn.Module) -> bool:
 
 
 def _uses_flashinfer_compute_kernels(worker: "Worker") -> bool:
+    """Return whether the worker's model executes FlashInfer kernels.
+
+    Args:
+        worker: Worker whose model runner and loaded model are inspected.
+
+    Returns:
+        True when attention or any model module uses FlashInfer.
+    """
     return _uses_flashinfer_attention(
         worker.model_runner
     ) or _uses_flashinfer_model_kernels(worker.get_model())

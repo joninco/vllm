@@ -674,13 +674,23 @@ class MoERunner(MoERunnerInterface):
         hidden_states: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ):
-        """The weight-first fused router + shared gate_up projection for this
-        call, or None when the path does not apply: disabled, the runner does
-        not hold both the gate and the shared experts, a latent-MoE input
-        transform (the shared experts consume a different tensor), the fused
-        shared-expert gate mode, more than 16 rows, or weights outside the
-        kernel contract. Built on the first call (after the weights are
+        """Select the weight-first router + shared gate_up projection.
+
+        The projection is built on the first call (after the weights are
         loaded, before any CUDA-graph capture) regardless of the row count.
+
+        Args:
+            hidden_states: Router input of this call.
+            shared_experts_input: Tensor the shared experts consume; the path
+                requires it to be ``hidden_states`` itself.
+
+        Returns:
+            The projection when it applies, otherwise None: the path is
+            disabled, the runner does not hold both the gate and the shared
+            experts, a latent-MoE input transform feeds the shared experts a
+            different tensor, the fused shared-expert gate mode is active, the
+            weights are outside the kernel contract, or ``hidden_states`` has
+            more rows than the projection supports.
         """
         if (
             not _WF_GATE_ENABLED
@@ -699,12 +709,18 @@ class MoERunner(MoERunnerInterface):
         return projection
 
     def _build_weight_first_projection(self):
-        """Concatenate the router gate and the shared expert's gate_up
-        weights into one weight-first projection (the parameters become views
-        into the concatenated buffer) and wrap the shared-expert MLP so that
-        it consumes the projection's gate_up activation. Returns False when
-        the weights are outside the contract or b12x does not serve this
-        device."""
+        """Build the weight-first projection over the gate and gate_up weights.
+
+        The router gate and the shared expert's gate_up weights are
+        concatenated into one weight-first projection (the parameters become
+        views into the concatenated buffer) and the shared-expert MLP is
+        wrapped so that it consumes the projection's gate_up activation.
+
+        Returns:
+            The projection, or False when a weight carries a bias, the weights
+            are outside the kernel contract, b12x does not serve this device,
+            or the construction fails.
+        """
         assert self.gate is not None and self._shared_experts is not None
         try:
             from b12x.gemm import weight_first_gemv
@@ -770,7 +786,23 @@ class MoERunner(MoERunnerInterface):
         fused_output: torch.Tensor,
         output_buffer: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Combine expert branches, optionally into declared dead storage."""
+        """Combine expert branches, optionally into declared dead storage.
+
+        Args:
+            shared_output: Shared-expert output.
+            fused_output: Routed-expert output of the same shape and dtype.
+            output_buffer: Storage the caller declares dead, written in place
+                with the sum; None allocates a fresh sum.
+
+        Returns:
+            The sum of both branches: ``output_buffer`` when it was given,
+            otherwise a new tensor.
+
+        Raises:
+            ValueError: ``output_buffer`` is used with gradients enabled, does
+                not match the outputs' shape, dtype, device and contiguity, or
+                aliases one of them.
+        """
         if output_buffer is None:
             return shared_output + fused_output
         if torch.is_grad_enabled():

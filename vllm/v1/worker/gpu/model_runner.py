@@ -863,6 +863,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         One speculative decode step can produce ``decode_query_len`` target
         logits per request. Native top-k/top-p processing must therefore cover
         that expanded batch even when ordinary sampling uses FlashInfer.
+
+        Returns:
+            Reserved scratch size in bytes; zero without a sampler or when the
+            native Triton path is not selectable.
         """
         if self.sampler is None:
             return 0

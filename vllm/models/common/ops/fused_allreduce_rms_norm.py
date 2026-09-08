@@ -30,13 +30,20 @@ def fused_allreduce_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """All-reduce + add residual + standard RMSNorm with available fusion.
 
-    ``hidden_states`` is the per-rank *partial* output of a row-parallel linear
-    run with ``reduce_results=False``; ``norm`` is the RMSNorm applied right
-    after. Returns ``(normed_output, new_residual)``, equivalent to
-    ``norm(all_reduce(hidden_states), residual)``. An active B12X PCIe
-    communicator gets the first opportunity to execute the fused operation;
-    FlashInfer is used for shapes B12X rejects. The final fallback is an
-    explicit all-reduce followed by RMSNorm.
+    An active B12X PCIe communicator gets the first opportunity to execute the
+    fused operation; FlashInfer is used for shapes B12X rejects. The final
+    fallback is an explicit all-reduce followed by RMSNorm.
+
+    Args:
+        hidden_states: Per-rank partial output of a row-parallel linear run
+            with ``reduce_results=False``. The B12X and FlashInfer paths
+            overwrite it with the new residual.
+        residual: Residual stream added after the reduction.
+        norm: RMSNorm applied to the reduced sum.
+
+    Returns:
+        ``(normed_output, new_residual)``, equivalent to
+        ``norm(all_reduce(hidden_states), residual)``.
     """
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size == 1:

@@ -917,6 +917,15 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     (e.g. inductor graph partition reclaims the storages of earlier cudagraph
     recordings once the real capture records new ones, leading to use-after-free
     crashes).
+
+    Args:
+        runner: Model runner whose configured graphs are captured for
+            measurement.
+
+    Returns:
+        Device memory in bytes consumed while capturing the complete graph set
+        (the free-memory drop across the capture); zero when CUDA graphs are
+        off or nothing needs capture.
     """
     if runner.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
         return 0

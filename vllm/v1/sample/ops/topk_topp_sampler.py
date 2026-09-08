@@ -23,7 +23,17 @@ def reserve_top_k_top_p_workspace(
     vocab_size: int,
     max_batch_size: int,
 ) -> int:
-    """Reserve native top-k/top-p scratch for the maximum serving batch."""
+    """Reserve native top-k/top-p scratch for the maximum serving batch.
+
+    Args:
+        device: Device the sampler runs on.
+        vocab_size: Number of logits per row.
+        max_batch_size: Largest logits batch one sampling call can see.
+
+    Returns:
+        Reserved scratch size in bytes; zero when the Triton path cannot be
+        selected (fewer than eight rows, no Triton, or a non-CUDA platform).
+    """
     # CUDA batches below eight rows use the PyTorch sort implementation.
     if max_batch_size < 8 or not HAS_TRITON or not current_platform.is_cuda():
         return 0
