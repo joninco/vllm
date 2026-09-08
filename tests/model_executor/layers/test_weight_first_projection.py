@@ -125,12 +125,11 @@ def test_projection_built_once_and_used_at_decode_rows(
     assert runner._shared_experts._layer.mlp is mlp
     # The build happens once; later calls reuse the instance.
     assert runner._weight_first_projection(x, x) is projection
-    # Rows beyond the kernel contract and a different shared-expert input
-    # return None without rebuilding.
-    assert (
-        runner._weight_first_projection(torch.zeros(17, 8, dtype=torch.bfloat16), None)
-        is None
-    )
+    # Rows beyond the kernel contract (the same tensor as the shared-expert
+    # input, so the row limit itself decides) and a different shared-expert
+    # input return None without rebuilding.
+    x_17 = torch.zeros(17, 8, dtype=torch.bfloat16)
+    assert runner._weight_first_projection(x_17, x_17) is None
     other = torch.zeros(4, 8, dtype=torch.bfloat16)
     assert runner._weight_first_projection(x, other) is None
     assert runner.__dict__["_wf_projection"] is projection
