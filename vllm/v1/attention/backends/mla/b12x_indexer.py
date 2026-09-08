@@ -193,6 +193,31 @@ def _plan_output_space(
     return "physical"
 
 
+def _decode_plan_sizes(
+    capture_sizes: list[int], max_num_seqs: int, sort_selection: bool
+) -> list[int]:
+    """Row counts of the decode plans prepared before CUDA-graph capture.
+
+    Args:
+        capture_sizes: The CUDA-graph capture sizes.
+        max_num_seqs: The largest decode batch.
+        sort_selection: Whether the selection sort serves this indexer.
+
+    Returns:
+        The capture sizes within ``max_num_seqs``, ``max_num_seqs`` itself
+        and, with the sort active and its row gate below ``max_num_seqs``,
+        the gate itself, so that a decode batch within the gate selects a
+        plan emitting logical positions for the sort whatever the capture
+        sizes are (a plan is selected by the smallest prepared row count at
+        or above the batch).
+    """
+    sizes = {int(size) for size in capture_sizes if 0 < int(size) <= max_num_seqs}
+    sizes.add(max_num_seqs)
+    if sort_selection and 0 < b12x_topk_sort.MAX_TOKENS < max_num_seqs:
+        sizes.add(b12x_topk_sort.MAX_TOKENS)
+    return sorted(sizes)
+
+
 def _plan_emits_physical_slots(plan: Any) -> bool:
     """Whether an indexer plan writes physical cache slots. The scratch caps
     a compiled plan carries record the choice as ``output_physical_slots``;
@@ -397,11 +422,9 @@ class B12xSparseIndexer(nn.Module):
 
         self._make_plan = make_plan
         capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
-        decode_plan_sizes = {
-            int(size) for size in capture_sizes if 0 < int(size) <= max_num_seqs
-        }
-        decode_plan_sizes.add(max_num_seqs)
-        self._decode_plan_sizes = sorted(decode_plan_sizes)
+        self._decode_plan_sizes = _decode_plan_sizes(
+            capture_sizes, max_num_seqs, self.sort_selection
+        )
         self._decode_plans = {
             rows: make_plan(mode="decode", q_rows=rows)
             for rows in self._decode_plan_sizes

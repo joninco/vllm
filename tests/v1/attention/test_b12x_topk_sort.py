@@ -47,6 +47,34 @@ def test_active_gate(monkeypatch, enabled, max_tokens, rows, expected) -> None:
 
 
 @pytest.mark.parametrize(
+    ("capture_sizes", "max_num_seqs", "sort_selection", "expected"),
+    [
+        # Capture sizes above the gate: the gate-sized plan is added so a
+        # small decode batch does not select the 16-row physical-slot plan.
+        ([16, 32], 32, True, [8, 16, 32]),
+        # Capture sizes within the gate already provide sorting plans.
+        ([1, 2, 4, 8, 16], 32, True, [1, 2, 4, 8, 16, 32]),
+        # No capture sizes: the gate and the largest batch.
+        ([], 32, True, [8, 32]),
+        # The largest batch is within the gate: it sorts already.
+        ([], 8, True, [8]),
+        # Sort inactive: capture sizes and the largest batch only.
+        ([16, 32], 32, False, [16, 32]),
+        # Capture sizes above the largest batch are dropped.
+        ([4, 64], 32, False, [4, 32]),
+    ],
+)
+def test_decode_plan_sizes_include_the_sort_gate(
+    monkeypatch, capture_sizes, max_num_seqs, sort_selection, expected
+):
+    monkeypatch.setattr(b12x_topk_sort, "MAX_TOKENS", 8)
+    assert (
+        b12x_indexer._decode_plan_sizes(capture_sizes, max_num_seqs, sort_selection)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
     ("physical", "sort_selection", "rows", "expected"),
     [
         (True, True, 4, "logical"),
