@@ -272,9 +272,11 @@ def test_b12x_warmup_deduplicates_registered_and_completed_signatures(
         lambda: synchronized.append(True),
     )
 
-    b12x_warmup(worker, [1, 2])
-    b12x_warmup(worker, [1, 2])
-    b12x_warmup(worker, [1, 2, 3])
+    # The return value reports whether the call resolved kernels: a repeated
+    # signature resolves nothing.
+    assert b12x_warmup(worker, [1, 2]) is True
+    assert b12x_warmup(worker, [1, 2]) is False
+    assert b12x_warmup(worker, [1, 2, 3]) is True
 
     assert scans == 2
     assert calls == [
@@ -284,6 +286,19 @@ def test_b12x_warmup_deduplicates_registered_and_completed_signatures(
         ("second", (1, 2, 3, 4, 8, 16, 29, 32), torch.bfloat16),
     ]
     assert synchronized == [True, True]
+
+    # Off SM120-class CUDA devices, and with a model that holds no warm-up
+    # units, nothing is resolved.
+    other_platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability_family=lambda family: family == 100,
+    )
+    monkeypatch.setattr(warmup_mod, "current_platform", other_platform)
+    assert b12x_warmup(worker, [5]) is False
+    monkeypatch.setattr(warmup_mod, "current_platform", platform)
+    layers[:] = [SimpleNamespace()]
+    assert b12x_warmup(worker, [5]) is False
+    assert len(calls) == 4
 
 
 def test_b12x_dsa_indexer_warmup_unit_compiles_before_the_index_cache(

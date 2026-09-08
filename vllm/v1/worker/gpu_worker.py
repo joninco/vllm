@@ -572,11 +572,15 @@ class Worker(WorkerBase):
             self.model_runner.profile_run()
             self.model_runner.profile_glm_dcp_attention()
             first_profile_snapshot = MemorySnapshot(device=self.device)
-            if profile_cudagraphs:
-                # KV sizing must use a repeatable serving peak. Resolve persistent
-                # B12X modules, discard cold-start high-water, then measure the
-                # same model profile again.
-                b12x_warmup(self, capture_sizes)
+            # Resolve persistent B12X modules before the graph-memory profiler
+            # enters its descriptor capture loop (a disk-cache miss can run
+            # CUDA module initialization on first use, which is not a valid
+            # operation between breakable graph descriptors). When kernels
+            # were resolved, KV sizing must use a repeatable serving peak:
+            # discard the cold-start high-water and measure the same model
+            # profile again. Deployments without B12X kernels keep the single
+            # profile.
+            if profile_cudagraphs and b12x_warmup(self, capture_sizes):
                 b12x_warmup_snapshot = MemorySnapshot(device=self.device)
                 torch.accelerator.reset_peak_memory_stats(self.device)
                 self.model_runner.profile_run()

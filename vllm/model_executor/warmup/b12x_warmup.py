@@ -50,11 +50,24 @@ def _compile_warmup_units(
     return warmed
 
 
-def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
+def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> bool:
+    """Resolve the B12X kernels the loaded model will launch when serving.
+
+    Args:
+        worker: The worker holding the loaded model and its configuration.
+        cudagraph_capture_sizes: The CUDA-graph capture sizes; with the
+            batched-token limit and the compile sizes they define the
+            capacities to resolve.
+
+    Returns:
+        Whether this call resolved kernels: ``False`` off CUDA SM120-class
+        devices, when the model holds no B12X warm-up units, or when the
+        same capacities and dtype were already resolved in this worker.
+    """
     if not current_platform.is_cuda():
-        return
+        return False
     if not current_platform.is_device_capability_family(120):
-        return
+        return False
 
     output_dtype = getattr(
         getattr(worker, "model_config", None),
@@ -100,7 +113,7 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
             token_counts,
             output_dtype,
         )
-        return
+        return False
 
     units = tuple(
         _collect_warmup_units(
@@ -110,7 +123,7 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         )
     )
     if not units:
-        return
+        return False
 
     for name, count in _compile_warmup_units(units).items():
         logger.info_once(
@@ -120,3 +133,4 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         )
     completed.add(signature)
     vars(worker)["_b12x_completed_warmup_signatures"] = completed
+    return True

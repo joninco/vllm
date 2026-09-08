@@ -94,46 +94,52 @@ def test_startup_plan_apply_gate(plan_env):
     ],
 )
 @pytest.mark.parametrize("estimate_graphs", [False, True])
+@pytest.mark.parametrize("resolves_kernels", [True, False])
 def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     monkeypatch,
     final_free_memory,
     cudagraph_estimate,
     expected_available_memory,
     estimate_graphs,
+    resolves_kernels,
 ):
     """KV sizing must retain the warmed allocator and graph high-waters and
     the persistent allocations made after the activation profile, charging
     the part of them inside the CUDA-graph estimate once. The expected
     budgets of the table apply when the estimate is applied; without it the
-    retained memory is charged in full and nothing is subtracted for graphs."""
+    retained memory is charged in full and nothing is subtracted for graphs.
+    The repeated profile runs only when the B12X warm-up resolved kernels;
+    otherwise the single profile's headroom stands and no correction is
+    subtracted."""
     events: list[object] = []
+    first_profile = SimpleNamespace(
+        free_memory=84,
+        torch_allocated=7,
+        torch_memory=8,
+        non_torch_memory=2,
+    )
+    after_warmup = SimpleNamespace(
+        free_memory=83,
+        torch_allocated=8,
+        torch_memory=9,
+        non_torch_memory=2,
+    )
+    repeatable_profile = SimpleNamespace(
+        free_memory=82,
+        torch_allocated=9,
+        torch_memory=16,
+        non_torch_memory=2,
+    )
+    final = SimpleNamespace(
+        free_memory=final_free_memory,
+        torch_allocated=8,
+        torch_memory=9,
+        non_torch_memory=3,
+    )
     snapshots = iter(
-        [
-            SimpleNamespace(
-                free_memory=84,
-                torch_allocated=7,
-                torch_memory=8,
-                non_torch_memory=2,
-            ),
-            SimpleNamespace(
-                free_memory=83,
-                torch_allocated=8,
-                torch_memory=9,
-                non_torch_memory=2,
-            ),
-            SimpleNamespace(
-                free_memory=82,
-                torch_allocated=9,
-                torch_memory=16,
-                non_torch_memory=2,
-            ),
-            SimpleNamespace(
-                free_memory=final_free_memory,
-                torch_allocated=8,
-                torch_memory=9,
-                non_torch_memory=3,
-            ),
-        ]
+        [first_profile, after_warmup, repeatable_profile, final]
+        if resolves_kernels
+        else [first_profile, final]
     )
 
     def profile_cudagraph_memory():
@@ -209,11 +215,12 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
         "current_platform",
         SimpleNamespace(is_cuda_alike=lambda: True),
     )
-    monkeypatch.setattr(
-        gpu_worker,
-        "b12x_warmup",
-        lambda worker, sizes: events.append(("b12x_warmup", tuple(sizes))),
-    )
+
+    def fake_b12x_warmup(worker, sizes):
+        events.append(("b12x_warmup", tuple(sizes)))
+        return resolves_kernels
+
+    monkeypatch.setattr(gpu_worker, "b12x_warmup", fake_b12x_warmup)
     monkeypatch.setattr(
         gpu_worker.torch.accelerator,
         "reset_peak_memory_stats",
@@ -236,31 +243,36 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     # the activation profile released them before its own after-profile
     # snapshot, so only allocations retained after the CUDA-graph profile
     # count as late persistent memory.
+    repeated_profile: list[object] = (
+        [("reset_peak", "cuda:0"), "profile_run", "profile_glm_dcp_attention"]
+        if resolves_kernels
+        else []
+    )
     assert events == [
         "reserve_sampler_workspace",
         "profile_run",
         "profile_glm_dcp_attention",
         ("b12x_warmup", (8, 4)),
-        ("reset_peak", "cuda:0"),
-        "profile_run",
-        "profile_glm_dcp_attention",
+        *repeated_profile,
         "profile_cudagraph_memory",
         "empty_cache",
     ]
     # The repeatable profile retained seven bytes above its cleanup state.
     # Five are already covered by the live-allocation peak, leaving two bytes
     # of allocator-reservation headroom to deduct from KV capacity, plus the
-    # free memory retained after the activation profile.
+    # free memory retained after the activation profile. Without the repeat
+    # those two bytes are not deducted.
+    headroom_correction = 2 if resolves_kernels else 0
     late_persistent_memory = 80 - final_free_memory
     if estimate_graphs:
-        assert available == expected_available_memory
+        assert available == expected_available_memory + 2 - headroom_correction
     else:
-        assert available == 78 - late_persistent_memory
+        assert available == 80 - headroom_correction - late_persistent_memory
     # The activation peak stays activation-only (the repeatable allocator
-    # headroom, seven bytes here); post-capture recommendations add measured
-    # graph memory to it, and the admission budget subtracts the estimate
-    # separately.
-    assert worker.peak_activation_memory == 7
+    # headroom, seven bytes here, or the single profile's five); post-capture
+    # recommendations add measured graph memory to it, and the admission
+    # budget subtracts the estimate separately.
+    assert worker.peak_activation_memory == 5 + headroom_correction
     assert worker.total_consumed == 10 + late_persistent_memory
     assert worker.cudagraph_memory_estimate == cudagraph_estimate
 
