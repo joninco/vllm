@@ -93,15 +93,19 @@ def test_startup_plan_apply_gate(plan_env):
         (75, 6, 72),
     ],
 )
+@pytest.mark.parametrize("estimate_graphs", [False, True])
 def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     monkeypatch,
     final_free_memory,
     cudagraph_estimate,
     expected_available_memory,
+    estimate_graphs,
 ):
     """KV sizing must retain the warmed allocator and graph high-waters and
     the persistent allocations made after the activation profile, charging
-    the part of them inside the CUDA-graph estimate once."""
+    the part of them inside the CUDA-graph estimate once. The expected
+    budgets of the table apply when the estimate is applied; without it the
+    retained memory is charged in full and nothing is subtracted for graphs."""
     events: list[object] = []
     snapshots = iter(
         [
@@ -191,6 +195,9 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     )
 
     monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda worker: None)
+    monkeypatch.setenv(
+        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", str(int(estimate_graphs))
+    )
     monkeypatch.setattr(gpu_worker, "memory_profiling", fake_memory_profiling)
     monkeypatch.setattr(
         gpu_worker,
@@ -244,4 +251,74 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     # Five are already covered by the live-allocation peak, leaving two bytes
     # of allocator-reservation headroom to deduct from KV capacity, plus the
     # free memory retained after the activation profile.
-    assert available == expected_available_memory
+    late_persistent_memory = 80 - final_free_memory
+    if estimate_graphs:
+        assert available == expected_available_memory
+    else:
+        assert available == 78 - late_persistent_memory
+    # The activation peak stays activation-only (the repeatable allocator
+    # headroom, seven bytes here); post-capture recommendations add measured
+    # graph memory to it, and the admission budget subtracts the estimate
+    # separately.
+    assert worker.peak_activation_memory == 7
+    assert worker.total_consumed == 10 + late_persistent_memory
+    assert worker.cudagraph_memory_estimate == cudagraph_estimate
+
+
+@pytest.mark.parametrize("estimated_gib", [0, 4])
+@pytest.mark.parametrize("measured_gib", [3, 7])
+def test_post_capture_recommendation_counts_measured_graph_memory_once(
+    monkeypatch, estimated_gib, measured_gib
+):
+    """The saved KV budget uses measured graph storage, not its estimate."""
+    compilation = SimpleNamespace(
+        mode=gpu_worker.CompilationMode.NONE,
+        compilation_time=0.0,
+        encoder_compilation_time=0.0,
+    )
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(compilation_config=compilation),
+        compilation_config=compilation,
+        model_runner=SimpleNamespace(
+            lora_config=None,
+            maybe_remove_all_loras=lambda config: None,
+            capture_model=lambda: measured_gib * GiB_bytes,
+        ),
+        model_config=SimpleNamespace(enforce_eager=False, seed=0),
+        cache_config=SimpleNamespace(
+            kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
+        ),
+        init_snapshot=SimpleNamespace(
+            free_memory=100 * GiB_bytes, total_memory=100 * GiB_bytes
+        ),
+        requested_memory=90 * GiB_bytes,
+        total_consumed=10 * GiB_bytes,
+        peak_activation_memory=5 * GiB_bytes,
+        cudagraph_memory_estimate=estimated_gib * GiB_bytes,
+        available_kv_cache_memory_bytes=(75 - estimated_gib) * GiB_bytes,
+        use_v2_model_runner=False,
+        observability_config=SimpleNamespace(
+            jit_monitor_mode="off", jit_monitor_verbose=False
+        ),
+    )
+    saved = []
+    monkeypatch.setattr(
+        gpu_worker, "maybe_save_startup_plan", lambda w, budget: saved.append(budget)
+    )
+    monkeypatch.setattr(
+        gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+    )
+    for name in (
+        "kernel_warmup",
+        "set_random_seed",
+        "freeze_gc_heap",
+        "maybe_attach_gc_debug_callback",
+        "enable_gpu_sync_check",
+        "set_torch_threads_for_runtime",
+    ):
+        monkeypatch.setattr(gpu_worker, name, lambda *args: None)
+    monkeypatch.setattr("vllm.utils.jit_monitor.activate", lambda **kwargs: None)
+
+    gpu_worker.Worker.compile_or_warm_up_model(worker)
+
+    assert saved == [(90 - 10 - 5 - measured_gib) * GiB_bytes - 150 * (1 << 20)]

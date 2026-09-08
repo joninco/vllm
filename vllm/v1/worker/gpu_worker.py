@@ -639,9 +639,9 @@ class Worker(WorkerBase):
         allocator_headroom_correction = (
             repeatable_allocator_headroom - profile_result.transient_peak_headroom
         )
-        self.peak_activation_memory = (
-            repeatable_allocator_headroom + cudagraph_memory_estimate_applied
-        )
+        # KV admission subtracts the graph estimate separately. Post-capture
+        # recommendations add measured graph memory to this activation peak.
+        self.peak_activation_memory = repeatable_allocator_headroom
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
         free_gpu_memory = final_profile_snapshot.free_memory
