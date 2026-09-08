@@ -72,6 +72,7 @@ def test_active_requires_full_graph_or_capture(
 ) -> None:
     monkeypatch.setattr(l2_prefetch, "ENABLED", True)
     monkeypatch.setattr(l2_prefetch, "MAX_TOKENS", 16)
+    monkeypatch.setattr(l2_prefetch, "WINDOWS", frozenset({"moe", "attn"}))
     monkeypatch.setattr(l2_prefetch, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(
         l2_prefetch,
@@ -127,6 +128,35 @@ def test_default_program_counts() -> None:
         int(os.environ.get("VLLM_L2_PREFETCH_ATTN_CTAS", "32"))
         == l2_prefetch.ATTN_NUM_PROGRAMS
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", 1), ("64", 64), (str(1 << 16), 1 << 16)],
+)
+def test_program_count_accepts_one_word_per_program(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: int
+) -> None:
+    monkeypatch.setenv("VLLM_L2_PREFETCH_CTAS", value)
+    assert l2_prefetch._program_count("VLLM_L2_PREFETCH_CTAS", "64") == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", str((1 << 16) + 1), "many"])
+def test_program_count_rejects_counts_outside_the_sink(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """Every program stores one word into the sink, so the count must stay
+    within the sink's words; a non-integer value is rejected as well."""
+    monkeypatch.setenv("VLLM_L2_PREFETCH_ATTN_CTAS", value)
+    with pytest.raises(ValueError):
+        l2_prefetch._program_count("VLLM_L2_PREFETCH_ATTN_CTAS", "32")
+
+
+def test_program_count_uses_the_default_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLLM_L2_PREFETCH_CTAS", raising=False)
+    assert l2_prefetch._program_count("VLLM_L2_PREFETCH_CTAS", "64") == 64
 
 
 def test_window_program_counts(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -64,16 +64,41 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+# Each program of the prefetch kernel stores one word into the per-device
+# sink, which holds this many words.
+_SINK_WORDS = 1 << 16
+
+
+def _program_count(name: str, default: str) -> int:
+    """Program count of a prefetch window from the environment.
+
+    Args:
+        name: Environment variable holding the count.
+        default: Value used when the variable is unset.
+
+    Returns:
+        The count, within ``1.._SINK_WORDS`` (the sink holds one word per
+        program).
+
+    Raises:
+        ValueError: The value is not an integer in that range.
+    """
+    value = int(os.environ.get(name, default))
+    if not 1 <= value <= _SINK_WORDS:
+        raise ValueError(f"{name} must be in 1..{_SINK_WORDS}, got {value}")
+    return value
+
+
 ENABLED = os.environ.get("VLLM_L2_PREFETCH", "1") == "1"
 MAX_TOKENS = int(os.environ.get("VLLM_L2_PREFETCH_MAX_TOKENS", "64"))
-NUM_PROGRAMS = int(os.environ.get("VLLM_L2_PREFETCH_CTAS", "64"))
+NUM_PROGRAMS = _program_count("VLLM_L2_PREFETCH_CTAS", "64")
 WINDOWS = frozenset(
     window.strip()
     for window in os.environ.get("VLLM_L2_PREFETCH_WINDOWS", "moe,attn").split(",")
     if window.strip()
 )
 ATTN_MAX_TOKENS = int(os.environ.get("VLLM_L2_PREFETCH_ATTN_MAX_TOKENS", "8"))
-ATTN_NUM_PROGRAMS = int(os.environ.get("VLLM_L2_PREFETCH_ATTN_CTAS", "32"))
+ATTN_NUM_PROGRAMS = _program_count("VLLM_L2_PREFETCH_ATTN_CTAS", "32")
 MOE_WINDOW = "moe"
 ATTN_WINDOW = "attn"
 
@@ -126,7 +151,7 @@ def _sink(device: torch.device) -> torch.Tensor:
     device_index = _device_index(device)
     value = _sinks.get(device_index)
     if value is None:
-        value = torch.zeros(1 << 16, dtype=torch.int64, device=device)
+        value = torch.zeros(_SINK_WORDS, dtype=torch.int64, device=device)
         _sinks[device_index] = value
     return value
 
@@ -170,7 +195,13 @@ def _active(num_tokens: int, window: str = MOE_WINDOW) -> bool:
 
 def _warm_up(weights: list[torch.Tensor], sink: torch.Tensor) -> None:
     """Compile and load every program-count specialization outside any
-    capture (a first launch inside a capture fails)."""
+    capture (a first launch inside a capture fails).
+
+    Args:
+        weights: Prefetch targets; the first one is read by the warm-up
+            launches.
+        sink: The device's sink tensor, which also selects the device.
+    """
     device_index = _device_index(sink.device)
     if device_index in _warmed_devices or torch.cuda.is_current_stream_capturing():
         return
@@ -248,7 +279,15 @@ def issue(
     window: str = MOE_WINDOW,
 ) -> None:
     """Issue a prefetch of ``window`` ordered after ``hidden_states`` when
-    targets exist."""
+    targets exist.
+
+    Args:
+        hidden_states: The activation whose row count gates the window and
+            whose stream orders the prefetch.
+        weights: The window's prefetch targets, or ``None`` when the layer
+            has none.
+        window: ``MOE_WINDOW`` or ``ATTN_WINDOW``.
+    """
     if weights and hidden_states.device.type == "cuda":
         torch.ops.vllm.l2_weight_prefetch(
             hidden_states,
@@ -259,7 +298,11 @@ def issue(
 
 
 def join(hidden_states: torch.Tensor) -> None:
-    """Join an existing device prefetch stream before the model returns."""
+    """Join an existing device prefetch stream before the model returns.
+
+    Args:
+        hidden_states: The model output; its device selects the stream.
+    """
     if hidden_states.device.type != "cuda":
         return
     sink = _sinks.get(_device_index(hidden_states.device))
@@ -294,8 +337,16 @@ def register_attention_layers(layers: torch.nn.ModuleList, start: int, end: int)
     attention block so it is in L2 when the attention kernels finish.
 
     Both attributes are set on every layer (``None`` where there is nothing
-    to load) whatever ``VLLM_L2_PREFETCH_WINDOWS`` selects. The returned count
-    is the number of decoder transitions with a non-empty ``moe`` target list.
+    to load) whatever ``VLLM_L2_PREFETCH_WINDOWS`` selects.
+
+    Args:
+        layers: The model's decoder layers.
+        start: Index of the first local layer.
+        end: One past the index of the last local layer.
+
+    Returns:
+        The number of decoder transitions with a non-empty ``moe`` target
+        list.
     """
     target_count = 0
     attn_count = 0
