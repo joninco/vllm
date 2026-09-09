@@ -7,6 +7,7 @@ CUDA. GPU selector equivalence is a separate required validation.
 """
 
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -273,6 +274,105 @@ def test_owner_transport_retains_rank_major_scores_ids_and_partition_order(monke
     assert not indexer._merge_prefill_topk_by_owner(
         indices[:3], scores[:3], output, shard, tp, 1
     )
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("fail_send", [False, True])
+def test_owner_pynccl_preserves_peer_slices_stream_and_group_closure(
+    monkeypatch, rank, fail_send
+):
+    packed = torch.arange(32, dtype=torch.float32).reshape(8, 2, 2)
+    received = torch.full_like(packed, -1)
+    stream = object()
+    events: list[object] = []
+    active = False
+
+    @contextmanager
+    def use_stream(value):
+        nonlocal active
+        assert value is stream
+        active = True
+        try:
+            yield
+        finally:
+            active = False
+
+    def start():
+        assert active
+        # The self partition is copied on the explicit stream before grouping.
+        assert torch.equal(
+            received[rank * 2 : rank * 2 + 2], packed[rank * 2 : rank * 2 + 2]
+        )
+        events.append("start")
+
+    def send(tensor, peer, used_stream):
+        assert active and used_stream is stream
+        assert tensor.data_ptr() == packed[peer * 2].data_ptr()
+        assert tensor.shape == (2, 2, 2)
+        events.append(("send", peer))
+        if fail_send:
+            raise RuntimeError("send failure")
+
+    def recv(tensor, peer, used_stream):
+        assert active and used_stream is stream
+        assert tensor.data_ptr() == received[peer * 2].data_ptr()
+        tensor.fill_(peer + 100)
+        events.append(("recv", peer))
+
+    def end():
+        assert active
+        events.append("end")
+
+    pynccl = SimpleNamespace(
+        disabled=False, group_start=start, group_end=end, send=send, recv=recv
+    )
+    group = SimpleNamespace(
+        world_size=4,
+        rank_in_group=rank,
+        device_communicator=SimpleNamespace(pynccl_comm=pynccl),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    if fail_send:
+        with pytest.raises(RuntimeError, match="send failure"):
+            indexer._exchange_prefill_owner_candidates(group, packed, received)
+        assert events == [
+            "start",
+            ("send", next(p for p in range(4) if p != rank)),
+            "end",
+        ]
+    else:
+        indexer._exchange_prefill_owner_candidates(group, packed, received)
+        expected = [
+            op for p in range(4) if p != rank for op in [("send", p), ("recv", p)]
+        ]
+        assert events == ["start", *expected, "end"]
+        for peer in range(4):
+            if peer != rank:
+                assert torch.all(received[peer * 2 : peer * 2 + 2] == peer + 100)
+    assert not active
+    with pytest.raises(ValueError, match="overlap"):
+        indexer._exchange_prefill_owner_candidates(group, packed, packed)
+
+
+@pytest.mark.parametrize("pynccl", [None, SimpleNamespace(disabled=True)])
+def test_owner_exchange_falls_back_when_pynccl_unavailable(monkeypatch, pynccl):
+    packed = torch.arange(16, dtype=torch.float32).reshape(4, 2, 2)
+    received = torch.empty_like(packed)
+    group = SimpleNamespace(
+        device_group=object(), device_communicator=SimpleNamespace(pynccl_comm=pynccl)
+    )
+    calls = []
+
+    def exchange(output, source, group):
+        calls.append(group)
+        assert output is received and source is packed
+        output.copy_(source)
+
+    monkeypatch.setattr(indexer.dist, "all_to_all_single", exchange)
+    indexer._exchange_prefill_owner_candidates(group, packed, received)
+    assert calls == [group.device_group]
+    assert torch.equal(received, packed)
 
 
 def test_single_shard_indexer_splits_queries_across_attention_replicas(monkeypatch):

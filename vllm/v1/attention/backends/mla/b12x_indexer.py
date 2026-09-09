@@ -403,6 +403,43 @@ def _restore_prefill_indices(group, local: torch.Tensor, output: torch.Tensor) -
     _gather_dcp_candidates(group, send, output.view(group.world_size, rows, -1))
 
 
+def _exchange_prefill_owner_candidates(group, packed, received) -> None:
+    """Exchange equal row partitions on the existing shard communicator."""
+    communicator = getattr(group, "device_communicator", None)
+    pynccl = getattr(communicator, "pynccl_comm", None)
+    if pynccl is None or pynccl.disabled:
+        dist.all_to_all_single(received, packed, group=group.device_group)
+        return
+    size, rank = group.world_size, group.rank_in_group
+    if (
+        packed.shape != received.shape
+        or packed.dtype != received.dtype
+        or packed.device != received.device
+        or not packed.is_contiguous()
+        or not received.is_contiguous()
+        or packed.shape[0] % size
+    ):
+        raise ValueError("Owner exchange requires matching contiguous equal partitions")
+    nbytes = packed.numel() * packed.element_size()
+    if max(packed.data_ptr(), received.data_ptr()) < min(
+        packed.data_ptr() + nbytes, received.data_ptr() + nbytes
+    ):
+        raise ValueError("Owner exchange send and receive buffers must not overlap")
+    sends = packed.chunk(size, dim=0)
+    receives = received.chunk(size, dim=0)
+    stream = torch.cuda.current_stream(device=packed.device)
+    with torch.cuda.stream(stream):
+        receives[rank].copy_(sends[rank])
+        pynccl.group_start()
+        try:
+            for peer in range(size):
+                if peer != rank:
+                    pynccl.send(sends[peer], peer, stream)
+                    pynccl.recv(receives[peer], peer, stream)
+        finally:
+            pynccl.group_end()
+
+
 def _merge_prefill_topk_by_owner(
     indices: torch.Tensor,
     scores: torch.Tensor,
@@ -439,7 +476,7 @@ def _merge_prefill_topk_by_owner(
     pack_dcp_candidates(
         indices, scores, packed, shard_group.rank_in_group, shards, interleave
     )
-    dist.all_to_all_single(received, packed, group=shard_group.device_group)
+    _exchange_prefill_owner_candidates(shard_group, packed, received)
     rank_major_topk(received.view(shards, rows // shards, topk, 2), selected)
     _gather_dcp_candidates(
         tp_group, selected, output.view(tp_group.world_size, rows // shards, topk)
