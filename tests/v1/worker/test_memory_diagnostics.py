@@ -96,6 +96,7 @@ def test_stopped_cpu_profiler_exports_distinct_raw_memory_timelines(tmp_path):
     ]
     assert observations[0]["path"] != observations[1]["path"]
     for result in observations:
+        assert result["exported"]
         path = Path(result["path"])
         assert path.parent.parent == tmp_path
         assert result["rank"] == 3
@@ -123,7 +124,40 @@ def test_memory_timeline_rejects_incomplete_profiler_before_file_creation(
     wrapper = (
         None if fault == "missing" else SimpleNamespace(is_running=fault == "running")
     )
-    worker = SimpleNamespace(profiler_config=config, profiler=wrapper)
-    with pytest.raises(RuntimeError, match="stopped torch profiler"):
-        MemoryDiagnostics.export_memory_diagnostics_timeline(worker)
+    worker = SimpleNamespace(
+        rank=3, device=torch.device("cpu"), profiler_config=config, profiler=wrapper
+    )
+    result = MemoryDiagnostics.export_memory_diagnostics_timeline(worker)
+    assert not result["exported"]
+    assert result["error"]["type"] == "RuntimeError"
+    assert "stopped torch profiler" in result["error"]["message"]
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "error", [AssertionError("duplicate outputs: aten::sub"), OSError("export failed")]
+)
+def test_export_failure_returns_worker_reply_without_claiming_a_timeline(
+    tmp_path, error
+):
+    worker = SimpleNamespace(
+        rank=0,
+        device=torch.device("cpu"),
+        profiler_config=SimpleNamespace(
+            profiler="torch",
+            torch_profiler_with_memory=True,
+            torch_profiler_with_stack=True,
+            torch_profiler_record_shapes=True,
+            torch_profiler_dir=str(tmp_path),
+        ),
+        profiler=SimpleNamespace(
+            is_running=False,
+            profiler=SimpleNamespace(export_memory_timeline=Mock(side_effect=error)),
+        ),
+    )
+    result = MemoryDiagnostics.export_memory_diagnostics_timeline(worker)
+    assert json.loads(json.dumps(result)) == result
+    assert result["rank"] == 0
+    assert not result["exported"]
+    assert result["error"] == {"type": type(error).__name__, "message": str(error)}
+    assert "sha256" not in result and "path" not in result

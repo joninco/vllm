@@ -36,41 +36,57 @@ class MemoryDiagnostics:
         Call after the profiling stop RPC and before another profiling cycle.
         Files remain under the configured local profiler directory. Each export
         uses a distinct directory, including when workers finish together.
+        Failures return ``exported=False`` and an error type/message so all
+        rank replies are consumed by collective RPC.
         """
-        config = self.profiler_config
-        wrapper = self.profiler
-        if (
-            config is None
-            or config.profiler != "torch"
-            or not config.torch_profiler_with_memory
-            or not config.torch_profiler_with_stack
-            or not config.torch_profiler_record_shapes
-            or wrapper is None
-            or wrapper.is_running
-        ):
-            raise RuntimeError(
-                "Memory timeline export requires a stopped torch profiler with "
-                "memory, stacks and shapes enabled"
-            )
-        directory = Path(
-            tempfile.mkdtemp(
-                prefix=f"worker-{self.rank}-memory-",
-                dir=config.torch_profiler_dir,
-            )
-        )
-        destination = directory / "timeline.raw.json.gz"
-        wrapper.profiler.export_memory_timeline(
-            str(destination), device=str(self.device)
-        )
-        return {
+        result: dict[str, Any] = {
             "rank": self.rank,
             "worker_pid": os.getpid(),
             "device": str(self.device),
-            "path": str(destination),
-            "size_bytes": destination.stat().st_size,
-            "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
-            "format": "torch.profiler raw memory events",
+            "exported": False,
         }
+        # Every worker must return a reply: the executor stops consuming rank
+        # queues at the first exception, leaving other replies for a later RPC.
+        try:
+            config = self.profiler_config
+            wrapper = self.profiler
+            if (
+                config is None
+                or config.profiler != "torch"
+                or not config.torch_profiler_with_memory
+                or not config.torch_profiler_with_stack
+                or not config.torch_profiler_record_shapes
+                or wrapper is None
+                or wrapper.is_running
+            ):
+                raise RuntimeError(
+                    "Memory timeline export requires a stopped torch profiler with "
+                    "memory, stacks and shapes enabled"
+                )
+            directory = Path(
+                tempfile.mkdtemp(
+                    prefix=f"worker-{self.rank}-memory-",
+                    dir=config.torch_profiler_dir,
+                )
+            )
+            result["export_directory"] = str(directory)
+            destination = directory / "timeline.raw.json.gz"
+            wrapper.profiler.export_memory_timeline(
+                str(destination), device=str(self.device)
+            )
+            result.update(
+                exported=True,
+                path=str(destination),
+                size_bytes=destination.stat().st_size,
+                sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
+                format="torch.profiler raw memory events",
+            )
+        except Exception as error:
+            result["error"] = {
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+        return result
 
     def capture_memory_diagnostics(self, reset_peak: str = "false") -> dict[str, Any]:
         """Read byte-valued device and allocator observations on this worker.
