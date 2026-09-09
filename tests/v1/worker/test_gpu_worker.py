@@ -334,3 +334,84 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
     gpu_worker.Worker.compile_or_warm_up_model(worker)
 
     assert saved == [(90 - 10 - 5 - measured_gib) * GiB_bytes - 150 * (1 << 20)]
+
+
+@pytest.mark.parametrize("dcp_size", [1, 4])
+@pytest.mark.parametrize("external_shortfall", [False, True])
+def test_dcp_startup_charges_communicators_inside_requested_memory(
+    monkeypatch,
+    dcp_size,
+    external_shortfall,
+):
+    import torch
+
+    from vllm.utils.mem_utils import MemorySnapshot
+    from vllm.v1.worker import gpu_model_runner
+
+    total = 100 * GiB_bytes
+    requested = 97.5 * GiB_bytes
+    before_free = int(requested + (150 if not external_shortfall else -10) * 1024**2)
+    owned = 350 * 1024**2
+    before = MemorySnapshot(
+        device="cuda:0", auto_measure=False, total_memory=total, free_memory=before_free
+    )
+    after = MemorySnapshot(
+        device="cuda:0",
+        auto_measure=False,
+        total_memory=total,
+        free_memory=before_free - owned,
+    )
+    snapshots = iter([before, after] if dcp_size > 1 else [after])
+    parallel = SimpleNamespace(
+        distributed_executor_backend="external_launcher",
+        data_parallel_backend="mp",
+        assigned_physical_gpu_ids=None,
+        enable_dbo=False,
+        decode_context_parallel_size=dcp_size,
+    )
+    config = SimpleNamespace(parallel_config=parallel)
+    worker = SimpleNamespace(
+        device_config=SimpleNamespace(device_type="cuda"),
+        parallel_config=parallel,
+        vllm_config=config,
+        local_rank=0,
+        rank=1,
+        distributed_init_method="unused",
+        use_v2_model_runner=False,
+        model_config=SimpleNamespace(dtype=torch.bfloat16, seed=0),
+        cache_config=SimpleNamespace(gpu_memory_utilization=0.975),
+    )
+    monkeypatch.setattr(gpu_worker, "MemorySnapshot", lambda **kw: next(snapshots))
+    monkeypatch.setattr(
+        gpu_worker, "init_worker_distributed_environment", lambda *a: None
+    )
+    monkeypatch.setattr(gpu_worker, "set_random_seed", lambda *a: None)
+    monkeypatch.setattr(gpu_worker, "init_workspace_manager", lambda *a: None)
+    monkeypatch.setattr(gpu_worker, "_num_workspace_lanes", lambda *a: 1)
+    monkeypatch.setattr(
+        gpu_worker,
+        "current_platform",
+        SimpleNamespace(
+            logical_device_id_to_visible_device_id=lambda rank: rank,
+            check_if_supports_dtype=lambda dtype: None,
+            dist_backend="nccl",
+        ),
+    )
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 8)
+    monkeypatch.setattr(torch.accelerator, "set_device_index", lambda *a: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(gpu_model_runner, "GPUModelRunner", lambda *a: None)
+    if external_shortfall or dcp_size == 1:
+        with pytest.raises(ValueError, match="Free memory on device"):
+            gpu_worker.Worker.init_device(worker)
+    else:
+        gpu_worker.Worker.init_device(worker)
+        assert worker.requested_memory == requested
+        assert worker.distributed_init_memory == owned
+        # The profiler's baseline includes communicator bytes once in the
+        # free-memory delta used to subtract non-KV storage from the request.
+        assert worker.init_snapshot is before
+        free_after_model = after.free_memory - 60 * GiB_bytes
+        consumed = worker.init_snapshot.free_memory - free_after_model
+        assert consumed == 60 * GiB_bytes + owned
+        assert worker.requested_memory - consumed == requested - 60 * GiB_bytes - owned

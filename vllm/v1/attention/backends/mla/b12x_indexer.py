@@ -8,14 +8,15 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
-from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import B12xWarmupUnit, get_b12x_dsa_indexer
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla import b12x_topk_sort
@@ -29,6 +30,8 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
 
 _INDEX_HEAD_DIM = 128
 _INDEX_SCALE_BYTES = 4
@@ -240,9 +243,14 @@ def _run_paged_topk(
     block_table: torch.Tensor,
     active_width: torch.Tensor | None,
     output: torch.Tensor,
-    scores: torch.Tensor | None,
-) -> None:
-    scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+    return_scores: bool = False,
+) -> torch.Tensor | None:
+    specs = plan.shapes_and_dtypes()
+    if return_scores:
+        # Scores occupy the same prefix during selection and candidate packing.
+        specs = (((q.shape[0], output.shape[1]), torch.float32), *specs)
+    buffers = current_workspace_manager().get_simultaneous(*specs)
+    scores, scratch = (buffers[0], buffers[1:]) if return_scores else (None, buffers)
     if active_width is None:
         raise RuntimeError("B12X DSA requires a device active-width scalar.")
     binding = module.bind(
@@ -258,40 +266,28 @@ def _run_paged_topk(
         output_scores=scores,
     )
     module.run(binding)
+    return scores
 
 
-@triton.jit
-def _pack_dcp_candidates_kernel(
-    indices,
-    scores,
-    packed,
-    index_stride,
-    score_stride,
-    packed_row_stride,
-    packed_col_stride,
-    dcp_rank: tl.constexpr,
-    dcp_world_size: tl.constexpr,
-    interleave: tl.constexpr,
-    topk: tl.constexpr,
-    block: tl.constexpr,
-):
-    row = tl.program_id(0)
-    col = tl.program_id(1) * block + tl.arange(0, block)
-    mask = col < topk
-    local_idx = tl.load(indices + row * index_stride + col, mask=mask, other=-1)
-    score = tl.load(scores + row * score_stride + col, mask=mask, other=-float("inf"))
-    valid = local_idx >= 0
-    safe_idx = tl.maximum(local_idx, 0)
-    global_idx = (
-        (safe_idx // interleave) * (dcp_world_size * interleave)
-        + dcp_rank * interleave
-        + safe_idx % interleave
+def _dcp_merge_shapes(rows: int, topk: int, world_size: int):
+    return (
+        ((rows, topk), torch.float32),
+        ((rows, topk, 2), torch.float32),
+        ((world_size, rows, topk, 2), torch.float32),
     )
-    global_idx = tl.where(valid, global_idx, -1)
-    score = tl.where(valid, score, -float("inf"))
-    base = packed + row * packed_row_stride + col * packed_col_stride
-    tl.store(base, score, mask=mask)
-    tl.store(base + 1, global_idx.to(tl.float32), mask=mask)
+
+
+def _gather_dcp_candidates(group, packed, gathered) -> None:
+    communicator = group.device_communicator
+    pynccl = getattr(communicator, "pynccl_comm", None)
+    if pynccl is not None and not pynccl.disabled:
+        pynccl.all_gather(gathered, packed)
+    else:
+        dist.all_gather_into_tensor(
+            gathered.flatten(0, 1),
+            packed,
+            group=group.device_group,
+        )
 
 
 def _merge_dcp_topk(
@@ -309,30 +305,19 @@ def _merge_dcp_topk(
             "B12X DCP indexer merge requires index_topk in (512, 1024, 2048), "
             f"got {topk}."
         )
-    packed = torch.empty(
-        (indices.shape[0], topk, 2), dtype=torch.float32, device=indices.device
-    )
-    _pack_dcp_candidates_kernel[(indices.shape[0], triton.cdiv(topk, 512))](
-        indices,
-        scores,
-        packed,
-        indices.stride(0),
-        scores.stride(0),
-        packed.stride(0),
-        packed.stride(1),
-        dcp_rank,
-        dcp_world_size,
-        interleave,
-        topk,
-        512,
-        num_warps=8,
-    )
-    gathered = get_dcp_group().all_gather(packed, dim=1)
-    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
-        stable_topk_from_gathered_candidates_cutedsl,
+    from b12x.comm.pcie.dcp_candidate_topk import (
+        pack_dcp_candidates,
+        rank_major_topk,
     )
 
-    stable_topk_from_gathered_candidates_cutedsl(gathered, topk, out=indices)
+    score_view, packed, gathered = current_workspace_manager().get_simultaneous(
+        *_dcp_merge_shapes(indices.shape[0], topk, dcp_world_size)
+    )
+    if scores.data_ptr() != score_view.data_ptr():
+        raise RuntimeError("DCP scores must use the reserved merge workspace prefix")
+    pack_dcp_candidates(indices, scores, packed, dcp_rank, dcp_world_size, interleave)
+    _gather_dcp_candidates(get_dcp_group(), packed, gathered)
+    rank_major_topk(gathered, indices)
 
 
 class B12xSparseIndexer(nn.Module):
@@ -474,8 +459,32 @@ class B12xSparseIndexer(nn.Module):
         return self.sort_selection and not _plan_emits_physical_slots(plan)
 
     def _reserve_profile_workspace(self) -> None:
+        manager = current_workspace_manager()
         for plan in (*self._decode_plans.values(), *self._prefill_plans.values()):
-            current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+            specs = plan.shapes_and_dtypes()
+            if self.dcp_world_size > 1:
+                specs = (
+                    ((int(plan.caps.max_q_rows), self.topk_tokens), torch.float32),
+                    *specs,
+                )
+                manager.reserve_all(*specs)
+            else:
+                manager.get_simultaneous(*specs)
+        if self.dcp_world_size > 1:
+            rows = int(self.topk_indices_buffer.shape[0])
+            manager.reserve_all(
+                *_dcp_merge_shapes(rows, self.topk_tokens, self.dcp_world_size)
+            )
+            score_bytes = rows * self.topk_tokens * 4
+            logger.info_once(
+                "DCP indexer workspace budget: rows=%d, scores=%d bytes, "
+                "packed_candidates=%d bytes, rank_major_gather=%d bytes; "
+                "shared with plan scratch, reserved in every execution slot",
+                rows,
+                score_bytes,
+                2 * score_bytes,
+                2 * self.dcp_world_size * score_bytes,
+            )
 
     def get_b12x_warmup_unit(
         self,
@@ -486,6 +495,15 @@ class B12xSparseIndexer(nn.Module):
         del layer, token_counts, output_dtype
 
         def compile() -> None:
+            if self.dcp_world_size > 1:
+                self._reserve_profile_workspace()
+                from b12x.comm.pcie.dcp_candidate_topk import precompile_rank_major_topk
+
+                precompile_rank_major_topk(
+                    self.topk_tokens,
+                    self.dcp_world_size,
+                    self.topk_indices_buffer.device,
+                )
             kv_cache = self.k_cache.kv_cache
             if kv_cache.numel() == 0:
                 # Warmup before the index KV cache is allocated (the
@@ -533,12 +551,7 @@ class B12xSparseIndexer(nn.Module):
                     dtype=torch.int32,
                     device=caps.device,
                 )
-                scores = (
-                    torch.empty_like(output, dtype=torch.float32)
-                    if self.dcp_world_size > 1
-                    else None
-                )
-                _run_paged_topk(
+                scores = _run_paged_topk(
                     module=self._module,
                     plan=plan,
                     q=q,
@@ -548,8 +561,16 @@ class B12xSparseIndexer(nn.Module):
                     block_table=page_table,
                     active_width=self.active_width_cap,
                     output=output,
-                    scores=scores,
+                    return_scores=self.dcp_world_size > 1,
                 )
+                if scores is not None:
+                    _merge_dcp_topk(
+                        output,
+                        scores,
+                        self.dcp_rank,
+                        self.dcp_world_size,
+                        self.cp_kv_cache_interleave_size,
+                    )
                 if self._sorts(plan):
                     b12x_topk_sort.precompile(self.max_model_len, caps.device)
                     b12x_topk_sort.sort_convert(
@@ -606,13 +627,6 @@ class B12xSparseIndexer(nn.Module):
             return self.topk_indices_buffer
 
         metadata = cast(DeepseekV32IndexerMetadata, attn_metadata[self.k_cache.prefix])
-        scores = None
-        if self.dcp_world_size > 1:
-            scores = torch.empty(
-                (q_quant.shape[0], self.topk_tokens),
-                dtype=torch.float32,
-                device=q_quant.device,
-            )
 
         if metadata.prefill is not None:
             for chunk in metadata.prefill.chunks:
@@ -624,7 +638,6 @@ class B12xSparseIndexer(nn.Module):
                 q_chunk = q_quant[start:end].contiguous()
                 weights_chunk = weights[start:end].contiguous()
                 output = self.topk_indices_buffer[start:end, : self.topk_tokens]
-                score_chunk = scores[start:end] if scores is not None else None
                 seq_lens = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).contiguous()
                 local_rows = (
                     chunk.local_total_seq_lens
@@ -639,7 +652,7 @@ class B12xSparseIndexer(nn.Module):
                     int(q_chunk.shape[0]), active_pages
                 )
                 plan = self._get_plan("prefill", int(q_chunk.shape[0]))
-                _run_paged_topk(
+                score_chunk = _run_paged_topk(
                     module=self._module,
                     plan=plan,
                     q=q_chunk,
@@ -649,7 +662,7 @@ class B12xSparseIndexer(nn.Module):
                     block_table=block_table,
                     active_width=self.active_width_cap,
                     output=output,
-                    scores=score_chunk,
+                    return_scores=self.dcp_world_size > 1,
                 )
                 if self._sorts(plan):
                     # In line: prefill runs eagerly, and the selection is
@@ -686,11 +699,10 @@ class B12xSparseIndexer(nn.Module):
                 )
             num_tokens = metadata.num_decode_tokens
             output = self.topk_indices_buffer[:num_tokens, : self.topk_tokens]
-            score_slice = scores[:num_tokens] if scores is not None else None
             plan = self._get_plan("decode", num_tokens)
             decode_seq_lens = seq_lens[:num_tokens]
             decode_block_table = block_table[:num_tokens].contiguous()
-            _run_paged_topk(
+            score_slice = _run_paged_topk(
                 module=self._module,
                 plan=plan,
                 q=q_quant[:num_tokens].contiguous(),
@@ -700,7 +712,7 @@ class B12xSparseIndexer(nn.Module):
                 block_table=decode_block_table,
                 active_width=getattr(decode, "active_width", None),
                 output=output,
-                scores=score_slice,
+                return_scores=self.dcp_world_size > 1,
             )
             if self._sorts(plan):
                 # Side stream inside full graphs; joined in the sparse MLA

@@ -1567,8 +1567,7 @@ def test_b12x_non_compressed_indexer_exposes_scores_for_dcp(monkeypatch) -> None
     )
 
     output = torch.empty((2, 4), dtype=torch.int32)
-    scores = torch.empty((2, 4), dtype=torch.float32)
-    generic_b12x_indexer._run_paged_topk(
+    scores = generic_b12x_indexer._run_paged_topk(
         module=module,
         plan=plan,
         q=torch.empty((2, 32, 128), dtype=torch.float8_e4m3fn),
@@ -1578,7 +1577,7 @@ def test_b12x_non_compressed_indexer_exposes_scores_for_dcp(monkeypatch) -> None
         block_table=torch.zeros((2, 2), dtype=torch.int32),
         active_width=torch.full((1,), 128, dtype=torch.int32),
         output=output,
-        scores=scores,
+        return_scores=True,
     )
 
     assert calls["bind_plan"] is plan
@@ -2053,3 +2052,147 @@ def test_dcp_combine_uses_local_causal_lengths_in_stable_buffers(
         if pointers is not None:
             assert addresses == pointers
         pointers = addresses
+
+
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_non_compressed_indexer_profiles_dcp_merge_capacity(monkeypatch, world_size):
+    from vllm.v1.worker.workspace import WorkspaceManager, use_workspace_lane
+
+    manager = WorkspaceManager(torch.device("cpu"), num_lanes=2)
+    monkeypatch.setattr(
+        generic_b12x_indexer, "current_workspace_manager", lambda: manager
+    )
+    indexer = object.__new__(generic_b12x_indexer.B12xSparseIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.dcp_world_size = world_size
+    indexer.topk_tokens = 2048
+    indexer.topk_indices_buffer = torch.empty((8192, 2048), dtype=torch.int32)
+    scratch_bytes = 96 * 1024**2
+    plan = SimpleNamespace(
+        caps=SimpleNamespace(max_q_rows=128),
+        shapes_and_dtypes=lambda: (((scratch_bytes,), torch.uint8),),
+    )
+    indexer._decode_plans = {128: plan}
+    indexer._prefill_plans = {128: plan}
+    indexer._reserve_profile_workspace()
+    manager.lock()
+    if world_size == 1:
+        assert manager._current_workspaces[1] is None
+        assert manager._current_workspaces[0].numel() == scratch_bytes
+        return
+    for lane in range(2):
+        with use_workspace_lane(lane):
+            buffers = manager.get_simultaneous(
+                *generic_b12x_indexer._dcp_merge_shapes(8192, 2048, world_size)
+            )
+            assert [buf.nbytes for buf in buffers] == [
+                64 * 1024**2,
+                128 * 1024**2,
+                512 * 1024**2,
+            ]
+            base = buffers[0].data_ptr()
+            assert buffers[1].data_ptr() == base + 64 * 1024**2
+            assert buffers[2].data_ptr() == base + 192 * 1024**2
+            assert manager._current_workspaces[lane].numel() == 704 * 1024**2
+            # Indexer scratch and merge storage can alias only after scores.
+            output = torch.empty((4, 2048), dtype=torch.int32)
+
+            def run(binding):
+                binding.scratch[0].fill_(255)
+                binding.output_scores.fill_(1.5)
+
+            scores = generic_b12x_indexer._run_paged_topk(
+                module=SimpleNamespace(
+                    bind=lambda plan, **kw: SimpleNamespace(**kw), run=run
+                ),
+                plan=plan,
+                q=torch.empty((4, 1, 128)),
+                weights=torch.empty((4, 1)),
+                kv_cache=torch.empty((1, 64, 132), dtype=torch.uint8),
+                seq_lens=torch.ones(4, dtype=torch.int32),
+                block_table=torch.zeros((4, 1), dtype=torch.int32),
+                active_width=torch.ones(1, dtype=torch.int32),
+                output=output,
+                return_scores=True,
+            )
+            score_view, packed, gathered = manager.get_simultaneous(
+                *generic_b12x_indexer._dcp_merge_shapes(4, 2048, world_size)
+            )
+            assert scores.data_ptr() == score_view.data_ptr() == base
+            packed.fill_(-2)
+            gathered.fill_(-3)
+            torch.testing.assert_close(scores, torch.full_like(scores, 1.5))
+
+
+def test_dcp_candidate_gather_writes_rank_major_destination(monkeypatch):
+    packed = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
+    gathered = torch.empty((4, 2, 3, 2))
+    addresses = []
+
+    def all_gather(output, source):
+        addresses.append(output.data_ptr())
+        for rank in range(4):
+            output[rank].copy_(source + rank)
+
+    group = SimpleNamespace(
+        device_communicator=SimpleNamespace(
+            pynccl_comm=SimpleNamespace(disabled=False, all_gather=all_gather),
+        )
+    )
+    generic_b12x_indexer._gather_dcp_candidates(group, packed, gathered)
+    assert addresses == [gathered.data_ptr()]
+    for rank in range(4):
+        torch.testing.assert_close(gathered[rank], packed + rank)
+
+
+def test_dcp_merge_reuses_reserved_scores_and_gather_storage(monkeypatch):
+    pytest.importorskip("b12x.comm.pcie.dcp_candidate_topk")
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    rows, topk, ranks = 4, 2048, 4
+    manager = WorkspaceManager(torch.device("cuda:0"))
+    specs = generic_b12x_indexer._dcp_merge_shapes(rows, topk, ranks)
+    manager.reserve_all(*specs)
+    manager.lock()
+    monkeypatch.setattr(
+        generic_b12x_indexer, "current_workspace_manager", lambda: manager
+    )
+    scores, packed, gathered = manager.get_simultaneous(*specs)
+    indices = torch.arange(topk, dtype=torch.int32, device="cuda").repeat(rows, 1)
+    expected = indices.clone()
+    scores.fill_(2)
+    peers = torch.full_like(gathered, -1)
+    peers[:, :, :, 0] = -torch.inf
+
+    def all_gather(destination, source):
+        destination.copy_(peers)
+        destination[0].copy_(source)
+
+    monkeypatch.setattr(
+        generic_b12x_indexer,
+        "get_dcp_group",
+        lambda: SimpleNamespace(
+            device_communicator=SimpleNamespace(
+                pynccl_comm=SimpleNamespace(
+                    disabled=False,
+                    all_gather=all_gather,
+                )
+            ),
+        ),
+    )
+    generic_b12x_indexer._merge_dcp_topk(indices, scores, 0, ranks, 1)
+    torch.testing.assert_close(indices.sort().values, expected * ranks)
+    # Mutating outputs must not touch the scores or invalidate workspace views.
+    torch.testing.assert_close(scores, torch.full_like(scores, 2))
+    assert gathered.data_ptr() == manager.get_simultaneous(*specs)[2].data_ptr()
+    indices.copy_(expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        generic_b12x_indexer._merge_dcp_topk(indices, scores, 0, ranks, 1)
+    allocated = torch.accelerator.memory_allocated()
+    for _ in range(3):
+        indices.copy_(expected)
+        graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.accelerator.memory_allocated() == allocated
+    torch.testing.assert_close(indices.sort().values, expected * ranks)

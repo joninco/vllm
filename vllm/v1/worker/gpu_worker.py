@@ -405,10 +405,14 @@ class Worker(WorkerBase):
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
-            # Initialize the distributed environment BEFORE taking
-            # memory snapshot
-            # This ensures NCCL buffers are allocated before we measure
-            # available memory
+            # DCP communication storage belongs inside the requested budget.
+            # A baseline before group initialization charges that storage in
+            # memory_profiling and keeps it out of the external-memory check.
+            before_distributed = None
+            if self.parallel_config.decode_context_parallel_size > 1:
+                gc.collect()
+                torch.accelerator.empty_cache()
+                before_distributed = MemorySnapshot(device=self.device)
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
@@ -423,12 +427,29 @@ class Worker(WorkerBase):
             # Set random seed.
             set_random_seed(self.model_config.seed)
 
-            # Now take memory snapshot after NCCL is initialized
             gc.collect()
             torch.accelerator.empty_cache()
 
-            # take current memory snapshot
-            self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+            after_distributed = MemorySnapshot(device=self.device)
+            self.distributed_init_memory = 0
+            if before_distributed is not None:
+                self.distributed_init_memory = max(
+                    before_distributed.free_memory - after_distributed.free_memory, 0
+                )
+                logger.info(
+                    "DCP startup memory budget components: "
+                    "free_before_distributed_init=%d bytes, "
+                    "free_after_distributed_init=%d bytes, "
+                    "distributed_init=%d bytes (included in persistent_total)",
+                    before_distributed.free_memory,
+                    after_distributed.free_memory,
+                    self.distributed_init_memory,
+                )
+            self.init_snapshot = init_snapshot = (
+                before_distributed
+                if before_distributed is not None
+                else after_distributed
+            )
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
@@ -712,6 +733,12 @@ class Worker(WorkerBase):
             format_gib(repeatable_allocator_headroom),
             format_gib(cudagraph_memory_estimate_applied),
         )
+        if getattr(self, "distributed_init_memory", 0):
+            logger.info(
+                "DCP KV cache memory budget component: distributed_init=%d bytes "
+                "(subset of persistent_total; no additional deduction)",
+                self.distributed_init_memory,
+            )
         logger.info_once(
             "KV cache persistent memory detail: initialized_before_profile=%s GiB, "
             "retained_by_profile=%s GiB, torch_allocated_since_worker_init=%s "
