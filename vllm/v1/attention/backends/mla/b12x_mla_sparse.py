@@ -1606,7 +1606,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         trace = getattr(self, "_prefill_trace", None)
         exchange = _dcp_all_gather_current_stream
         group = get_dcp_group()
-        if trace is not None and trace.active:
+        if trace is not None and trace.ownership_active:
             gather_ckv_current_chunk = trace.wrap(
                 "current_pack", gather_ckv_current_chunk
             )
@@ -1714,7 +1714,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             state.begin_step(main_stream)
             prefetched = False
         trace = getattr(self, "_prefill_trace", None)
-        if trace is not None and trace.active:
+        if trace is not None and trace.ownership_active:
             with trace.scope(
                 "ckv_selection",
                 prefetched=int(prefetched),
@@ -1914,7 +1914,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         unit = plan.local_capacity * plan.record_bytes
         trace = getattr(self, "_prefill_trace", None)
         exchange = _dcp_all_gather_current_stream
-        if trace is not None and trace.active:
+        if trace is not None and trace.ownership_active:
 
             def observed_exchange(group, source, output):
                 with trace.scope(
@@ -1966,7 +1966,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     if stream is None:
                         stream = torch.cuda.Stream(device=local.device)
                         reservation.gather_streams[lane] = stream
-                    if trace is not None and trace.active:
+                    if trace is not None and trace.ownership_active:
                         with trace.scope(
                             "startup_stream_wait",
                             ubatch=ubatch,
@@ -1986,7 +1986,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                                     gathered[: plan.dcp_world_size * count].view(-1),
                                 )
                         completion = torch.cuda.Event()
-                        if trace is not None and trace.active:
+                        if trace is not None and trace.ownership_active:
                             trace.record(
                                 completion,
                                 stream,
@@ -1996,7 +1996,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                             )
                         else:
                             completion.record(stream)
-                    if trace is not None and trace.active:
+                    if trace is not None and trace.ownership_active:
                         with trace.scope(
                             "startup_join", ubatch=ubatch, lane=model_lane
                         ):

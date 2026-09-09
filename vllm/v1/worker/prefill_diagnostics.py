@@ -57,6 +57,69 @@ def install_prefill_runner_diagnostics(runner, *, request_state_runner=False):
     if trace is None:
         return
     execute = runner.execute_model
+    sample = getattr(runner, "sample_tokens", None)
+    ticket = trace.new_ticket_slot() if callable(sample) else None
+    if ticket is not None:
+        assert callable(sample)
+
+        @wraps(sample)
+        def sample_with_ticket(*args, **kwargs):
+            with ticket.resume(getattr(runner, "execute_model_state", None)):
+                return sample(*args, **kwargs)
+
+        runner.sample_tokens = sample_with_ticket
+
+        for name in ("initialize_kv_cache", "_cleanup_profiling_kv_cache", "shutdown"):
+            original_reset = getattr(runner, name, None)
+            if not callable(original_reset):
+                continue
+
+            def reset_wrapper(original):
+                @wraps(original)
+                def reset(*args, **kwargs):
+                    ticket.clear("runner_reset")
+                    return original(*args, **kwargs)
+
+                return reset
+
+            setattr(runner, name, reset_wrapper(original_reset))
+
+    proposer = getattr(
+        runner, "speculator" if request_state_runner else "drafter", None
+    )
+    propose = getattr(proposer, "propose", None)
+    if callable(propose):
+        assert proposer is not None
+
+        @wraps(propose)
+        def propose_with_owner(*args, **kwargs):
+            if not trace.active:
+                return propose(*args, **kwargs)
+            with trace.scope(
+                "proposer", owner_role=1, ownership_enabled=0, membership_relation=1
+            ):
+                return propose(*args, **kwargs)
+
+        proposer.propose = propose_with_owner
+
+    def observe_execution_choice(owner):
+        choose = getattr(owner, "_determine_batch_execution_and_padding", None)
+        if not callable(choose):
+            return
+
+        @wraps(choose)
+        def choice(*args, **kwargs):
+            result = choose(*args, **kwargs)
+            if trace.active:
+                with trace.scope("execution_choice", graph_mode=result[0].value):
+                    pass
+            return result
+
+        owner._determine_batch_execution_and_padding = choice
+
+    observe_execution_choice(runner)
+    if proposer is not None:
+        observe_execution_choice(proposer)
     prepare_name = "prepare_inputs" if request_state_runner else "_prepare_inputs"
     prepare = getattr(runner, prepare_name)
 
@@ -74,13 +137,23 @@ def install_prefill_runner_diagnostics(runner, *, request_state_runner=False):
 
     @wraps(execute)
     def execute_with_batch(*args, **kwargs):
+        if ticket is not None:
+            ticket.clear("next_execute")
         dummy = request_state_runner and (
             kwargs.get("dummy_run", False) or (len(args) > 2 and args[2])
         )
         if dummy or not trace.capture_active():
             return execute(*args, **kwargs)
         with trace.batch():
-            return execute(*args, **kwargs)
+            try:
+                result = execute(*args, **kwargs)
+                if ticket is not None:
+                    ticket.bind(getattr(runner, "execute_model_state", None))
+                return result
+            except BaseException:
+                if ticket is not None:
+                    ticket.clear("execute_exception")
+                raise
 
     setattr(runner, prepare_name, prepare_with_membership)
     runner.execute_model = execute_with_batch

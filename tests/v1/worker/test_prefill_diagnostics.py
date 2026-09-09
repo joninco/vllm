@@ -154,3 +154,150 @@ def test_real_trace_exports_opaque_membership_and_ignores_dummy(monkeypatch):
     assert names[0].startswith("dcp_prefill.v1/batch ")
     assert any(name.startswith("dcp_prefill.v1/membership ") for name in names)
     assert all("private-request" not in name for name in names)
+
+
+@pytest.mark.parametrize("request_state", [False, True])
+@pytest.mark.parametrize("sample_fails", [False, True])
+def test_real_ticket_follows_sample_and_actual_proposer(
+    monkeypatch, request_state, sample_fails
+):
+    import torch
+
+    trace = diagnostics.PrefillTrace(max_batches=1)
+    monkeypatch.setattr(torch.autograd.profiler, "_is_profiler_enabled", True)
+    names = []
+
+    @contextmanager
+    def record(name):
+        names.append(name)
+        yield
+
+    monkeypatch.setattr(torch.profiler, "record_function", record)
+    monkeypatch.setattr(diagnostics, "get_prefill_trace", lambda: trace)
+    runner = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        execute_model_state=None,
+        use_async_scheduling=False,
+    )
+    batch = SimpleNamespace(
+        req_ids=["request"],
+        query_start_loc_np=[0, 4],
+        num_computed_tokens_np=[0],
+        num_scheduled_tokens=[4],
+        is_prefilling_np=[True],
+        num_computed_tokens_cpu=[0],
+        num_prompt_tokens=[4],
+    )
+    runner.prepare_inputs = lambda _: batch
+
+    def persistent_prepare(*args):
+        runner.input_batch = batch
+
+    runner._prepare_inputs = persistent_prepare
+    observed = []
+
+    def propose():
+        observed.append(dict(trace.current_fields))
+        assert not trace.ownership_active
+        return "draft"
+
+    setattr(
+        runner,
+        "speculator" if request_state else "drafter",
+        SimpleNamespace(propose=propose),
+    )
+
+    def execute(scheduler):
+        (runner.prepare_inputs if request_state else runner._prepare_inputs)(scheduler)
+        runner.execute_model_state = tuple([object(), object()])
+
+    def sample():
+        runner.execute_model_state = None
+        owner = runner.speculator if request_state else runner.drafter
+        assert owner.propose() == "draft"
+        if sample_fails:
+            raise ValueError("sample failure")
+        return "sample"
+
+    runner.execute_model, runner.sample_tokens = execute, sample
+    runner.shutdown = lambda: None
+    install_prefill_runner_diagnostics(runner, request_state_runner=request_state)
+    runner.execute_model(SimpleNamespace(num_scheduled_tokens={"request": 4}))
+    assert not trace.active and not trace.capture_active()
+    if sample_fails:
+        with pytest.raises(ValueError, match="sample failure"):
+            runner.sample_tokens()
+    else:
+        assert runner.sample_tokens() == "sample"
+    assert observed[0]["batch"] == 1
+    assert observed[0]["owner_role"] == 1
+    assert observed[0]["ownership_enabled"] == 0
+    assert not {"lease", "slot", "use", "event"} & observed[0].keys()
+    assert trace.manifest()["tickets"][0]["disposition"] == (
+        "sample_exception" if sample_fails else "complete"
+    )
+    assert not trace.active
+
+
+@pytest.mark.parametrize("dcp,enabled", [(1, True), (4, False)])
+def test_disabled_diagnostics_preserve_sample_and_proposer_callables(
+    monkeypatch, dcp, enabled
+):
+    trace = diagnostics.PrefillTrace()
+    monkeypatch.setattr(
+        diagnostics, "get_prefill_trace", lambda: trace if enabled else None
+    )
+    sample, propose = lambda: None, lambda: None
+    runner = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        execute_model=lambda: None,
+        _prepare_inputs=lambda: None,
+        sample_tokens=sample,
+        drafter=SimpleNamespace(propose=propose),
+    )
+    install_prefill_runner_diagnostics(runner)
+    assert runner.sample_tokens is sample
+    assert runner.drafter.propose is propose
+
+
+def test_runner_reset_and_execution_choice_are_boundary_only(monkeypatch):
+    import torch
+
+    from vllm.config import CUDAGraphMode
+
+    trace = diagnostics.PrefillTrace()
+    monkeypatch.setattr(torch.autograd.profiler, "_is_profiler_enabled", True)
+    monkeypatch.setattr(diagnostics, "get_prefill_trace", lambda: trace)
+    names = []
+
+    @contextmanager
+    def record(name):
+        names.append(name)
+        yield
+
+    monkeypatch.setattr(torch.profiler, "record_function", record)
+    runner = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        execute_model_state=None,
+        _prepare_inputs=lambda *args: None,
+        sample_tokens=lambda: None,
+        shutdown=lambda: "shutdown",
+        _determine_batch_execution_and_padding=lambda: (CUDAGraphMode.FULL, 16),
+    )
+
+    def execute():
+        assert runner._determine_batch_execution_and_padding() == (
+            CUDAGraphMode.FULL,
+            16,
+        )
+        runner.execute_model_state = object()
+
+    runner.execute_model = execute
+    install_prefill_runner_diagnostics(runner)
+    runner.execute_model()
+    assert runner.shutdown() == "shutdown"
+    assert trace.manifest()["tickets"][0]["disposition"] == "runner_reset"
+    assert any("/execution_choice " in name for name in names)
+    assert not any(
+        "graph_replay" in name or "attention_dispatch" in name for name in names
+    )

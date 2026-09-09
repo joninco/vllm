@@ -474,3 +474,153 @@ def test_worker_capture_identity_matches_reused_torch_trace_name(monkeypatch, tm
     capture = worker._prefill_trace.manifest()["capture"]
     assert capture["name"] == "first_rank3-dcp1"
     assert capture["capture"] == 2
+
+
+def test_dispatch_only_scope_strips_ownership_and_delegates_events(scopes):
+    trace, event, stream = PrefillTrace(), Event(), Stream()
+    with (
+        trace.batch(),
+        trace.scope("layer", lease=1, slot=2, use=3, event=9),
+        trace.scope("layer", ownership_enabled=0, role=0, verification=1),
+    ):
+        assert trace.active and not trace.ownership_active
+        assert not {"lease", "slot", "use", "event"} & trace.current_fields.keys()
+        trace.record(event, stream)
+        trace.wait(stream, event, reason=1)
+    assert event.records == [stream] and stream.events == [event]
+    assert not any("/event_" in name for name in scopes)
+    disabled = [name for name in scopes if "ownership_enabled=0" in name]
+    assert disabled and all("lease=" not in name for name in disabled)
+
+
+def test_ticket_resumes_exact_batch_after_budget_without_ownership(scopes):
+    trace = PrefillTrace(max_batches=1)
+    slot = trace.new_ticket_slot()
+    state = (object(),)
+    with trace.batch([dict(request_id="request", is_prefill=True)]):
+        batch = trace.current_fields["batch"]
+        slot.bind(state)
+    assert not trace.capture_active()
+    with slot.resume(state):
+        assert slot.pending is None
+        assert trace.active and not trace.ownership_active
+        assert trace.current_fields["batch"] == batch
+        assert trace.current_fields["parent_membership"] == batch
+        with trace.scope("proposer", owner_role=1, ownership_enabled=0):
+            assert trace.current_fields["owner_role"] == 1
+    assert trace.manifest()["tickets"][0]["disposition"] == "complete"
+    assert trace.manifest()["observed_scheduler_executions"] == 1
+
+
+@pytest.mark.parametrize(
+    "action", ["equal_state", "missing_state", "exception", "stop", "reset"]
+)
+def test_ticket_dispositions_and_state_reference_release(scopes, tmp_path, action):
+    trace = PrefillTrace()
+    slot = trace.new_ticket_slot()
+    state = tuple([1, 2])
+    with trace.batch():
+        slot.bind(state)
+    if action == "stop":
+        trace.export_manifest(str(tmp_path))
+        expected = "capture_stopped"
+    elif action == "reset":
+        slot.clear("runner_reset")
+        expected = "runner_reset"
+    elif action == "exception":
+        with pytest.raises(ValueError, match="sampler"), slot.resume(state):
+            raise ValueError("sampler")
+        expected = "sample_exception"
+    else:
+        other = tuple([1, 2]) if action == "equal_state" else None
+        assert other is not state
+        with slot.resume(other):
+            assert not trace.active
+        expected = "state_mismatch"
+    assert slot.pending is None
+    assert trace.manifest()["tickets"][0]["disposition"] == expected
+
+
+def test_capture_start_clears_pending_state_and_event_context(scopes):
+    trace = PrefillTrace()
+    slot = trace.new_ticket_slot()
+    with trace.batch():
+        slot.bind(object())
+    trace.start_capture(rank=0, name="second", device="cpu")
+    assert slot.pending is None
+    with slot.resume(object()):
+        assert not trace.active
+    assert any("ticket_rejected" in name for name in scopes)
+    assert trace.manifest()["execution_context_schema"] == "dcp_prefill.execution.v1"
+
+
+def test_ticket_replacement_and_capacity_bound(scopes):
+    trace = PrefillTrace(max_objects=1)
+    slot = trace.new_ticket_slot()
+    with trace.batch():
+        slot.bind(object())
+        slot.bind(object())
+    assert slot.pending is None and trace.overflow
+    assert trace.manifest()["tickets"][0]["disposition"] == "replaced"
+
+
+def test_dispatch_only_backend_binding_records_actual_plan_without_reads(scopes):
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.mla.prefill_diagnostics import install_backend_trace
+
+    decode, extend, ckv = object(), object(), object()
+    calls = []
+    impl = SimpleNamespace(
+        _consume_ckv=lambda *args: None,
+        _queue_ckv_gather=lambda *args: None,
+        _run=lambda *args: calls.append("run"),
+        _bind=lambda plan: calls.append(plan),
+        _gather_full_ckv=lambda *args: None,
+        do_kv_cache_update=lambda *args: calls.append("producer"),
+        _warmup_ckv_collectives=lambda: None,
+        _decode_plan=decode,
+        _extend_plan=extend,
+        _ckv_extend_plan=ckv,
+    )
+    trace = PrefillTrace()
+    install_backend_trace(impl, trace)
+    with trace.batch(), trace.scope("layer", ownership_enabled=0, owner_role=1):
+        impl._bind(decode)
+        impl._bind(extend)
+        impl._run(None)
+        impl.do_kv_cache_update()
+    assert calls == [decode, extend, "run", "producer"]
+    dispatches = [name for name in scopes if "/attention_dispatch " in name]
+    assert len(dispatches) == 2
+    assert "plan=0" in dispatches[0] and "plan=1" in dispatches[1]
+    assert not any(
+        "/attention_read " in name or "/cache_produce " in name for name in scopes
+    )
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_filtered_layer_preserves_dispatch_only_context_and_restores_on_error(
+    scopes, fails
+):
+    trace = PrefillTrace(layer_range=(4, 8))
+    event, stream = Event(), Stream()
+    with trace.batch():
+        original = dict(trace.current_fields)
+        try:
+            with trace.scope("layer", layer=2, ownership_enabled=0, owner_role=1):
+                assert trace.current_fields["layer"] == 2
+                assert not trace.ownership_active
+                trace.record(event, stream)
+                with trace.scope("attention_dispatch", plan=0):
+                    pass
+                if fails:
+                    raise ValueError("filtered layer failed")
+        except ValueError:
+            assert fails
+        assert trace.current_fields == original
+        assert trace.ownership_active
+    assert event.records == [stream]
+    assert not any(
+        "/event_" in name or "/attention_dispatch " in name for name in scopes
+    )

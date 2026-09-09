@@ -23,6 +23,94 @@ import torch
 
 from vllm import envs
 
+_OWNERSHIP_FIELDS = frozenset(
+    {
+        "lease",
+        "generation",
+        "ubatch",
+        "lane",
+        "slot",
+        "use",
+        "event",
+        "record",
+        "stream",
+        "group",
+        "collective",
+        "source_layer",
+    }
+)
+
+
+class ExecutionTicketSlot:
+    """One exact runner-state handoff, released before sampling enters."""
+
+    def __init__(self, trace):
+        self.trace = trace
+        self.pending = None
+
+    def clear(self, reason="reset"):
+        if self.pending is not None:
+            _, _, record = self.pending
+            record["disposition"] = reason
+            self.pending = None
+
+    def bind(self, state):
+        self.clear("replaced")
+        trace = self.trace
+        if state is None or not trace.active:
+            return
+        if trace._ticket_count >= len(trace._ticket_records):
+            trace.overflow = True
+            return
+        fields = {key: trace.current_fields[key] for key in ("capture", "batch")}
+        fields.update(
+            ticket=trace._ticket_count + 1,
+            owner_role=0,
+            ownership_enabled=0,
+            parent_membership=fields["batch"],
+        )
+        record = {**fields, "disposition": "pending"}
+        trace._ticket_records[trace._ticket_count] = record
+        trace._ticket_count += 1
+        self.pending = state, fields, record
+        with trace.scope("execution_handoff", **fields):
+            pass
+
+    @contextmanager
+    def resume(self, state):
+        trace = self.trace
+        pending, self.pending = self.pending, None
+        if pending is None:
+            with trace.unmatched_boundary("missing_ticket"):
+                yield
+            return
+        expected, fields, record = pending
+        matches = state is expected and state is not None
+        del expected, pending, state
+        if not matches or fields["capture"] != trace._capture_index:
+            record["disposition"] = (
+                "state_mismatch" if not matches else "capture_changed"
+            )
+            with trace.unmatched_boundary(record["disposition"]):
+                yield
+            return
+        if not torch.autograd.profiler._is_profiler_enabled or trace.overflow:
+            record["disposition"] = "capture_inactive"
+            with trace.suspend():
+                yield
+            return
+        token = trace._context.set(dict(fields))
+        record["disposition"] = "sampling"
+        try:
+            with trace.scope("sample"):
+                yield
+            record["disposition"] = "complete"
+        except BaseException:
+            record["disposition"] = "sample_exception"
+            raise
+        finally:
+            trace._context.reset(token)
+
 
 class PrefillTrace:
     """A startup-allocated, bounded diagnosis ledger scoped to one worker."""
@@ -58,6 +146,9 @@ class PrefillTrace:
         self._capture: dict[str, Any] = {}
         self._capture_index = 0
         self._layers: dict[tuple[str, int], dict[str, Any]] = {}
+        self._ticket_slots: list[ExecutionTicketSlot] = []
+        self._ticket_records: list[Any] = [None] * max_objects
+        self._ticket_count = 0
 
     def register_layer(self, index: int, name: str, role: int) -> None:
         key = (name, role)
@@ -68,6 +159,11 @@ class PrefillTrace:
 
     def start_capture(self, *, rank: int, name: str, device: str) -> None:
         """Reset bounded capture records without changing execution resources."""
+        for slot in self._ticket_slots:
+            slot.clear("capture_changed")
+        for index in range(self._ticket_count):
+            self._ticket_records[index] = None
+        self._ticket_count = 0
         for index in range(self._member_count):
             self._members[index] = None
         self._member_count = self._batches = self._executions = 0
@@ -90,6 +186,8 @@ class PrefillTrace:
 
     def export_manifest(self, directory: str) -> str:
         """Write a unique rank/capture artifact; callers report export failures."""
+        for slot in self._ticket_slots:
+            slot.clear("capture_stopped")
         path = Path(directory)
         path.mkdir(parents=True, exist_ok=True)
         rank = self._capture.get("rank", -1)
@@ -114,6 +212,43 @@ class PrefillTrace:
         return self._context.get() is not None and not self.overflow
 
     @property
+    def ownership_active(self) -> bool:
+        return (
+            self.active
+            and self.current_fields.get("ownership_enabled", 1) == 1
+            and self.current_fields.get("owner_role", 0) == 0
+        )
+
+    def new_ticket_slot(self):
+        slot = ExecutionTicketSlot(self)
+        self._ticket_slots.append(slot)
+        return slot
+
+    @contextmanager
+    def unmatched_boundary(self, reason):
+        if not torch.autograd.profiler._is_profiler_enabled or self.overflow:
+            with self.suspend():
+                yield
+            return
+        reasons = {"missing_ticket": 1, "state_mismatch": 2, "capture_changed": 3}
+        token = self._context.set(
+            {
+                "capture": self._capture_index,
+                "batch": -1,
+                "ticket": -1,
+                "ownership_enabled": 0,
+                "owner_role": -1,
+            }
+        )
+        try:
+            with self.scope("ticket_rejected", reason=reasons[reason]):
+                pass
+            with self.suspend():
+                yield
+        finally:
+            self._context.reset(token)
+
+    @property
     def current_fields(self) -> dict[str, int]:
         return self._context.get() or {}
 
@@ -128,7 +263,12 @@ class PrefillTrace:
             return
         self._executions += 1
         token = self._context.set(
-            {"batch": self._executions, "capture": self._capture_index}
+            {
+                "batch": self._executions,
+                "capture": self._capture_index,
+                "owner_role": 0,
+                "ownership_enabled": 1,
+            }
         )
         try:
             if membership is not None:
@@ -144,7 +284,13 @@ class PrefillTrace:
             yield
             return
         token = self._context.set(
-            {"batch": -1, "domain": 1, "capture": self._capture_index}
+            {
+                "batch": -1,
+                "domain": 1,
+                "capture": self._capture_index,
+                "ownership_enabled": 1,
+                "owner_role": 0,
+            }
         )
         try:
             with self.scope("startup"):
@@ -164,7 +310,7 @@ class PrefillTrace:
     def wrap(self, operation, function, **fields):
         @functools.wraps(function)
         def call(*args, **kwargs):
-            if not self.active:
+            if not self.ownership_active:
                 return function(*args, **kwargs)
             with self.scope(operation, **fields):
                 return function(*args, **kwargs)
@@ -207,6 +353,17 @@ class PrefillTrace:
             yield
             return
         merged = dict(self.current_fields)
+        if fields.get("ownership_enabled", merged.get("ownership_enabled", 1)) == 0:
+            merged = {
+                key: value
+                for key, value in merged.items()
+                if key not in _OWNERSHIP_FIELDS
+            }
+            fields = {
+                key: value
+                for key, value in fields.items()
+                if key not in _OWNERSHIP_FIELDS
+            }
         merged.update(fields)
         layer = merged.get("layer", -1)
         if (
@@ -214,7 +371,11 @@ class PrefillTrace:
             and layer >= 0
             and not self.layer_range[0] <= layer <= self.layer_range[1]
         ):
-            yield
+            token = self._context.set(merged)
+            try:
+                yield
+            finally:
+                self._context.reset(token)
             return
         name = (
             "dcp_prefill.v1/"
@@ -285,7 +446,7 @@ class PrefillTrace:
         return {"group": entry["id"], "collective": entry["sequence"]}
 
     def record(self, event, stream, **fields: int) -> None:
-        if not self.active:
+        if not self.ownership_active:
             event.record(stream)
             return
         event_id, sequence = self.event_identity(event, recorded=True)
@@ -299,7 +460,7 @@ class PrefillTrace:
             event.record(stream)
 
     def wait(self, stream, event, *, reason: int) -> None:
-        if not self.active:
+        if not self.ownership_active:
             stream.wait_event(event)
             return
         event_id, sequence = self.event_identity(event)
@@ -315,7 +476,24 @@ class PrefillTrace:
     def manifest(self) -> dict[str, Any]:
         return {
             "schema": "dcp_prefill.v1",
+            "execution_context_schema": "dcp_prefill.execution.v1",
+            "capabilities": ["execution_tickets", "ownership_enabled", "owner_role"],
+            "tickets": self._ticket_records[: self._ticket_count],
+            "incomplete_tickets": sum(
+                record["disposition"] != "complete"
+                for record in self._ticket_records[: self._ticket_count]
+            ),
             "codes": {
+                "attention_plan": {0: "decode", 1: "extend", 2: "full CKV extend"},
+                "membership_relation": {
+                    0: "target batch rows",
+                    1: "parent candidate requests; draft rows unproven",
+                },
+                "ticket_rejected_reason": {
+                    1: "missing ticket",
+                    2: "state identity mismatch",
+                    3: "capture changed",
+                },
                 "wait_reason": {
                     1: "staging writer",
                     2: "previous slot consumer",
@@ -382,7 +560,7 @@ class _ObservedStream:
 
     def wait_stream(self, producer):
         source = producer.stream if isinstance(producer, _ObservedStream) else producer
-        if not self.trace.active:
+        if not self.trace.ownership_active:
             self.stream.wait_stream(source)
             return
         with self.trace.scope(
@@ -416,7 +594,7 @@ def install_state_trace(state, trace: PrefillTrace) -> None:
 
     def preparation(original):
         def call(layer, stream, *, producer_stream):
-            if not trace.active:
+            if not trace.ownership_active:
                 return original(layer, stream, producer_stream=producer_stream)
             slot = layer % len(uses)
             uses[slot] += 1
@@ -444,7 +622,7 @@ def install_state_trace(state, trace: PrefillTrace) -> None:
 
     def staging(original):
         def call(stream):
-            if not trace.active:
+            if not trace.ownership_active:
                 return original(stream)
             real = stream.stream if isinstance(stream, _ObservedStream) else stream
             return original(_ObservedStream(trace, real, 1))
@@ -455,7 +633,7 @@ def install_state_trace(state, trace: PrefillTrace) -> None:
 
     def consumption(original):
         def call(layer, stream):
-            if not trace.active:
+            if not trace.ownership_active:
                 return original(layer, stream)
             slot = layer % len(uses)
             trace.set_owner(
@@ -474,7 +652,7 @@ def install_state_trace(state, trace: PrefillTrace) -> None:
     def association(original, operation):
         def call(layer, event):
             slot = layer % len(uses)
-            if not trace.active:
+            if not trace.ownership_active:
                 return original(layer, event)
             event_id, record = trace.event_identity(event)
             with trace.scope(
@@ -495,7 +673,7 @@ def install_state_trace(state, trace: PrefillTrace) -> None:
     original_synchronize = state._synchronize
 
     def synchronize():
-        if not trace.active:
+        if not trace.ownership_active:
             return original_synchronize()
         state._check_finished()
         for slot in state._slots:
@@ -514,7 +692,7 @@ def install_state_trace(state, trace: PrefillTrace) -> None:
 
         def lifecycle(original, operation=name):
             def call(*args, **kwargs):
-                if not trace.active:
+                if not trace.ownership_active:
                     return original(*args, **kwargs)
                 with trace.scope(operation, **base):
                     result = original(*args, **kwargs)
@@ -533,6 +711,11 @@ def install_backend_trace(impl, trace: PrefillTrace) -> None:
     original_consume = impl._consume_ckv
 
     def consume(cache, metadata, layer, original_cache):
+        if not trace.ownership_active:
+            if trace.active:
+                with trace.scope("dispatch", route=2):
+                    return original_consume(cache, metadata, layer, original_cache)
+            return original_consume(cache, metadata, layer, original_cache)
         registry = impl._ckv_reservation.registry
         if not getattr(registry, "_prefill_trace_installed", False):
             registry._prefill_trace_installed = True
@@ -559,7 +742,7 @@ def install_backend_trace(impl, trace: PrefillTrace) -> None:
     original_queue = impl._queue_ckv_gather
 
     def queue(state, layer_idx, cache, metadata, stream, producer, *, asynchronous):
-        if not trace.active:
+        if not trace.ownership_active:
             return original_queue(
                 state,
                 layer_idx,
@@ -593,10 +776,31 @@ def install_backend_trace(impl, trace: PrefillTrace) -> None:
             )
 
     impl._queue_ckv_gather = queue
+    original_bind = getattr(impl, "_bind", None)
+    if callable(original_bind):
+
+        def bind(plan, *args, **kwargs):
+            if not trace.active or trace.ownership_active:
+                return original_bind(plan, *args, **kwargs)
+            kind = next(
+                (
+                    index
+                    for index, name in enumerate(
+                        ("_decode_plan", "_extend_plan", "_ckv_extend_plan")
+                    )
+                    if plan is getattr(impl, name, None)
+                ),
+                -1,
+            )
+            with trace.scope("attention_dispatch", plan=kind):
+                return original_bind(plan, *args, **kwargs)
+
+        impl._bind = bind
+
     original_run = impl._run
 
     def run(*args, **kwargs):
-        if not trace.active:
+        if not trace.ownership_active:
             return original_run(*args, **kwargs)
         with trace.scope("attention_read"):
             return original_run(*args, **kwargs)
@@ -606,7 +810,7 @@ def install_backend_trace(impl, trace: PrefillTrace) -> None:
     original_gather = impl._gather_full_ckv
 
     def gather(*args, **kwargs):
-        if not trace.active:
+        if not trace.ownership_active:
             return original_gather(*args, **kwargs)
         from vllm.distributed.parallel_state import get_dcp_group
 
