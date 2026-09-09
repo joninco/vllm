@@ -1127,8 +1127,9 @@ def test_full_ckv_allgather_uses_effective_communicator(monkeypatch, pynccl_disa
 
 
 @pytest.mark.parametrize("depth", [0, 1])
+@pytest.mark.parametrize("has_history", [False, True])
 def test_full_ckv_prefetch_backend_inserts_changed_chunks_and_reuses_cache_identity(
-    monkeypatch: pytest.MonkeyPatch, depth: int
+    monkeypatch: pytest.MonkeyPatch, depth: int, has_history: bool
 ) -> None:
     from vllm.v1.attention.backends.mla.ckv_prefetch import (
         CKVPrefetchPlan,
@@ -1199,7 +1200,20 @@ def test_full_ckv_prefetch_backend_inserts_changed_chunks_and_reuses_cache_ident
     impl._gather_full_ckv = gather
     impl._append_ckv_current_chunk = append
     caches = [torch.full((2, 2, 656), i, dtype=torch.uint8) for i in range(3)]
-    metadata = SimpleNamespace()
+    metadata = SimpleNamespace(ckv_has_history=has_history)
+    selections = []
+
+    @contextmanager
+    def scope(operation, **fields):
+        selections.append(fields)
+        yield
+
+    impl._prefill_trace = SimpleNamespace(
+        ownership_active=True,
+        scope=scope,
+        record=lambda event, stream: event.record(stream),
+    )
+    forced_stale = int(depth > 0 and not has_history)
     for execution in range(2):
         for layer_idx, cache in enumerate(caches):
             value = execution * 10 + layer_idx
@@ -1211,10 +1225,24 @@ def test_full_ckv_prefetch_backend_inserts_changed_chunks_and_reuses_cache_ident
             assert output.flatten()[0] == value
             assert state.layer_caches[layer_idx] is cache
             state.finish_consumer(index, Event())
-    assert len(appends) == (2 if depth else 0)
-    if depth:
+            if forced_stale and execution == 1 and layer_idx == 0:
+                impl._queue_ckv_gather(
+                    state, 1, caches[1], metadata, side, main, asynchronous=True
+                )
+                assert 1 in state.pending
+            elif not has_history:
+                assert not state.pending
+    assert all(fields["cache_identity_known"] == 1 for fields in selections)
+    assert all(fields["has_history"] == int(has_history) for fields in selections)
+    assert len(appends) == (2 if depth and has_history else 0)
+    if depth and has_history:
         assert appends[0] is caches[1] and appends[1] is caches[2]
-    assert sum(item is group for item in gathers) == (2 if depth else 0)
+    assert sum(item is group for item in gathers) == (
+        2 if depth and has_history else forced_stale
+    )
+    assert sum(item is None for item in gathers) == (4 if depth and has_history else 6)
+    if forced_stale:
+        assert ("wait", "main") in log
     assert ("producer", "side", "main") in log if depth else True
     reservation.registry.clear()
 
@@ -1386,8 +1414,6 @@ def test_b12x_glm_dsa_full_ckv_builder_allocates_exact_selector_width(
         assert builder.ckv_selected_indices_buffer is None
         assert builder.dcp_rank_req_lens_buffer is None
 
-    if not builder._ckv_gather_requested:
-        return
     query_starts = torch.tensor([0, 16, 32], dtype=torch.int32)
     seq_lens = torch.tensor([19, 33], dtype=torch.int32)
     common = SimpleNamespace(
@@ -1412,8 +1438,20 @@ def test_b12x_glm_dsa_full_ckv_builder_allocates_exact_selector_width(
             num_decode_tokens=0,
             num_actual_tokens=32,
             dcp_ckv_gather_eligible=False,
+            ckv_has_history=True,
         ),
     )
+    if not builder._ckv_gather_requested:
+
+        def unexpected_equal(*args, **kwargs):
+            pytest.fail("Disabled CKV must not compare CPU history lengths")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "equal", unexpected_equal)
+            metadata = builder.build(0, common)
+        assert metadata.ckv_has_history
+        assert not metadata.dcp_ckv_gather_eligible
+        return
     metadata = builder.build(0, common)
     assert metadata.dcp_ckv_gather_eligible
     assert metadata.ckv_selected_indices.shape == (32, 2048)
@@ -1422,6 +1460,25 @@ def test_b12x_glm_dsa_full_ckv_builder_allocates_exact_selector_width(
     assert metadata.dcp_local_cu_seq_lens.tolist() == [0, 7, 16]
     assert metadata.dcp_padded_total_tokens == 16
     assert metadata.global_cache_seq_lens_per_req.tolist() == [19, 33]
+    assert metadata.ckv_has_history
+    for lengths, upper_bound, expected in (
+        ([16, 16], None, False),  # Entirely initial chunks.
+        ([32, 32], None, True),  # Later chunks.
+        ([80, 16], None, True),  # Reused prefix in one request.
+        ([16, 17], None, True),  # A single history token is sufficient.
+        ([16, 16], [17, 16], True),  # Uncertain bound must not skip history.
+        ([16, 16], [16, 16], False),
+    ):
+        common.seq_lens = torch.tensor(lengths, dtype=torch.int32)
+        common.seq_lens_cpu = common.seq_lens
+        common.seq_lens_cpu_upper_bound = (
+            None
+            if upper_bound is None
+            else torch.tensor(upper_bound, dtype=torch.int32)
+        )
+        for rank in range(dcp_size):
+            builder.dcp_rank = rank
+            assert builder.build(0, common).ckv_has_history is expected
     captured = builder._build(0, common, for_cudagraph_capture=True)
     assert not captured.dcp_ckv_gather_eligible
 

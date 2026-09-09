@@ -650,6 +650,8 @@ class B12xMLASparseMetadata(AttentionMetadata):
     dcp_local_total_tokens: int = 0
     dcp_padded_total_tokens: int = 0
     dcp_ckv_gather_eligible: bool = False
+    # False only when CPU sequence bounds prove every prefill has zero history.
+    ckv_has_history: bool = True
 
 
 class B12xMLASparseMetadataBuilder(
@@ -985,6 +987,10 @@ class B12xMLASparseMetadataBuilder(
             metadata.prefill_seq_lens_cpu = seq_lens_cpu_source[
                 prefill_start : prefill_start + metadata.num_prefills
             ].clone()
+            if use_dcp and self._ckv_gather_requested:
+                metadata.ckv_has_history = not torch.equal(
+                    metadata.prefill_seq_lens_cpu, metadata.prefill_query_lens_cpu
+                )
         if _use_b12x_full_ckv_gather(
             enabled=self._ckv_gather_requested and not for_cudagraph_capture,
             is_glm_next=self.requires_glm_next_selector_metadata,
@@ -1634,12 +1640,15 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         except (AttributeError, ValueError, AssertionError, IndexError):
             layer_idx = 0
             original_cache = None
-        can_prefetch = original_cache is not None
+        cache_identity_known = original_cache is not None
+        can_prefetch = cache_identity_known and getattr(
+            metadata, "ckv_has_history", True
+        )
         original_cache = cache if original_cache is None else original_cache
         state.register_cache(layer_idx, original_cache)
         state.enter_layer(layer_idx, main_stream)
         prefetched = layer_idx in state.pending
-        if prefetched and not can_prefetch:
+        if state.pending and not can_prefetch:
             state.begin_step(main_stream)
             prefetched = False
         trace = getattr(self, "_prefill_trace", None)
@@ -1647,7 +1656,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             with trace.scope(
                 "ckv_selection",
                 prefetched=int(prefetched),
-                cache_identity_known=int(can_prefetch),
+                cache_identity_known=int(cache_identity_known),
+                has_history=int(getattr(metadata, "ckv_has_history", True)),
             ):
                 pass
         if not prefetched:
