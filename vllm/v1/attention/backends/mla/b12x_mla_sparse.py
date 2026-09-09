@@ -387,66 +387,6 @@ def _global_causal_lens_for_ckv_gather(
     return full_seq - chunk_len + (token_idx - chunk_start) + 1
 
 
-@triton.jit
-def _map_global_topk_to_gathered_ckv_kernel(
-    req_id_ptr,
-    token_indices_ptr,
-    rank_req_starts_ptr,
-    rank_req_lens_ptr,
-    out_ptr,
-    valid_count_ptr,
-    starts_stride0,
-    starts_stride1,
-    lens_stride0,
-    lens_stride1,
-    ti_stride0,
-    ti_stride1,
-    out_stride0,
-    out_stride1,
-    padded_rank_tokens,
-    DCP_SIZE: tl.constexpr,
-    DCP_INTERLEAVE: tl.constexpr,
-    NUM_TOPK_TOKENS: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    row = tl.program_id(0)
-    tile = tl.program_id(1)
-    cols = tile * BLOCK_N + tl.arange(0, BLOCK_N)
-    col_mask = cols < NUM_TOPK_TOKENS
-    req = tl.load(req_id_ptr + row)
-    tok = tl.load(
-        token_indices_ptr + row * ti_stride0 + cols * ti_stride1,
-        mask=col_mask,
-        other=-1,
-    )
-    owner = (tok // DCP_INTERLEAVE) % DCP_SIZE
-    local_idx = (
-        tok // (DCP_SIZE * DCP_INTERLEAVE)
-    ) * DCP_INTERLEAVE + tok % DCP_INTERLEAVE
-    valid_tok = col_mask & (tok >= 0)
-    req_start = tl.load(
-        rank_req_starts_ptr + owner * starts_stride0 + req * starts_stride1,
-        mask=valid_tok,
-        other=0,
-    )
-    req_len = tl.load(
-        rank_req_lens_ptr + owner * lens_stride0 + req * lens_stride1,
-        mask=valid_tok,
-        other=0,
-    )
-    valid = valid_tok & (local_idx >= 0) & (local_idx < req_len)
-    gathered_slot = owner * padded_rank_tokens + req_start + local_idx
-    valid_i32 = valid.to(tl.int32)
-    local_offset = tl.cumsum(valid_i32) - valid_i32
-    tile_valid_count = tl.sum(valid_i32)
-    output_base = tl.atomic_add(valid_count_ptr + row, tile_valid_count)
-    tl.store(
-        out_ptr + row * out_stride0 + (output_base + local_offset) * out_stride1,
-        gathered_slot,
-        mask=valid,
-    )
-
-
 def _map_global_topk_to_gathered_ckv(
     req_ids: torch.Tensor,
     token_indices: torch.Tensor,
@@ -478,31 +418,20 @@ def _map_global_topk_to_gathered_ckv(
     ):
         raise TypeError("CKV gather index metadata must be int32")
 
-    block_n = 128
-    out.fill_(-1)
-    valid_counts.zero_()
-    _map_global_topk_to_gathered_ckv_kernel[
-        (token_indices.shape[0], triton.cdiv(token_indices.shape[1], block_n))
-    ](
+    from b12x.attention._shared.mla.dcp_ckv_mapping import (
+        map_global_topk_to_gathered_ckv,
+    )
+
+    map_global_topk_to_gathered_ckv(
         req_ids,
         token_indices,
         rank_req_starts,
         rank_req_lens,
         out,
         valid_counts,
-        rank_req_starts.stride(0),
-        rank_req_starts.stride(1),
-        rank_req_lens.stride(0),
-        rank_req_lens.stride(1),
-        token_indices.stride(0),
-        token_indices.stride(1),
-        out.stride(0),
-        out.stride(1),
-        padded_rank_tokens,
-        DCP_SIZE=dcp_size,
-        DCP_INTERLEAVE=cp_kv_cache_interleave_size,
-        NUM_TOPK_TOKENS=token_indices.shape[1],
-        BLOCK_N=block_n,
+        dcp_size=dcp_size,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+        padded_rank_tokens=padded_rank_tokens,
     )
 
 

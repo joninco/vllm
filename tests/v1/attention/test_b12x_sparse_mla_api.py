@@ -788,6 +788,105 @@ def test_b12x_full_ckv_gather_uses_global_causal_lengths(
     assert actual.tolist() == expected
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_full_ckv_mapping_preserves_input_order_and_invalid_tail(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    from b12x.attention._shared.mla import dcp_ckv_mapping
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the package kernel integration")
+    req_ids = torch.tensor([0, 1, 0], dtype=torch.int32, device=device)
+    indices = torch.full((3, 2048), -1, dtype=torch.int32, device=device)
+    indices[0, [0, 127, 128, 2047]] = torch.tensor(
+        [8, 1, 4, 0], dtype=torch.int32, device=device
+    )
+    indices[1, [0, 128, 2047]] = torch.tensor(
+        [7, 0, 4], dtype=torch.int32, device=device
+    )
+    starts = torch.tensor(
+        [[0, 3], [0, 2], [0, 2], [0, 2]], dtype=torch.int32, device=device
+    )
+    lengths = torch.tensor(
+        [[3, 2], [2, 2], [2, 2], [2, 2]], dtype=torch.int32, device=device
+    )
+    out = torch.full_like(indices, 99)
+    counts = torch.full_like(req_ids, 99)
+    expected = torch.full_like(indices, -1)
+    expected[0, :4] = torch.tensor([2, 10, 1, 0], dtype=torch.int32, device=device)
+    expected[1, :3] = torch.tensor([33, 3, 4], dtype=torch.int32, device=device)
+    expected_counts = torch.tensor([4, 3, 0], dtype=torch.int32, device=device)
+    originals = [tensor.clone() for tensor in (req_ids, indices, starts, lengths)]
+    calls = []
+    if device == "cpu":
+
+        def package_dispatch(*args, **kwargs):
+            assert all(
+                a is b
+                for a, b in zip(args, (req_ids, indices, starts, lengths, out, counts))
+            )
+            assert kwargs == dict(
+                dcp_size=4, cp_kv_cache_interleave_size=1, padded_rank_tokens=10
+            )
+            calls.append(True)
+            out.copy_(expected)
+            counts.copy_(expected_counts)
+
+        monkeypatch.setattr(
+            dcp_ckv_mapping, "map_global_topk_to_gathered_ckv", package_dispatch
+        )
+    for _ in range(3):
+        b12x_mla_sparse._map_global_topk_to_gathered_ckv(
+            req_ids,
+            indices,
+            starts,
+            lengths,
+            out,
+            counts,
+            dcp_size=4,
+            cp_kv_cache_interleave_size=1,
+            padded_rank_tokens=10,
+        )
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(counts, expected_counts, rtol=0, atol=0)
+    for actual, original in zip((req_ids, indices, starts, lengths), originals):
+        torch.testing.assert_close(actual, original, rtol=0, atol=0)
+    if device == "cpu":
+        assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    "invalid", ["output_shape", "rank_shape", "rank_count", "dtype"]
+)
+def test_full_ckv_mapping_rejects_incompatible_metadata(invalid: str) -> None:
+    req_ids = torch.zeros(1, dtype=torch.int32)
+    indices = torch.zeros((1, 2048), dtype=torch.int32)
+    starts = torch.zeros((4, 1), dtype=torch.int32)
+    lengths = torch.ones_like(starts)
+    out = torch.empty_like(indices)
+    counts = torch.empty_like(req_ids)
+    if invalid == "output_shape":
+        out = out[:, :128]
+    elif invalid == "rank_shape":
+        lengths = lengths[:3]
+    elif invalid == "rank_count":
+        starts, lengths = starts[:3], lengths[:3]
+    else:
+        counts = counts.to(torch.int64)
+    with pytest.raises(TypeError if invalid == "dtype" else ValueError):
+        b12x_mla_sparse._map_global_topk_to_gathered_ckv(
+            req_ids,
+            indices,
+            starts,
+            lengths,
+            out,
+            counts,
+            dcp_size=4,
+            cp_kv_cache_interleave_size=1,
+            padded_rank_tokens=10,
+        )
+
+
 def test_b12x_full_ckv_gather_capture_fallback_ignores_runtime_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
