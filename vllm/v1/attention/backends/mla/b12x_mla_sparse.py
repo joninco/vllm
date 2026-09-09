@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B12x sparse MLA attention backend."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from math import gcd, prod
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 from weakref import WeakKeyDictionary
@@ -74,6 +74,10 @@ class _CKVReservation:
     registry: CKVPrefetchRegistry
     current_local: torch.Tensor
     current_gathered: torch.Tensor
+    gather_streams: dict[tuple[int, int], torch.cuda.Stream] = field(
+        default_factory=dict
+    )
+    collectives_warmed: bool = False
 
 
 _CKV_RESERVATIONS: WeakKeyDictionary = WeakKeyDictionary()
@@ -262,6 +266,22 @@ def _round_up_ckv_rank_tokens(
 ) -> int:
     alignment = _ckv_rank_token_alignment(page_size, dcp_world_size)
     return (token_count + alignment - 1) // alignment * alignment
+
+
+def _ckv_collective_warmup_sizes(
+    capacity: int, *, page_size: int, dcp_world_size: int
+) -> tuple[int, ...]:
+    """Cover aligned geometric message sizes and the full reserved rank span."""
+    alignment = _ckv_rank_token_alignment(page_size, dcp_world_size)
+    if capacity < alignment or capacity % alignment:
+        raise ValueError("CKV collective capacity must be positive and page-aligned")
+    sizes = []
+    count = alignment
+    while count < capacity:
+        sizes.append(count)
+        count *= 2
+    sizes.append(capacity)
+    return tuple(sizes)
 
 
 def _dcp_all_gather_current_stream(
@@ -1650,6 +1670,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             raise RuntimeError(
                 "CKV prefill storage was not reserved before KV admission"
             )
+        if not reservation.collectives_warmed:
+            raise RuntimeError("CKV collective warmup must finish before KV admission")
         lane = (dbo_current_ubatch_id(), current_workspace_lane())
         state = reservation.registry.for_workspace(
             reservation.registry.pool.storage, lane=lane
@@ -1687,7 +1709,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             if can_prefetch and reservation.registry.pool.plan.effective_depth:
                 targets = state.targets(layer_idx)
                 if targets:
-                    stream = state.get_gather_stream()
+                    stream = state.get_gather_stream(
+                        lambda: reservation.gather_streams[lane]
+                    )
                     for target in targets:
                         self._queue_ckv_gather(
                             state,
@@ -1831,6 +1855,89 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             self._ckv_gather_enabled,
         )
 
+    def prepare_profile_collectives(self) -> None:
+        """Prepare native-cache collectives before the attention memory profile."""
+        self._warmup_ckv_collectives()
+
+    def _warmup_ckv_collectives(self) -> None:
+        """Initialize actual collective paths and lane streams before KV admission."""
+        reservation = self._ckv_reservation
+        if reservation is None or reservation.collectives_warmed:
+            return
+        from vllm.distributed.parallel_state import get_dcp_ckv_prefetch_group
+
+        plan = reservation.registry.pool.plan
+        sizes = _ckv_collective_warmup_sizes(
+            plan.local_capacity,
+            page_size=self._kernel_page_size,
+            dcp_world_size=plan.dcp_world_size,
+        )
+        default_group = get_dcp_group()
+        prefetch_group = get_dcp_ckv_prefetch_group() if plan.effective_depth else None
+        main = torch.cuda.current_stream()
+        completions = []
+        unit = plan.local_capacity * plan.record_bytes
+        for ubatch in range(plan.num_ubatches):
+            for model_lane in range(plan.num_lanes):
+                lane = (ubatch, model_lane)
+                offset = (ubatch * plan.num_lanes + model_lane) * plan.lane_nbytes
+                storage = reservation.registry.pool.storage.narrow(
+                    0, offset, plan.lane_nbytes
+                )
+                local = storage[:unit].view(plan.local_capacity, plan.record_bytes)
+                local.zero_()
+                targets = [
+                    storage.narrow(
+                        0,
+                        unit + slot * unit * plan.dcp_world_size,
+                        unit * plan.dcp_world_size,
+                    ).view(plan.dcp_world_size * plan.local_capacity, plan.record_bytes)
+                    for slot in range(plan.ring_slots)
+                ]
+                for gathered in targets:
+                    for count in sizes:
+                        _dcp_all_gather_current_stream(
+                            default_group,
+                            local[:count].view(-1),
+                            gathered[: plan.dcp_world_size * count].view(-1),
+                        )
+                if prefetch_group is not None:
+                    current_local = reservation.current_local[ubatch, model_lane]
+                    current_local.zero_()
+                    _dcp_all_gather_current_stream(
+                        default_group,
+                        current_local,
+                        reservation.current_gathered[ubatch, model_lane],
+                    )
+                    stream = reservation.gather_streams.get(lane)
+                    if stream is None:
+                        stream = torch.cuda.Stream(device=local.device)
+                        reservation.gather_streams[lane] = stream
+                    stream.wait_stream(main)
+                    with torch.cuda.stream(stream):
+                        for gathered in targets:
+                            for count in sizes:
+                                _dcp_all_gather_current_stream(
+                                    prefetch_group,
+                                    local[:count].view(-1),
+                                    gathered[: plan.dcp_world_size * count].view(-1),
+                                )
+                        completion = torch.cuda.Event()
+                        completion.record(stream)
+                    main.wait_event(completion)
+                    completions.append(completion)
+        main.synchronize()
+        reservation.collectives_warmed = True
+        logger.info(
+            "Warmed CKV all-gather paths: rank_spans=%s ring_slots=%d lanes=%d "
+            "prefetch_streams=%d current_rank_capacity=%d",
+            sizes,
+            plan.ring_slots,
+            plan.num_ubatches * plan.num_lanes,
+            len(reservation.gather_streams),
+            reservation.current_local.shape[-2],
+        )
+
     def warmup(self, token_counts: tuple[int, ...]) -> None:
         decode_capacity = int(self._decode_plan.caps.max_q_rows)
         decode_rows = {
@@ -1949,6 +2056,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 current_capacity=self._ckv_current_capacity,
                 padded_tokens=1,
             )
+        self._warmup_ckv_collectives()
 
     def finalize_kv_cache_geometry(self, kernel_page_size: int) -> None:
         """Finalize kernel plans and workspace memory before KV profiling.

@@ -27,6 +27,9 @@ from vllm.distributed.dcp_prefill import build_indexer_replica_group_ranks
 from vllm.v1.attention.backends.mla import b12x_indexer as indexer
 from vllm.v1.worker import workspace
 
+# Module fixtures own the process groups across parametrized references.
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 def _score_order(score: float) -> int:
     bits = struct.unpack("<I", struct.pack("<f", score))[0]

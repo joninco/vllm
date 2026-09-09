@@ -1766,6 +1766,7 @@ def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
     architecture: str,
 ):
     runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
     runner.model_config = SimpleNamespace(architecture=architecture)
     runner.dcp_world_size = 4
     runner.vllm_config = object()

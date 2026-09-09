@@ -978,6 +978,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         _init_minimal_kv_cache_for_profiling(self)
         try:
+            # Native-cache collectives must be initialized before this first
+            # real prefill; their allocations belong to the admission profile.
+            for layer in self.compilation_config.static_forward_context.values():
+                prepare = getattr(
+                    getattr(layer, "impl", None), "prepare_profile_collectives", None
+                )
+                if callable(prepare):
+                    prepare()
             self._dummy_run(
                 self.max_num_tokens,
                 context_len=self.dcp_size * self.cp_interleave,

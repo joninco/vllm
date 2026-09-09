@@ -28,6 +28,9 @@ from tests.distributed.test_dcp_prefill_owner_merge import (
 from vllm.v1.attention.ops import dcp
 from vllm.v1.worker import workspace
 
+# Module fixtures own the process groups across parametrized references.
+pytestmark = pytest.mark.skip_global_cleanup
+
 _CAPACITY = 8192
 _LOCAL_HEADS = 8
 _HEADS = 32

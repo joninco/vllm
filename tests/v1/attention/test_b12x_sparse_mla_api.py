@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Behavior checks for the B12x sparse MLA adapters."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -798,6 +798,236 @@ def test_b12x_full_ckv_gather_capture_fallback_ignores_runtime_metadata(
 
 
 @pytest.mark.parametrize("depth", [0, 1])
+@pytest.mark.parametrize("profile_runner", [None, "v1", "v2"])
+def test_full_ckv_collective_warmup_covers_reserved_slots_lanes_and_streams(
+    monkeypatch, depth, profile_runner
+) -> None:
+    from vllm.v1.attention.backends.mla.ckv_prefetch import (
+        CKVPrefetchPlan,
+        CKVPrefetchRegistry,
+        CKVWorkspacePool,
+    )
+
+    module = None
+    if profile_runner is not None:
+        from importlib import import_module
+
+        module = import_module(
+            "vllm.v1.worker.gpu_model_runner"
+            if profile_runner == "v1"
+            else "vllm.v1.worker.gpu.model_runner"
+        )
+    log: list[tuple[Any, ...]] = []
+    calls: list[tuple[Any, str, int, int]] = []
+    streams: list[Any] = []
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, stream):
+            log.append((self.name, "after", stream.name))
+
+        def wait_event(self, event):
+            log.append((self.name, "join", event.stream.name))
+
+        def synchronize(self):
+            log.append((self.name, "synchronize"))
+
+    class Event:
+        def record(self, stream):
+            self.stream = stream
+            log.append((stream.name, "event"))
+
+        def synchronize(self):
+            pass
+
+    main = Stream("main")
+    active = [main]
+
+    def make_stream(**kwargs):
+        stream = Stream(f"side-{len(streams)}")
+        streams.append(stream)
+        return stream
+
+    @contextmanager
+    def use_stream(stream):
+        previous = active[0]
+        active[0] = stream
+        try:
+            yield
+        finally:
+            active[0] = previous
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: active[0])
+    monkeypatch.setattr(torch.cuda, "Stream", make_stream)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    default, side_group = object(), object()
+    monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda: default)
+    group_lookups = []
+
+    def get_side_group():
+        group_lookups.append(True)
+        return side_group
+
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dcp_ckv_prefetch_group", get_side_group
+    )
+
+    def exchange(group, source, output):
+        assert source.dtype == output.dtype == torch.uint8
+        assert source.is_contiguous() and output.is_contiguous()
+        assert output.numel() == source.numel() * 2
+        calls.append((group, active[0].name, source.numel(), output.data_ptr()))
+        output.view(-1).copy_(source.view(-1).repeat(2))
+
+    monkeypatch.setattr(b12x_mla_sparse, "_dcp_all_gather_current_stream", exchange)
+    plan = CKVPrefetchPlan.create(
+        requested_depth=depth,
+        budget_bytes=0,
+        dcp_world_size=2,
+        local_capacity=8,
+        record_bytes=8,
+        num_ubatches=2,
+        num_lanes=2,
+    )
+    pool = CKVWorkspacePool(plan, torch.device("cpu"))
+    reservation = b12x_mla_sparse._CKVReservation(
+        CKVPrefetchRegistry(pool),
+        torch.empty((2, 2, 3 if depth else 0, 8), dtype=torch.uint8),
+        torch.empty((2, 2, 6 if depth else 0, 8), dtype=torch.uint8),
+    )
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._ckv_reservation = reservation
+    impl._kernel_page_size = 4
+    impl._cache_record_bytes = 8
+    if profile_runner is None:
+        impl.prepare_profile_collectives()
+    else:
+        assert module is not None
+        runner = object.__new__(module.GPUModelRunner)
+        runner.model_config = SimpleNamespace(architecture="GlmMoeDsaForCausalLM")
+        runner.compilation_config = SimpleNamespace(
+            static_forward_context={"attention": SimpleNamespace(impl=impl)}
+        )
+        runner.vllm_config = object()
+        runner.max_num_tokens = 8
+        runner.dcp_world_size = runner.dcp_size = 2
+        runner.cp_interleave = 1
+        profile_events = []
+
+        def init_cache():
+            assert not reservation.collectives_warmed
+            profile_events.append("cache-bound")
+
+        def gather(cache, metadata, local, output, **kwargs):
+            output.zero_()
+            return output
+
+        impl._gather_full_ckv = gather
+
+        def dummy_run(*args, **kwargs):
+            # Exercise the serving guard and real registry/event lifecycle.
+            cache = torch.zeros((2, 4, 8), dtype=torch.uint8)
+            _, state, layer_index = impl._consume_ckv(
+                cache,
+                SimpleNamespace(),
+                SimpleNamespace(layer_name="model.layers.0.self_attn"),
+                cache,
+            )
+            completion = Event()
+            completion.record(main)
+            state.finish_consumer(layer_index, completion)
+            profile_events.append("attention-consumed")
+            return torch.empty(0), torch.empty(0)
+
+        def cleanup():
+            reservation.registry.clear()
+            profile_events.append("cache-released")
+
+        runner._dummy_run = dummy_run
+        if profile_runner == "v1":
+            runner._init_minimal_kv_cache_for_profiling = init_cache
+            runner._cleanup_profiling_kv_cache = cleanup
+            runner._sync_device = lambda: None
+            monkeypatch.setattr(
+                module, "set_current_vllm_config", lambda _: nullcontext()
+            )
+        else:
+            monkeypatch.setattr(
+                module, "_init_minimal_kv_cache_for_profiling", lambda _: init_cache()
+            )
+            monkeypatch.setattr(
+                module, "_teardown_profiling_state", lambda _: cleanup()
+            )
+            monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+        runner.profile_glm_dcp_attention()
+        assert profile_events == ["cache-bound", "attention-consumed", "cache-released"]
+
+    expected_history = {16, 32, 64}
+    default_history = [c for c in calls if c[0] is default and c[2] in expected_history]
+    assert len(default_history) == 4 * plan.ring_slots * 3
+    assert {c[1] for c in default_history} == {"main"}
+    assert len({c[3] for c in default_history}) == 4 * plan.ring_slots
+    side_calls = [c for c in calls if c[0] is side_group]
+    assert len(side_calls) == (4 * plan.ring_slots * 3 if depth else 0)
+    assert {c[2] for c in side_calls} == (expected_history if depth else set())
+    assert len([c for c in calls if c[2] == 24]) == (4 if depth else 0)
+    assert len(streams) == (4 if depth else 0)
+    assert group_lookups == ([True] if depth else [])
+    assert ("main", "synchronize") in log
+    assert reservation.collectives_warmed
+    assert reservation.registry.states == {}
+    if depth:
+        assert (
+            sum(event[1] == "join" and event[2].startswith("side-") for event in log)
+            == 4
+        )
+        assert set(reservation.gather_streams) == {(0, 0), (0, 1), (1, 0), (1, 1)}
+    before = len(calls), len(streams)
+    reservation.registry.clear()
+    impl._warmup_ckv_collectives()
+    assert (len(calls), len(streams)) == before
+
+
+def test_full_ckv_requires_collective_warmup_before_serving():
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._ckv_reservation = SimpleNamespace(collectives_warmed=False)
+    with pytest.raises(RuntimeError, match="warmup must finish before KV admission"):
+        impl._consume_ckv(torch.empty(0), SimpleNamespace(), SimpleNamespace(), None)
+
+
+@pytest.mark.parametrize("pynccl_disabled", [False, True])
+def test_full_ckv_allgather_uses_effective_communicator(monkeypatch, pynccl_disabled):
+    calls = []
+    process_group = object()
+
+    def pynccl(output, source):
+        calls.append("pynccl")
+        output.copy_(source.repeat(2))
+
+    def torch_dist(output, source, *, group, async_op):
+        assert group is process_group and not async_op
+        calls.append("torch_dist")
+        output.copy_(source.repeat(2))
+
+    group = SimpleNamespace(
+        world_size=2,
+        device_group=process_group,
+        device_communicator=SimpleNamespace(
+            pynccl_comm=SimpleNamespace(disabled=pynccl_disabled, all_gather=pynccl)
+        ),
+    )
+    monkeypatch.setattr(b12x_mla_sparse.dist, "all_gather_into_tensor", torch_dist)
+    source = torch.arange(8, dtype=torch.uint8)
+    output = torch.empty(16, dtype=torch.uint8)
+    b12x_mla_sparse._dcp_all_gather_current_stream(group, source, output)
+    assert calls == (["torch_dist"] if pynccl_disabled else ["pynccl"])
+    assert torch.equal(output, source.repeat(2))
+
+
+@pytest.mark.parametrize("depth", [0, 1])
 def test_full_ckv_prefetch_backend_inserts_changed_chunks_and_reuses_cache_identity(
     monkeypatch: pytest.MonkeyPatch, depth: int
 ) -> None:
@@ -848,6 +1078,9 @@ def test_full_ckv_prefetch_backend_inserts_changed_chunks_and_reuses_cache_ident
         torch.empty((1, 1, 4, 656), dtype=torch.uint8),
         torch.empty((1, 1, 8, 656), dtype=torch.uint8),
     )
+    reservation.collectives_warmed = True
+    if depth:
+        reservation.gather_streams[(0, 0)] = side
     impl = object.__new__(B12xMLASparseImpl)
     impl._ckv_reservation = reservation
     impl._kernel_page_size = 2
