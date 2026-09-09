@@ -37,7 +37,6 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import KVCacheLayout, KVCacheSpec, MLAAttentionSpec
-from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 
 logger = init_logger(__name__)
 
@@ -673,35 +672,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         num_decodes: int,
         seq_lens_is_buffer_view: bool,
     ) -> torch.Tensor:
-        out = (
-            seq_lens
-            if seq_lens_is_buffer_view
-            else self.decode_seq_lens_buffer[:num_decodes]
-        )
-        if (
-            self.dcp_world_size > 1
-            and seq_lens.is_cuda
-            and seq_lens.dtype == torch.int32
-            and seq_lens.is_contiguous()
-            and seq_lens.numel() > 0
-        ):
-            # Each expanded MTP row has its own global causal bound. The
-            # elementwise kernel permits the persistent output to alias it.
-            prepare_dcp_local_seq_lens(
-                out.view(-1),
-                seq_lens.view(-1),
-                seq_lens.numel(),
-                self.dcp_world_size,
-                self.dcp_rank,
-                self.cp_kv_cache_interleave_size,
-            )
-            return out
         local_seq_lens = get_dcp_local_seq_lens(
             seq_lens,
             self.dcp_world_size,
             self.dcp_rank,
             self.cp_kv_cache_interleave_size,
         )
+        if seq_lens_is_buffer_view:
+            seq_lens.copy_(local_seq_lens)
+            return seq_lens
+
+        out = self.decode_seq_lens_buffer[:num_decodes]
         out.copy_(local_seq_lens)
         return out
 

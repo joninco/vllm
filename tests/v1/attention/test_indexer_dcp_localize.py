@@ -7,10 +7,8 @@ import torch
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
-from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV32IndexerMetadataBuilder,
-    build_prefill_chunk_metadata,
-)
+from vllm.v1.attention.backends.mla.b12x_indexer import B12xIndexerMetadataBuilder
+from vllm.v1.attention.backends.mla.indexer import build_prefill_chunk_metadata
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
@@ -336,7 +334,7 @@ def test_indexer_local_lengths_preserve_buffers_and_graph_replay(
     owned = layout != "request"
     source = torch.tensor(values, dtype=torch.int32, device=device).view(shape)
     global_lengths = source.clone()
-    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder = object.__new__(B12xIndexerMetadataBuilder)
     builder.dcp_world_size = 4
     builder.dcp_rank = rank
     builder.cp_kv_cache_interleave_size = interleave

@@ -74,6 +74,45 @@ class B12xIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         self.active_width_buffer = torch.zeros(
             (1,), dtype=torch.int32, device=self.device
         )
+        if self.dcp_world_size > 1 and self.active_width_buffer.is_cuda:
+            from b12x.comm.pcie._dcp_attention_metadata import (
+                precompile_dcp_sequence_lengths,
+            )
+
+            precompile_dcp_sequence_lengths(self.active_width_buffer.device.index)
+
+    def _dcp_localize_decode_seq_lens(
+        self,
+        seq_lens: torch.Tensor,
+        num_decodes: int,
+        seq_lens_is_buffer_view: bool,
+    ) -> torch.Tensor:
+        if not (
+            self.dcp_world_size > 1
+            and seq_lens.is_cuda
+            and seq_lens.dtype == torch.int32
+            and seq_lens.is_contiguous()
+        ):
+            return super()._dcp_localize_decode_seq_lens(
+                seq_lens, num_decodes, seq_lens_is_buffer_view
+            )
+        from b12x.comm.pcie._dcp_attention_metadata import (
+            localize_dcp_sequence_lengths,
+        )
+
+        out = (
+            seq_lens
+            if seq_lens_is_buffer_view
+            else self.decode_seq_lens_buffer[:num_decodes]
+        )
+        localize_dcp_sequence_lengths(
+            seq_lens.view(-1),
+            out.view(-1),
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
+        )
+        return out
 
     def _supports_native_decode(self, next_n: int) -> bool:
         return True
