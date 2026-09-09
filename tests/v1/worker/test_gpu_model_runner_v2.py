@@ -120,14 +120,17 @@ def test_append_block_ids_rejects_write_past_row_capacity():
 
 
 @pytest.mark.parametrize("dummy_run_fails", [False, True])
+@pytest.mark.parametrize(
+    "architecture",
+    ["Glm5NextForConditionalGeneration", "GlmMoeDsaForCausalLM"],
+)
 def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
     dummy_run_fails: bool,
+    architecture: str,
 ):
     runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.model_config = SimpleNamespace(
-        architecture="Glm5NextForConditionalGeneration"
-    )
+    runner.model_config = SimpleNamespace(architecture=architecture)
     runner.dcp_size = 4
     runner.cp_interleave = 4
     runner.max_num_tokens = 4096
@@ -178,7 +181,11 @@ def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
 
 @pytest.mark.parametrize(
     ("architecture", "dcp_size"),
-    [("OtherArchitecture", 4), ("Glm5NextForConditionalGeneration", 1)],
+    [
+        ("OtherArchitecture", 4),
+        ("Glm5NextForConditionalGeneration", 1),
+        ("GlmMoeDsaForCausalLM", 1),
+    ],
 )
 def test_glm_dcp_attention_profile_skips_irrelevant_configurations(
     monkeypatch: pytest.MonkeyPatch,

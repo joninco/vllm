@@ -6668,7 +6668,7 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_glm_dcp_attention(self) -> None:
-        """Profile GLM split-cache DCP attention before KV cache sizing.
+        """Profile GLM sparse DCP attention before KV cache sizing.
 
         The generic activation profile omits attention metadata and spreads the
         scheduler token budget across many requests. GLM sparse MLA can instead
@@ -6677,7 +6677,8 @@ class GPUModelRunner(
         backend path reachable without reserving production KV storage.
         """
         if (
-            self.model_config.architecture != "Glm5NextForConditionalGeneration"
+            self.model_config.architecture
+            not in ("Glm5NextForConditionalGeneration", "GlmMoeDsaForCausalLM")
             or self.dcp_world_size <= 1
         ):
             return

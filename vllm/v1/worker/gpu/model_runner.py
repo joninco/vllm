@@ -928,11 +928,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         its token budget across many requests. A GLM sparse-MLA prefill can put
         the complete scheduler budget in one request, causing the DCP query
         all-gather to require substantially more temporary memory. Bind a
-        minimal split cache, execute that shape, then release all temporary
+        minimal temporary cache, execute that shape, then release all temporary
         cache and backend state before production cache allocation.
         """
         if (
-            self.model_config.architecture != "Glm5NextForConditionalGeneration"
+            self.model_config.architecture
+            not in ("Glm5NextForConditionalGeneration", "GlmMoeDsaForCausalLM")
             or self.dcp_size <= 1
         ):
             return
