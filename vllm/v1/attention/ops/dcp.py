@@ -21,6 +21,7 @@ from vllm.v1.attention.ops.cp_common import (
     direct_cp_enabled,
     direct_cp_multicast_enabled,
 )
+from vllm.v1.attention.ops.dcp_prefill_policy import DCPPrefillPolicy
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
@@ -1242,6 +1243,7 @@ class MLADCPManager:
         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
         self.padded_num_heads = padded_num_heads
+        self.is_lse_base_on_e = is_lse_base_on_e
 
         self.combine = self._init_combine(
             num_heads,
@@ -1259,6 +1261,45 @@ class MLADCPManager:
                 query_dtype,
             )
         )
+
+    def configure_prefill(self, vllm_config: VllmConfig) -> DCPPrefillPolicy:
+        """Bind validated eager-prefill policy without changing decode combine."""
+        if self.group.world_size > 1 and (
+            envs.VLLM_DCP_PROJECT_BEFORE_MERGE
+            or envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE
+        ):
+            raise NotImplementedError(
+                "Projected DCP prefill and borrowed workspace dispatch are not "
+                "implemented; disable VLLM_DCP_PROJECT_BEFORE_MERGE and "
+                "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE"
+            )
+        policy = DCPPrefillPolicy(
+            dcp_world_size=self.group.world_size,
+            max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+            enabled=True,
+            base_backend="a2a" if self.use_a2a else "ag_rs",
+            a2a_max_tokens=envs.VLLM_DCP_A2A_MAX_TOKENS,
+            large_backend=envs.VLLM_DCP_A2A_LARGE_BACKEND,
+            project_min_tokens=envs.VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS,
+            max_capture_tokens=max(
+                vllm_config.compilation_config.cudagraph_capture_sizes or [], default=0
+            ),
+        )
+        self.prefill_ag_rs_combine = functools.partial(
+            cp_lse_ag_out_rs,
+            cp_group=self.group,
+            is_lse_base_on_e=self.is_lse_base_on_e,
+        )
+        logger.info_once(
+            "Sparse MLA DCP eager prefill: base=%s, A2A cap=%d "
+            "(non-positive is uncapped), large=%s, capacity=%d; "
+            "decode/capture/mixed/MTP use configured transport.",
+            policy.base_backend,
+            policy.a2a_max_tokens,
+            policy.large_backend,
+            policy.max_num_tokens,
+        )
+        return policy
 
     def _init_combine(
         self,

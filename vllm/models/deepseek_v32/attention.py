@@ -35,6 +35,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.ops.dcp_prefill_policy import DCPPrefillBatch
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
@@ -264,6 +265,12 @@ class DeepseekV32Attention(MLAAttention):
             attn_backend=attn_backend,
         )
 
+        self._is_mtp_layer = is_mtp_layer
+        self._dcp_prefill_policy = (
+            self.dcp_manager.configure_prefill(vllm_config)
+            if self.dcp_manager is not None and not self.use_pcp
+            else None
+        )
         self.num_local_heads = num_local_heads
         self.qk_head_dim = qk_head_dim
         self.indexer = indexer
@@ -599,6 +606,7 @@ class DeepseekV32Attention(MLAAttention):
         dcp_world_size = self.impl.dcp_world_size
         full_ckv_dcp = False
         direct_dcp = None
+        prefill_route = "configured"
         if dcp_world_size > 1:
             assert self.dcp_manager is not None
             if self.use_pcp:
@@ -611,11 +619,32 @@ class DeepseekV32Attention(MLAAttention):
                     attn_metadata, num_actual
                 )
                 if not full_ckv_dcp:
+                    policy = getattr(self, "_dcp_prefill_policy", None)
+                    if policy is not None:
+                        prefill_route = policy.select(
+                            DCPPrefillBatch(
+                                num_tokens=num_actual,
+                                num_prefills=attn_metadata.num_prefills,
+                                num_decodes=attn_metadata.num_decodes,
+                                is_capturing=(
+                                    attn_metadata.num_prefills > 0
+                                    and torch.cuda.is_current_stream_capturing()
+                                ),
+                                is_mtp=(
+                                    self._is_mtp_layer
+                                    or getattr(attn_metadata, "is_spec_decode", False)
+                                ),
+                            )
+                        ).route
                     if isinstance(mqa_q_arg, tuple):
                         mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
                     from vllm.v1.attention.ops.b12x_dcp import active_dcp_transport
 
-                    binding = active_dcp_transport()
+                    binding = (
+                        active_dcp_transport()
+                        if prefill_route == "configured"
+                        else None
+                    )
                     if binding is not None and binding.accepts(
                         mqa_q_arg, getattr(attn_metadata, "dcp_combine_seq_lens", None)
                     ):
@@ -649,6 +678,13 @@ class DeepseekV32Attention(MLAAttention):
                 assert seq_lens is not None and query_start_loc is not None
             if direct_dcp is not None:
                 attn_out = direct_dcp.combine(attn_out, lse, seq_lens)
+            elif prefill_route == "ag_rs":
+                attn_out = self.dcp_manager.prefill_ag_rs_combine(
+                    attn_out,
+                    lse,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                )
             else:
                 attn_out = self.dcp_manager.combine(
                     attn_out,

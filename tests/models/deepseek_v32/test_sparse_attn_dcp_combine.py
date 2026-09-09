@@ -451,3 +451,149 @@ def test_projected_shard_merge_matches_global_attention(dtype, is_base_e):
     torch.testing.assert_close(
         project_then_merge, merge_then_project, atol=tolerance, rtol=0
     )
+
+
+@pytest.mark.parametrize(
+    ("cap", "large_backend", "capture", "decodes", "mtp", "full_ckv", "expected"),
+    [
+        (256, "ag_rs", False, 0, False, False, "ag_rs"),
+        (0, "ag_rs", False, 0, False, False, "combine"),
+        (-1, "ag_rs", False, 0, False, False, "combine"),
+        (256, "a2a", False, 0, False, False, "combine"),
+        (256, "ag_rs", True, 0, False, False, "combine"),
+        (256, "ag_rs", False, 1, False, False, "combine"),
+        (256, "ag_rs", False, 0, True, False, "combine"),
+        (256, "ag_rs", False, 0, False, True, None),
+    ],
+)
+@pytest.mark.parametrize("rows", [4, 257])
+@pytest.mark.parametrize("spec_decode", [False, True])
+def test_prefill_environment_controls_model_exchange(
+    monkeypatch,
+    cap,
+    large_backend,
+    capture,
+    decodes,
+    mtp,
+    full_ckv,
+    expected,
+    rows,
+    spec_decode,
+):
+    """Process-time flags reach model dispatch without changing excluded batches."""
+    from vllm.v1.attention.ops import b12x_dcp, dcp
+
+    events: list[str] = []
+    module = _module(events, dcp_world_size=4, full_ckv=full_ckv)
+    module._is_mtp_layer = mtp
+    manager = dcp.MLADCPManager.__new__(dcp.MLADCPManager)
+    manager.group = SimpleNamespace(world_size=4)
+    manager.use_a2a = True
+    manager.is_lse_base_on_e = True
+    manager.combine = module.dcp_manager.combine
+    manager.query_gather = module.dcp_manager.query_gather
+
+    def ag_rs(output, lse, *, cp_group, is_lse_base_on_e, seq_lens, query_start_loc):
+        assert cp_group is manager.group
+        assert is_lse_base_on_e
+        assert seq_lens.shape == (rows,)
+        assert query_start_loc.shape == (rows + 1,)
+        events.append("ag_rs")
+        return output[:, :_HEADS]
+
+    monkeypatch.setattr(dcp, "cp_lse_ag_out_rs", ag_rs)
+    monkeypatch.setattr(dcp.envs, "VLLM_DCP_A2A_MAX_TOKENS", cap)
+    monkeypatch.setattr(dcp.envs, "VLLM_DCP_A2A_LARGE_BACKEND", large_backend)
+    monkeypatch.setattr(dcp.envs, "VLLM_DCP_PROJECT_BEFORE_MERGE", False)
+    monkeypatch.setattr(dcp.envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", False)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 4, 8, 16]),
+    )
+    module._dcp_prefill_policy = manager.configure_prefill(config)
+    module.dcp_manager = manager
+    # Changing the environment after construction must not change batch routing.
+    monkeypatch.setattr(dcp.envs, "VLLM_DCP_A2A_MAX_TOKENS", 1)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capture)
+    metadata = SimpleNamespace(
+        num_actual_tokens=rows,
+        is_spec_decode=spec_decode,
+        num_prefills=1,
+        num_decodes=decodes,
+        dcp_combine_seq_lens=torch.ones(rows, dtype=torch.int32),
+        dcp_combine_query_start_loc=torch.arange(rows + 1, dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "get_attention_context",
+        lambda _: (metadata, None, torch.zeros(1), None),
+    )
+
+    def direct_combine(partials, lse, lengths):
+        assert lengths is metadata.dcp_combine_seq_lens
+        events.append("direct_combine")
+        return partials[:, :_HEADS]
+
+    binding = SimpleNamespace(
+        accepts=lambda query, lengths: rows <= 16,
+        query=manager.query_gather,
+        combine=direct_combine,
+    )
+    monkeypatch.setattr(b12x_dcp, "active_dcp_transport", lambda: binding)
+    output = torch.zeros(rows, _HEADS * _V_HEAD)
+    module._sparse_indexer_and_attn(
+        torch.zeros(rows, 6),
+        None,
+        None,
+        None,
+        None,
+        None,
+        torch.zeros(rows, _HEADS, _LATENT),
+        torch.zeros(rows, _HEADS, 3),
+        torch.zeros(rows, _HEADS, _ROPE),
+        output,
+    )
+    exchanges = [
+        event.split(":")[0]
+        for event in events
+        if event.startswith(("combine", "ag_rs", "direct_combine"))
+    ]
+    if spec_decode and not full_ckv:
+        expected = "combine"
+    if rows <= 16 and not full_ckv:
+        expected = "direct_combine"
+    assert exchanges == ([] if expected is None else [expected])
+    torch.testing.assert_close(output, torch.full_like(output, _LATENT))
+
+
+@pytest.mark.parametrize(
+    "flag", ["VLLM_DCP_PROJECT_BEFORE_MERGE", "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE"]
+)
+def test_unimplemented_projected_dispatch_is_rejected_at_configuration(
+    monkeypatch, flag
+):
+    from vllm.v1.attention.ops import dcp
+
+    monkeypatch.setattr(dcp.envs, flag, True)
+    manager = dcp.MLADCPManager.__new__(dcp.MLADCPManager)
+    manager.group = SimpleNamespace(world_size=4)
+    with pytest.raises(NotImplementedError, match="Projected DCP prefill"):
+        manager.configure_prefill(None)
+
+
+def test_dcp1_prefill_configuration_ignores_projected_flags(monkeypatch):
+    from vllm.v1.attention.ops import dcp
+    from vllm.v1.attention.ops.dcp_prefill_policy import DCPPrefillBatch
+
+    monkeypatch.setattr(dcp.envs, "VLLM_DCP_PROJECT_BEFORE_MERGE", True)
+    monkeypatch.setattr(dcp.envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", True)
+    manager = dcp.MLADCPManager.__new__(dcp.MLADCPManager)
+    manager.group = SimpleNamespace(world_size=1)
+    manager.use_a2a = True
+    manager.is_lse_base_on_e = True
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[16]),
+    )
+    policy = manager.configure_prefill(config)
+    assert policy.select(DCPPrefillBatch(2048, 1, 0)).route == "local"
