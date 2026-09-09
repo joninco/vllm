@@ -429,12 +429,23 @@ def fused_norm_rope(
     kv_c_out: torch.Tensor | None = None,
     k_pe_out: torch.Tensor | None = None,
     index_k_out: torch.Tensor | None = None,
+    materialize_nonlocal_mla_inputs: bool = False,
 ) -> torch.Tensor:
     assert positions.ndim == 1
     assert q_c.ndim == 2
     assert kv_c.ndim == 2
     assert k_pe.ndim == 2
     assert topk_indices_buffer.ndim == 2
+    if materialize_nonlocal_mla_inputs and (kv_c_out is None or k_pe_out is None):
+        raise ValueError(
+            "Nonlocal MLA inputs require both normalized KV and RoPE outputs"
+        )
+    if (
+        materialize_nonlocal_mla_inputs
+        and q_c_out is not None
+        and q_c_out.untyped_storage().data_ptr() == q_c.untyped_storage().data_ptr()
+    ):
+        raise ValueError("Nonlocal query output must not share storage with its input")
 
     num_tokens = positions.shape[0]
     q_dim = q_c.shape[-1]
@@ -590,6 +601,31 @@ def fused_norm_rope(
         USE_PDL=use_pdl,
         launch_pdl=use_pdl,
     )
+    if materialize_nonlocal_mla_inputs and slot_mapping is not None:
+        # DCP marks nonlocal cache slots negative, but every rank needs every
+        # query. Uncached dispatch preserves the norm/RoPE arithmetic while
+        # the cache-writing launch above remains restricted to local rows.
+        q_c_out = fused_norm_rope(
+            positions,
+            q_c,
+            q_rms_norm_w,
+            q_rms_eps,
+            kv_c,
+            kv_rms_norm_w,
+            kv_rms_eps,
+            k_pe,
+            k_rope_cos_sin_cache,
+            None,
+            None,
+            None,
+            index_k_layer_norm_eps,
+            None,
+            topk_indices_buffer,
+            has_indexer=False,
+            q_c_out=q_c_out,
+            kv_c_out=kv_c_out,
+            k_pe_out=k_pe_out,
+        )
     return q_c_out
 
 

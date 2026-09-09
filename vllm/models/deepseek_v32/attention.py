@@ -434,6 +434,9 @@ class DeepseekV32Attention(MLAAttention):
             kv_c_out=kv_c_out,
             k_pe_out=k_pe_out,
             index_k_out=index_k_out,
+            materialize_nonlocal_mla_inputs=(
+                self._native_packed_kv_update and self.impl.dcp_world_size > 1
+            ),
         )
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
