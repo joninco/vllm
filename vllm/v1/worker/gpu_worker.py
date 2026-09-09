@@ -450,6 +450,14 @@ class Worker(WorkerBase):
                 if before_distributed is not None
                 else after_distributed
             )
+            # DCP's device-wide budget includes memory already present when
+            # profiling starts, including the worker's CUDA context. The
+            # profiler's free-memory delta excludes this initial footprint.
+            self.initial_device_memory_charge = (
+                max(init_snapshot.total_memory - init_snapshot.free_memory, 0)
+                if before_distributed is not None
+                else 0
+            )
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
@@ -681,12 +689,14 @@ class Worker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
+        initial_device_memory_charge = getattr(self, "initial_device_memory_charge", 0)
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - late_persistent_charge
             - cudagraph_memory_estimate_applied
             - allocator_headroom_correction
+            - initial_device_memory_charge
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
@@ -733,6 +743,12 @@ class Worker(WorkerBase):
             format_gib(repeatable_allocator_headroom),
             format_gib(cudagraph_memory_estimate_applied),
         )
+        if initial_device_memory_charge:
+            logger.info(
+                "DCP KV cache memory budget component: initial_device=%d bytes "
+                "(outside persistent_total; deducted once from requested memory)",
+                initial_device_memory_charge,
+            )
         if getattr(self, "distributed_init_memory", 0):
             logger.info(
                 "DCP KV cache memory budget component: distributed_init=%d bytes "
@@ -995,6 +1011,7 @@ class Worker(WorkerBase):
                 int(self.requested_memory)
                 - non_kv_cache_memory
                 - redundancy_buffer_memory
+                - getattr(self, "initial_device_memory_charge", 0)
             )
 
             msg = (

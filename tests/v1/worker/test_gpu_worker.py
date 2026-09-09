@@ -95,6 +95,7 @@ def test_startup_plan_apply_gate(plan_env):
 )
 @pytest.mark.parametrize("estimate_graphs", [False, True])
 @pytest.mark.parametrize("resolves_kernels", [True, False])
+@pytest.mark.parametrize("initial_device_charge", [0, 3])
 def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     monkeypatch,
     final_free_memory,
@@ -102,6 +103,7 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     expected_available_memory,
     estimate_graphs,
     resolves_kernels,
+    initial_device_charge,
 ):
     """KV sizing must retain the warmed allocator and graph high-waters and
     the persistent allocations made after the activation profile, charging
@@ -189,6 +191,7 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
             non_torch_memory=1,
         ),
         requested_memory=90,
+        initial_device_memory_charge=initial_device_charge,
         device="cuda:0",
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(),
@@ -265,9 +268,18 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     headroom_correction = 2 if resolves_kernels else 0
     late_persistent_memory = 80 - final_free_memory
     if estimate_graphs:
-        assert available == expected_available_memory + 2 - headroom_correction
+        assert (
+            available
+            == expected_available_memory
+            + 2
+            - headroom_correction
+            - initial_device_charge
+        )
     else:
-        assert available == 80 - headroom_correction - late_persistent_memory
+        assert (
+            available
+            == 80 - headroom_correction - late_persistent_memory - initial_device_charge
+        )
     # The activation peak stays activation-only (the repeatable allocator
     # headroom, seven bytes here, or the single profile's five); post-capture
     # recommendations add measured graph memory to it, and the admission
@@ -279,8 +291,9 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
 
 @pytest.mark.parametrize("estimated_gib", [0, 4])
 @pytest.mark.parametrize("measured_gib", [3, 7])
+@pytest.mark.parametrize("initial_device_charge", [0, 512 * (1 << 20)])
 def test_post_capture_recommendation_counts_measured_graph_memory_once(
-    monkeypatch, estimated_gib, measured_gib
+    monkeypatch, estimated_gib, measured_gib, initial_device_charge
 ):
     """The saved KV budget uses measured graph storage, not its estimate."""
     compilation = SimpleNamespace(
@@ -304,6 +317,7 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
             free_memory=100 * GiB_bytes, total_memory=100 * GiB_bytes
         ),
         requested_memory=90 * GiB_bytes,
+        initial_device_memory_charge=initial_device_charge,
         total_consumed=10 * GiB_bytes,
         peak_activation_memory=5 * GiB_bytes,
         cudagraph_memory_estimate=estimated_gib * GiB_bytes,
@@ -333,7 +347,11 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
 
     gpu_worker.Worker.compile_or_warm_up_model(worker)
 
-    assert saved == [(90 - 10 - 5 - measured_gib) * GiB_bytes - 150 * (1 << 20)]
+    assert saved == [
+        (90 - 10 - 5 - measured_gib) * GiB_bytes
+        - 150 * (1 << 20)
+        - initial_device_charge
+    ]
 
 
 @pytest.mark.parametrize("dcp_size", [1, 4])
@@ -415,3 +433,6 @@ def test_dcp_startup_charges_communicators_inside_requested_memory(
         consumed = worker.init_snapshot.free_memory - free_after_model
         assert consumed == 60 * GiB_bytes + owned
         assert worker.requested_memory - consumed == requested - 60 * GiB_bytes - owned
+    assert worker.initial_device_memory_charge == (
+        total - before_free if dcp_size > 1 else 0
+    )
