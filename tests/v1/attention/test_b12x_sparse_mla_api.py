@@ -1979,3 +1979,77 @@ def test_b12x_dsa_indexer_reuses_plans_and_rebinds_shared_workspace(
 
     assert calls == {"plan": 1, "workspace": 2, "bind": 2, "run": 2}
     assert torch.count_nonzero(inputs["output"] != 7) == 0
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("interleave", [1, 4])
+@pytest.mark.parametrize("provided_local_lengths", [False, True])
+@pytest.mark.parametrize(
+    "rows_per_request,use_positions", [(1, False), (1, True), (4, True)]
+)
+def test_dcp_combine_uses_local_causal_lengths_in_stable_buffers(
+    monkeypatch,
+    rank,
+    interleave,
+    provided_local_lengths,
+    rows_per_request,
+    use_positions,
+) -> None:
+    """Draft rows can cross a shard boundary within one request."""
+    monkeypatch.setattr(
+        SparseMLACommonMetadataBuilder,
+        "build",
+        lambda *args, **kwargs: SimpleNamespace(
+            num_prefills=0, num_decodes=2, num_decode_tokens=2 * rows_per_request
+        ),
+    )
+    builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
+    builder.requires_glm_next_selector_metadata = False
+    builder._ckv_gather_requested = False
+    builder.dcp_world_size = 4
+    builder.dcp_rank = rank
+    builder.cp_kv_cache_interleave_size = interleave
+    builder._max_speculative_decode_query_len = 4
+    builder.cache_seq_lens_per_token_buffer = torch.zeros(16, dtype=torch.int32)
+    builder.dcp_combine_query_start_loc_buffer = torch.arange(17, dtype=torch.int32)
+
+    def local_count(length):
+        return sum((position // interleave) % 4 == rank for position in range(length))
+
+    pointers = None
+    for offset in (0, 8):
+        positions = (
+            torch.tensor(
+                [start + row for start in (0, 2) for row in range(rows_per_request)]
+            )
+            + offset
+        )
+        global_lengths = [rows_per_request + offset, rows_per_request + 2 + offset]
+        local_lengths = torch.tensor(
+            [local_count(n) for n in global_lengths], dtype=torch.int32
+        )
+        common = SimpleNamespace(
+            num_reqs=2,
+            num_actual_tokens=2 * rows_per_request,
+            max_query_len=rows_per_request,
+            seq_lens=torch.tensor(global_lengths, dtype=torch.int32),
+            dcp_local_seq_lens=local_lengths if provided_local_lengths else None,
+            positions=positions if use_positions else None,
+            is_prefilling=torch.zeros(2, dtype=torch.bool),
+        )
+        metadata = builder.build(0, common)
+        torch.testing.assert_close(metadata.seq_lens, local_lengths)
+        assert metadata.dcp_combine_seq_lens.tolist() == [
+            local_count(int(p) + 1) for p in positions
+        ]
+        assert metadata.dcp_combine_query_start_loc.tolist() == list(
+            range(2 * rows_per_request + 1)
+        )
+        assert metadata.dcp_combine_seq_lens is metadata.cache_seq_lens_per_token
+        addresses = (
+            metadata.dcp_combine_seq_lens.data_ptr(),
+            metadata.dcp_combine_query_start_loc.data_ptr(),
+        )
+        if pointers is not None:
+            assert addresses == pointers
+        pointers = addresses

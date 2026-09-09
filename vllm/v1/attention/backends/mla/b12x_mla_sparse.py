@@ -665,6 +665,8 @@ class B12xMLASparseMetadata(AttentionMetadata):
     topk_tokens: int = 2048
     cp_kv_cache_interleave_size: int = 1
     cache_seq_lens_per_token: torch.Tensor | None = None
+    dcp_combine_seq_lens: torch.Tensor | None = None
+    dcp_combine_query_start_loc: torch.Tensor | None = None
     selector_state_slot_ids: torch.Tensor | None = None
     selector_state_is_fresh: torch.Tensor | None = None
     selector_num_accepted_tokens: torch.Tensor | None = None
@@ -712,6 +714,11 @@ class B12xMLASparseMetadataBuilder(
         self._ckv_max_reqs = max_reqs
         self.cache_seq_lens_per_token_buffer = torch.empty(
             (max_tokens,), dtype=torch.int32, device=device
+        )
+        self.dcp_combine_query_start_loc_buffer = (
+            torch.arange(max_tokens + 1, dtype=torch.int32, device=device)
+            if self.dcp_world_size > 1
+            else None
         )
         if self.requires_glm_next_selector_metadata:
             self._capture_default_state_slot_ids = torch.arange(
@@ -876,22 +883,43 @@ class B12xMLASparseMetadataBuilder(
         common = common_attn_metadata
         num_tokens = common.num_actual_tokens
         use_dcp = self.dcp_world_size > 1
-        seq_lens = (
-            common.dcp_local_seq_lens
-            if use_dcp and common.dcp_local_seq_lens is not None
-            else common.seq_lens
-        )
+        seq_lens = common.seq_lens
+        if use_dcp:
+            seq_lens = common.dcp_local_seq_lens
+            if seq_lens is None:
+                seq_lens = get_dcp_local_seq_lens(
+                    common.seq_lens,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
+                )
         metadata.seq_lens = seq_lens
 
-        if common.max_query_len <= 1 and num_tokens == common.num_reqs:
+        if (
+            common.max_query_len <= 1
+            and num_tokens == common.num_reqs
+            and (not use_dcp or common.positions is None)
+        ):
             per_token_lens = seq_lens[:num_tokens]
-        elif not use_dcp and common.positions is not None:
+            if use_dcp:
+                self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(per_token_lens)
+                per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
+        elif common.positions is not None:
             # The decode kernel binds these lengths, so they must live in the
             # builder's buffer: a FULL CUDA graph captures the buffer address
             # and replays against whatever a later build wrote there.
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
             per_token_lens.copy_(common.positions[:num_tokens])
             per_token_lens += 1
+            if use_dcp:
+                per_token_lens.copy_(
+                    get_dcp_local_seq_lens(
+                        per_token_lens,
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    )
+                )
         else:
             starts = np.asarray(common.query_start_loc_cpu, dtype=np.int32)
             query_lens = np.diff(starts)
@@ -928,6 +956,14 @@ class B12xMLASparseMetadataBuilder(
             per_token_lens = self.cache_seq_lens_per_token_buffer[:num_tokens]
 
         metadata.cache_seq_lens_per_token = per_token_lens
+        if use_dcp:
+            # Each causal query row can have a different empty-shard mask,
+            # including rows belonging to the same speculative request.
+            assert self.dcp_combine_query_start_loc_buffer is not None
+            metadata.dcp_combine_seq_lens = per_token_lens
+            metadata.dcp_combine_query_start_loc = (
+                self.dcp_combine_query_start_loc_buffer[: num_tokens + 1]
+            )
         metadata.is_spec_decode = _is_speculative_decode_batch(
             common,
             self._max_speculative_decode_query_len,
