@@ -11,6 +11,12 @@ The tests use actual NCCL collectives, candidate packing, stable CuTe selection
 and vLLM workspace/restore helpers. Independent CPU candidate unions determine
 expected IDs, including signed-zero ordering. They do not validate indexer
 scoring or cache ownership; those require separate model/cache references.
+
+Each topology runs with two transports: groups without a device communicator,
+which exercise the c10d fallbacks, and groups carrying a PyNCCL communicator
+of their own, which exercise the grouped send/receive owner exchange and the
+PyNCCL all-gathers. With PyNCCL configured the c10d all-to-all is poisoned so
+a silent fallback fails the test.
 """
 
 import os
@@ -24,6 +30,7 @@ import torch.distributed as dist
 
 from vllm.distributed import parallel_state
 from vllm.distributed.dcp_prefill import build_indexer_replica_group_ranks
+from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.v1.attention.backends.mla import b12x_indexer as indexer
 from vllm.v1.worker import workspace
 
@@ -92,14 +99,37 @@ def distributed_world():
     dist.destroy_process_group()
 
 
+def _pynccl_communicator(ranks, rank, device, handles, communicators):
+    """Create the group's PyNCCL communicator from a gloo unique-id group.
+
+    Every rank joins the collective group creation; only members receive a
+    communicator. A single-rank group yields a disabled communicator, which the
+    dispatch helpers treat as absent.
+    """
+    gloo = dist.new_group(ranks, backend="gloo", timeout=timedelta(seconds=180))
+    if rank not in ranks:
+        return None
+    handles.append(gloo)
+    communicator = PyNcclCommunicator(group=gloo, device=device)
+    assert communicator.disabled is (len(ranks) == 1)
+    communicators.append(communicator)
+    return SimpleNamespace(pynccl_comm=communicator)
+
+
+@pytest.fixture(params=["c10d", "pynccl"])
+def transport(request):
+    return request.param
+
+
 @pytest.fixture(params=[1, 2, 4])
-def topology(distributed_world, request):
+def topology(distributed_world, transport, request, monkeypatch):
     rank, device, tp = distributed_world
     shards = request.param
     shard_ranks, replica_ranks = build_indexer_replica_group_ranks(
         [list(range(8))], shards
     )
-    handles = []
+    handles: list[dist.ProcessGroup] = []
+    communicators: list[PyNcclCommunicator] = []
     selected = []
     for rank_lists in (shard_ranks, replica_ranks):
         local = None
@@ -107,20 +137,43 @@ def topology(distributed_world, request):
             handle = dist.new_group(
                 ranks, backend="nccl", timeout=timedelta(seconds=180)
             )
+            communicator = None
+            if transport == "pynccl":
+                communicator = _pynccl_communicator(
+                    ranks, rank, device, handles, communicators
+                )
             if rank in ranks:
                 handles.append(handle)
                 local = SimpleNamespace(
                     world_size=len(ranks),
                     rank_in_group=ranks.index(rank),
                     device_group=handle,
-                    device_communicator=None,
+                    device_communicator=communicator,
                 )
         selected.append(local)
+    if transport == "pynccl":
+        tp = SimpleNamespace(
+            world_size=tp.world_size,
+            rank_in_group=tp.rank_in_group,
+            device_group=tp.device_group,
+            device_communicator=_pynccl_communicator(
+                list(range(8)), rank, device, handles, communicators
+            ),
+        )
+
+        def poisoned(*args, **kwargs):
+            raise AssertionError("PyNCCL transport fell back to c10d all-to-all")
+
+        monkeypatch.setattr(indexer.dist, "all_to_all_single", poisoned)
     original = parallel_state._DCP
     parallel_state._DCP = selected[0]
     yield shards, rank, device, tp, selected[0], selected[1]
     parallel_state._DCP = original
     dist.barrier()
+    torch.accelerator.synchronize(device)
+    for communicator in communicators:
+        if not communicator.disabled:
+            communicator.destroy()
     for handle in reversed(handles):
         dist.destroy_process_group(handle)
 
