@@ -287,6 +287,20 @@ def test_get_dcp_local_seq_lens_can_localize_per_token_bounds():
         torch.testing.assert_close(actual, expected)
 
 
+def test_get_dcp_local_seq_lens_does_not_upload_rank(monkeypatch):
+    """A scalar rank must not introduce a synchronizing host-to-device copy."""
+    seq_lens = torch.tensor([[0, 1, 3, 64], [257, 4096, 122880, 524288]])
+    expected = get_dcp_local_seq_lens(seq_lens, 4, None, 64)
+
+    def reject_tensor_upload(*args, **kwargs):
+        raise AssertionError("DCP localization must keep the rank as a scalar")
+
+    monkeypatch.setattr(torch, "tensor", reject_tensor_upload)
+    for rank in range(4):
+        actual = get_dcp_local_seq_lens(seq_lens, 4, rank, 64)
+        torch.testing.assert_close(actual, expected[..., rank])
+
+
 def test_get_dcp_local_seq_lens_preserves_mtp_bounds_shape():
     seq_lens = torch.tensor([[8, 9, 10], [11, 12, 13]], dtype=torch.int32)
     world = 2

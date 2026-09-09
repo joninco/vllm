@@ -1119,11 +1119,9 @@ def get_dcp_local_seq_lens(
     dcp_rank: int | None = None,
     cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
-    """While using dcp, kv_cache size stored on each rank may be different,
-    use this function to calculate split decode seq_lens of each dcp rank.
-    Only consider dcp now, we can extend the case of cp based on this.
-    """
+    """Return local KV lengths for one DCP rank or an appended axis of ranks."""
     seq_lens_i32 = seq_lens.to(torch.int32)
+    rank_offsets: torch.Tensor | int
     if dcp_rank is None:
         rank_offsets = torch.arange(
             dcp_size,
@@ -1135,7 +1133,9 @@ def get_dcp_local_seq_lens(
         )
         seq_lens_tiled = seq_lens_i32.unsqueeze(-1)
     else:
-        rank_offsets = torch.tensor(dcp_rank, dtype=torch.int32, device=seq_lens.device)
+        # Uploading a scalar tensor synchronizes the compute stream during
+        # attention metadata construction, including between draft graphs.
+        rank_offsets = dcp_rank
         seq_lens_tiled = seq_lens_i32
     base = (
         seq_lens_tiled
