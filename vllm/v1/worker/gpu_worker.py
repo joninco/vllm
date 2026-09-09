@@ -217,6 +217,13 @@ class Worker(WorkerBase):
         # Worker profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
         # so we have all the information needed for proper trace naming.
+        self._prefill_trace = None
+        if envs.VLLM_DCP_PREFILL_TRACE:
+            from vllm.v1.attention.backends.mla.prefill_diagnostics import (
+                get_prefill_trace,
+            )
+
+            self._prefill_trace = get_prefill_trace()
         self.profiler: Any | None = None
         self.profiler_config = vllm_config.profiler_config
 
@@ -1473,6 +1480,8 @@ class Worker(WorkerBase):
 
             # Create the profiler wrapper only on the first start call
             if self.profiler is None:
+                if getattr(self, "_prefill_trace", None) is not None:
+                    self._prefill_trace_worker_name = trace_name
                 if profiler_type == "torch":
                     self.profiler = TorchProfilerWrapper(
                         self.profiler_config,
@@ -1499,6 +1508,13 @@ class Worker(WorkerBase):
                         f"Invalid profiler value of {self.profiler_config.profiler}"
                     )
 
+            trace = getattr(self, "_prefill_trace", None)
+            if trace is not None:
+                trace.start_capture(
+                    rank=self.rank,
+                    name=getattr(self, "_prefill_trace_worker_name", trace_name),
+                    device=str(self.device),
+                )
             self.profiler.start()
         else:
             if self.profiler is None:
@@ -1507,6 +1523,15 @@ class Worker(WorkerBase):
             try:
                 self.profiler.stop()
             finally:
+                trace = getattr(self, "_prefill_trace", None)
+                if trace is not None and self.profiler_config.profiler == "torch":
+                    try:
+                        path = trace.export_manifest(
+                            self.profiler_config.torch_profiler_dir
+                        )
+                        logger.info("Prefill diagnosis manifest: %s", path)
+                    except Exception:
+                        logger.exception("Failed to export prefill diagnosis manifest")
                 if self.profiler_config.profiler == "proton":
                     # Proton output names are fixed when the wrapper is constructed.
                     # Recreate it so the next profile_prefix is honored.

@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_DCP_PREFILL_TRACE: bool = False
     VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
     VLLM_B12X_MLA_PREFILL_QUERY_BMM: bool = False
     VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB: int = 1024
@@ -1705,6 +1706,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MLA_PREFILL_QUERY_BMM": lambda: bool(
         int(os.getenv("VLLM_B12X_MLA_PREFILL_QUERY_BMM", "0"))
     ),
+    "VLLM_DCP_PREFILL_TRACE": lambda: os.getenv("VLLM_DCP_PREFILL_TRACE", "0") == "1",
     "VLLM_B12X_MLA_CKV_PREFETCH_DEPTH": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", "1")
     ),

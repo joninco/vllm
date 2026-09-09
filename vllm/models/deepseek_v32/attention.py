@@ -165,6 +165,8 @@ class DeepseekV32Indexer(nn.Module):
 
 
 class DeepseekV32Attention(MLAAttention):
+    _fused_norm_rope = staticmethod(fused_norm_rope)
+
     indexer: "DeepseekV32Indexer | None"
     indexer_cls: "type[DeepseekV32Indexer]" = DeepseekV32Indexer
 
@@ -343,6 +345,12 @@ class DeepseekV32Attention(MLAAttention):
             is_neox_style=not getattr(config, "indexer_rope_interleave", False),
         )
 
+        from vllm.models.deepseek_v32.prefill_diagnostics import (
+            install_glm_prefill_diagnostics,
+        )
+
+        install_glm_prefill_diagnostics(self)
+
     def forward(  # type: ignore[override]
         self,
         positions: torch.Tensor,
@@ -424,7 +432,7 @@ class DeepseekV32Attention(MLAAttention):
         )
         kv_c_out = torch.empty_like(kv_c) if materialize_mla_inputs else None
         k_pe_out = torch.empty_like(k_pe) if materialize_mla_inputs else None
-        q_c = fused_norm_rope(
+        q_c = self._fused_norm_rope(
             positions,
             q_c,
             self.q_a_layernorm.weight,

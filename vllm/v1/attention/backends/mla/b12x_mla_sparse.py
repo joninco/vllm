@@ -1378,6 +1378,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._kernel_page_size_finalized = not self._is_glm_next
         self._set_kernel_page_size(kernel_page_size)
         self.supports_quant_query_input = False
+        if self.dcp_world_size > 1:
+            from .prefill_diagnostics import get_prefill_trace, install_backend_trace
+
+            trace = get_prefill_trace()
+            if trace is not None:
+                install_backend_trace(self, trace)
 
     def _set_kernel_page_size(self, kernel_page_size: int) -> None:
         if kernel_page_size <= 0 or kernel_page_size % 64:
@@ -1597,6 +1603,19 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         assert metadata.dcp_rank_req_starts is not None
         local = reservation.current_local[lane[0], lane[1]]
         current = reservation.current_gathered[lane[0], lane[1]]
+        trace = getattr(self, "_prefill_trace", None)
+        exchange = _dcp_all_gather_current_stream
+        group = get_dcp_group()
+        if trace is not None and trace.active:
+            gather_ckv_current_chunk = trace.wrap(
+                "current_pack", gather_ckv_current_chunk
+            )
+            exchange = trace.wrap(
+                "current_exchange", exchange, **trace.group_fields(group)
+            )
+            insert_ckv_current_chunk = trace.wrap(
+                "current_insert", insert_ckv_current_chunk
+            )
         gather_ckv_current_chunk(
             original_cache.view(torch.uint8),
             local,
@@ -1609,7 +1628,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             num_reqs=metadata.num_reqs,
             current_capacity=self._ckv_current_capacity,
         )
-        _dcp_all_gather_current_stream(get_dcp_group(), local, current)
+        exchange(group, local, current)
         insert_ckv_current_chunk(
             current,
             gathered,
@@ -1651,7 +1670,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 )
         finally:
             completion = torch.cuda.Event()
-            completion.record(stream)
+            trace = getattr(self, "_prefill_trace", None)
+            if trace is None:
+                completion.record(stream)
+            else:
+                trace.record(completion, stream)
             state.finish_gather(layer_idx, completion)
 
     def _consume_ckv(
@@ -1690,6 +1713,14 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         if prefetched and not can_prefetch:
             state.begin_step(main_stream)
             prefetched = False
+        trace = getattr(self, "_prefill_trace", None)
+        if trace is not None and trace.active:
+            with trace.scope(
+                "ckv_selection",
+                prefetched=int(prefetched),
+                cache_identity_known=int(can_prefetch),
+            ):
+                pass
         if not prefetched:
             self._queue_ckv_gather(
                 state,
@@ -1724,7 +1755,11 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                         )
         except BaseException:
             completion = torch.cuda.Event()
-            completion.record(main_stream)
+            trace = getattr(self, "_prefill_trace", None)
+            if trace is None:
+                completion.record(main_stream)
+            else:
+                trace.record(completion, main_stream)
             state.finish_consumer(layer_idx, completion)
             raise
         return gathered, state, layer_idx
@@ -1877,6 +1912,22 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         main = torch.cuda.current_stream()
         completions = []
         unit = plan.local_capacity * plan.record_bytes
+        trace = getattr(self, "_prefill_trace", None)
+        exchange = _dcp_all_gather_current_stream
+        if trace is not None and trace.active:
+
+            def observed_exchange(group, source, output):
+                with trace.scope(
+                    "startup_collective",
+                    ubatch=ubatch,
+                    lane=model_lane,
+                    slot=slot,
+                    stream_role=stream_role,
+                    **trace.group_fields(group),
+                ):
+                    return _dcp_all_gather_current_stream(group, source, output)
+
+            exchange = observed_exchange
         for ubatch in range(plan.num_ubatches):
             for model_lane in range(plan.num_lanes):
                 lane = (ubatch, model_lane)
@@ -1894,17 +1945,19 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     ).view(plan.dcp_world_size * plan.local_capacity, plan.record_bytes)
                     for slot in range(plan.ring_slots)
                 ]
-                for gathered in targets:
+                stream_role = 0
+                for slot, gathered in enumerate(targets):
                     for count in sizes:
-                        _dcp_all_gather_current_stream(
+                        exchange(
                             default_group,
                             local[:count].view(-1),
                             gathered[: plan.dcp_world_size * count].view(-1),
                         )
                 if prefetch_group is not None:
+                    slot = -1
                     current_local = reservation.current_local[ubatch, model_lane]
                     current_local.zero_()
-                    _dcp_all_gather_current_stream(
+                    exchange(
                         default_group,
                         current_local,
                         reservation.current_gathered[ubatch, model_lane],
@@ -1913,18 +1966,43 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     if stream is None:
                         stream = torch.cuda.Stream(device=local.device)
                         reservation.gather_streams[lane] = stream
-                    stream.wait_stream(main)
+                    if trace is not None and trace.active:
+                        with trace.scope(
+                            "startup_stream_wait",
+                            ubatch=ubatch,
+                            lane=model_lane,
+                            event=-1,
+                        ):
+                            stream.wait_stream(main)
+                    else:
+                        stream.wait_stream(main)
+                    stream_role = 1
                     with torch.cuda.stream(stream):
-                        for gathered in targets:
+                        for slot, gathered in enumerate(targets):
                             for count in sizes:
-                                _dcp_all_gather_current_stream(
+                                exchange(
                                     prefetch_group,
                                     local[:count].view(-1),
                                     gathered[: plan.dcp_world_size * count].view(-1),
                                 )
                         completion = torch.cuda.Event()
-                        completion.record(stream)
-                    main.wait_event(completion)
+                        if trace is not None and trace.active:
+                            trace.record(
+                                completion,
+                                stream,
+                                ubatch=ubatch,
+                                lane=model_lane,
+                                slot=-1,
+                            )
+                        else:
+                            completion.record(stream)
+                    if trace is not None and trace.active:
+                        with trace.scope(
+                            "startup_join", ubatch=ubatch, lane=model_lane
+                        ):
+                            trace.wait(main, completion, reason=5)
+                    else:
+                        main.wait_event(completion)
                     completions.append(completion)
         main.synchronize()
         reservation.collectives_warmed = True
@@ -2479,5 +2557,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         finally:
             if ckv_state is not None:
                 completion = torch.cuda.Event()
-                completion.record(torch.cuda.current_stream())
+                trace = getattr(self, "_prefill_trace", None)
+                if trace is None:
+                    completion.record(torch.cuda.current_stream())
+                else:
+                    trace.record(completion, torch.cuda.current_stream())
                 ckv_state.finish_consumer(ckv_layer_idx, completion)

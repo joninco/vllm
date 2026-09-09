@@ -350,6 +350,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
 
+        from vllm.v1.worker.prefill_diagnostics import (
+            install_prefill_runner_diagnostics,
+        )
+
+        install_prefill_runner_diagnostics(self, request_state_runner=True)
+
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len

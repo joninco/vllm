@@ -1004,6 +1004,12 @@ class GPUModelRunner(
             )
         self.layerwise_nvtx_hooks_registered = False
 
+        from vllm.v1.worker.prefill_diagnostics import (
+            install_prefill_runner_diagnostics,
+        )
+
+        install_prefill_runner_diagnostics(self, request_state_runner=False)
+
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         if self.speculative_config:
