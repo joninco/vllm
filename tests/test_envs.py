@@ -587,3 +587,51 @@ class TestVllmMaxNSequences:
 
         with pytest.raises(VLLMValidationError, match="n must be at most 128"):
             SamplingParams(n=129)
+
+
+@pytest.mark.parametrize(
+    ("name", "default", "override", "expected"),
+    [
+        ("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", 1, "0", 0),
+        ("VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB", 1024, "768", 768),
+        ("VLLM_DCP_QUERY_SPLIT", False, "1", True),
+        ("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", 0, "4096", 4096),
+        ("VLLM_DCP_TOPK_OWNER_MERGE", False, "1", True),
+        ("VLLM_DCP_INDEXER_SHARDS", 0, "2", 2),
+        ("VLLM_DCP_REPLICATE_INDEXER_CACHE", False, "1", True),
+        ("VLLM_DCP_A2A_MAX_TOKENS", 0, "64", 64),
+        ("VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs", "a2a", "a2a"),
+        ("VLLM_DCP_PROJECT_BEFORE_MERGE", False, "1", True),
+        ("VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS", 1024, "2048", 2048),
+    ],
+)
+def test_dcp_prefill_environment_defaults_and_overrides(
+    monkeypatch: pytest.MonkeyPatch, name, default, override, expected
+):
+    """Worker configuration reads typed values for optional prefill mechanisms."""
+    disable_envs_cache()
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(envs, name) == default
+    monkeypatch.setenv(name, override)
+    assert getattr(envs, name) == expected
+
+
+@pytest.mark.parametrize("value", ["allgather", "AG_RS", "unknown"])
+def test_dcp_prefill_rejects_unknown_large_backend(monkeypatch, value):
+    disable_envs_cache()
+    monkeypatch.setenv("VLLM_DCP_A2A_LARGE_BACKEND", value)
+    with pytest.raises(ValueError):
+        _ = envs.VLLM_DCP_A2A_LARGE_BACKEND
+
+
+@pytest.mark.parametrize("explicit", [None, "0", "1"])
+def test_dcp_prefill_workspace_alias_precedence(monkeypatch, explicit):
+    disable_envs_cache()
+    name = "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE"
+    monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("B12X_MLA_DCP_GATHER_IN_WORKSPACE", raising=False)
+    assert not getattr(envs, name)
+    monkeypatch.setenv("B12X_MLA_DCP_GATHER_IN_WORKSPACE", "1")
+    if explicit is not None:
+        monkeypatch.setenv(name, explicit)
+    assert getattr(envs, name) is (explicit != "0")

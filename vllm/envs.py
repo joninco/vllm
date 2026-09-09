@@ -203,6 +203,18 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
+    VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB: int = 1024
+    VLLM_DCP_QUERY_SPLIT: bool = False
+    VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS: int = 0
+    VLLM_DCP_TOPK_OWNER_MERGE: bool = False
+    VLLM_DCP_INDEXER_SHARDS: int = 0
+    VLLM_DCP_REPLICATE_INDEXER_CACHE: bool = False
+    VLLM_DCP_A2A_MAX_TOKENS: int = 0
+    VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
+    VLLM_DCP_PROJECT_BEFORE_MERGE: bool = False
+    VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS: int = 1024
+    VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE: bool = False
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -1675,9 +1687,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
     ),
-    # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
-    # query replication plus the per-rank LSE combine and is opt-in while the
-    # path is being qualified on GLM5Next.
+    # Gather native DCP KV records for local-head sparse-MLA prefill.
+    # This opt-in route bypasses query gathering and partial-output merging.
     "VLLM_B12X_MLA_CKV_GATHER": lambda: (
         os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
     ),
@@ -1686,6 +1697,47 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+    ),
+    # Persistent gathered history uses depth+1 slots per execution lane.
+    # A zero byte budget is uncapped; every reservation is still accounted.
+    "VLLM_B12X_MLA_CKV_PREFETCH_DEPTH": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", "1")
+    ),
+    "VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB", "1024")
+    ),
+    # Partition prefill rows across replicas and restore selected indices only.
+    "VLLM_DCP_QUERY_SPLIT": lambda: bool(int(os.getenv("VLLM_DCP_QUERY_SPLIT", "0"))),
+    "VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", "0")
+    ),
+    "VLLM_DCP_TOPK_OWNER_MERGE": lambda: bool(
+        int(os.getenv("VLLM_DCP_TOPK_OWNER_MERGE", "0"))
+    ),
+    # Zero retains attention DCP sharding; replication changes cache geometry.
+    "VLLM_DCP_INDEXER_SHARDS": lambda: int(os.getenv("VLLM_DCP_INDEXER_SHARDS", "0")),
+    "VLLM_DCP_REPLICATE_INDEXER_CACHE": lambda: bool(
+        int(os.getenv("VLLM_DCP_REPLICATE_INDEXER_CACHE", "0"))
+    ),
+    # A nonpositive cap keeps A2A for eligible unprojected prefill batches.
+    "VLLM_DCP_A2A_MAX_TOKENS": lambda: int(os.getenv("VLLM_DCP_A2A_MAX_TOKENS", "0")),
+    "VLLM_DCP_A2A_LARGE_BACKEND": env_with_choices(
+        "VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs", ["ag_rs", "a2a"]
+    ),
+    "VLLM_DCP_PROJECT_BEFORE_MERGE": lambda: bool(
+        int(os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE", "0"))
+    ),
+    "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS", "1024")
+    ),
+    # The VLLM-prefixed setting takes precedence over the compatibility alias.
+    "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE",
+                os.getenv("B12X_MLA_DCP_GATHER_IN_WORKSPACE", "0"),
+            )
+        )
     ),
     # Qwen3.8-Flash-Next only. Store PLE table payloads in CUDA-mapped host
     # memory unless additional_config.ple_table_memory is explicitly set.
