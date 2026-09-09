@@ -55,11 +55,10 @@ def test_prefill_thresholds_are_exclusive_and_capacity_is_inclusive(
     [
         {"is_capturing": True},
         {"is_mtp": True},
-        {"num_decodes": 1},
         {"num_prefills": 0},
     ],
 )
-def test_decode_mixed_mtp_and_capture_use_configured_route(policy, changes):
+def test_decode_mtp_and_capture_use_configured_route(policy, changes):
     batch = DCPPrefillBatch(2048, 1, 0, full_ckv_eligible=True)
     assert policy.select(replace(batch, **changes)).route == "configured"
 
@@ -122,3 +121,47 @@ def test_invalid_configuration_fails_before_collectives(policy, changes):
 def test_negative_batch_counts_are_rejected():
     with pytest.raises(ValueError, match="counts"):
         DCPPrefillBatch(-1, 1, 0)
+
+
+@pytest.mark.parametrize(
+    ("rows", "route"),
+    [
+        (0, "configured"),
+        (16, "configured"),
+        (17, "ag_rs"),
+        (1025, "ag_rs"),
+        (8192, "ag_rs"),
+        (8193, "configured"),
+    ],
+)
+def test_large_mixed_rows_use_unprojected_ag_rs_at_exact_limits(policy, rows, route):
+    selected = replace(policy, a2a_max_tokens=16)
+    batch = DCPPrefillBatch(rows, 2, 1, full_ckv_eligible=True)
+    assert selected.select(batch) == DCPPrefillDecision(route)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"a2a_max_tokens": 0},
+        {"a2a_max_tokens": -1},
+        {"a2a_max_tokens": 8192},
+        {"large_backend": "a2a"},
+        {"enabled": False},
+        {"max_capture_tokens": 2048, "project_min_tokens": 2048},
+    ],
+)
+def test_mixed_ag_rs_requires_explicit_backend_and_uncaptured_size(policy, changes):
+    batch = DCPPrefillBatch(2048, 1, 1)
+    assert replace(policy, **changes).select(batch) == DCPPrefillDecision("configured")
+
+
+def test_mixed_preserves_mtp_capture_and_rank_uniform_selection(policy):
+    selected = replace(policy, a2a_max_tokens=16)
+    batch = DCPPrefillBatch(4096, 3, 2)
+    assert [replace(selected).select(replace(batch)) for _ in range(4)] == [
+        DCPPrefillDecision("ag_rs")
+    ] * 4
+    for change in ({"is_mtp": True}, {"is_capturing": True}, {"num_prefills": 0}):
+        assert selected.select(replace(batch, **change)).route == "configured"
+    assert replace(selected, dcp_world_size=1).select(batch).route == "local"

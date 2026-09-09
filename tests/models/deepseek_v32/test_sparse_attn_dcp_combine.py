@@ -462,7 +462,7 @@ def test_projected_shard_merge_matches_global_attention(dtype, is_base_e):
         (-1, "ag_rs", False, 0, False, False, "combine"),
         (256, "a2a", False, 0, False, False, "combine"),
         (256, "ag_rs", True, 0, False, False, "combine"),
-        (256, "ag_rs", False, 1, False, False, "combine"),
+        (256, "ag_rs", False, 1, False, False, "ag_rs"),
         (256, "ag_rs", False, 0, True, False, "combine"),
         (256, "ag_rs", False, 0, False, True, None),
     ],

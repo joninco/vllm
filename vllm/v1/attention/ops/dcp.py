@@ -1337,8 +1337,9 @@ class MLADCPManager:
         logger.info_once(
             "Sparse MLA DCP eager prefill: base=%s, A2A cap=%d "
             "(non-positive is uncapped), large=%s, projected=%s, borrowed=%s, "
-            "capacity=%d, workspace bytes=%s; decode/capture/mixed/MTP "
-            "use configured transport.",
+            "capacity=%d, workspace bytes=%s; decode/capture/MTP "
+            "use configured transport; eligible large mixed batches use "
+            "unprojected AG/RS when selected by the backend policy.",
             policy.base_backend,
             policy.a2a_max_tokens,
             policy.large_backend,

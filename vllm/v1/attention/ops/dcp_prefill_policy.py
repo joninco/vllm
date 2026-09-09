@@ -93,11 +93,12 @@ class DCPPrefillPolicy:
             or batch.is_capturing
             or batch.is_mtp
             or batch.num_prefills == 0
-            or batch.num_decodes != 0
             or not self.min_prefill_tokens < batch.num_tokens <= self.max_num_tokens
         ):
             return DCPPrefillDecision("configured")
-        if batch.full_ckv_eligible:
+        if batch.num_decodes and batch.num_tokens <= self.max_capture_tokens:
+            return DCPPrefillDecision("configured")
+        if batch.full_ckv_eligible and batch.num_decodes == 0:
             return DCPPrefillDecision("full_ckv")
         backend = self.base_backend
         if (
@@ -106,6 +107,10 @@ class DCPPrefillPolicy:
             and batch.num_tokens > self.a2a_max_tokens
         ):
             backend = self.large_backend
+        if batch.num_decodes:
+            # Mixed rows share the existing latent-output AG/RS contract.
+            # Projection and full-KV gathering remain pure-prefill routes.
+            return DCPPrefillDecision("ag_rs" if backend == "ag_rs" else "configured")
         if (
             backend == "ag_rs"
             and self.project_before_merge
