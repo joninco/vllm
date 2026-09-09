@@ -7,6 +7,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed.indexer_kv_geometry import effective_kv_shards
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup import (
     VllmJitKernel,
@@ -550,8 +551,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         scheduler_config = self.vllm_config.scheduler_config
         parallel_config = self.vllm_config.parallel_config
-        self.dcp_world_size = parallel_config.decode_context_parallel_size
-        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.dcp_world_size = effective_kv_shards(
+            self.kv_cache_spec, parallel_config.decode_context_parallel_size
+        )
+        self.dcp_rank = (
+            get_dcp_group().rank_in_group % self.dcp_world_size
+            if self.dcp_world_size > 1
+            else 0
+        )
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
@@ -866,7 +873,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         seq_lens = common_attn_metadata.seq_lens
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
-        dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+        # Only the presence is consumed below; per-token bounds are localized
+        # with this cache group's shard geometry after causal expansion.
+        dcp_local_seq_lens = (
+            common_attn_metadata.seq_lens if self.dcp_world_size > 1 else None
+        )
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,

@@ -1406,6 +1406,7 @@ _QUERY_SPLIT: GroupCoordinator | None = None
 _INDEXER_DCP: GroupCoordinator | None = None
 _INDEXER_QUERY_SPLIT: GroupCoordinator | None = None
 _DCP_CKV_PREFETCH: GroupCoordinator | None = None
+_DCP_CKV_PREFETCH_CONFIG: tuple[list[list[int]], int, str] | None = None
 
 
 def get_query_split_group() -> GroupCoordinator:
@@ -1441,8 +1442,28 @@ def get_dcp_ckv_prefetch_group() -> GroupCoordinator:
     return _DCP_CKV_PREFETCH
 
 
+def ensure_dcp_ckv_prefetch_group() -> GroupCoordinator:
+    """Create the side-stream group after a positive-depth workspace reservation.
+
+    Every worker calls this during model construction, before KV admission.
+    Runtime dispatch only uses the getter; it must never create collectives.
+    Budget-clamped depth-zero plans leave this communicator unallocated.
+    """
+    global _DCP_CKV_PREFETCH
+    if _DCP_CKV_PREFETCH is None:
+        if _DCP_CKV_PREFETCH_CONFIG is None:
+            raise RuntimeError("CKV prefetch communicator was not configured")
+        ranks, local_rank, backend = _DCP_CKV_PREFETCH_CONFIG
+        _DCP_CKV_PREFETCH = init_model_parallel_group(
+            ranks, local_rank, backend, group_name="dcp_ckv_prefetch"
+        )
+        logger.info("Created budgeted CKV prefetch communicator before KV admission")
+    return _DCP_CKV_PREFETCH
+
+
 def _destroy_dcp_prefill_groups() -> None:
     global _QUERY_SPLIT, _INDEXER_DCP, _INDEXER_QUERY_SPLIT, _DCP_CKV_PREFETCH
+    global _DCP_CKV_PREFETCH_CONFIG
     for group in (
         _DCP_CKV_PREFETCH,
         _INDEXER_QUERY_SPLIT,
@@ -1452,6 +1473,7 @@ def _destroy_dcp_prefill_groups() -> None:
         if group is not None:
             group.destroy()
     _QUERY_SPLIT = _INDEXER_DCP = _INDEXER_QUERY_SPLIT = _DCP_CKV_PREFETCH = None
+    _DCP_CKV_PREFETCH_CONFIG = None
 
 
 def _initialize_dcp_prefill_groups(
@@ -1476,6 +1498,7 @@ def _initialize_dcp_prefill_groups(
     )
 
     global _QUERY_SPLIT, _INDEXER_DCP, _INDEXER_QUERY_SPLIT, _DCP_CKV_PREFETCH
+    global _DCP_CKV_PREFETCH_CONFIG
     if any(
         group is not None
         for group in (
@@ -1483,6 +1506,7 @@ def _initialize_dcp_prefill_groups(
             _INDEXER_DCP,
             _INDEXER_QUERY_SPLIT,
             _DCP_CKV_PREFETCH,
+            _DCP_CKV_PREFETCH_CONFIG,
         )
     ):
         raise RuntimeError("DCP prefill groups are already initialized")
@@ -1514,13 +1538,18 @@ def _initialize_dcp_prefill_groups(
             if query_split:
                 _INDEXER_QUERY_SPLIT = create(partial_queries, "indexer_query_split")
         if ckv_prefetch:
-            # Side-stream KV gathers cannot share the indexer merge communicator.
-            _DCP_CKV_PREFETCH = create(dcp_ranks, "dcp_ckv_prefetch")
+            # The backend computes effective depth before allocating the group.
+            _DCP_CKV_PREFETCH_CONFIG = (
+                [list(ranks) for ranks in dcp_ranks],
+                local_rank,
+                backend,
+            )
     except Exception:
         _destroy_dcp_prefill_groups()
         raise
     logger.info(
-        "DCP prefill groups: DCP=%d indexer_shards=%d query_split=%s CKV_prefetch=%s",
+        "DCP prefill groups: DCP=%d indexer_shards=%d query_split=%s "
+        "CKV_prefetch_configured=%s",
         dcp_size,
         shards,
         query_split,

@@ -94,6 +94,19 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
+def _has_dcp_prefill_warmup(worker: "Worker") -> bool:
+    """Detect configured DCP resources that require initialization before KV sizing."""
+    if getattr(worker.parallel_config, "decode_context_parallel_size", 1) <= 1:
+        return False
+    return any(
+        getattr(getattr(layer, "dcp_manager", None), "prefill_warmup_key", None)
+        is not None
+        or getattr(layer, "_prefill_query_bmm_module", None) is not None
+        or getattr(getattr(layer, "impl", None), "_ckv_gather_enabled", False)
+        for layer in worker.model_runner.get_model().modules()
+    )
+
+
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
     return (
@@ -558,10 +571,16 @@ class Worker(WorkerBase):
                 format_gib(sampler_workspace_bytes),
             )
 
+        profile_prefill_resources = _has_dcp_prefill_warmup(self)
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            if profile_prefill_resources and b12x_warmup(
+                self,
+                list(self.vllm_config.compilation_config.cudagraph_capture_sizes or []),
+            ):
+                self.model_runner.profile_run()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -609,7 +628,13 @@ class Worker(WorkerBase):
             # discard the cold-start high-water and measure the same model
             # profile again. Deployments without B12X kernels keep the single
             # profile.
-            if profile_cudagraphs and b12x_warmup(self, capture_sizes):
+            # Optional DCP prefill also initializes kernel, collective and BLAS
+            # state in eager launches. Charge that state before admission even when no
+            # CUDA graphs will be captured. Registry dedup prevents a second
+            # cold warmup after KV allocation.
+            if (profile_cudagraphs or profile_prefill_resources) and b12x_warmup(
+                self, capture_sizes
+            ):
                 b12x_warmup_snapshot = MemorySnapshot(device=self.device)
                 torch.accelerator.reset_peak_memory_stats(self.device)
                 self.model_runner.profile_run()

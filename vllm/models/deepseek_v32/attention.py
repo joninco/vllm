@@ -267,7 +267,12 @@ class DeepseekV32Attention(MLAAttention):
 
         self._is_mtp_layer = is_mtp_layer
         self._dcp_prefill_policy = (
-            self.dcp_manager.configure_prefill(vllm_config)
+            self.dcp_manager.configure_prefill(
+                vllm_config,
+                backend=self.impl,
+                latent_dim=self.kv_lora_rank,
+                value_dim=self.v_head_dim,
+            )
             if self.dcp_manager is not None and not self.use_pcp
             else None
         )
@@ -436,6 +441,11 @@ class DeepseekV32Attention(MLAAttention):
             indexer_k_rope_cos_sin_cache,
             self.topk_indices_buffer,
             slot_mapping=mla_slot,
+            indexer_slot_mapping=(
+                slot_mapping.get(self.indexer.k_cache.prefix)
+                if indexer_k_cache is not None and self.indexer is not None
+                else None
+            ),
             indexer_k_cache=indexer_k_cache,
             mla_kv_cache=mla_kv_cache,
             mla_kv_cache_dtype=self.kv_cache_dtype,
@@ -501,6 +511,9 @@ class DeepseekV32Attention(MLAAttention):
 
     def _latent_query(self, q_nope: torch.Tensor) -> torch.Tensor:
         """Project the query's NoPE part into the KV latent space (W_UK)."""
+        projected = self._try_prefill_query_bmm(q_nope)
+        if projected is not None:
+            return projected
         return torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
 
     @eager_break_during_capture
@@ -586,6 +599,7 @@ class DeepseekV32Attention(MLAAttention):
             output.zero_()
             return
 
+        original_kv_cache = kv_cache
         if self._fp8_kv_needs_view:
             kv_cache = kv_cache.view(torch.float8_e4m3fn)
         if self._fp8_query:
@@ -607,6 +621,7 @@ class DeepseekV32Attention(MLAAttention):
         full_ckv_dcp = False
         direct_dcp = None
         prefill_route = "configured"
+        prefill_buffers = None
         if dcp_world_size > 1:
             assert self.dcp_manager is not None
             if self.use_pcp:
@@ -621,7 +636,7 @@ class DeepseekV32Attention(MLAAttention):
                 if not full_ckv_dcp:
                     policy = getattr(self, "_dcp_prefill_policy", None)
                     if policy is not None:
-                        prefill_route = policy.select(
+                        decision = policy.select(
                             DCPPrefillBatch(
                                 num_tokens=num_actual,
                                 num_prefills=attn_metadata.num_prefills,
@@ -635,8 +650,20 @@ class DeepseekV32Attention(MLAAttention):
                                     or getattr(attn_metadata, "is_spec_decode", False)
                                 ),
                             )
-                        ).route
-                    if isinstance(mqa_q_arg, tuple):
+                        )
+                        prefill_route = decision.route
+                        if prefill_route == "projected_ag_rs":
+                            workspace_specs = getattr(
+                                self.impl, "get_dcp_prefill_workspace_specs", None
+                            )
+                            assert callable(workspace_specs)
+                            prefill_buffers = self.dcp_manager.prefill_workspaces[
+                                decision.borrow_workspace
+                            ].borrow(
+                                num_actual,
+                                backend_specs=workspace_specs(),
+                            )
+                    if isinstance(mqa_q_arg, tuple) and prefill_buffers is None:
                         mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
                     from vllm.v1.attention.ops.b12x_dcp import active_dcp_transport
 
@@ -645,7 +672,11 @@ class DeepseekV32Attention(MLAAttention):
                         if prefill_route == "configured"
                         else None
                     )
-                    if binding is not None and binding.accepts(
+                    if prefill_buffers is not None:
+                        mqa_q_arg = prefill_buffers.gather_query(
+                            mqa_q_arg, self.dcp_manager.group
+                        )
+                    elif binding is not None and binding.accepts(
                         mqa_q_arg, getattr(attn_metadata, "dcp_combine_seq_lens", None)
                     ):
                         direct_dcp = binding
@@ -653,6 +684,10 @@ class DeepseekV32Attention(MLAAttention):
                     else:
                         assert self.dcp_manager.query_gather is not None
                         mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
+        if full_ckv_dcp:
+            self.impl.set_ckv_current_cache(  # type: ignore[attr-defined]
+                original_kv_cache
+            )
         attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
             mqa_q_arg, kv_cache, attn_metadata, self
         )
@@ -676,7 +711,26 @@ class DeepseekV32Attention(MLAAttention):
                 seq_lens = attn_metadata.dcp_combine_seq_lens  # type: ignore[attr-defined]
                 query_start_loc = attn_metadata.dcp_combine_query_start_loc  # type: ignore[attr-defined]
                 assert seq_lens is not None and query_start_loc is not None
-            if direct_dcp is not None:
+            if prefill_buffers is not None:
+                from b12x.comm.prefill import prepare_prefill_lse
+
+                from vllm.v1.attention.ops.dcp import correct_attn_out
+
+                attn_out = prefill_buffers.project(
+                    attn_out,
+                    lse,
+                    seq_lens,
+                    self.W_UV,
+                    self.dcp_manager.group,
+                    prepare_prefill_lse,
+                )
+                attn_out = prefill_buffers.combine(
+                    attn_out,
+                    self.dcp_manager.group,
+                    correct_attn_out,
+                    is_lse_base_on_e=self.dcp_manager.is_lse_base_on_e,
+                )
+            elif direct_dcp is not None:
                 attn_out = direct_dcp.combine(attn_out, lse, seq_lens)
             elif prefill_route == "ag_rs":
                 attn_out = self.dcp_manager.prefill_ag_rs_combine(
@@ -698,6 +752,11 @@ class DeepseekV32Attention(MLAAttention):
         # NOTE(woosuk): While the below does not need to be in the eager region,
         # we put it here to avoid copying the attention output. Move this back to the
         # captured region once forward_mqa supports `out` argument.
+        if prefill_buffers is not None:
+            output[:num_actual].view(
+                num_actual, self.num_local_heads, self.v_head_dim
+            ).copy_(attn_out)
+            return
         x = attn_out.view(
             num_actual, self.num_local_heads, self.kv_lora_rank
         ).transpose(0, 1)

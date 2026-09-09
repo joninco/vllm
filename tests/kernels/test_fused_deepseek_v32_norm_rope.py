@@ -968,3 +968,63 @@ def test_fused_eh_norm(num_tokens: int):
     ref = torch.cat([rms_norm(embeds, ew), rms_norm(prev, hw)], dim=-1)
     assert out.shape == (num_tokens, 2 * HIDDEN)
     assert_bf16(out, ref, "eh_norm")
+
+
+@pytest.mark.parametrize("indexer_shards", [1, 2, 4])
+def test_fused_norm_rope_independent_indexer_and_attention_slots(indexer_shards):
+    """Replicated indexer writes include tokens outside this rank's MLA shard."""
+    device = torch.device("cuda")
+    rows = 9
+    positions = torch.arange(rows, dtype=torch.int64, device=device)
+    mla_slots = torch.where(positions % 4 == 1, positions // 4 + 64, -1)
+    index_slots = torch.where(
+        positions % indexer_shards == 1 % indexer_shards,
+        positions // indexer_shards + 3,
+        -1,
+    )
+    mla = torch.empty((2, 64, 656), dtype=torch.uint8, device=device)
+    index = torch.empty((2, 64, 132), dtype=torch.uint8, device=device)
+    mla_reference = torch.empty_like(mla)
+    index_reference = torch.empty_like(index)
+    torch.manual_seed(733)
+    for generation in range(2):
+        arguments = dict(
+            positions=positions,
+            q_c=torch.randn((rows, 512), dtype=torch.bfloat16, device=device),
+            q_rms_norm_w=torch.ones(512, dtype=torch.bfloat16, device=device),
+            q_rms_eps=EPS,
+            kv_c=torch.randn((rows, 512), dtype=torch.bfloat16, device=device),
+            kv_rms_norm_w=torch.ones(512, dtype=torch.bfloat16, device=device),
+            kv_rms_eps=EPS,
+            k_pe=torch.randn((rows, 64), dtype=torch.bfloat16, device=device),
+            k_rope_cos_sin_cache=make_cos_sin(32, 64, device),
+            index_k=torch.randn((rows, 128), dtype=torch.bfloat16, device=device),
+            index_k_layer_norm_w=torch.ones(128, dtype=torch.float32, device=device),
+            index_k_layer_norm_bias=torch.zeros(
+                128, dtype=torch.float32, device=device
+            ),
+            index_k_layer_norm_eps=EPS,
+            index_k_rope_cos_sin_cache=make_cos_sin(32, 64, device),
+            topk_indices_buffer=torch.empty(
+                (rows, 2048), dtype=torch.int32, device=device
+            ),
+            mla_kv_cache_dtype="fp8_ds_mla",
+        )
+        for cache in (mla, index, mla_reference, index_reference):
+            cache.fill_(91 + generation)
+        K.fused_norm_rope(
+            **arguments,
+            slot_mapping=mla_slots,
+            indexer_slot_mapping=index_slots,
+            mla_kv_cache=mla,
+            indexer_k_cache=index,
+        )
+        K.fused_norm_rope(
+            **arguments, slot_mapping=mla_slots, mla_kv_cache=mla_reference
+        )
+        K.fused_norm_rope(
+            **arguments, slot_mapping=index_slots, indexer_k_cache=index_reference
+        )
+        torch.testing.assert_close(mla, mla_reference, rtol=0, atol=0)
+        torch.testing.assert_close(index, index_reference, rtol=0, atol=0)
+        assert not torch.all(index == 91 + generation)

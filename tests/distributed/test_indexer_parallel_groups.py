@@ -59,6 +59,7 @@ def groups(monkeypatch):
         "_INDEXER_DCP",
         "_INDEXER_QUERY_SPLIT",
         "_DCP_CKV_PREFETCH",
+        "_DCP_CKV_PREFETCH_CONFIG",
     ):
         monkeypatch.setattr(state, name, None)
     monkeypatch.setattr(state, "_DCP", SimpleNamespace(world_size=4))
@@ -98,6 +99,8 @@ def initialize(**overrides):
 def test_target_and_drafter_choose_their_own_groups(groups):
     created, destroyed = groups
     initialize()
+    assert state._DCP_CKV_PREFETCH is None
+    state.ensure_dcp_ckv_prefetch_group()
     assert [entry[0] for entry in created] == [
         "query_split",
         "indexer_dcp",
@@ -159,7 +162,7 @@ def test_dcp1_initialization_ignores_dcp4_mechanism_options(
 @pytest.mark.parametrize(
     "overrides,expected",
     [
-        (dict(query_split=False, indexer_shards=0), ["dcp_ckv_prefetch"]),
+        (dict(query_split=False, indexer_shards=0), []),
         (dict(ckv_gather=False, indexer_shards=0), ["query_split"]),
         (dict(ckv_gather=False, query_split=False), ["indexer_dcp"]),
         (dict(ckv_prefetch_depth=0, query_split=False, indexer_shards=0), []),
@@ -182,6 +185,26 @@ def test_only_requested_collectives_are_created(groups, overrides, expected):
 def test_enabled_prefetch_rejects_negative_depth_without_collectives(groups):
     with pytest.raises(ValueError, match="PREFETCH_DEPTH"):
         initialize(ckv_prefetch_depth=-1)
+    assert not groups[0]
+
+
+def test_budget_clamped_prefetch_has_no_communicator_until_reserved(groups):
+    initialize(query_split=False, indexer_shards=0)
+    assert not groups[0]
+    assert state._DCP_CKV_PREFETCH_CONFIG is not None
+    with pytest.raises(AssertionError, match="not initialized"):
+        state.get_dcp_ckv_prefetch_group()
+    group = state.ensure_dcp_ckv_prefetch_group()
+    assert state.ensure_dcp_ckv_prefetch_group() is group
+    assert [entry[0] for entry in groups[0]] == ["dcp_ckv_prefetch"]
+    state._destroy_dcp_prefill_groups()
+    assert state._DCP_CKV_PREFETCH_CONFIG is None
+
+
+def test_disabled_prefetch_cannot_create_runtime_communicator(groups):
+    initialize(ckv_prefetch_depth=0, query_split=False, indexer_shards=0)
+    with pytest.raises(RuntimeError, match="not configured"):
+        state.ensure_dcp_ckv_prefetch_group()
     assert not groups[0]
 
 

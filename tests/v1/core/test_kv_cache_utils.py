@@ -3685,3 +3685,35 @@ def test_iter_layer_specs_returns_group_members():
         block_size=4, kv_cache_specs={"a": full, "b": mla}
     )
     assert list(iter_layer_specs(wrapped)) == [full, mla]
+
+
+@pytest.mark.parametrize("indexer_shards", [1, 2, 4])
+def test_indexer_replication_groups_preserve_global_block_spans(indexer_shards):
+    from vllm.distributed.indexer_kv_geometry import effective_kv_shards
+
+    config = _grouping_config()
+    config.parallel_config = SimpleNamespace(decode_context_parallel_size=4)
+    attention = new_mla_spec(block_size=64)
+    indexer = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        dcp_kv_shard_count=indexer_shards if indexer_shards != 4 else None,
+    )
+    groups = get_kv_cache_groups(
+        config,
+        {
+            "model.layers.0.attn": attention,
+            "model.layers.0.indexer": indexer,
+            "model.layers.78.indexer": new_mla_spec(block_size=64),
+        },
+    )
+    by_layer = {
+        name: group.kv_cache_spec for group in groups for name in group.layer_names
+    }
+    assert effective_kv_shards(by_layer["model.layers.0.indexer"], 4) == indexer_shards
+    assert effective_kv_shards(by_layer["model.layers.0.attn"], 4) == 4
+    assert effective_kv_shards(by_layer["model.layers.78.indexer"], 4) == 4
+    for group in groups:
+        assert group.kv_cache_spec.block_size == 64

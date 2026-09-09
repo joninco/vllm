@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU references for CKV budget, cache lifetime and event-ordered lease reuse.
+"""References for CKV budget, cache lifetime and event-ordered lease reuse.
 
-Inputs are planned geometry, CPU workspace views, and fake CUDA events/streams.
-Assertions detect missing dependencies and storage aliasing without GPU work;
-they do not establish CUDA collective or attention correctness.
+CPU fixtures check geometry and event contracts. GPU cases use delayed producers
+and consumers on real streams to check storage retirement and changed inputs.
+Collective and attention correctness require separate distributed references.
 """
 
 import gc
@@ -306,3 +306,179 @@ def test_changed_inputs_replace_gathered_bytes_without_changing_storage():
     assert addresses[0] == addresses[1]
     assert ("main", "wait", "reader-11") in log
     assert workspace.numel() == 32
+
+
+# These references exercise real stream dependencies with delayed device work.
+# They do not establish all-rank communication or native attention correctness.
+_CUDA_DELAY_CYCLES = 20_000_000
+
+
+def _cuda_registry(depth=1):
+    plan = CKVPrefetchPlan.create(
+        requested_depth=depth,
+        budget_bytes=0,
+        dcp_world_size=4,
+        local_capacity=16,
+        record_bytes=8,
+        num_lanes=2,
+    )
+    registry = CKVPrefetchRegistry(CKVWorkspacePool(plan, torch.device("cuda")))
+    workspace = torch.empty(32, device="cuda")
+    state = registry.for_workspace(workspace, lane=(0, 0))
+    producer = torch.cuda.Stream()
+    gather_stream = state.get_gather_stream()
+    consumer = torch.cuda.Stream()
+    for stream in (producer, gather_stream, consumer):
+        stream.wait_stream(torch.cuda.current_stream())
+    return registry, workspace, state, producer, gather_stream, consumer
+
+
+def _cuda_gather(state, layer, value, producer, stream):
+    # Distinct source allocations prevent the fixture from overwriting a source
+    # while a preceding gather reads it. Ring and staging addresses remain shared.
+    source = torch.empty((16, 8), dtype=torch.uint8, device="cuda")
+    with torch.cuda.stream(producer):
+        torch.cuda._sleep(_CUDA_DELAY_CYCLES)
+        source.fill_(value)
+    local, gathered = state.prepare_gather(layer, stream, producer_stream=producer)
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(_CUDA_DELAY_CYCLES)
+        local.copy_(source)
+        for rank in range(4):
+            gathered[rank * 16 : (rank + 1) * 16].copy_(local)
+        writer = torch.cuda.Event()
+        writer.record()
+    state.finish_gather(layer, writer)
+    return source, gathered, writer
+
+
+def _cuda_consume(state, layer, consumer):
+    result = state.consume(layer, consumer)
+    snapshot = torch.empty_like(result)
+    with torch.cuda.stream(consumer):
+        # Ring reuse must wait for this delayed read, not just the gather writer.
+        torch.cuda._sleep(4 * _CUDA_DELAY_CYCLES)
+        snapshot.copy_(result)
+        reader = torch.cuda.Event()
+        reader.record()
+    state.finish_consumer(layer, reader)
+    return snapshot, reader
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires coordinator-owned CUDA GPU"
+)
+def test_cuda_ring_reuse_preserves_changed_layer_and_step_bytes():
+    registry, workspace, state, producer, side, consumer = _cuda_registry()
+    sources, snapshots = [], []
+    completions: list[torch.cuda.Event] = []
+    addresses: dict[int, int] = {}
+    try:
+        for step in range(2):
+            state.begin_step(consumer)
+            for layer in range(4):
+                state.enter_layer(layer, consumer)
+                value = 17 + step * 31 + layer
+                source, gathered, writer = _cuda_gather(
+                    state, layer, value, producer, side
+                )
+                sources.append(source)
+                slot = layer % state.pool.plan.ring_slots
+                addresses.setdefault(slot, gathered.data_ptr())
+                assert gathered.data_ptr() == addresses[slot]
+                snapshot, reader = _cuda_consume(state, layer, consumer)
+                snapshots.append((snapshot, value))
+                completions.extend((writer, reader))
+        state.close()
+        assert all(event.query() for event in completions)
+        for snapshot, value in snapshots:
+            assert torch.equal(
+                snapshot.cpu(), torch.full(snapshot.shape, value, dtype=torch.uint8)
+            )
+        assert workspace.numel() == 32
+    finally:
+        registry.clear()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires coordinator-owned CUDA GPU"
+)
+def test_cuda_interrupted_step_and_missing_cache_preserve_dependencies():
+    registry, workspace, state, producer, side, consumer = _cuda_registry(depth=0)
+    sources = []
+    try:
+        state.enter_layer(4, consumer)
+        source, _, interrupted_writer = _cuda_gather(state, 5, 97, producer, side)
+        sources.append(source)
+        # A restarted execution discards unconsumed work but must order its
+        # staging and ring reuse after that work's real CUDA completion.
+        state.enter_layer(0, consumer)
+        assert not state.pending
+        assert state.targets(0) == []
+        source, _, writer = _cuda_gather(state, 0, 43, producer, consumer)
+        sources.append(source)
+        snapshot, reader = _cuda_consume(state, 0, consumer)
+        state.close()
+        assert interrupted_writer.query() and writer.query() and reader.query()
+        assert torch.equal(
+            snapshot.cpu(), torch.full(snapshot.shape, 43, dtype=torch.uint8)
+        )
+        assert workspace.numel() == 32
+    finally:
+        registry.clear()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires coordinator-owned CUDA GPU"
+)
+def test_cuda_rebinding_retires_writers_and_readers_without_stealing_other_lane():
+    registry, workspace, state, producer, side, consumer = _cuda_registry()
+    sources = []
+    snapshots = []
+    try:
+        cache0 = torch.zeros(1, device="cuda")
+        cache2 = torch.zeros(1, device="cuda")
+        state.register_cache(0, cache0)
+        state.register_cache(2, cache2)
+        assert state.targets(0) == []  # Missing layer 1 stops prefetch discovery.
+        source, _, writer = _cuda_gather(state, 0, 61, producer, side)
+        sources.append(source)
+        snapshot, reader = _cuda_consume(state, 0, consumer)
+        snapshots.append((snapshot, 61))
+        # An additional unconsumed writer must also finish before lease release.
+        source, _, pending_writer = _cuda_gather(state, 1, 103, producer, side)
+        sources.append(source)
+        draft = registry.for_workspace(workspace, lane=(0, 1))
+        draft_cache = torch.ones(1, device="cuda")
+        draft.register_cache(0, draft_cache)
+        with torch.cuda.stream(producer):
+            draft.storage.fill_(211)
+        replacement_workspace = workspace[:16]
+        replacement = registry.for_workspace(
+            replacement_workspace, lane=(0, 0), generation=1
+        )
+        assert writer.query() and reader.query() and pending_writer.query()
+        assert replacement.storage.data_ptr() == state.storage.data_ptr()
+        assert not replacement.layer_caches
+        assert registry.states[(0, 1)] is draft
+        assert draft.layer_caches[0] is draft_cache
+        with pytest.raises(RuntimeError, match="closed"):
+            state.views(0)
+        source, _, writer2 = _cuda_gather(replacement, 0, 151, producer, side)
+        sources.append(source)
+        snapshot2, reader2 = _cuda_consume(replacement, 0, consumer)
+        snapshots.append((snapshot2, 151))
+        replacement.register_cache(0, cache0)
+        replacement.register_cache(0, cache2)
+        assert writer2.query() and reader2.query()
+        assert replacement.layer_caches == {0: cache2}
+        assert draft.layer_caches[0] is draft_cache
+        assert torch.equal(
+            draft.storage.cpu(), torch.full(draft.storage.shape, 211, dtype=torch.uint8)
+        )
+        for result, value in snapshots:
+            assert torch.equal(
+                result.cpu(), torch.full(result.shape, value, dtype=torch.uint8)
+            )
+    finally:
+        registry.clear()

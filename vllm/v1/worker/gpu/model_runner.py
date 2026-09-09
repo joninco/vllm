@@ -31,6 +31,7 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.indexer_kv_geometry import effective_kv_shards
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -545,9 +546,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
 
+    def _reset_attention_kv_cache_bindings(self) -> None:
+        """Complete persistent attention users before replacing native caches."""
+        hooks = {
+            hook
+            for layer in self.compilation_config.static_forward_context.values()
+            if (
+                hook := getattr(
+                    getattr(layer, "impl", None), "reset_kv_cache_binding_state", None
+                )
+            )
+            is not None
+        }
+        for hook in hooks:
+            hook()
+
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, is_profiling: bool = False
     ) -> None:
+        self._reset_attention_kv_cache_bindings()
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
@@ -567,9 +584,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
-            group_cp_sizes.append(
-                1 if getattr(spec, "dcp_replicated", False) else self.dcp_size
-            )
+            group_cp_sizes.append(effective_kv_shards(spec, self.dcp_size))
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(
@@ -2270,6 +2285,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.synchronize()
         self.cudagraph_manager = None
         self.boundary_checkpoint_state = None
+        self._reset_attention_kv_cache_bindings()
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):

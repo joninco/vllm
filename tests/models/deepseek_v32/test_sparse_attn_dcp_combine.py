@@ -61,6 +61,7 @@ def _module(events: list[str], *, dcp_world_size: int, full_ckv: bool):
         pcp_world_size=1,
         uses_full_ckv_dcp=lambda attn_metadata, num_tokens: full_ckv,
         forward_mqa=forward_mqa,
+        set_ckv_current_cache=lambda *args: None,
     )
 
     def query_gather(q):
@@ -566,19 +567,20 @@ def test_prefill_environment_controls_model_exchange(
     torch.testing.assert_close(output, torch.full_like(output, _LATENT))
 
 
-@pytest.mark.parametrize(
-    "flag", ["VLLM_DCP_PROJECT_BEFORE_MERGE", "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE"]
-)
-def test_unimplemented_projected_dispatch_is_rejected_at_configuration(
-    monkeypatch, flag
-):
+def test_projected_prefill_requires_backend_workspace_contract(monkeypatch):
     from vllm.v1.attention.ops import dcp
 
-    monkeypatch.setattr(dcp.envs, flag, True)
+    monkeypatch.setattr(dcp.envs, "VLLM_DCP_PROJECT_BEFORE_MERGE", True)
+    monkeypatch.setattr(dcp.envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", False)
     manager = dcp.MLADCPManager.__new__(dcp.MLADCPManager)
     manager.group = SimpleNamespace(world_size=4)
-    with pytest.raises(NotImplementedError, match="Projected DCP prefill"):
-        manager.configure_prefill(None)
+    manager.use_a2a = True
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[16]),
+    )
+    with pytest.raises(ValueError, match="backend workspace support"):
+        manager.configure_prefill(config)
 
 
 def test_dcp1_prefill_configuration_ignores_projected_flags(monkeypatch):
@@ -597,3 +599,145 @@ def test_dcp1_prefill_configuration_ignores_projected_flags(monkeypatch):
     )
     policy = manager.configure_prefill(config)
     assert policy.select(DCPPrefillBatch(2048, 1, 0)).route == "local"
+
+
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_projected_prefill_uses_reserved_buffers_and_projects_exactly_once(
+    monkeypatch, borrowed
+):
+    """Exercise model→workspace→BMM→RS dispatch with CPU collective substitutes."""
+    import sys
+
+    from vllm.v1.attention.ops import dcp, dcp_prefill_workspace
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    rows, capacity = 1025, 1030
+    heads = _HEADS * 4
+    manager = WorkspaceManager(torch.device("cpu"))
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        dcp_prefill_workspace, "current_workspace_manager", lambda: manager
+    )
+    layer = _module([], dcp_world_size=4, full_ckv=False)
+    layer._is_mtp_layer = False
+    layer.W_UV = layer.W_UV.bfloat16()
+    specs = (
+        ((capacity, heads, _LATENT + _ROPE), torch.bfloat16),
+        ((capacity * heads * (_LATENT * 2 + 4),), torch.uint8),
+    )
+    layer.impl.get_dcp_prefill_workspace_specs = lambda: specs
+    transport = dcp.MLADCPManager.__new__(dcp.MLADCPManager)
+    transport.group = SimpleNamespace(
+        world_size=4, rank_in_group=0, device_group=object()
+    )
+    transport.use_a2a = True
+    transport.is_lse_base_on_e = True
+    transport.query_gather = lambda *args: pytest.fail(
+        "Projected route used allocating query gather"
+    )
+    transport.combine = lambda *args, **kwargs: pytest.fail(
+        "Projected route used latent-output combine"
+    )
+    for name, value in {
+        "VLLM_DCP_PROJECT_BEFORE_MERGE": True,
+        "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE": borrowed,
+        "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS": 1024,
+        "VLLM_DCP_A2A_MAX_TOKENS": 16,
+        "VLLM_DCP_A2A_LARGE_BACKEND": "ag_rs",
+    }.items():
+        monkeypatch.setattr(dcp.envs, name, value)
+    layer._dcp_prefill_policy = transport.configure_prefill(
+        SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=capacity),
+            compilation_config=SimpleNamespace(cudagraph_capture_sizes=[16]),
+        ),
+        backend=layer.impl,
+        latent_dim=_LATENT,
+        value_dim=_V_HEAD,
+    )
+    manager.lock()
+    layer.dcp_manager = transport
+
+    def attention(query, *args):
+        _, scratch = manager.get_simultaneous(*specs)
+        output = (
+            scratch[: capacity * heads * _LATENT * 2]
+            .view(torch.bfloat16)
+            .as_strided((rows, heads, _LATENT), (_LATENT, capacity * _LATENT, 1))
+        )
+        lse = (
+            scratch[capacity * heads * _LATENT * 2 :]
+            .view(torch.float32)[: rows * heads]
+            .view(rows, heads)
+        )
+        output.fill_(1)
+        output[0] = float("nan")
+        lse.zero_()
+        return output, lse
+
+    layer.impl.forward_mqa = attention
+
+    def prepare(source, lengths, out):
+        out.copy_(torch.where(lengths[:, None] > 0, source, -float("inf")))
+
+    monkeypatch.setitem(
+        sys.modules, "b12x.comm.prefill", SimpleNamespace(prepare_prefill_lse=prepare)
+    )
+
+    def gather(out, local, *, group):
+        for rank in range(4):
+            out.view(4, *local.shape)[rank].copy_(local)
+
+    def correct(out, lses, rank, ctx, *, is_lse_base_on_e, lse_output):
+        out[0].zero_()
+        out.div_(4)
+        lse_output.copy_(torch.logsumexp(lses, dim=0))
+        return out, lse_output
+
+    def reduce(out, local, *, group):
+        out.copy_(local[:_HEADS] * 4)
+
+    monkeypatch.setattr(dcp_prefill_workspace.dist, "all_gather_into_tensor", gather)
+    monkeypatch.setattr(dcp_prefill_workspace.dist, "reduce_scatter_tensor", reduce)
+    monkeypatch.setattr(dcp, "correct_attn_out", correct)
+    metadata = SimpleNamespace(
+        num_actual_tokens=rows,
+        num_prefills=1,
+        num_decodes=0,
+        dcp_combine_seq_lens=torch.ones(rows, dtype=torch.int32),
+        dcp_combine_query_start_loc=torch.arange(rows + 1, dtype=torch.int32),
+    )
+    metadata.dcp_combine_seq_lens[0] = 0
+    monkeypatch.setattr(
+        attention_module,
+        "get_attention_context",
+        lambda _: (metadata, None, None, None),
+    )
+    bmm = torch.bmm
+    projections = []
+
+    def counted_bmm(*args, **kwargs):
+        projections.append(args[0].shape)
+        return bmm(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "bmm", counted_bmm)
+    output = torch.full((rows + 2, _HEADS * _V_HEAD), 17, dtype=torch.bfloat16)
+    layer._sparse_indexer_and_attn(
+        torch.zeros(rows, 6),
+        None,
+        None,
+        None,
+        None,
+        None,
+        torch.zeros(rows, _HEADS, _LATENT, dtype=torch.bfloat16),
+        torch.zeros(rows, _HEADS, 3, dtype=torch.bfloat16),
+        torch.zeros(rows, _HEADS, _ROPE, dtype=torch.bfloat16),
+        output,
+    )
+    assert projections == [torch.Size([heads, rows, _LATENT])]
+    expected = torch.full_like(output, _LATENT)
+    expected[0].zero_()
+    expected[rows:] = 17
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    assert manager.is_locked()

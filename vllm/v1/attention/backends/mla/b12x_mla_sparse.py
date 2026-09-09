@@ -5,6 +5,7 @@
 from dataclasses import dataclass, replace
 from math import gcd, prod
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
+from weakref import WeakKeyDictionary
 
 import numpy as np
 import torch
@@ -34,6 +35,12 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla import b12x_topk_sort
+from vllm.v1.attention.backends.mla.ckv_prefetch import (
+    CKVPrefetchPlan,
+    CKVPrefetchRegistry,
+    CKVPrefetchState,
+    CKVWorkspacePool,
+)
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
@@ -60,6 +67,16 @@ _GLM_NEXT_INDEX_PAGE_BYTES = 64 * 132
 _GLM_DSA_NVFP4_CACHE_RECORD_BYTES = 368
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _CKVReservation:
+    registry: CKVPrefetchRegistry
+    current_local: torch.Tensor
+    current_gathered: torch.Tensor
+
+
+_CKV_RESERVATIONS: WeakKeyDictionary = WeakKeyDictionary()
 
 
 @runtime_checkable
@@ -895,6 +912,12 @@ class B12xMLASparseMetadataBuilder(
         selector_num_accepted_tokens: torch.Tensor | None = None,
         selector_is_prefilling: torch.Tensor | None = None,
     ) -> B12xMLASparseMetadata:
+        if (
+            self._ckv_gather_requested
+            and not for_cudagraph_capture
+            and self.cache_seq_lens_per_token_buffer.is_cuda
+        ):
+            B12xMLASparseImpl.begin_ckv_prefetch_step()
         metadata = super().build(
             common_prefix_len, common_attn_metadata, fast_build=fast_build
         )
@@ -1322,10 +1345,13 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         cp_kv_cache_interleave_size = int(
             vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
+        self._ckv_interleave = cp_kv_cache_interleave_size
         self._ckv_capacity_tokens = (
             max_ckv_tokens + self.dcp_world_size - 1
         ) // self.dcp_world_size + max_seqs * cp_kv_cache_interleave_size
         self._ckv_local_capacity = 0
+        self._ckv_reservation: _CKVReservation | None = None
+        self._ckv_current_cache: torch.Tensor | None = None
 
         self._module = module
         self._kernel_page_size = 0
@@ -1384,6 +1410,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             page_size=kernel_page_size,
             dcp_world_size=self.dcp_world_size,
         )
+        self._ckv_current_capacity = _round_up_ckv_rank_tokens(
+            (self._max_tokens + self.dcp_world_size - 1) // self.dcp_world_size
+            + self._max_seqs * self._ckv_interleave,
+            page_size=kernel_page_size,
+            dcp_world_size=self.dcp_world_size,
+        )
         self._kernel_page_size = kernel_page_size
         self._reserve_planned_workspaces()
 
@@ -1416,6 +1448,262 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         )
         largest_specs = max(plan_specs, key=self._workspace_nbytes)
         current_workspace_manager().get_simultaneous(*largest_specs)
+        if self._ckv_gather_enabled and self._kernel_page_size_finalized:
+            self._reserve_ckv_prefetch()
+
+    def get_dcp_prefill_workspace_specs(
+        self,
+    ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        """Return the sequential prefill scratch prefix, excluding persistent KV."""
+        return self._base_workspace_specs(self._extend_plan)
+
+    def _reserve_ckv_prefetch(self) -> None:
+        manager = current_workspace_manager()
+        num_ubatches, num_lanes = manager.execution_lane_shape()
+        budget_bytes = envs.VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB * 1024**2
+        current_bytes = (
+            (1 + self.dcp_world_size)
+            * self._ckv_current_capacity
+            * self._cache_record_bytes
+        )
+        requested_depth = (
+            envs.VLLM_B12X_MLA_CKV_PREFETCH_DEPTH if self._is_glm_dsa else 0
+        )
+        if requested_depth < 0:
+            raise ValueError("CKV prefetch depth must be non-negative")
+        geometry = dict(
+            dcp_world_size=self.dcp_world_size,
+            local_capacity=self._ckv_local_capacity,
+            record_bytes=self._cache_record_bytes,
+            num_ubatches=num_ubatches,
+            num_lanes=num_lanes,
+        )
+        plan = CKVPrefetchPlan.create(
+            requested_depth=0, budget_bytes=budget_bytes, **geometry
+        )
+        if requested_depth and (
+            budget_bytes == 0 or budget_bytes >= current_bytes + plan.lane_nbytes
+        ):
+            plan = CKVPrefetchPlan.create(
+                requested_depth=requested_depth,
+                budget_bytes=budget_bytes - current_bytes if budget_bytes else 0,
+                **geometry,
+            )
+        current_capacity = self._ckv_current_capacity if plan.effective_depth else 0
+        key = (plan, current_capacity)
+        reservations = _CKV_RESERVATIONS.setdefault(manager, {})
+        reservation = reservations.get(key)
+        if reservation is None:
+            if plan.effective_depth:
+                from vllm.distributed.parallel_state import (
+                    ensure_dcp_ckv_prefetch_group,
+                )
+
+                ensure_dcp_ckv_prefetch_group()
+            device = self._decode_plan.caps.device
+            pool = CKVWorkspacePool(plan, device)
+            current_local = torch.empty(
+                (
+                    plan.num_ubatches,
+                    plan.num_lanes,
+                    current_capacity,
+                    self._cache_record_bytes,
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            current_gathered = torch.empty(
+                (
+                    plan.num_ubatches,
+                    plan.num_lanes,
+                    self.dcp_world_size * current_capacity,
+                    self._cache_record_bytes,
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            reservation = _CKVReservation(
+                CKVPrefetchRegistry(pool), current_local, current_gathered
+            )
+            reservations[key] = reservation
+            logger.info(
+                "Reserved CKV prefill storage: depth=%d lanes=%d bytes=%d "
+                "including native current-chunk exchange",
+                plan.effective_depth,
+                plan.num_ubatches * plan.num_lanes,
+                plan.total_nbytes + current_local.numel() + current_gathered.numel(),
+            )
+        self._ckv_reservation = reservation
+
+    @staticmethod
+    def reset_kv_cache_binding_state() -> None:
+        """Finish ring users and discard cache identities before cache rebinding."""
+        for reservations in _CKV_RESERVATIONS.values():
+            for reservation in reservations.values():
+                reservation.registry.clear()
+
+    @staticmethod
+    def begin_ckv_prefetch_step() -> None:
+        """Join interrupted gathers before this lane's native-cache updates."""
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+        from vllm.v1.worker.workspace import current_workspace_lane
+
+        lane = (dbo_current_ubatch_id(), current_workspace_lane())
+        for reservations in _CKV_RESERVATIONS.values():
+            for reservation in reservations.values():
+                state = reservation.registry.states.get(lane)
+                if state is not None and state.pending:
+                    state.begin_step(torch.cuda.current_stream())
+
+    def set_ckv_current_cache(self, original_cache: torch.Tensor) -> None:
+        """Supply stable cache identity after this layer's native producer runs."""
+        self._ckv_current_cache = original_cache
+
+    def _append_ckv_current_chunk(
+        self,
+        gathered: torch.Tensor,
+        metadata: B12xMLASparseMetadata,
+        original_cache: torch.Tensor,
+        lane: tuple[int, int],
+    ) -> None:
+        from b12x.attention._shared.mla.kv_cache import (
+            gather_ckv_current_chunk,
+            insert_ckv_current_chunk,
+        )
+
+        reservation = self._ckv_reservation
+        assert reservation is not None
+        assert metadata.global_cache_seq_lens_per_req is not None
+        assert metadata.dcp_rank_req_starts is not None
+        local = reservation.current_local[lane[0], lane[1]]
+        current = reservation.current_gathered[lane[0], lane[1]]
+        gather_ckv_current_chunk(
+            original_cache.view(torch.uint8),
+            local,
+            metadata.block_table,
+            metadata.global_cache_seq_lens_per_req,
+            metadata.query_start_loc,
+            dcp_rank=self.dcp_rank,
+            dcp_world_size=self.dcp_world_size,
+            interleave=metadata.cp_kv_cache_interleave_size,
+            num_reqs=metadata.num_reqs,
+            current_capacity=self._ckv_current_capacity,
+        )
+        _dcp_all_gather_current_stream(get_dcp_group(), local, current)
+        insert_ckv_current_chunk(
+            current,
+            gathered,
+            metadata.dcp_rank_req_starts,
+            metadata.global_cache_seq_lens_per_req,
+            metadata.query_start_loc,
+            dcp_world_size=self.dcp_world_size,
+            interleave=metadata.cp_kv_cache_interleave_size,
+            num_reqs=metadata.num_reqs,
+            current_capacity=self._ckv_current_capacity,
+            padded_tokens=metadata.dcp_padded_total_tokens,
+        )
+
+    def _queue_ckv_gather(
+        self,
+        state: CKVPrefetchState,
+        layer_idx: int,
+        cache: torch.Tensor,
+        metadata: B12xMLASparseMetadata,
+        stream: torch.cuda.Stream,
+        producer: torch.cuda.Stream,
+        *,
+        asynchronous: bool,
+    ) -> None:
+        from vllm.distributed.parallel_state import get_dcp_ckv_prefetch_group
+
+        local, gathered = state.prepare_gather(
+            layer_idx, stream, producer_stream=producer
+        )
+        try:
+            with torch.cuda.stream(stream):
+                self._gather_full_ckv(
+                    cache,
+                    metadata,
+                    local,
+                    gathered,
+                    group=get_dcp_ckv_prefetch_group() if asynchronous else None,
+                    history_only=asynchronous,
+                )
+        finally:
+            completion = torch.cuda.Event()
+            completion.record(stream)
+            state.finish_gather(layer_idx, completion)
+
+    def _consume_ckv(
+        self,
+        cache: torch.Tensor,
+        metadata: B12xMLASparseMetadata,
+        layer: AttentionLayer,
+        original_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, CKVPrefetchState, int]:
+        from vllm.model_executor.models.utils import extract_layer_index
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+        from vllm.v1.worker.workspace import current_workspace_lane
+
+        reservation = self._ckv_reservation
+        if reservation is None:
+            raise RuntimeError(
+                "CKV prefill storage was not reserved before KV admission"
+            )
+        lane = (dbo_current_ubatch_id(), current_workspace_lane())
+        state = reservation.registry.for_workspace(
+            reservation.registry.pool.storage, lane=lane
+        )
+        main_stream = torch.cuda.current_stream()
+        try:
+            layer_idx = extract_layer_index(getattr(layer, "layer_name", ""))
+        except (AttributeError, ValueError, AssertionError, IndexError):
+            layer_idx = 0
+            original_cache = None
+        can_prefetch = original_cache is not None
+        original_cache = cache if original_cache is None else original_cache
+        state.register_cache(layer_idx, original_cache)
+        state.enter_layer(layer_idx, main_stream)
+        prefetched = layer_idx in state.pending
+        if prefetched and not can_prefetch:
+            state.begin_step(main_stream)
+            prefetched = False
+        if not prefetched:
+            self._queue_ckv_gather(
+                state,
+                layer_idx,
+                original_cache,
+                metadata,
+                main_stream,
+                main_stream,
+                asynchronous=False,
+            )
+        gathered = state.consume(layer_idx, main_stream).view(
+            -1, self._kernel_page_size, self._cache_record_bytes
+        )
+        try:
+            if prefetched:
+                self._append_ckv_current_chunk(gathered, metadata, original_cache, lane)
+            if can_prefetch and reservation.registry.pool.plan.effective_depth:
+                targets = state.targets(layer_idx)
+                if targets:
+                    stream = state.get_gather_stream()
+                    for target in targets:
+                        self._queue_ckv_gather(
+                            state,
+                            target,
+                            state.layer_caches[target],
+                            metadata,
+                            stream,
+                            main_stream,
+                            asynchronous=True,
+                        )
+        except BaseException:
+            completion = torch.cuda.Event()
+            completion.record(main_stream)
+            state.finish_consumer(layer_idx, completion)
+            raise
+        return gathered, state, layer_idx
 
     def _use_decode_plan(
         self,
@@ -1472,7 +1760,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         for plan, input_num_heads, include_ckv in (
             (self._decode_plan, self._input_num_heads, False),
             (self._extend_plan, self._input_num_heads, False),
-            (self._ckv_extend_plan, self.num_heads, True),
+            (self._ckv_extend_plan, self.num_heads, False),
         ):
             manager.reserve_all(
                 *self._workspace_specs(
@@ -1597,6 +1885,71 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 )
                 self._run(binding)
 
+        reservation = self._ckv_reservation
+        if reservation is not None and reservation.registry.pool.plan.effective_depth:
+            from b12x.attention._shared.mla.kv_cache import (
+                gather_ckv_current_chunk,
+                gather_ckv_history,
+                insert_ckv_current_chunk,
+            )
+
+            # Empty request spans compile native-copy paths without reading KV.
+            device = kv_cache.device
+            starts = torch.zeros(2, dtype=torch.int32, device=device)
+            lengths = torch.zeros(1, dtype=torch.int32, device=device)
+            rank_spans = torch.zeros(
+                (self.dcp_world_size, 1), dtype=torch.int32, device=device
+            )
+            blocks = torch.full((1, 1), -1, dtype=torch.int32, device=device)
+            unit = self._ckv_local_capacity * self._cache_record_bytes
+            storage = reservation.registry.pool.storage
+            local = storage[:unit].view(
+                self._ckv_local_capacity, self._cache_record_bytes
+            )
+            gathered = storage[unit : unit * (1 + self.dcp_world_size)].view(
+                self.dcp_world_size * self._ckv_local_capacity, self._cache_record_bytes
+            )
+            gather_ckv_history(
+                kv_cache,
+                local,
+                blocks,
+                rank_spans,
+                rank_spans,
+                lengths,
+                starts,
+                dcp_rank=self.dcp_rank,
+                dcp_world_size=self.dcp_world_size,
+                interleave=self._ckv_interleave,
+                num_reqs=1,
+                padded_tokens=1,
+            )
+            current_local = reservation.current_local[0, 0]
+            current_gathered = reservation.current_gathered[0, 0]
+            gather_ckv_current_chunk(
+                kv_cache,
+                current_local,
+                blocks,
+                lengths,
+                starts,
+                dcp_rank=self.dcp_rank,
+                dcp_world_size=self.dcp_world_size,
+                interleave=self._ckv_interleave,
+                num_reqs=1,
+                current_capacity=self._ckv_current_capacity,
+            )
+            insert_ckv_current_chunk(
+                current_gathered,
+                gathered,
+                rank_spans,
+                lengths,
+                starts,
+                dcp_world_size=self.dcp_world_size,
+                interleave=self._ckv_interleave,
+                num_reqs=1,
+                current_capacity=self._ckv_current_capacity,
+                padded_tokens=1,
+            )
+
     def finalize_kv_cache_geometry(self, kernel_page_size: int) -> None:
         """Finalize kernel plans and workspace memory before KV profiling.
 
@@ -1623,6 +1976,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._set_kernel_page_size(kernel_page_size)
         self._reserve_attention_workspaces()
         self._kernel_page_size_finalized = True
+        if self._ckv_gather_enabled:
+            self._reserve_ckv_prefetch()
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         if getattr(self, "_uses_glm_dsa_nvfp4_cache", False) and (
@@ -1743,6 +2098,9 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         attn_metadata: B12xMLASparseMetadata,
         local_buffer: torch.Tensor,
         gathered_buffer: torch.Tensor,
+        *,
+        group: Any | None = None,
+        history_only: bool = False,
     ) -> torch.Tensor:
         if not self.uses_full_ckv_dcp(attn_metadata, attn_metadata.num_actual_tokens):
             raise RuntimeError("full CKV gather called for an ineligible batch")
@@ -1776,7 +2134,27 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         assert attn_metadata.dcp_local_cu_seq_lens is not None
         local_tokens = attn_metadata.dcp_local_total_tokens
         padded_tokens = attn_metadata.dcp_padded_total_tokens
-        if local_tokens:
+        if history_only:
+            from b12x.attention._shared.mla.kv_cache import gather_ckv_history
+
+            assert attn_metadata.dcp_rank_req_starts is not None
+            assert attn_metadata.dcp_rank_req_lens is not None
+            assert attn_metadata.global_cache_seq_lens_per_req is not None
+            gather_ckv_history(
+                kv_cache,
+                local_buffer,
+                attn_metadata.block_table,
+                attn_metadata.dcp_rank_req_starts,
+                attn_metadata.dcp_rank_req_lens,
+                attn_metadata.global_cache_seq_lens_per_req,
+                attn_metadata.query_start_loc,
+                dcp_rank=self.dcp_rank,
+                dcp_world_size=self.dcp_world_size,
+                interleave=attn_metadata.cp_kv_cache_interleave_size,
+                num_reqs=attn_metadata.num_reqs,
+                padded_tokens=padded_tokens,
+            )
+        elif local_tokens:
             ops.cp_gather_cache(
                 src_cache=kv_cache,
                 dst=local_buffer[:local_tokens],
@@ -1784,10 +2162,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 cu_seq_lens=attn_metadata.dcp_local_cu_seq_lens,
                 batch_size=attn_metadata.num_reqs,
             )
-        if local_tokens < padded_tokens:
+        if not history_only and local_tokens < padded_tokens:
             local_buffer[local_tokens:padded_tokens].zero_()
         _dcp_all_gather_current_stream(
-            get_dcp_group(),
+            get_dcp_group() if group is None else group,
             local_buffer[:padded_tokens].view(-1),
             gathered_buffer[: self.dcp_world_size * padded_tokens].view(-1),
         )
@@ -1802,7 +2180,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         attn_metadata: B12xMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        del layer
+        current_cache = getattr(self, "_ckv_current_cache", None)
+        self._ckv_current_cache = None
         cache_page_size = int(kv_c_and_k_pe_cache.shape[1])
         metadata_page_size = int(attn_metadata.block_size)
         if self._is_glm_next and (
@@ -1830,7 +2209,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         workspace_specs = self._workspace_specs(
             plan,
             input_num_heads=input_num_heads,
-            include_ckv=use_ckv_gather,
+            include_ckv=False,
         )
         workspaces = current_workspace_manager().get_simultaneous(*workspace_specs)
         q_buffer = workspaces[0]
@@ -1870,116 +2249,127 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         b12x_topk_sort.join(self.topk_indices_buffer.device)
         topk_indices = self.topk_indices_buffer[:num_tokens]
         kv_cache_for_run = kv_c_and_k_pe_cache
-        if use_ckv_gather:
-            local_buffer, gathered_buffer = workspaces[2:]
-            kv_cache_for_run = self._gather_full_ckv(
-                kv_c_and_k_pe_cache,
-                attn_metadata,
-                local_buffer,
-                gathered_buffer,
-            )
-            assert attn_metadata.ckv_selected_indices is not None
-            assert attn_metadata.ckv_active_counts is not None
-            assert attn_metadata.dcp_rank_req_starts is not None
-            assert attn_metadata.dcp_rank_req_lens is not None
-            selected_indices = attn_metadata.ckv_selected_indices[
-                :num_tokens, : topk_indices.shape[1]
-            ]
-            active_counts = attn_metadata.ckv_active_counts[:num_tokens]
-            _map_global_topk_to_gathered_ckv(
-                attn_metadata.req_id_per_token[:num_tokens],
-                topk_indices,
-                attn_metadata.dcp_rank_req_starts,
-                attn_metadata.dcp_rank_req_lens,
-                selected_indices,
-                active_counts,
-                dcp_size=self.dcp_world_size,
-                cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),
-                padded_rank_tokens=attn_metadata.dcp_padded_total_tokens,
-            )
-            assert attn_metadata.global_cache_seq_lens_per_req is not None
-            cache_seq_lens = _global_causal_lens_for_ckv_gather(
-                attn_metadata.global_cache_seq_lens_per_req,
-                attn_metadata.query_start_loc,
-                attn_metadata.req_id_per_token,
-                num_tokens,
-            ).contiguous()
-            torch.minimum(active_counts, cache_seq_lens, out=active_counts)
-            _mask_page_table_after_nsa_len(selected_indices, active_counts)
-        else:
-            physical_selection = (
-                self._physical_selection_provider.get_b12x_physical_selection(
-                    num_tokens=num_tokens,
-                    num_prefills=int(attn_metadata.num_prefills),
-                    num_decode_tokens=int(attn_metadata.num_decode_tokens),
-                )
-                if self._physical_selection_provider is not None
-                else None
-            )
-            if physical_selection is not None:
-                selected_indices, active_counts = physical_selection
-            elif self.dcp_world_size > 1:
-                block_stride_rows = _selected_index_block_stride_rows(
+        ckv_state = None
+        ckv_layer_idx = 0
+        try:
+            if use_ckv_gather:
+                kv_cache_for_run, ckv_state, ckv_layer_idx = self._consume_ckv(
                     kv_c_and_k_pe_cache,
-                    block_size=attn_metadata.block_size,
+                    attn_metadata,
+                    layer,
+                    current_cache,
                 )
-                selected_indices, active_counts = triton_filter_and_convert_dcp_index(
+                assert attn_metadata.ckv_selected_indices is not None
+                assert attn_metadata.ckv_active_counts is not None
+                assert attn_metadata.dcp_rank_req_starts is not None
+                assert attn_metadata.dcp_rank_req_lens is not None
+                selected_indices = attn_metadata.ckv_selected_indices[
+                    :num_tokens, : topk_indices.shape[1]
+                ]
+                active_counts = attn_metadata.ckv_active_counts[:num_tokens]
+                _map_global_topk_to_gathered_ckv(
                     attn_metadata.req_id_per_token[:num_tokens],
-                    attn_metadata.block_table,
                     topk_indices,
+                    attn_metadata.dcp_rank_req_starts,
+                    attn_metadata.dcp_rank_req_lens,
+                    selected_indices,
+                    active_counts,
                     dcp_size=self.dcp_world_size,
-                    dcp_rank=self.dcp_rank,
                     cp_kv_cache_interleave_size=(
                         attn_metadata.cp_kv_cache_interleave_size
                     ),
-                    BLOCK_SIZE=attn_metadata.block_size,
-                    BLOCK_STRIDE_ROWS=block_stride_rows,
-                    NUM_TOPK_TOKENS=topk_indices.shape[1],
-                    return_valid_counts=True,
+                    padded_rank_tokens=attn_metadata.dcp_padded_total_tokens,
                 )
-            elif not self._is_glm_next:
-                selected_indices = topk_indices
-                cache_seq_lens_per_token = attn_metadata.cache_seq_lens_per_token
-                assert cache_seq_lens_per_token is not None
-                active_counts = cache_seq_lens_per_token[:num_tokens]
+                assert attn_metadata.global_cache_seq_lens_per_req is not None
+                cache_seq_lens = _global_causal_lens_for_ckv_gather(
+                    attn_metadata.global_cache_seq_lens_per_req,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.req_id_per_token,
+                    num_tokens,
+                ).contiguous()
+                torch.minimum(active_counts, cache_seq_lens, out=active_counts)
+                _mask_page_table_after_nsa_len(selected_indices, active_counts)
             else:
-                block_stride_rows = _selected_index_block_stride_rows(
-                    kv_c_and_k_pe_cache,
-                    block_size=attn_metadata.block_size,
-                )
-                selected_indices, active_counts = (
-                    triton_convert_req_index_to_global_index(
-                        attn_metadata.req_id_per_token[:num_tokens],
-                        attn_metadata.block_table,
-                        topk_indices,
-                        BLOCK_SIZE=attn_metadata.block_size,
-                        BLOCK_STRIDE_ROWS=block_stride_rows,
-                        NUM_TOPK_TOKENS=topk_indices.shape[1],
-                        return_valid_counts=True,
+                physical_selection = (
+                    self._physical_selection_provider.get_b12x_physical_selection(
+                        num_tokens=num_tokens,
+                        num_prefills=int(attn_metadata.num_prefills),
+                        num_decode_tokens=int(attn_metadata.num_decode_tokens),
                     )
+                    if self._physical_selection_provider is not None
+                    else None
                 )
+                if physical_selection is not None:
+                    selected_indices, active_counts = physical_selection
+                elif self.dcp_world_size > 1:
+                    block_stride_rows = _selected_index_block_stride_rows(
+                        kv_c_and_k_pe_cache,
+                        block_size=attn_metadata.block_size,
+                    )
+                    selected_indices, active_counts = (
+                        triton_filter_and_convert_dcp_index(
+                            attn_metadata.req_id_per_token[:num_tokens],
+                            attn_metadata.block_table,
+                            topk_indices,
+                            dcp_size=self.dcp_world_size,
+                            dcp_rank=self.dcp_rank,
+                            cp_kv_cache_interleave_size=(
+                                attn_metadata.cp_kv_cache_interleave_size
+                            ),
+                            BLOCK_SIZE=attn_metadata.block_size,
+                            BLOCK_STRIDE_ROWS=block_stride_rows,
+                            NUM_TOPK_TOKENS=topk_indices.shape[1],
+                            return_valid_counts=True,
+                        )
+                    )
+                elif not self._is_glm_next:
+                    selected_indices = topk_indices
+                    cache_seq_lens_per_token = attn_metadata.cache_seq_lens_per_token
+                    assert cache_seq_lens_per_token is not None
+                    active_counts = cache_seq_lens_per_token[:num_tokens]
+                else:
+                    block_stride_rows = _selected_index_block_stride_rows(
+                        kv_c_and_k_pe_cache,
+                        block_size=attn_metadata.block_size,
+                    )
+                    selected_indices, active_counts = (
+                        triton_convert_req_index_to_global_index(
+                            attn_metadata.req_id_per_token[:num_tokens],
+                            attn_metadata.block_table,
+                            topk_indices,
+                            BLOCK_SIZE=attn_metadata.block_size,
+                            BLOCK_STRIDE_ROWS=block_stride_rows,
+                            NUM_TOPK_TOKENS=topk_indices.shape[1],
+                            return_valid_counts=True,
+                        )
+                    )
 
-        if not use_ckv_gather:
-            if self._is_glm_next:
-                cache_seq_lens = attn_metadata.cache_seq_lens_per_token
-                assert cache_seq_lens is not None
-                cache_seq_lens = cache_seq_lens[:num_tokens].contiguous()
-            else:
-                cache_seq_lens = attn_metadata.seq_lens[
-                    : attn_metadata.num_reqs
-                ].contiguous()
-        binding = self._bind(
-            plan,
-            scratch=scratch,
-            q=q_all,
-            kv_cache=kv_cache_for_run,
-            selected_indices=selected_indices,
-            cache_lengths=cache_seq_lens,
-            selected_lengths=active_counts,
-        )
-        result = self._run(binding)
-        if self.need_to_return_lse_for_decode:
-            output, lse = result
-            return output, lse
-        assert isinstance(result, torch.Tensor)
-        return result, None
+            if not use_ckv_gather:
+                if self._is_glm_next:
+                    cache_seq_lens = attn_metadata.cache_seq_lens_per_token
+                    assert cache_seq_lens is not None
+                    cache_seq_lens = cache_seq_lens[:num_tokens].contiguous()
+                else:
+                    cache_seq_lens = attn_metadata.seq_lens[
+                        : attn_metadata.num_reqs
+                    ].contiguous()
+            binding = self._bind(
+                plan,
+                scratch=scratch,
+                q=q_all,
+                kv_cache=kv_cache_for_run,
+                selected_indices=selected_indices,
+                cache_lengths=cache_seq_lens,
+                selected_lengths=active_counts,
+            )
+            result = self._run(binding)
+            if self.need_to_return_lse_for_decode:
+                output, lse = result
+                return output, lse
+            assert isinstance(result, torch.Tensor)
+            return result, None
+        finally:
+            if ckv_state is not None:
+                completion = torch.cuda.Event()
+                completion.record(torch.cuda.current_stream())
+                ckv_state.finish_consumer(ckv_layer_idx, completion)

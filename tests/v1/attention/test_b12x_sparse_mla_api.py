@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Behavior checks for the B12x sparse MLA adapters."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -796,6 +797,199 @@ def test_b12x_full_ckv_gather_capture_fallback_ignores_runtime_metadata(
     assert not impl.uses_full_ckv_dcp(SimpleNamespace(), 128)
 
 
+@pytest.mark.parametrize("depth", [0, 1])
+def test_full_ckv_prefetch_backend_inserts_changed_chunks_and_reuses_cache_identity(
+    monkeypatch: pytest.MonkeyPatch, depth: int
+) -> None:
+    from vllm.v1.attention.backends.mla.ckv_prefetch import (
+        CKVPrefetchPlan,
+        CKVPrefetchRegistry,
+        CKVWorkspacePool,
+    )
+
+    log: list[tuple[Any, ...]] = []
+
+    class Event:
+        def record(self, stream):
+            log.append(("record", stream.name))
+
+        def synchronize(self):
+            log.append(("synchronize",))
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            log.append(("wait", self.name))
+
+        def wait_stream(self, stream):
+            log.append(("producer", self.name, stream.name))
+
+    main, side = Stream("main"), Stream("side")
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **_: side)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    group = object()
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dcp_ckv_prefetch_group", lambda: group
+    )
+    plan = CKVPrefetchPlan.create(
+        requested_depth=depth,
+        budget_bytes=0,
+        dcp_world_size=2,
+        local_capacity=4,
+        record_bytes=656,
+    )
+    pool = CKVWorkspacePool(plan, torch.device("cpu"))
+    reservation = b12x_mla_sparse._CKVReservation(
+        CKVPrefetchRegistry(pool),
+        torch.empty((1, 1, 4, 656), dtype=torch.uint8),
+        torch.empty((1, 1, 8, 656), dtype=torch.uint8),
+    )
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._ckv_reservation = reservation
+    impl._kernel_page_size = 2
+    impl._cache_record_bytes = 656
+    gathers, appends = [], []
+
+    def gather(cache, metadata, local, output, *, group=None, history_only=False):
+        assert history_only is (group is not None)
+        gathers.append(group)
+        output.fill_(int(cache.view(torch.uint8).flatten()[0]))
+        return output.view(-1, 2, 656)
+
+    def append(output, metadata, original_cache, lane):
+        appends.append(original_cache)
+        output.copy_(original_cache.repeat(2, 1, 1))
+
+    impl._gather_full_ckv = gather
+    impl._append_ckv_current_chunk = append
+    caches = [torch.full((2, 2, 656), i, dtype=torch.uint8) for i in range(3)]
+    metadata = SimpleNamespace()
+    for execution in range(2):
+        for layer_idx, cache in enumerate(caches):
+            value = execution * 10 + layer_idx
+            cache.fill_(value)
+            layer = SimpleNamespace(layer_name=f"model.layers.{layer_idx}.self_attn")
+            output, state, index = impl._consume_ckv(
+                cache.view(torch.float8_e4m3fn), metadata, layer, cache
+            )
+            assert output.flatten()[0] == value
+            assert state.layer_caches[layer_idx] is cache
+            state.finish_consumer(index, Event())
+    assert len(appends) == (2 if depth else 0)
+    if depth:
+        assert appends[0] is caches[1] and appends[1] is caches[2]
+    assert sum(item is group for item in gathers) == (2 if depth else 0)
+    assert ("producer", "side", "main") in log if depth else True
+    reservation.registry.clear()
+
+
+@pytest.mark.parametrize("capacity,depth", [(8, 1), (256, 0)])
+def test_full_ckv_reservation_is_shared_and_charged_for_every_lane(
+    monkeypatch, capacity, depth
+) -> None:
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=2, num_lanes=2)
+    monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    monkeypatch.setenv("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", "1")
+    monkeypatch.setenv("VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB", "1")
+    communicator_calls = []
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.ensure_dcp_ckv_prefetch_group",
+        lambda: communicator_calls.append(True),
+        raising=False,
+    )
+    implementations = []
+    for _ in range(2):
+        impl = object.__new__(B12xMLASparseImpl)
+        impl._is_glm_dsa = True
+        impl.dcp_world_size = 4
+        impl._ckv_local_capacity = capacity
+        impl._ckv_current_capacity = 8
+        impl._cache_record_bytes = 656
+        impl._max_tokens = 32
+        impl._decode_plan = SimpleNamespace(
+            caps=SimpleNamespace(device=torch.device("cpu"))
+        )
+        impl._reserve_ckv_prefetch()
+        implementations.append(impl)
+    first, second = implementations
+    assert first._ckv_reservation is second._ckv_reservation
+    reservation = first._ckv_reservation
+    assert reservation.registry.pool.plan.effective_depth == depth
+    assert (
+        reservation.registry.pool.storage.numel()
+        == 4 * (1 + 4 * (depth + 1)) * capacity * 656
+    )
+    assert reservation.current_local.shape == (2, 2, 8 if depth else 0, 656)
+    assert reservation.current_gathered.shape == (2, 2, 32 if depth else 0, 656)
+    assert communicator_calls == ([True] if depth else [])
+    first.reset_kv_cache_binding_state()
+
+
+@pytest.mark.parametrize("record_bytes", [656, 368])
+def test_full_ckv_current_chunk_copies_producer_bytes_without_requantization(
+    monkeypatch, record_bytes
+) -> None:
+    from b12x.attention._shared.mla import kv_cache as native
+
+    impl = object.__new__(B12xMLASparseImpl)
+    impl.dcp_world_size = 4
+    impl.dcp_rank = 0
+    impl._ckv_current_capacity = 3
+    local = torch.empty((1, 1, 3, record_bytes), dtype=torch.uint8)
+    current = torch.empty((1, 1, 12, record_bytes), dtype=torch.uint8)
+    impl._ckv_reservation = b12x_mla_sparse._CKVReservation(None, local, current)
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
+        global_cache_seq_lens_per_req=torch.tensor([17, 9], dtype=torch.int32),
+        dcp_rank_req_starts=torch.zeros((4, 2), dtype=torch.int32),
+        block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+        num_reqs=2,
+        dcp_padded_total_tokens=16,
+        cp_kv_cache_interleave_size=4,
+    )
+    gathered = torch.empty((4, 16, record_bytes), dtype=torch.uint8)
+    calls = []
+
+    def pack(source, output, blocks, lengths, starts, **kwargs):
+        assert source.dtype == torch.uint8
+        assert blocks is metadata.block_table
+        assert lengths is metadata.global_cache_seq_lens_per_req
+        assert starts is metadata.query_start_loc
+        assert kwargs == dict(
+            dcp_rank=0, dcp_world_size=4, interleave=4, num_reqs=2, current_capacity=3
+        )
+        output.copy_(source.view(3, record_bytes))
+        calls.append("pack")
+
+    def exchange(group, source, output):
+        output.copy_(source.repeat(4, 1))
+        calls.append("exchange")
+
+    def insert(source, output, rank_starts, lengths, starts, **kwargs):
+        assert output is gathered
+        assert rank_starts is metadata.dcp_rank_req_starts
+        assert kwargs["current_capacity"] == 3
+        assert kwargs["padded_tokens"] == 16
+        output.view(-1, record_bytes)[:12].copy_(source)
+        calls.append("insert")
+
+    monkeypatch.setattr(native, "gather_ckv_current_chunk", pack)
+    monkeypatch.setattr(native, "insert_ckv_current_chunk", insert)
+    monkeypatch.setattr(b12x_mla_sparse, "_dcp_all_gather_current_stream", exchange)
+    monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda: object())
+    for value in (1, 199):
+        producer_bytes = torch.full((1, 3, record_bytes), value, dtype=torch.uint8)
+        impl._append_ckv_current_chunk(gathered, metadata, producer_bytes, (0, 0))
+        assert torch.all(gathered.view(-1, record_bytes)[:12] == value)
+    assert calls == ["pack", "exchange", "insert"] * 2
+
+
 @pytest.mark.parametrize("override", [{"enabled": False}, {"dcp_world_size": 1}])
 def test_b12x_full_ckv_gather_requires_enabled_dcp(override: dict[str, Any]) -> None:
     args = dict(
@@ -1259,6 +1453,7 @@ def test_b12x_glm_dsa_nvfp4_cache_writer_keeps_rope() -> None:
 def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> None:
     planned: list[SimpleNamespace] = []
     reservations: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = []
+    persistent_geometry: list[tuple[int, int, int, bool]] = []
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(
         b12x_mla_sparse,
@@ -1316,9 +1511,18 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
     impl._ckv_gather_enabled = True
     impl._ckv_capacity_tokens = 131200
     impl._ckv_local_capacity = 131200
+    impl._ckv_interleave = 1
     impl._decode_plan = SimpleNamespace()
     impl._extend_plan = SimpleNamespace()
     impl._ckv_extend_plan = SimpleNamespace()
+    impl._reserve_ckv_prefetch = lambda: persistent_geometry.append(
+        (
+            impl._kernel_page_size,
+            impl._ckv_local_capacity,
+            impl._cache_record_bytes,
+            impl._kernel_page_size_finalized,
+        )
+    )
     owner = SimpleNamespace(impl=impl, indexer=None)
     cache = torch.empty((2, 1, 2304, 528), dtype=torch.uint8)
 
@@ -1356,9 +1560,8 @@ def test_b12x_glm5_next_cache_geometry_is_finalized_before_bind(monkeypatch) -> 
     assert reservations[2] == (
         ((4096, 16, 512), torch.bfloat16),
         ((256,), torch.uint8),
-        ((131328, 528), torch.uint8),
-        ((525312, 528), torch.uint8),
     )
+    assert persistent_geometry == [(2304, 131328, 528, True)]
 
     with pytest.raises(RuntimeError, match="immutable after finalization"):
         impl.finalize_kv_cache_geometry(64)
@@ -1463,6 +1666,7 @@ def test_b12x_sparse_mla_reserves_largest_planned_workspace(monkeypatch) -> None
     )
 
     impl = object.__new__(B12xMLASparseImpl)
+    impl._ckv_gather_enabled = False
     impl._max_tokens = 64
     impl._input_num_heads = 8
     impl._q_head_dim = 512

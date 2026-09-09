@@ -42,7 +42,7 @@ class DCPPrefillDecision:
 class DCPPrefillPolicy:
     """Validated configuration for optional prefill routing.
 
-    ``preserved`` delegates to the configured manager transport and
+    ``configured`` delegates to the configured manager transport and
     projection. A non-positive A2A cap means uncapped A2A. Token minima are exclusive.
     The attention layer must consume the decision before issuing collectives.
     """

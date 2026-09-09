@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
+    VLLM_B12X_MLA_PREFILL_QUERY_BMM: bool = False
     VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB: int = 1024
     VLLM_DCP_QUERY_SPLIT: bool = False
     VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS: int = 0
@@ -1700,6 +1701,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Persistent gathered history uses depth+1 slots per execution lane.
     # A zero byte budget is uncapped; every reservation is still accounted.
+    # Optional caller-owned BF16 query projection for eligible DCP prefill.
+    "VLLM_B12X_MLA_PREFILL_QUERY_BMM": lambda: bool(
+        int(os.getenv("VLLM_B12X_MLA_PREFILL_QUERY_BMM", "0"))
+    ),
     "VLLM_B12X_MLA_CKV_PREFETCH_DEPTH": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", "1")
     ),

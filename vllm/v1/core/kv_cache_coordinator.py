@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
+from vllm.distributed.indexer_kv_geometry import effective_kv_shards
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
@@ -518,8 +519,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         self.block_size = self.kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1:
-            self.block_size *= dcp_world_size
+        self.block_size *= effective_kv_shards(self.kv_cache_spec, dcp_world_size)
         # For models using only Mamba, block_size is set to max_model_len when
         # prefix caching is disabled, and hash_block_size validation is skipped.
         assert not enable_caching or (hash_block_size == self.block_size), (
@@ -610,6 +610,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self.pcp_world_size = pcp_world_size
         self.has_dcp_replicated_group = any(
             getattr(group.kv_cache_spec, "dcp_replicated", False)
+            or getattr(group.kv_cache_spec, "dcp_kv_shard_count", None) is not None
             for group in kv_cache_config.kv_cache_groups
         )
         group_block_sizes = [

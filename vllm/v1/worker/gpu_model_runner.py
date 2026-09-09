@@ -41,6 +41,7 @@ from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
+from vllm.distributed.indexer_kv_geometry import effective_kv_shards
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     copy_kv_blocks,
@@ -6792,6 +6793,7 @@ class GPUModelRunner(
             delattr(self, "kv_cache_config")
         self.cache_config.num_gpu_blocks = None
 
+        self._reset_attention_kv_cache_bindings()
         unbind_kv_cache(self.compilation_config.static_forward_context)
         self._mamba_bufs = None
 
@@ -7455,6 +7457,7 @@ class GPUModelRunner(
         block_sizes = []
         max_num_blocks = []
         slot_mapping_modes = []
+        dcp_kv_shard_counts = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -7463,6 +7466,9 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_spec.block_size
             block_sizes.append(block_size)
+            dcp_kv_shard_counts.append(
+                effective_kv_shards(kv_cache_spec, self.dcp_world_size)
+            )
             if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
                 slot_mapping_modes.append(SlotMappingMode.NONE)
             else:
@@ -7477,11 +7483,13 @@ class GPUModelRunner(
             or kernel_block_sizes != self._init_kernel_block_sizes
             or max_num_blocks != self._init_max_num_blocks
             or slot_mapping_modes != self._init_slot_mapping_modes
+            or dcp_kv_shard_counts != getattr(self, "_init_dcp_kv_shard_counts", None)
         ):
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
             self._init_max_num_blocks = max_num_blocks
             self._init_slot_mapping_modes = slot_mapping_modes
+            self._init_dcp_kv_shard_counts = dcp_kv_shard_counts
             # Capture warmup providers registered after final KV-cache geometry is known
             with self.jit_warmup_registry.activate():
                 self.input_batch = InputBatch(
@@ -7501,6 +7509,7 @@ class GPUModelRunner(
                     reasoning_config=self.vllm_config.reasoning_config,
                     use_replayssm=self.cache_config.use_replayssm,
                     slot_mapping_modes=slot_mapping_modes,
+                    dcp_kv_shard_counts=dcp_kv_shard_counts,
                 )
 
         assert self._init_block_sizes == block_sizes, (
@@ -7587,6 +7596,21 @@ class GPUModelRunner(
                 else:
                     break
 
+    def _reset_attention_kv_cache_bindings(self) -> None:
+        """Complete persistent attention users before replacing native caches."""
+        hooks = {
+            hook
+            for layer in self.compilation_config.static_forward_context.values()
+            if (
+                hook := getattr(
+                    getattr(layer, "impl", None), "reset_kv_cache_binding_state", None
+                )
+            )
+            is not None
+        }
+        for hook in hooks:
+            hook()
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
@@ -7598,6 +7622,7 @@ class GPUModelRunner(
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        self._reset_attention_kv_cache_bindings()
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None

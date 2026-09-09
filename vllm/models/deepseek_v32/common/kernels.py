@@ -129,8 +129,9 @@ def _fused_norm_rope_kernel(
     index_k_out_ptr,
     index_k_out_stride,
     INDEX_K_HALF_ROT_DIM: tl.constexpr,
-    # Cache params (shared by indexer K and MLA)
+    # Cache ownership can differ between attention and indexer KV groups.
     slot_mapping_ptr,
+    indexer_slot_mapping_ptr,
     # Index K FP8 cache
     indexer_cache_ptr,
     indexer_cache_scale_ptr,
@@ -181,12 +182,18 @@ def _fused_norm_rope_kernel(
             )
         return
 
-    if slot_mapping_ptr is None:
-        if kv_out_ptr is None and kpe_out_ptr is None and index_k_out_ptr is None:
+    if pid == 0:
+        if indexer_slot_mapping_ptr is None:
+            if index_k_out_ptr is None:
+                return
+        elif tl.load(indexer_slot_mapping_ptr + tok_idx) < 0:
             return
-    elif tl.load(slot_mapping_ptr + tok_idx) < 0:
-        # Padding
-        return
+    else:
+        if slot_mapping_ptr is None:
+            if kv_out_ptr is None and kpe_out_ptr is None and index_k_out_ptr is None:
+                return
+        elif tl.load(slot_mapping_ptr + tok_idx) < 0:
+            return
 
     if pid == 2:
         # Q RMS norm
@@ -386,8 +393,8 @@ def _fused_norm_rope_kernel(
             )
 
         # PCP inserts index K after gathering; other paths write it directly.
-        if indexer_cache_ptr is not None and slot_mapping_ptr is not None:
-            slot_idx = tl.load(slot_mapping_ptr + tok_idx)
+        if indexer_cache_ptr is not None and indexer_slot_mapping_ptr is not None:
+            slot_idx = tl.load(indexer_slot_mapping_ptr + tok_idx)
             _fp8_quant_and_cache_write(
                 result,
                 index_k_mask,
@@ -417,7 +424,7 @@ def fused_norm_rope(
     index_k_layer_norm_eps: float,
     index_k_rope_cos_sin_cache: torch.Tensor | None,
     topk_indices_buffer: torch.Tensor,
-    # Cache params for fused writes (single slot_mapping for both caches)
+    # Attention slots; indexer slots default to the same mapping.
     slot_mapping: torch.Tensor | None = None,
     indexer_k_cache: torch.Tensor | None = None,
     mla_kv_cache: torch.Tensor | None = None,
@@ -430,6 +437,7 @@ def fused_norm_rope(
     k_pe_out: torch.Tensor | None = None,
     index_k_out: torch.Tensor | None = None,
     materialize_nonlocal_mla_inputs: bool = False,
+    indexer_slot_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert positions.ndim == 1
     assert q_c.ndim == 2
@@ -465,14 +473,17 @@ def fused_norm_rope(
     assert index_k_rope_cos_sin_cache is not None
     index_k_dim = index_k.shape[-1]
     topk = topk_indices_buffer.shape[-1]
-    if indexer_k_cache is not None or mla_kv_cache is not None:
+    if indexer_slot_mapping is None:
+        indexer_slot_mapping = slot_mapping
+    if mla_kv_cache is not None:
         assert slot_mapping is not None
-    else:
+    if indexer_k_cache is None and mla_kv_cache is None:
         slot_mapping = None
+        indexer_slot_mapping = None
 
     # --- Indexer K cache setup ---
     if indexer_k_cache is not None:
-        assert slot_mapping is not None
+        assert indexer_slot_mapping is not None
         idx_cache_scale_view = indexer_k_cache.view(torch.uint8).view(torch.float32)
         idx_cache_block_size = indexer_k_cache.shape[1]
         idx_cache_block_stride = indexer_k_cache.stride(0)
@@ -575,11 +586,12 @@ def fused_norm_rope(
         index_k_rope_cos_sin_cache.shape[-1] // 2,
         # Cache params
         slot_mapping,
+        indexer_slot_mapping,
         indexer_k_cache,
         idx_cache_scale_view,
         idx_cache_block_size,
         idx_cache_block_stride,
-        # MLA KV cache (uses same slot_mapping)
+        # MLA KV cache
         mla_kv_cache,
         mla_block_size,
         mla_block_stride,

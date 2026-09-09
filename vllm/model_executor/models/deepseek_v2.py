@@ -45,6 +45,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.distributed.indexer_kv_geometry import indexer_layer_shards
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import (
@@ -698,7 +699,37 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
-        compilation_config = get_current_vllm_config().compilation_config
+        vllm_config = get_current_vllm_config()
+        parallel_config = vllm_config.parallel_config
+        try:
+            layer_index = extract_layer_index(prefix)
+        except (AssertionError, IndexError, ValueError):
+            layer_index = None
+        self.dcp_shard_count = indexer_layer_shards(
+            dcp_size=parallel_config.decode_context_parallel_size,
+            pcp_size=parallel_config.prefill_context_parallel_size,
+            requested_shards=envs.VLLM_DCP_INDEXER_SHARDS,
+            replicate_cache=envs.VLLM_DCP_REPLICATE_INDEXER_CACHE,
+            layer_index=layer_index,
+            target_layers=getattr(
+                vllm_config.model_config.hf_config, "num_hidden_layers", None
+            ),
+            b12x_enabled=self.get_attn_backend().get_name() == "B12X_INDEXER",
+        )
+        configured_shards = (
+            parallel_config.decode_context_parallel_size
+            * parallel_config.prefill_context_parallel_size
+        )
+        self.dcp_kv_shard_count = (
+            self.dcp_shard_count if self.dcp_shard_count != configured_shards else None
+        )
+        logger.info_once(
+            "Indexer KV geometry: shards=%d attention_shards=%d layer=%s",
+            self.dcp_shard_count,
+            configured_shards,
+            prefix,
+        )
+        compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
@@ -714,6 +745,7 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            dcp_kv_shard_count=self.dcp_kv_shard_count,
         )  # Only has one vector instead of K + V
 
     def forward(self): ...

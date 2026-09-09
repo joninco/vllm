@@ -335,6 +335,7 @@ def _merge_dcp_topk(
     dcp_rank: int,
     dcp_world_size: int,
     interleave: int,
+    shard_group=None,
 ) -> None:
     if dcp_world_size <= 1 or indices.numel() == 0:
         return
@@ -357,11 +358,93 @@ def _merge_dcp_topk(
     pack_dcp_candidates(indices, scores, packed, dcp_rank, dcp_world_size, interleave)
     from vllm.v1.attention.ops.b12x_dcp import active_dcp_transport
 
-    binding = active_dcp_transport()
+    # Captured DCP transport is bound to the attention group's geometry.
+    # Optional indexer replicas use their own communicator.
+    group = get_dcp_group() if shard_group is None else shard_group
+    binding = active_dcp_transport() if shard_group is None else None
     if binding is not None and binding.merge_candidates(packed, indices):
         return
-    _gather_dcp_candidates(get_dcp_group(), packed, gathered)
+    _gather_dcp_candidates(group, packed, gathered)
     rank_major_topk(gathered, indices)
+
+
+def _prefill_owner_shapes(rows: int, topk: int, shards: int):
+    return (
+        ((rows, topk), torch.float32),
+        ((rows, topk, 2), torch.float32),
+        ((rows, topk, 2), torch.float32),
+        ((rows // shards, topk), torch.int32),
+    )
+
+
+def _is_target_indexer(prefix: str, target_layers: int) -> bool:
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    try:
+        index = extract_layer_index(prefix)
+    except (AssertionError, IndexError, ValueError):
+        return False
+    return 0 <= index < target_layers
+
+
+def _restore_prefill_indices(group, local: torch.Tensor, output: torch.Tensor) -> None:
+    """Restore row order using nonaliasing input for every collective backend."""
+    rows = local.shape[0]
+    expected = output.narrow(0, group.rank_in_group * rows, rows)
+    if (
+        output.shape[0] != rows * group.world_size
+        or expected.data_ptr() != local.data_ptr()
+    ):
+        raise RuntimeError("Query-split output must alias its replica row interval")
+    (send,) = current_workspace_manager().get_simultaneous(
+        (tuple(local.shape), torch.int32)
+    )
+    send.copy_(local)
+    _gather_dcp_candidates(group, send, output.view(group.world_size, rows, -1))
+
+
+def _merge_prefill_topk_by_owner(
+    indices: torch.Tensor,
+    scores: torch.Tensor,
+    output: torch.Tensor,
+    shard_group,
+    tp_group,
+    interleave: int,
+) -> bool:
+    """Select each row once using the same stable selector as replicated DCP."""
+    shards = int(shard_group.world_size)
+    rows, topk = indices.shape
+    if shards <= 1 or rows == 0 or rows % shards:
+        return False
+    if tp_group.world_size % shards:
+        return False
+    replicas = tp_group.world_size // shards
+    if output.shape != (rows * replicas, topk):
+        return False
+    rank = tp_group.rank_in_group
+    if rank % shards != shard_group.rank_in_group:
+        raise RuntimeError("Owner merge requires matching TP and indexer shard order")
+    local = output.narrow(0, (rank // shards) * rows, rows)
+    if local.data_ptr() != indices.data_ptr():
+        raise RuntimeError("Owner merge input must alias its TP query partition")
+    from b12x.comm.pcie.dcp_candidate_topk import pack_dcp_candidates, rank_major_topk
+
+    score_view, packed, received, selected = (
+        current_workspace_manager().get_simultaneous(
+            *_prefill_owner_shapes(rows, topk, shards)
+        )
+    )
+    if score_view.data_ptr() != scores.data_ptr():
+        raise RuntimeError("Owner scores must use the reserved workspace prefix")
+    pack_dcp_candidates(
+        indices, scores, packed, shard_group.rank_in_group, shards, interleave
+    )
+    dist.all_to_all_single(received, packed, group=shard_group.device_group)
+    rank_major_topk(received.view(shards, rows // shards, topk, 2), selected)
+    _gather_dcp_candidates(
+        tp_group, selected, output.view(tp_group.world_size, rows // shards, topk)
+    )
+    return True
 
 
 class B12xSparseIndexer(nn.Module):
@@ -406,7 +489,16 @@ class B12xSparseIndexer(nn.Module):
         self.topk_tokens = int(topk_tokens)
         self.max_model_len = int(max_model_len)
         self.topk_indices_buffer = topk_indices_buffer
-        self.output_physical_slots = bool(output_physical_slots)
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        self.attention_dcp_world_size = (
+            vllm_config.parallel_config.decode_context_parallel_size
+        )
+        # Attention DCP consumes global token IDs even when indexer KV is local.
+        self.output_physical_slots = bool(output_physical_slots) and (
+            self.attention_dcp_world_size == 1
+        )
         # Deterministic selection order (b12x_topk_sort): plans whose row
         # count is within the sort gate emit logical positions, which the
         # sort rewrites ascending and converts to physical slots in place.
@@ -426,9 +518,6 @@ class B12xSparseIndexer(nn.Module):
             max(1, (self.max_model_len + _INDEX_PAGE_SIZE - 1) // _INDEX_PAGE_SIZE),
             _INDEX_PAGE_SIZE,
         )
-        from vllm.config import get_current_vllm_config
-
-        vllm_config = get_current_vllm_config()
         scheduler_config = vllm_config.scheduler_config
         parallel_config = vllm_config.parallel_config
         max_num_seqs = int(scheduler_config.max_num_seqs)
@@ -469,9 +558,50 @@ class B12xSparseIndexer(nn.Module):
             rows: make_plan(mode="prefill", q_rows=rows)
             for rows in self._prefill_plan_sizes
         }
-        self.dcp_world_size = parallel_config.decode_context_parallel_size
-        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.dcp_world_size = getattr(
+            k_cache, "dcp_shard_count", self.attention_dcp_world_size
+        )
+        self.dcp_rank = (
+            get_dcp_group().rank_in_group % self.dcp_world_size
+            if self.dcp_world_size > 1
+            else 0
+        )
+        self._indexer_shard_group = None
+        if 1 < self.dcp_world_size < self.attention_dcp_world_size:
+            from vllm.distributed.parallel_state import get_indexer_dcp_group
+
+            self._indexer_shard_group = get_indexer_dcp_group(self.dcp_world_size)
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self._prefill_query_group = None
+        self._prefill_shard_group = None
+        self._prefill_owner_merge = False
+        self._prefill_min_context = 0
+        if self.attention_dcp_world_size > 1 and envs.VLLM_DCP_QUERY_SPLIT:
+            from vllm.distributed.parallel_state import (
+                get_indexer_dcp_group,
+                get_indexer_query_split_group,
+            )
+
+            target_layers = getattr(
+                vllm_config.model_config.hf_config, "num_hidden_layers", 0
+            )
+            if _is_target_indexer(k_cache.prefix, target_layers):
+                self._prefill_query_group = get_indexer_query_split_group(
+                    self.dcp_world_size
+                )
+                self._prefill_shard_group = get_indexer_dcp_group(self.dcp_world_size)
+                self._prefill_owner_merge = envs.VLLM_DCP_TOPK_OWNER_MERGE
+                self._prefill_min_context = envs.VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS
+                if self._prefill_min_context < 0:
+                    raise ValueError("Query split minimum context must be nonnegative")
+                logger.info_once(
+                    "DCP indexer prefill: shards=%d replicas=%d "
+                    "owner_merge=%s min_context=%d",
+                    self.dcp_world_size,
+                    self._prefill_query_group.world_size,
+                    self._prefill_owner_merge,
+                    self._prefill_min_context,
+                )
         object.__setattr__(self, "b12x_warmup_provider", self)
 
     def _get_plan(self, mode: str, q_rows: int) -> Any:
@@ -512,13 +642,24 @@ class B12xSparseIndexer(nn.Module):
                     *specs,
                 )
                 manager.reserve_all(*specs)
+            elif getattr(self, "_prefill_query_group", None) is not None:
+                manager.reserve_all(*specs)
             else:
                 manager.get_simultaneous(*specs)
+        if getattr(self, "_prefill_query_group", None) is not None:
+            manager.reserve_all((tuple(self.topk_indices_buffer.shape), torch.int32))
         if self.dcp_world_size > 1:
             rows = int(self.topk_indices_buffer.shape[0])
             manager.reserve_all(
                 *_dcp_merge_shapes(rows, self.topk_tokens, self.dcp_world_size)
             )
+            if (
+                getattr(self, "_prefill_query_group", None) is not None
+                and self._prefill_owner_merge
+            ):
+                manager.reserve_all(
+                    *_prefill_owner_shapes(rows, self.topk_tokens, self.dcp_world_size)
+                )
             score_bytes = rows * self.topk_tokens * 4
             logger.info_once(
                 "DCP indexer workspace budget: rows=%d, scores=%d bytes, "
@@ -539,8 +680,9 @@ class B12xSparseIndexer(nn.Module):
         del layer, token_counts, output_dtype
 
         def compile() -> None:
-            if self.dcp_world_size > 1:
+            if self.dcp_world_size > 1 or self._prefill_query_group is not None:
                 self._reserve_profile_workspace()
+            if self.dcp_world_size > 1:
                 from b12x.comm.pcie.dcp_candidate_topk import precompile_rank_major_topk
 
                 precompile_rank_major_topk(
@@ -614,6 +756,7 @@ class B12xSparseIndexer(nn.Module):
                         self.dcp_rank,
                         self.dcp_world_size,
                         self.cp_kv_cache_interleave_size,
+                        shard_group=self._indexer_shard_group,
                     )
                 if self._sorts(plan):
                     b12x_topk_sort.precompile(self.max_model_len, caps.device)
@@ -640,6 +783,8 @@ class B12xSparseIndexer(nn.Module):
                 type(self),
                 self.topk_indices_buffer.device,
                 self.topk_tokens,
+                self.dcp_world_size,
+                self.cp_kv_cache_interleave_size,
                 self.output_physical_slots,
                 self.sort_selection,
                 plan_key,
@@ -679,10 +824,33 @@ class B12xSparseIndexer(nn.Module):
                         "B12X sparse prefill requires single-request chunks."
                     )
                 start, end = chunk.token_start, chunk.token_end
+                full_output = self.topk_indices_buffer[start:end, : self.topk_tokens]
+                query_group = getattr(self, "_prefill_query_group", None)
+                split = (
+                    getattr(self, "attention_dcp_world_size", self.dcp_world_size) > 1
+                    and query_group is not None
+                    and query_group.world_size > 1
+                    and metadata.decode is None
+                    and forward_context.cudagraph_runtime_mode == CUDAGraphMode.NONE
+                    and not _is_current_stream_capturing(q_quant)
+                    and chunk.total_seq_lens > 0
+                    and chunk.total_seq_lens >= self._prefill_min_context
+                    and (end - start) % query_group.world_size == 0
+                )
+                relative_start, relative_end = 0, end - start
+                if split:
+                    assert query_group is not None
+                    rows = (end - start) // query_group.world_size
+                    relative_start = query_group.rank_in_group * rows
+                    relative_end = relative_start + rows
+                    start, end = start + relative_start, start + relative_end
                 q_chunk = q_quant[start:end].contiguous()
                 weights_chunk = weights[start:end].contiguous()
                 output = self.topk_indices_buffer[start:end, : self.topk_tokens]
-                seq_lens = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).contiguous()
+                seq_lens = (
+                    chunk.cu_seqlen_ke[relative_start:relative_end]
+                    - chunk.cu_seqlen_ks[relative_start:relative_end]
+                ).contiguous()
                 local_rows = (
                     chunk.local_total_seq_lens
                     if self.dcp_world_size > 1
@@ -719,13 +887,28 @@ class B12xSparseIndexer(nn.Module):
                         self.max_model_len,
                     )
                 if score_chunk is not None:
+                    if split and self._prefill_owner_merge:
+                        from vllm.distributed.parallel_state import get_tp_group
+
+                        if _merge_prefill_topk_by_owner(
+                            output,
+                            score_chunk,
+                            full_output,
+                            self._prefill_shard_group,
+                            get_tp_group(),
+                            self.cp_kv_cache_interleave_size,
+                        ):
+                            continue
                     _merge_dcp_topk(
                         output,
                         score_chunk,
                         self.dcp_rank,
                         self.dcp_world_size,
                         self.cp_kv_cache_interleave_size,
+                        shard_group=self._indexer_shard_group,
                     )
+                if split:
+                    _restore_prefill_indices(query_group, output, full_output)
 
         if metadata.decode is not None:
             decode = metadata.decode
@@ -775,6 +958,7 @@ class B12xSparseIndexer(nn.Module):
                     self.dcp_rank,
                     self.dcp_world_size,
                     self.cp_kv_cache_interleave_size,
+                    shard_group=self._indexer_shard_group,
                 )
 
         return self.topk_indices_buffer

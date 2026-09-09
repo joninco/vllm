@@ -14,6 +14,7 @@ from typing import Any, NamedTuple, NewType, TypeAlias, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.distributed.indexer_kv_geometry import effective_kv_shards
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.hashing import xxhash, xxhash_cbor
@@ -671,16 +672,13 @@ def resolve_kv_cache_block_sizes(
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:
-        dcp_replicated = len(groups) == 1 and getattr(
-            groups[0].kv_cache_spec, "dcp_replicated", False
-        )
-        bs = cache_config.block_size * (1 if dcp_replicated else dcp)
+        shards = effective_kv_shards(groups[0].kv_cache_spec, dcp) if groups else dcp
+        bs = cache_config.block_size * shards
         return bs, bs
 
     group_block_sizes = [
-        g.kv_cache_spec.block_size * dcp
+        g.kv_cache_spec.block_size * effective_kv_shards(g.kv_cache_spec, dcp)
         if isinstance(g.kv_cache_spec, AttentionSpec)
-        and not getattr(g.kv_cache_spec, "dcp_replicated", False)
         else g.kv_cache_spec.block_size
         for g in groups
     ]
@@ -1739,7 +1737,7 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     """
 
     dcp_replication_modes = {
-        spec.dcp_replicated
+        (spec.dcp_replicated, spec.dcp_kv_shard_count)
         for spec in kv_cache_spec.values()
         if isinstance(spec, AttentionSpec)
     }
@@ -2063,6 +2061,22 @@ def get_kv_cache_groups(
             len(draft_groups),
         )
         return [*target_groups, *draft_groups]
+
+    if any(
+        getattr(spec, "dcp_kv_shard_count", None) is not None
+        for spec in kv_cache_spec.values()
+    ):
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        shard_partitions: dict[int, dict[str, KVCacheSpec]] = {}
+        for name, spec in kv_cache_spec.items():
+            shards = effective_kv_shards(spec, dcp_size)
+            shard_partitions.setdefault(shards, {})[name] = spec
+        if len(shard_partitions) > 1:
+            return [
+                group
+                for specs in shard_partitions.values()
+                for group in get_kv_cache_groups(vllm_config, specs)
+            ]
 
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for
@@ -2584,7 +2598,7 @@ class BlockHashListWithBlockSize:
 
     def __init__(
         self,
-        block_hashes: list[BlockHash],
+        block_hashes: Sequence[BlockHash],
         hash_block_size: int,
         target_block_size: int,
     ):

@@ -174,6 +174,7 @@ def correct_attn_out(
     cp_rank: int,
     ctx: CPTritonContext,
     is_lse_base_on_e: bool = True,
+    lse_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -214,9 +215,19 @@ def correct_attn_out(
 
     # Allocate LSE with the same B/H strides as `lses` so writes land correctly
     # even when `lses` is a non-contiguous view (e.g., 4-D to 3-D squeeze).
-    lse = torch.empty_strided(
-        (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
-    )
+    if lse_output is None:
+        lse = torch.empty_strided(
+            (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
+        )
+    else:
+        if (
+            lse_output.shape != (B, H)
+            or lse_output.stride() != (l_sB, l_sH)
+            or lse_output.device != lses.device
+            or lse_output.dtype != lses.dtype
+        ):
+            raise ValueError("Provided DCP LSE output must match gathered LSE layout")
+        lse = lse_output
 
     # Kernel launch config
     grid = (B, H, 1)
@@ -1262,17 +1273,16 @@ class MLADCPManager:
             )
         )
 
-    def configure_prefill(self, vllm_config: VllmConfig) -> DCPPrefillPolicy:
-        """Bind validated eager-prefill policy without changing decode combine."""
-        if self.group.world_size > 1 and (
-            envs.VLLM_DCP_PROJECT_BEFORE_MERGE
-            or envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE
-        ):
-            raise NotImplementedError(
-                "Projected DCP prefill and borrowed workspace dispatch are not "
-                "implemented; disable VLLM_DCP_PROJECT_BEFORE_MERGE and "
-                "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE"
-            )
+    def configure_prefill(
+        self,
+        vllm_config: VllmConfig,
+        *,
+        backend=None,
+        latent_dim: int = 512,
+        value_dim: int = 256,
+    ) -> DCPPrefillPolicy:
+        """Reserve eager-prefill resources without changing decode combine."""
+        dcp_enabled = self.group.world_size > 1
         policy = DCPPrefillPolicy(
             dcp_world_size=self.group.world_size,
             max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
@@ -1280,11 +1290,45 @@ class MLADCPManager:
             base_backend="a2a" if self.use_a2a else "ag_rs",
             a2a_max_tokens=envs.VLLM_DCP_A2A_MAX_TOKENS,
             large_backend=envs.VLLM_DCP_A2A_LARGE_BACKEND,
+            project_before_merge=(dcp_enabled and envs.VLLM_DCP_PROJECT_BEFORE_MERGE),
+            borrow_workspace=(
+                dcp_enabled and envs.VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE
+            ),
+            non_dbo_workspace=getattr(self, "num_ubatches", 1) == 1,
             project_min_tokens=envs.VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS,
             max_capture_tokens=max(
                 vllm_config.compilation_config.cudagraph_capture_sizes or [], default=0
             ),
         )
+        self.prefill_workspaces = {}
+        if policy.project_before_merge:
+            from vllm.v1.attention.ops.dcp_prefill_workspace import DCPPrefillWorkspace
+
+            spec_provider = getattr(backend, "get_dcp_prefill_workspace_specs", None)
+            if not callable(spec_provider):
+                raise ValueError(
+                    "Projected DCP prefill requires backend workspace support"
+                )
+            specs = spec_provider()
+            borrow = policy.borrow_workspace and policy.non_dbo_workspace
+            modes = [True] if borrow else [False]
+            if borrow and policy.project_min_tokens < 1024:
+                modes.append(False)
+            for mode in modes:
+                workspace = DCPPrefillWorkspace(
+                    specs,
+                    world_size=self.group.world_size,
+                    latent_dim=latent_dim,
+                    value_dim=value_dim,
+                    borrowed=mode,
+                    max_rows=(
+                        min(1024, policy.max_num_tokens)
+                        if borrow and not mode
+                        else None
+                    ),
+                )
+                workspace.reserve()
+                self.prefill_workspaces[mode] = workspace
         self.prefill_ag_rs_combine = functools.partial(
             cp_lse_ag_out_rs,
             cp_group=self.group,
@@ -1292,14 +1336,129 @@ class MLADCPManager:
         )
         logger.info_once(
             "Sparse MLA DCP eager prefill: base=%s, A2A cap=%d "
-            "(non-positive is uncapped), large=%s, capacity=%d; "
-            "decode/capture/mixed/MTP use configured transport.",
+            "(non-positive is uncapped), large=%s, projected=%s, borrowed=%s, "
+            "capacity=%d, workspace bytes=%s; decode/capture/mixed/MTP "
+            "use configured transport.",
             policy.base_backend,
             policy.a2a_max_tokens,
             policy.large_backend,
+            policy.project_before_merge,
+            policy.borrow_workspace,
             policy.max_num_tokens,
+            tuple(
+                (mode, plan.reserved_bytes)
+                for mode, plan in self.prefill_workspaces.items()
+            ),
         )
         return policy
+
+    @property
+    def prefill_warmup_key(self) -> tuple | None:
+        """Identify communicator and static projected geometry for deduplication."""
+        workspaces = getattr(self, "prefill_workspaces", {})
+        if not workspaces:
+            return None
+        ranks = tuple(getattr(self.group, "ranks", range(self.group.world_size)))
+        return (
+            ranks,
+            self.is_lse_base_on_e,
+            tuple(
+                (mode, plan.specs, plan.capacity, plan.latent_dim, plan.value_dim)
+                for mode, plan in sorted(workspaces.items())
+            ),
+        )
+
+    def prewarm_prefill(self, local_weights: torch.Tensor, *, backend_specs) -> None:
+        """Initialize projected kernels and collectives before KV admission.
+
+        One row compiles runtime-strided kernels; the reserved maximum also
+        exercises the largest selected BMM and communication buffers. Every
+        DCP rank must call this method in the same warmup registry order.
+        """
+        workspaces = getattr(self, "prefill_workspaces", {})
+        if not workspaces:
+            return
+        from b12x.comm.prefill import prepare_prefill_lse
+
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Projected DCP warmup must precede CUDA capture")
+        completed = []
+        for mode, plan in sorted(workspaces.items()):
+            for rows in sorted({1, plan.capacity}):
+                buffers = plan.borrow(rows, backend_specs=backend_specs)
+                # Native query communication is initialized with zero data.
+                # Scratch input and query output are disjoint, and neither is
+                # live when the dummy attention partials replace scratch.
+                query_rows = min(
+                    rows,
+                    buffers.scratch.numel()
+                    // (plan.local_heads * plan.query_dim * plan.dtype.itemsize),
+                )
+                local_elements = query_rows * plan.local_heads * plan.query_dim
+                local_query = (
+                    buffers.scratch[: local_elements * plan.dtype.itemsize]
+                    .view(plan.dtype)
+                    .view(query_rows, plan.local_heads, plan.query_dim)
+                )
+                if local_query.numel() != local_elements:
+                    raise RuntimeError(
+                        "Prefill scratch cannot prewarm query collective"
+                    )
+                local_query.zero_()
+                gathered_query = buffers.query.view(-1)[
+                    : local_elements * plan.world_size
+                ].view(query_rows * plan.world_size, plan.local_heads, plan.query_dim)
+                dist.all_gather_into_tensor(
+                    gathered_query, local_query, group=self.group.device_group
+                )
+                partial_elements = rows * plan.heads * plan.latent_dim
+                partials = (
+                    buffers.scratch[: partial_elements * plan.dtype.itemsize]
+                    .view(plan.dtype)
+                    .view(plan.heads, rows, plan.latent_dim)
+                    .transpose(0, 1)
+                )
+                partials.zero_()
+                source_lse = buffers.all_lse[0]
+                source_lse.zero_()
+                counts = buffers.final_lse.view(-1)[:rows].view(torch.int32)
+                counts.fill_(1)
+                projected = buffers.project(
+                    partials,
+                    source_lse,
+                    counts,
+                    local_weights,
+                    self.group,
+                    prepare_prefill_lse,
+                )
+                buffers.combine(
+                    projected,
+                    self.group,
+                    correct_attn_out,
+                    is_lse_base_on_e=self.is_lse_base_on_e,
+                )
+                completed.append((mode, rows, plan.reserved_bytes))
+        # Finish initialization while startup memory profiling still owns all
+        # lazy cuBLAS/NCCL resources; serving never calls this synchronization.
+        if local_weights.is_cuda:
+            torch.cuda.current_stream(local_weights.device).synchronize()
+        self.prefill_warmup_record = {
+            "group_ranks": tuple(
+                getattr(self.group, "ranks", range(self.group.world_size))
+            ),
+            "device": str(local_weights.device),
+            "layouts": tuple(completed),
+            "collective_calls": 4 * len(completed),
+            "completed": True,
+        }
+        logger.info_once(
+            "Projected DCP prefill startup warmup completed on %s: "
+            "group=%s, layouts(mode,rows,bytes)=%s, collective calls=%d.",
+            self.prefill_warmup_record["device"],
+            self.prefill_warmup_record["group_ranks"],
+            self.prefill_warmup_record["layouts"],
+            self.prefill_warmup_record["collective_calls"],
+        )
 
     def _init_combine(
         self,

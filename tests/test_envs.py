@@ -593,6 +593,7 @@ class TestVllmMaxNSequences:
     ("name", "default", "override", "expected"),
     [
         ("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", 1, "0", 0),
+        ("VLLM_B12X_MLA_PREFILL_QUERY_BMM", False, "1", True),
         ("VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB", 1024, "768", 768),
         ("VLLM_DCP_QUERY_SPLIT", False, "1", True),
         ("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", 0, "4096", 4096),
