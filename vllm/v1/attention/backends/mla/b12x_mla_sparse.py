@@ -715,6 +715,14 @@ class B12xMLASparseMetadataBuilder(
         self.cache_seq_lens_per_token_buffer = torch.empty(
             (max_tokens,), dtype=torch.int32, device=device
         )
+        if self.dcp_world_size > 1 and device.type == "cuda":
+            from b12x.comm.pcie._dcp_attention_metadata import (
+                precompile_dcp_sequence_lengths,
+            )
+
+            precompile_dcp_sequence_lengths(
+                self.cache_seq_lens_per_token_buffer.device.index
+            )
         self.dcp_combine_query_start_loc_buffer = (
             torch.arange(max_tokens + 1, dtype=torch.int32, device=device)
             if self.dcp_world_size > 1
@@ -912,14 +920,27 @@ class B12xMLASparseMetadataBuilder(
             per_token_lens.copy_(common.positions[:num_tokens])
             per_token_lens += 1
             if use_dcp:
-                per_token_lens.copy_(
-                    get_dcp_local_seq_lens(
+                if per_token_lens.is_cuda:
+                    from b12x.comm.pcie._dcp_attention_metadata import (
+                        localize_dcp_sequence_lengths,
+                    )
+
+                    localize_dcp_sequence_lengths(
+                        per_token_lens,
                         per_token_lens,
                         self.dcp_world_size,
                         self.dcp_rank,
                         self.cp_kv_cache_interleave_size,
                     )
-                )
+                else:
+                    per_token_lens.copy_(
+                        get_dcp_local_seq_lens(
+                            per_token_lens,
+                            self.dcp_world_size,
+                            self.dcp_rank,
+                            self.cp_kv_cache_interleave_size,
+                        )
+                    )
         else:
             starts = np.asarray(common.query_start_loc_cpu, dtype=np.int32)
             query_lens = np.diff(starts)

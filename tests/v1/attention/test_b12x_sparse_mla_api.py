@@ -1983,6 +1983,7 @@ def test_b12x_dsa_indexer_reuses_plans_and_rebinds_shared_workspace(
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize("interleave", [1, 4])
 @pytest.mark.parametrize("provided_local_lengths", [False, True])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize(
     "rows_per_request,use_positions", [(1, False), (1, True), (4, True)]
 )
@@ -1993,8 +1994,11 @@ def test_dcp_combine_uses_local_causal_lengths_in_stable_buffers(
     provided_local_lengths,
     rows_per_request,
     use_positions,
+    device,
 ) -> None:
     """Draft rows can cross a shard boundary within one request."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
     monkeypatch.setattr(
         SparseMLACommonMetadataBuilder,
         "build",
@@ -2009,8 +2013,12 @@ def test_dcp_combine_uses_local_causal_lengths_in_stable_buffers(
     builder.dcp_rank = rank
     builder.cp_kv_cache_interleave_size = interleave
     builder._max_speculative_decode_query_len = 4
-    builder.cache_seq_lens_per_token_buffer = torch.zeros(16, dtype=torch.int32)
-    builder.dcp_combine_query_start_loc_buffer = torch.arange(17, dtype=torch.int32)
+    builder.cache_seq_lens_per_token_buffer = torch.zeros(
+        16, dtype=torch.int32, device=device
+    )
+    builder.dcp_combine_query_start_loc_buffer = torch.arange(
+        17, dtype=torch.int32, device=device
+    )
 
     def local_count(length):
         return sum((position // interleave) % 4 == rank for position in range(length))
@@ -2019,19 +2027,20 @@ def test_dcp_combine_uses_local_causal_lengths_in_stable_buffers(
     for offset in (0, 8):
         positions = (
             torch.tensor(
-                [start + row for start in (0, 2) for row in range(rows_per_request)]
+                [start + row for start in (0, 2) for row in range(rows_per_request)],
+                device=device,
             )
             + offset
         )
         global_lengths = [rows_per_request + offset, rows_per_request + 2 + offset]
         local_lengths = torch.tensor(
-            [local_count(n) for n in global_lengths], dtype=torch.int32
+            [local_count(n) for n in global_lengths], dtype=torch.int32, device=device
         )
         common = SimpleNamespace(
             num_reqs=2,
             num_actual_tokens=2 * rows_per_request,
             max_query_len=rows_per_request,
-            seq_lens=torch.tensor(global_lengths, dtype=torch.int32),
+            seq_lens=torch.tensor(global_lengths, dtype=torch.int32, device=device),
             dcp_local_seq_lens=local_lengths if provided_local_lengths else None,
             positions=positions if use_positions else None,
             is_prefilling=torch.zeros(2, dtype=torch.bool),
@@ -2052,6 +2061,19 @@ def test_dcp_combine_uses_local_causal_lengths_in_stable_buffers(
         if pointers is not None:
             assert addresses == pointers
         pointers = addresses
+        if device == "cuda" and use_positions:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                replay_metadata = builder.build(0, common)
+            positions.add_(1)
+            expected = [local_count(int(p) + 1) for p in positions]
+            for _ in range(3):
+                graph.replay()
+                assert replay_metadata.dcp_combine_seq_lens.tolist() == expected
+                assert replay_metadata.dcp_combine_seq_lens.data_ptr() == pointers[0]
+            assert not builder.cache_seq_lens_per_token_buffer[
+                2 * rows_per_request :
+            ].any()
 
 
 @pytest.mark.parametrize("world_size", [1, 4])
