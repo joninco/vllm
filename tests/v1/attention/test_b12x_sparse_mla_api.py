@@ -42,7 +42,7 @@ from vllm.v1.attention.backends.mla.b12x_mla_sparse import (
     B12xMLASparseMetadataBuilder,
     _ckv_rank_token_alignment,
     _global_causal_lens_for_ckv_gather,
-    _is_glm_next_ckv_source_layout,
+    _is_native_ckv_source_layout,
     _is_speculative_decode_batch,
     _max_speculative_decode_query_len,
     _round_up_ckv_rank_tokens,
@@ -362,12 +362,19 @@ def test_b12x_glm_dsa_binds_nvfp4_fp8_rope_record() -> None:
         ("glm5_next_text", "nvfp4_ds_mla", 304),
     ],
 )
+@pytest.mark.parametrize("dcp_size", [1, 4])
 def test_b12x_sparse_mla_constructor_uses_planned_cache_width(
-    monkeypatch, model_type: str, kv_cache_dtype: str, record_bytes: int
+    monkeypatch, model_type: str, kv_cache_dtype: str, record_bytes: int, dcp_size: int
 ) -> None:
     sparse_mla = pytest.importorskip("b12x.attention.sparse_mla")
     is_glm_next = model_type == "glm5_next_text"
-    config = _glm5_next_config()
+    config = _glm5_next_config(dcp_size=dcp_size, cp_interleave=4)
+    config.parallel_config.enable_dbo = False
+    monkeypatch.setenv("VLLM_B12X_MLA_CKV_GATHER", "1")
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dcp_group",
+        lambda: SimpleNamespace(world_size=dcp_size, rank_in_group=0),
+    )
     hf_config = config.model_config.hf_text_config
     hf_config.model_type = model_type
     hf_config.qk_nope_head_dim = 256 if is_glm_next else 192
@@ -419,6 +426,14 @@ def test_b12x_sparse_mla_constructor_uses_planned_cache_width(
     assert impl._cache_record_bytes == record_bytes
     assert impl._decode_plan.caps.cache_record_bytes == record_bytes
     assert impl._extend_plan.caps.cache_record_bytes == record_bytes
+    expected_gather = dcp_size > 1 and model_type != "deepseek_v32"
+    assert impl._ckv_gather_enabled is expected_gather
+    if expected_gather:
+        assert impl._ckv_extend_plan.caps.num_q_heads == 8
+        assert impl._ckv_extend_plan.caps.cache_record_bytes == record_bytes
+        assert impl._extend_plan.caps.num_q_heads == 8 * dcp_size
+    else:
+        assert impl._ckv_extend_plan is None
 
 
 def test_b12x_nvfp4_run_options_match_each_glm_record_abi() -> None:
@@ -798,6 +813,113 @@ def test_b12x_full_ckv_gather_requires_enabled_dcp(override: dict[str, Any]) -> 
     assert not _use_b12x_full_ckv_gather(**args)
 
 
+@pytest.mark.parametrize("dcp_size,enabled", [(1, True), (4, False), (4, True)])
+@pytest.mark.parametrize("local_heads,enable_dbo", [(8, False), (4, False), (8, True)])
+def test_b12x_glm_dsa_full_ckv_builder_allocates_exact_selector_width(
+    monkeypatch: pytest.MonkeyPatch,
+    dcp_size: int,
+    enabled: bool,
+    local_heads: int,
+    enable_dbo: bool,
+) -> None:
+    config = _glm5_next_config(dcp_size=dcp_size)
+    config.model_config.hf_text_config.model_type = "glm_moe_dsa"
+    del config.model_config.hf_text_config.index_kpool
+    config.model_config.get_num_attention_heads = lambda _: local_heads
+    config.parallel_config.enable_dbo = enable_dbo
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32, max_num_seqs=2)
+    monkeypatch.setenv("VLLM_B12X_MLA_CKV_GATHER", str(int(enabled)))
+
+    def initialize_common(builder, spec, layer_names, config, device):
+        builder.dcp_world_size = dcp_size
+        builder.kv_cache_spec = spec
+        builder.cp_kv_cache_interleave_size = 4
+
+    monkeypatch.setattr(SparseMLACommonMetadataBuilder, "__init__", initialize_common)
+    monkeypatch.setattr(
+        B12xMLASparseMetadataBuilder,
+        "_init_reorder_batch_threshold",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        b12x_mla_sparse, "get_dcp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
+    builder = B12xMLASparseMetadataBuilder(
+        SimpleNamespace(block_size=64), [], config, torch.device("cpu")
+    )
+
+    assert not builder.requires_glm_next_selector_metadata
+    assert not builder.supports_draft_decode_metadata_update
+    assert builder._ckv_gather_requested is (
+        enabled and dcp_size > 1 and local_heads == 8 and not enable_dbo
+    )
+    if builder._ckv_gather_requested:
+        assert builder.ckv_selected_indices_buffer.shape == (32, 2048)
+        assert builder.dcp_rank_req_lens_buffer.shape == (4, 2)
+    else:
+        assert builder.ckv_selected_indices_buffer is None
+        assert builder.dcp_rank_req_lens_buffer is None
+
+    if not builder._ckv_gather_requested:
+        return
+    query_starts = torch.tensor([0, 16, 32], dtype=torch.int32)
+    seq_lens = torch.tensor([19, 33], dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=32,
+        max_query_len=16,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens,
+        seq_lens_cpu_upper_bound=None,
+        query_start_loc=query_starts,
+        query_start_loc_cpu=query_starts,
+        dcp_local_seq_lens=None,
+        positions=torch.cat((torch.arange(3, 19), torch.arange(17, 33))),
+        is_prefilling=torch.tensor([True, True]),
+    )
+    monkeypatch.setattr(
+        SparseMLACommonMetadataBuilder,
+        "build",
+        lambda *a, **k: SimpleNamespace(
+            num_prefills=2,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_actual_tokens=32,
+            dcp_ckv_gather_eligible=False,
+        ),
+    )
+    metadata = builder.build(0, common)
+    assert metadata.dcp_ckv_gather_eligible
+    assert metadata.ckv_selected_indices.shape == (32, 2048)
+    assert metadata.dcp_rank_req_lens.tolist() == [[7, 9], [4, 8], [4, 8], [4, 8]]
+    assert metadata.dcp_rank_req_starts.tolist() == [[0, 7], [0, 4], [0, 4], [0, 4]]
+    assert metadata.dcp_local_cu_seq_lens.tolist() == [0, 7, 16]
+    assert metadata.dcp_padded_total_tokens == 16
+    assert metadata.global_cache_seq_lens_per_req.tolist() == [19, 33]
+    captured = builder._build(0, common, for_cudagraph_capture=True)
+    assert not captured.dcp_ckv_gather_eligible
+
+
+@pytest.mark.parametrize(
+    "is_spec_decode,num_decode_tokens", [(False, 0), (False, 1), (True, 0)]
+)
+def test_b12x_glm_dsa_full_ckv_excludes_mixed_and_verification(
+    is_spec_decode: bool, num_decode_tokens: int
+) -> None:
+    assert _use_b12x_full_ckv_gather(
+        enabled=True,
+        is_glm_next=False,
+        is_glm_dsa=True,
+        is_spec_decode=is_spec_decode,
+        dcp_world_size=4,
+        max_query_len=4,
+        num_tokens=32,
+        num_decode_tokens=num_decode_tokens,
+        min_tokens=16,
+        max_tokens=524288,
+    ) is (not is_spec_decode and num_decode_tokens == 0)
+
+
 def test_b12x_glm5_next_accepts_dcp_with_prefix_caching(monkeypatch) -> None:
     monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
     with set_current_vllm_config(
@@ -873,8 +995,8 @@ def test_b12x_glm5_next_ckv_source_layout() -> None:
         size=(2, 64, 528),
         stride=(37888, 528, 1),
     )
-    assert _is_glm_next_ckv_source_layout(cache, page_size=64, record_bytes=528)
-    assert not _is_glm_next_ckv_source_layout(
+    assert _is_native_ckv_source_layout(cache, page_size=64, record_bytes=528)
+    assert not _is_native_ckv_source_layout(
         cache[:, :, ::2], page_size=64, record_bytes=528
     )
 
@@ -900,10 +1022,20 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     )
 
 
-@pytest.mark.parametrize("record_bytes", [528, 304, 656, 368])
+@pytest.mark.parametrize(
+    "record_bytes,input_dtype",
+    [
+        (528, torch.uint8),
+        (304, torch.uint8),
+        (656, torch.uint8),
+        (368, torch.uint8),
+        (656, torch.float8_e4m3fn),
+    ],
+)
 def test_b12x_full_ckv_gather_preserves_native_records(
     monkeypatch: pytest.MonkeyPatch,
     record_bytes: int,
+    input_dtype: torch.dtype,
 ) -> None:
     impl = object.__new__(B12xMLASparseImpl)
     impl._kernel_page_size = 2
@@ -929,6 +1061,7 @@ def test_b12x_full_ckv_gather_preserves_native_records(
     )
 
     def fake_cp_gather_cache(**kwargs: Any) -> None:
+        assert kwargs["src_cache"].dtype == torch.uint8
         kwargs["dst"].copy_(kwargs["src_cache"].view(-1, record_bytes)[:3])
 
     def fake_all_gather(_group: Any, src: torch.Tensor, dst: torch.Tensor) -> None:
@@ -940,7 +1073,9 @@ def test_b12x_full_ckv_gather_preserves_native_records(
     )
     monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda: object())
 
-    gathered = impl._gather_full_ckv(kv_cache, metadata, local_buffer, gathered_buffer)
+    gathered = impl._gather_full_ckv(
+        kv_cache.view(input_dtype), metadata, local_buffer, gathered_buffer
+    )
 
     expected_rank = torch.cat(
         (kv_cache.view(-1, record_bytes)[:3], torch.zeros((1, record_bytes))),
