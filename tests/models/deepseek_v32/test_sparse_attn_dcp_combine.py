@@ -392,3 +392,62 @@ def test_four_shard_combine_matches_causal_attention(
         )
         expected = reference[:, first : first + _HEADS].reshape(rows, -1)
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("is_base_e", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float64, torch.bfloat16])
+def test_projected_shard_merge_matches_global_attention(dtype, is_base_e):
+    """Per-head value projection commutes with merging disjoint KV shards.
+
+    CPU float64 attention supplies an independent oracle. BF16 tolerances
+    apply only to these bounded fixtures, not serving numerical acceptance.
+    """
+    from vllm.v1.attention.ops.dcp import _lse_weighted_combine
+
+    generator = torch.Generator().manual_seed(729)
+    ranks, rows, heads, tokens, latent, value_dim = 4, 7, 8, 13, 9, 5
+    scores = torch.randn(rows, heads, tokens, generator=generator, dtype=torch.float64)
+    values = torch.randn(tokens, latent, generator=generator, dtype=torch.float64)
+    weights = (
+        torch.randn(heads, latent, value_dim, generator=generator, dtype=torch.float64)
+        / latent**0.5
+    )
+    # Includes an all-empty padding row, causal prefixes and uneven shard tails.
+    lengths = torch.tensor([0, 1, 2, 4, 5, 9, tokens])
+    positions = torch.arange(tokens)
+    visible = positions[None, :] < lengths[:, None]
+    masked_scores = scores.masked_fill(~visible[:, None, :], -float("inf"))
+    probabilities = torch.nan_to_num(torch.softmax(masked_scores, dim=-1))
+    expected = torch.einsum("bht,tl,hlv->bhv", probabilities, values, weights)
+    partials, lses = [], []
+    for rank in range(ranks):
+        owned = (positions // 2) % ranks == rank
+        local_scores = masked_scores.masked_fill(~owned[None, None, :], -float("inf"))
+        local_lse = torch.logsumexp(local_scores, dim=-1)
+        # Empty backend outputs are undefined; the merge must mask NaN and inf.
+        local_output = torch.softmax(local_scores, dim=-1) @ values
+        local_output[~torch.isfinite(local_lse)] = (
+            float("nan") if rank % 2 else float("inf")
+        )
+        partials.append(local_output)
+        lses.append(local_lse)
+    partials = torch.stack(partials).to(dtype)
+    lses = torch.stack(lses)
+    if not is_base_e:
+        lses = lses / torch.log(torch.tensor(2.0, dtype=torch.float64))
+    lses = lses.to(torch.float64 if dtype == torch.float64 else torch.float32)
+    weights = weights.to(dtype)
+    projected = torch.einsum("rbhl,hlv->rbhv", partials, weights)
+    project_then_merge = _lse_weighted_combine(
+        projected, lses, is_lse_base_on_e=is_base_e
+    ).to(dtype)
+    merged = _lse_weighted_combine(partials, lses, is_lse_base_on_e=is_base_e).to(dtype)
+    merge_then_project = torch.einsum("bhl,hlv->bhv", merged, weights)
+    tolerance = 1e-12 if dtype == torch.float64 else 0.025
+    for actual in (project_then_merge, merge_then_project):
+        assert torch.isfinite(actual).all()
+        assert torch.count_nonzero(actual[0]) == 0
+        torch.testing.assert_close(actual.double(), expected, atol=tolerance, rtol=0)
+    torch.testing.assert_close(
+        project_then_merge, merge_then_project, atol=tolerance, rtol=0
+    )

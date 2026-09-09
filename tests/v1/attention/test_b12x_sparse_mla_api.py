@@ -711,7 +711,12 @@ def test_b12x_glm5_next_accepts_dcp_with_speculation(monkeypatch) -> None:
         (1, 0, 32, False),
         (6, 192, 192, False),
         (6, 0, 192, True),
+        (128, 1, 8192, False),
+        (128, 0, 16, False),
+        (128, 0, 17, True),
         (128, 0, 8192, True),
+        (128, 0, 524288, True),
+        (128, 0, 524289, False),
         (128, 0, 600000, False),
     ],
 )
@@ -736,19 +741,61 @@ def test_b12x_full_ckv_gather_excludes_decode_and_mtp_batches(
     )
 
 
-def test_b12x_full_ckv_gather_uses_global_causal_lengths() -> None:
-    global_seq_lens = torch.tensor([5, 12], dtype=torch.int32)
-    query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
-    req_id_per_token = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32)
+@pytest.mark.parametrize(
+    ("seq_lens", "query_starts", "request_ids", "expected"),
+    [
+        ([5, 12], [0, 2, 5], [0, 0, 1, 1, 1], [4, 5, 10, 11, 12]),
+        ([3, 1], [0, 3, 4], [0, 0, 0, 1], [1, 2, 3, 1]),
+        ([17, 8, 33], [0, 2, 3, 6], [0, 0, 1, 2, 2, 2], [16, 17, 8, 31, 32, 33]),
+        ([8, 17], [0, 1, 3], [0, 1, 1], [8, 16, 17]),
+        ([0], [0, 0], [], []),
+    ],
+)
+def test_b12x_full_ckv_gather_uses_global_causal_lengths(
+    seq_lens: list[int],
+    query_starts: list[int],
+    request_ids: list[int],
+    expected: list[int],
+) -> None:
+    global_seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    query_start_loc = torch.tensor(query_starts + [-1], dtype=torch.int32)
+    req_id_per_token = torch.tensor(request_ids + [-1, -1], dtype=torch.int32)
 
     actual = _global_causal_lens_for_ckv_gather(
         global_seq_lens,
         query_start_loc,
         req_id_per_token,
-        num_actual_tokens=5,
+        num_actual_tokens=len(expected),
     )
 
-    assert actual.tolist() == [4, 5, 10, 11, 12]
+    assert actual.dtype == torch.int32
+    assert actual.tolist() == expected
+
+
+def test_b12x_full_ckv_gather_capture_fallback_ignores_runtime_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = object.__new__(B12xMLASparseImpl)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    assert not impl.uses_full_ckv_dcp(SimpleNamespace(), 128)
+
+
+@pytest.mark.parametrize("override", [{"enabled": False}, {"dcp_world_size": 1}])
+def test_b12x_full_ckv_gather_requires_enabled_dcp(override: dict[str, Any]) -> None:
+    args = dict(
+        enabled=True,
+        is_glm_next=True,
+        dcp_world_size=4,
+        max_query_len=128,
+        num_tokens=128,
+        num_decode_tokens=0,
+        min_tokens=16,
+        max_tokens=524288,
+    )
+    args.update(override)
+
+    assert not _use_b12x_full_ckv_gather(**args)
 
 
 def test_b12x_glm5_next_accepts_dcp_with_prefix_caching(monkeypatch) -> None:
@@ -853,8 +900,8 @@ def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     )
 
 
-@pytest.mark.parametrize("record_bytes", [528, 304])
-def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
+@pytest.mark.parametrize("record_bytes", [528, 304, 656, 368])
+def test_b12x_full_ckv_gather_preserves_native_records(
     monkeypatch: pytest.MonkeyPatch,
     record_bytes: int,
 ) -> None:
@@ -901,6 +948,74 @@ def test_b12x_glm5_next_full_ckv_gather_preserves_native_records(
     )
     assert gathered.shape == (4, 2, record_bytes)
     assert torch.equal(gathered.view(-1, record_bytes), expected_rank.repeat(2, 1))
+
+
+@pytest.mark.parametrize("record_bytes", [656, 368])
+def test_b12x_full_ckv_gather_reuses_capacity_with_changed_request_records(
+    monkeypatch: pytest.MonkeyPatch,
+    record_bytes: int,
+) -> None:
+    """Backend borrows stable storage while copies observe each batch's records."""
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._kernel_page_size = 2
+    impl._ckv_local_capacity = 4
+    impl._cache_record_bytes = record_bytes
+    impl.dcp_world_size = 2
+    impl.uses_full_ckv_dcp = lambda *_: True
+    cache = torch.empty((4, 2, record_bytes), dtype=torch.uint8)
+    local = torch.full((4, record_bytes), 255, dtype=torch.uint8)
+    gathered = torch.full((8, record_bytes), 255, dtype=torch.uint8)
+    storage_ptr = gathered.data_ptr()
+    block_table = torch.tensor([[2, 0], [3, 1]], dtype=torch.int32)
+    copies = []
+
+    def copy_requests(**kwargs: Any) -> None:
+        assert kwargs["block_table"] is block_table
+        assert kwargs["batch_size"] == 2
+        starts = kwargs["cu_seq_lens"].tolist()
+        copies.append(starts)
+        for request in range(2):
+            for offset in range(starts[request + 1] - starts[request]):
+                page = int(block_table[request, offset // 2])
+                kwargs["dst"][starts[request] + offset].copy_(
+                    kwargs["src_cache"][page, offset % 2]
+                )
+
+    def gather_ranks(_group: Any, src: torch.Tensor, dst: torch.Tensor) -> None:
+        dst.copy_(src.repeat(2))
+
+    monkeypatch.setattr(b12x_mla_sparse.ops, "cp_gather_cache", copy_requests)
+    monkeypatch.setattr(b12x_mla_sparse, "_dcp_all_gather_current_stream", gather_ranks)
+    monkeypatch.setattr(b12x_mla_sparse, "get_dcp_group", lambda: object())
+
+    for generation, (lengths, physical_slots) in enumerate(
+        [([0, 1], [6]), ([2, 1], [4, 5, 6]), ([1, 3], [4, 6, 7, 2]), ([0, 0], [])]
+    ):
+        for slot in range(8):
+            cache.view(8, record_bytes)[slot].fill_(generation * 16 + slot)
+        token_count = sum(lengths)
+        padded = max(1, token_count)
+        metadata = SimpleNamespace(
+            num_actual_tokens=2,
+            dcp_local_total_tokens=token_count,
+            dcp_padded_total_tokens=padded,
+            dcp_local_cu_seq_lens=torch.tensor(
+                [0, lengths[0], token_count], dtype=torch.int32
+            ),
+            block_table=block_table,
+            num_reqs=2,
+        )
+
+        result = impl._gather_full_ckv(cache, metadata, local, gathered)
+
+        expected_rank = torch.zeros((padded, record_bytes), dtype=torch.uint8)
+        for row, slot in enumerate(physical_slots):
+            expected_rank[row].fill_(generation * 16 + slot)
+        assert result.shape == (4, 2, record_bytes)
+        assert result.data_ptr() == storage_ptr
+        assert torch.equal(gathered[: 2 * padded], expected_rank.repeat(2, 1))
+
+    assert copies == [[0, 0, 1], [0, 2, 3], [0, 1, 4]]
 
 
 def test_b12x_glm5_next_full_ckv_gather_rejects_wrong_record_width() -> None:
