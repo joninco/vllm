@@ -455,10 +455,21 @@ def test_fused_norm_rope_no_indexer(num_tokens: int):
 
 
 @pytest.mark.parametrize("has_indexer", [False, True])
-@pytest.mark.parametrize("dcp_rank", [None, 0, 1, 2, 3])
+@pytest.mark.parametrize(
+    ("dcp_rank", "mla_cache_dtype"),
+    [(None, None)]
+    + [
+        (rank, cache_dtype)
+        for rank in range(4)
+        for cache_dtype in (None, "fp8", "fp8_ds_mla")
+    ],
+)
 @pytest.mark.parametrize("num_tokens", [1, 17])
 def test_fused_norm_rope_materializes_cache_inputs(
-    has_indexer: bool, dcp_rank: int | None, num_tokens: int
+    has_indexer: bool,
+    dcp_rank: int | None,
+    mla_cache_dtype: str | None,
+    num_tokens: int,
 ):
     """Every query is materialized even when its cache slot belongs to a peer."""
     torch.manual_seed(6)
@@ -494,10 +505,17 @@ def test_fused_norm_rope_materializes_cache_inputs(
     topk = torch.full((num_tokens, 2048), 7, device=dev, dtype=torch.int32)
     slot_mapping = None
     index_cache = None
+    mla_cache = None
+    mla_scale = torch.ones(1, device=dev)
     if dcp_rank is not None:
         slot_mapping = torch.where(pos % 4 == dcp_rank, pos // 4, -1)
         if has_indexer:
             index_cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=dev)
+        if mla_cache_dtype is not None:
+            record_bytes = 656 if mla_cache_dtype == "fp8_ds_mla" else 576
+            mla_cache = torch.zeros(
+                (1, 64, record_bytes), dtype=torch.uint8, device=dev
+            )
 
     run = partial(
         K.fused_norm_rope,
@@ -522,6 +540,9 @@ def test_fused_norm_rope_materializes_cache_inputs(
     arguments = dict(
         slot_mapping=slot_mapping,
         indexer_k_cache=index_cache,
+        mla_kv_cache=mla_cache,
+        mla_kv_cache_dtype=mla_cache_dtype or "auto",
+        mla_k_scale=mla_scale,
         q_c_out=q_out,
         kv_c_out=kv_out,
         k_pe_out=kpe_out,
@@ -563,6 +584,23 @@ def test_fused_norm_rope_materializes_cache_inputs(
             assert torch.count_nonzero(values[count:].float()) == 0
             assert torch.count_nonzero(scales[count:]) == 0
     if dcp_rank is not None:
+        if mla_cache is not None:
+            reference_cache = torch.zeros_like(mla_cache)
+            run(
+                slot_mapping=pos,
+                mla_kv_cache=reference_cache,
+                mla_kv_cache_dtype=mla_cache_dtype,
+                mla_k_scale=mla_scale,
+            )
+            local_rows = pos % 4 == dcp_rank
+            count = len(range(dcp_rank, num_tokens, 4))
+            torch.testing.assert_close(
+                mla_cache[0, :count],
+                reference_cache[0, :num_tokens][local_rows],
+                rtol=0,
+                atol=0,
+            )
+            assert torch.count_nonzero(mla_cache[0, count:]) == 0
         expected_q, expected_kv, expected_rope = [
             torch.empty_like(value) for value in (q_c, kv_c, k_pe)
         ]

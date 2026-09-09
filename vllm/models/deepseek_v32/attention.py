@@ -405,9 +405,13 @@ class DeepseekV32Attention(MLAAttention):
             mla_kv_cache = self.kv_cache
             mla_k_scale = self._k_scale
 
-        separate_kv_update = self.use_pcp or self._native_packed_kv_update
-        kv_c_out = torch.empty_like(kv_c) if separate_kv_update else None
-        k_pe_out = torch.empty_like(k_pe) if separate_kv_update else None
+        materialize_mla_inputs = (
+            self.use_pcp
+            or self._native_packed_kv_update
+            or self.impl.dcp_world_size > 1
+        )
+        kv_c_out = torch.empty_like(kv_c) if materialize_mla_inputs else None
+        k_pe_out = torch.empty_like(k_pe) if materialize_mla_inputs else None
         q_c = fused_norm_rope(
             positions,
             q_c,
@@ -434,9 +438,7 @@ class DeepseekV32Attention(MLAAttention):
             kv_c_out=kv_c_out,
             k_pe_out=k_pe_out,
             index_k_out=index_k_out,
-            materialize_nonlocal_mla_inputs=(
-                self._native_packed_kv_update and self.impl.dcp_world_size > 1
-            ),
+            materialize_nonlocal_mla_inputs=self.impl.dcp_world_size > 1,
         )
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
