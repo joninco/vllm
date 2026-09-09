@@ -316,6 +316,11 @@ def _merge_dcp_topk(
     if scores.data_ptr() != score_view.data_ptr():
         raise RuntimeError("DCP scores must use the reserved merge workspace prefix")
     pack_dcp_candidates(indices, scores, packed, dcp_rank, dcp_world_size, interleave)
+    from vllm.v1.attention.ops.b12x_dcp import active_dcp_transport
+
+    binding = active_dcp_transport()
+    if binding is not None and binding.merge_candidates(packed, indices):
+        return
     _gather_dcp_candidates(get_dcp_group(), packed, gathered)
     rank_major_topk(gathered, indices)
 

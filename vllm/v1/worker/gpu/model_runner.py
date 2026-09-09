@@ -499,6 +499,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         get_offloader().post_init()
 
+        from vllm.v1.attention.ops.b12x_dcp import initialize_b12x_dcp_transport
+
+        self.b12x_dcp_transport = initialize_b12x_dcp_transport(
+            self.vllm_config, self.device
+        )
+
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -668,6 +674,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
             self.speculator.init_cudagraph_manager(cudagraph_mode)
+
+        transport = getattr(self, "b12x_dcp_transport", None)
+        if transport is not None:
+            transport.bind_graph_manager(
+                self.cudagraph_manager, "target", profiling=is_profiling
+            )
+            if self.speculator is not None:
+                transport.bind_graph_manager(
+                    self.speculator.prefill_cudagraph_manager,
+                    "draft_prefill",
+                    profiling=is_profiling,
+                )
+                transport.bind_graph_manager(
+                    self.speculator.decode_cudagraph_manager,
+                    "draft_decode",
+                    profiling=is_profiling,
+                )
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(

@@ -106,6 +106,14 @@ def test_dcp_decode_gathers_the_query_and_combines_the_partials(
 ) -> None:
     events: list[str] = []
     module = _module(events, dcp_world_size=dcp_world_size, full_ckv=full_ckv)
+    if dcp_world_size == 1 or full_ckv:
+        from vllm.v1.attention.ops import b12x_dcp
+
+        monkeypatch.setattr(
+            b12x_dcp,
+            "active_dcp_transport",
+            lambda: pytest.fail("DCP=1 or full-CKV prefill queried decode transport"),
+        )
     attn_metadata = SimpleNamespace(
         num_actual_tokens=_TOKENS,
         num_decode_tokens=_TOKENS,
@@ -283,9 +291,10 @@ def _through_mtp_block(monkeypatch, attend, rows, device):
 @pytest.mark.parametrize("rows_per_request", [1, 4])
 @pytest.mark.parametrize("interleave", [1, 4])
 @pytest.mark.parametrize("drafter", [False, True])
+@pytest.mark.parametrize("direct_dispatch", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires one CUDA GPU")
 def test_four_shard_combine_matches_causal_attention(
-    monkeypatch, rows_per_request, interleave, drafter
+    monkeypatch, rows_per_request, interleave, drafter, direct_dispatch
 ):
     """Global lengths or request-wide draft masks must not admit empty partials."""
     import functools
@@ -324,6 +333,31 @@ def test_four_shard_combine_matches_causal_attention(
             combine=functools.partial(cp_lse_ag_out_rs, cp_group=group),
         )
         boundaries = torch.arange(rows + 1, dtype=torch.int32, device=device)
+        if direct_dispatch:
+            from vllm.v1.attention.ops import b12x_dcp
+
+            def direct_combine(
+                output, lse, lengths, rank=rank, boundaries=boundaries, group=group
+            ):
+                assert lengths.data_ptr() == local_lengths[rank].data_ptr()
+                return cp_lse_ag_out_rs(
+                    output,
+                    lse,
+                    seq_lens=lengths,
+                    query_start_loc=boundaries,
+                    cp_group=group,
+                )
+
+            binding = SimpleNamespace(
+                accepts=lambda *args: True, query=gather, combine=direct_combine
+            )
+            monkeypatch.setattr(
+                b12x_dcp, "active_dcp_transport", lambda binding=binding: binding
+            )
+            module.dcp_manager = SimpleNamespace(
+                query_gather=lambda *args: pytest.fail("Generic gather selected"),
+                combine=lambda *args, **kwargs: pytest.fail("Generic combine selected"),
+            )
         metadata = SimpleNamespace(
             num_actual_tokens=rows,
             dcp_combine_seq_lens=local_lengths[rank],

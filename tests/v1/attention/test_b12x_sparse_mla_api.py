@@ -2145,7 +2145,10 @@ def test_dcp_candidate_gather_writes_rank_major_destination(monkeypatch):
         torch.testing.assert_close(gathered[rank], packed + rank)
 
 
-def test_dcp_merge_reuses_reserved_scores_and_gather_storage(monkeypatch):
+@pytest.mark.parametrize("direct_dispatch", [False, True])
+def test_dcp_merge_reuses_reserved_scores_and_gather_storage(
+    monkeypatch, direct_dispatch
+):
     pytest.importorskip("b12x.comm.pcie.dcp_candidate_topk")
     from vllm.v1.worker.workspace import WorkspaceManager
 
@@ -2167,6 +2170,29 @@ def test_dcp_merge_reuses_reserved_scores_and_gather_storage(monkeypatch):
     def all_gather(destination, source):
         destination.copy_(peers)
         destination[0].copy_(source)
+
+    if direct_dispatch:
+        from b12x.comm.pcie.dcp_candidate_topk import rank_major_topk
+
+        from vllm.v1.attention.ops import b12x_dcp
+
+        def merge_candidates(source, destination):
+            assert source.data_ptr() == packed.data_ptr()
+            assert destination.data_ptr() == indices.data_ptr()
+            all_gather(gathered, source)
+            rank_major_topk(gathered, destination)
+            return True
+
+        monkeypatch.setattr(
+            b12x_dcp,
+            "active_dcp_transport",
+            lambda: SimpleNamespace(merge_candidates=merge_candidates),
+        )
+        monkeypatch.setattr(
+            generic_b12x_indexer,
+            "_gather_dcp_candidates",
+            lambda *args: pytest.fail("Generic candidate exchange selected"),
+        )
 
     monkeypatch.setattr(
         generic_b12x_indexer,

@@ -593,6 +593,7 @@ class DeepseekV32Attention(MLAAttention):
         # neither the gather nor the combine.
         dcp_world_size = self.impl.dcp_world_size
         full_ckv_dcp = False
+        direct_dcp = None
         if dcp_world_size > 1:
             assert self.dcp_manager is not None
             if self.use_pcp:
@@ -607,8 +608,17 @@ class DeepseekV32Attention(MLAAttention):
                 if not full_ckv_dcp:
                     if isinstance(mqa_q_arg, tuple):
                         mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
-                    assert self.dcp_manager.query_gather is not None
-                    mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
+                    from vllm.v1.attention.ops.b12x_dcp import active_dcp_transport
+
+                    binding = active_dcp_transport()
+                    if binding is not None and binding.accepts(
+                        mqa_q_arg, getattr(attn_metadata, "dcp_combine_seq_lens", None)
+                    ):
+                        direct_dcp = binding
+                        mqa_q_arg = binding.query(mqa_q_arg)
+                    else:
+                        assert self.dcp_manager.query_gather is not None
+                        mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
         attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
             mqa_q_arg, kv_cache, attn_metadata, self
         )
@@ -632,12 +642,15 @@ class DeepseekV32Attention(MLAAttention):
                 seq_lens = attn_metadata.dcp_combine_seq_lens  # type: ignore[attr-defined]
                 query_start_loc = attn_metadata.dcp_combine_query_start_loc  # type: ignore[attr-defined]
                 assert seq_lens is not None and query_start_loc is not None
-            attn_out = self.dcp_manager.combine(
-                attn_out,
-                lse,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-            )
+            if direct_dcp is not None:
+                attn_out = direct_dcp.combine(attn_out, lse, seq_lens)
+            else:
+                attn_out = self.dcp_manager.combine(
+                    attn_out,
+                    lse,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                )
             if self.use_pcp:
                 attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
