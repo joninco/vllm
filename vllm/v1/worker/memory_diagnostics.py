@@ -9,8 +9,11 @@ The extension does not load by default or allocate GPU tensors. Development
 HTTP RPC, when used, requires a diagnosis server bound to a trusted interface.
 """
 
+import hashlib
 import os
+import tempfile
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -24,6 +27,50 @@ class MemoryDiagnostics:
     init_snapshot: "MemorySnapshot"
     rank: int
     requested_memory: int
+    profiler: Any
+    profiler_config: Any
+
+    def export_memory_diagnostics_timeline(self) -> dict[str, Any]:
+        """Export raw allocator events from a stopped memory-enabled profiler.
+
+        Call after the profiling stop RPC and before another profiling cycle.
+        Files remain under the configured local profiler directory. Each export
+        uses a distinct directory, including when workers finish together.
+        """
+        config = self.profiler_config
+        wrapper = self.profiler
+        if (
+            config is None
+            or config.profiler != "torch"
+            or not config.torch_profiler_with_memory
+            or not config.torch_profiler_with_stack
+            or not config.torch_profiler_record_shapes
+            or wrapper is None
+            or wrapper.is_running
+        ):
+            raise RuntimeError(
+                "Memory timeline export requires a stopped torch profiler with "
+                "memory, stacks and shapes enabled"
+            )
+        directory = Path(
+            tempfile.mkdtemp(
+                prefix=f"worker-{self.rank}-memory-",
+                dir=config.torch_profiler_dir,
+            )
+        )
+        destination = directory / "timeline.raw.json.gz"
+        wrapper.profiler.export_memory_timeline(
+            str(destination), device=str(self.device)
+        )
+        return {
+            "rank": self.rank,
+            "worker_pid": os.getpid(),
+            "device": str(self.device),
+            "path": str(destination),
+            "size_bytes": destination.stat().st_size,
+            "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            "format": "torch.profiler raw memory events",
+        }
 
     def capture_memory_diagnostics(self, reset_peak: str = "false") -> dict[str, Any]:
         """Read byte-valued device and allocator observations on this worker.
