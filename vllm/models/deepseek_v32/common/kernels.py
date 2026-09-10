@@ -420,15 +420,19 @@ def _fused_norm_rope_kernel(
                     index_k_block,
                     INDEX_K_DIM,
                 )
+        # The step-local copy takes every token of a fresh request, owned by
+        # this rank or not. The slot is reloaded here because Triton scopes the
+        # prologue's value to its own branch.
         if (  # noqa: SIM102
             indexer_local_cache_ptr is not None
             and indexer_local_slot_mapping_ptr is not None
         ):
-            if local_index_slot >= 0:
+            local_slot = tl.load(indexer_local_slot_mapping_ptr + tok_idx)
+            if local_slot >= 0:
                 _fp8_quant_and_cache_write(
                     result,
                     index_k_mask,
-                    local_index_slot,
+                    local_slot,
                     indexer_local_cache_ptr,
                     indexer_local_cache_scale_ptr,
                     indexer_local_cache_block_size,
