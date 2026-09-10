@@ -113,10 +113,14 @@ def install_glm_prefill_diagnostics(layer):
             return producer(*args, **kwargs)
         attention = kwargs.get("mla_kv_cache") is not None
         indexer = kwargs.get("indexer_k_cache") is not None
-        if not attention and not indexer:
+        local_context = kwargs.get("indexer_local_cache") is not None
+        if not attention and not indexer and not local_context:
             return producer(*args, **kwargs)
         with trace.scope(
-            "cache_produce", attention=int(attention), indexer=int(indexer)
+            "cache_produce",
+            attention=int(attention),
+            indexer=int(indexer),
+            local_context=int(local_context),
         ):
             return producer(*args, **kwargs)
 

@@ -210,6 +210,7 @@ if TYPE_CHECKING:
     VLLM_DCP_QUERY_SPLIT: bool = False
     VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS: int = 0
     VLLM_DCP_TOPK_OWNER_MERGE: bool = False
+    VLLM_DCP_INDEXER_LOCAL_CONTEXT: bool = False
     VLLM_DCP_INDEXER_SHARDS: int = 0
     VLLM_DCP_REPLICATE_INDEXER_CACHE: bool = False
     VLLM_DCP_A2A_MAX_TOKENS: int = 0
@@ -1720,6 +1721,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DCP_TOPK_OWNER_MERGE": lambda: bool(
         int(os.getenv("VLLM_DCP_TOPK_OWNER_MERGE", "0"))
+    ),
+    # Score prefill chunks whose whole context is among the step's tokens
+    # against a step-local key copy instead of merging sharded candidates.
+    "VLLM_DCP_INDEXER_LOCAL_CONTEXT": lambda: bool(
+        int(os.getenv("VLLM_DCP_INDEXER_LOCAL_CONTEXT", "0"))
     ),
     # Zero retains attention DCP sharding; replication changes cache geometry.
     "VLLM_DCP_INDEXER_SHARDS": lambda: int(os.getenv("VLLM_DCP_INDEXER_SHARDS", "0")),

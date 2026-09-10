@@ -214,6 +214,16 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     local_cu_seq_lens: torch.Tensor | None = None
     local_total_seq_lens: int = 0
     max_local_total_seq_lens: int = 0
+    # Local-context route (DCP): the request's whole context is among this
+    # step's tokens, so every rank holds a step-local copy of its index keys.
+    # ``context_base_page`` is the first page of that copy (-1 when the chunk
+    # is not eligible), ``context_query_offset`` the chunk's first row within
+    # the request, ``context_seq_lens`` the causal key bound of every row and
+    # ``context_block_table`` the expanded page table of the copy.
+    context_base_page: int = -1
+    context_query_offset: int = 0
+    context_seq_lens: torch.Tensor | None = None
+    context_block_table: torch.Tensor | None = None
 
 
 _BUILD_PREFILL_CHUNK_METADATA_INPUT_VARIANTS = (
@@ -424,6 +434,11 @@ _BUILD_PREFILL_CHUNK_METADATA_KERNEL = BuildPrefillChunkMetadataKernel()
 @dataclass
 class DeepseekV32IndexerPrefillMetadata:
     chunks: list[DeepseekV32IndexerPrefillChunkMetadata]
+    # Step-local index-key copy for the local-context route: a page-layout
+    # cache holding the keys of every request whose whole context is among
+    # this step's tokens, and the per-token slot into it (-1 elsewhere).
+    context_cache: torch.Tensor | None = None
+    context_slot_mapping: torch.Tensor | None = None
 
 
 @dataclass
@@ -643,6 +658,30 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
         )
 
+        # Local-context route: a step-local copy of the index keys of every
+        # request whose whole context is among the step's tokens. Requests
+        # occupy page-aligned spans, so the copy needs at most one extra page
+        # per sequence beyond the batched-token pages.
+        self.context_cache: torch.Tensor | None = None
+        self.context_slot_mapping_buffer: torch.Tensor | None = None
+        self.context_arange_buffer: torch.Tensor | None = None
+        if self.dcp_world_size > 1 and envs.VLLM_DCP_INDEXER_LOCAL_CONTEXT:
+            page_size = self.kv_cache_spec.block_size
+            max_tokens = int(scheduler_config.max_num_batched_tokens)
+            pages = -(-max_tokens // page_size) + int(scheduler_config.max_num_seqs)
+            self.context_cache = torch.zeros(
+                (pages, page_size, self.kv_cache_spec.page_size_bytes // page_size),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            self.context_slot_mapping_buffer = torch.full(
+                (max_tokens,), -1, dtype=torch.int32, device=self.device
+            )
+            # Causal bounds (1..tokens) and page tables (0..pages) are views.
+            self.context_arange_buffer = torch.arange(
+                max(max_tokens, pages) + 1, dtype=torch.int32, device=self.device
+            )
+
         # KV compression. Default to 1 for no compression.
         self.compress_ratio = 1
         # Get compress_ratio for DeepseekV4 support
@@ -860,6 +899,82 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
         return indices
 
+    def _assign_local_context(
+        self,
+        prefill: DeepseekV32IndexerPrefillMetadata,
+        query_start_loc_cpu: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        num_tokens: int,
+    ) -> None:
+        """Route single-request chunks whose whole context is in this step.
+
+        Such a request has no cached history: its context length equals its
+        query length in this step, so every rank computed all of its index
+        keys. The fused norm/RoPE kernel copies those keys into the
+        page-aligned span assigned here, and the indexer scores the chunk
+        against that copy without a cross-rank candidate merge. Eligibility
+        is decided from CPU metadata only; the slot mapping is copied to the
+        device once per step.
+        """
+        assert self.context_cache is not None
+        assert self.context_slot_mapping_buffer is not None
+        assert self.context_arange_buffer is not None
+        arange = self.context_arange_buffer
+        page_size = int(self.context_cache.shape[1])
+        capacity_pages = int(self.context_cache.shape[0])
+        base_pages: dict[int, int] = {}
+        next_page = 0
+        slots = torch.full((num_tokens,), -1, dtype=torch.int32)
+        for chunk in prefill.chunks:
+            chunk.context_base_page = -1
+            if chunk.num_reqs != 1:
+                continue
+            request = self._chunk_request_index(chunk, query_start_loc_cpu)
+            if request is None:
+                continue
+            query_start = int(query_start_loc_cpu[request].item())
+            query_len = int(query_start_loc_cpu[request + 1].item()) - query_start
+            if query_len <= 0 or chunk.total_seq_lens != query_len:
+                continue
+            pages = -(-query_len // page_size)
+            if request not in base_pages:
+                if next_page + pages > capacity_pages:
+                    continue
+                base_pages[request] = next_page
+                next_page += pages
+                slots[query_start : query_start + query_len] = torch.arange(
+                    base_pages[request] * page_size,
+                    base_pages[request] * page_size + query_len,
+                    dtype=torch.int32,
+                )
+            base = base_pages[request]
+            offset = chunk.token_start - query_start
+            rows = chunk.token_end - chunk.token_start
+            chunk.context_base_page = base
+            chunk.context_query_offset = offset
+            chunk.context_seq_lens = arange[offset + 1 : offset + rows + 1]
+            chunk.context_block_table = arange[base : base + pages].view(1, pages)
+        if not base_pages:
+            return
+        mapping = self.context_slot_mapping_buffer[:num_tokens]
+        mapping.copy_(slots, non_blocking=True)
+        prefill.context_cache = self.context_cache
+        prefill.context_slot_mapping = mapping
+
+    @staticmethod
+    def _chunk_request_index(
+        chunk: DeepseekV32IndexerPrefillChunkMetadata,
+        query_start_loc_cpu: torch.Tensor,
+    ) -> int | None:
+        """Return the request whose query span contains the chunk's rows."""
+        starts = query_start_loc_cpu.tolist()
+        for request in range(len(starts) - 1):
+            if starts[request] <= chunk.token_start < starts[request + 1]:
+                if chunk.token_end <= starts[request + 1]:
+                    return request
+                return None
+        return None
+
     def build(
         self,
         common_prefix_len: int,
@@ -961,6 +1076,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 if metadata is not None:
                     chunks.append(metadata)
             prefill_metadata = DeepseekV32IndexerPrefillMetadata(chunks)
+            if self.context_cache is not None:
+                self._assign_local_context(
+                    prefill_metadata,
+                    query_start_loc_cpu,
+                    compressed_seq_lens_cpu,
+                    num_tokens,
+                )
 
         decode_metadata = None
         if num_decodes > 0:

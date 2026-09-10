@@ -598,6 +598,7 @@ class TestVllmMaxNSequences:
         ("VLLM_DCP_QUERY_SPLIT", False, "1", True),
         ("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", 0, "4096", 4096),
         ("VLLM_DCP_TOPK_OWNER_MERGE", False, "1", True),
+        ("VLLM_DCP_INDEXER_LOCAL_CONTEXT", False, "1", True),
         ("VLLM_DCP_INDEXER_SHARDS", 0, "2", 2),
         ("VLLM_DCP_REPLICATE_INDEXER_CACHE", False, "1", True),
         ("VLLM_DCP_A2A_MAX_TOKENS", 0, "64", 64),

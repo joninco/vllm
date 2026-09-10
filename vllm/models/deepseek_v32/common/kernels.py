@@ -137,6 +137,13 @@ def _fused_norm_rope_kernel(
     indexer_cache_scale_ptr,
     indexer_cache_block_size,
     indexer_cache_block_stride,
+    # Step-local index K copy: every token with a nonnegative local slot is
+    # written, independent of KV ownership under DCP (same page layout).
+    indexer_local_slot_mapping_ptr,
+    indexer_local_cache_ptr,
+    indexer_local_cache_scale_ptr,
+    indexer_local_cache_block_size,
+    indexer_local_cache_block_stride,
     # MLA KV cache (concat kv_c_normed + k_pe_roped, uses slot_mapping_ptr)
     mla_cache_ptr,
     mla_cache_block_size,
@@ -183,11 +190,17 @@ def _fused_norm_rope_kernel(
         return
 
     if pid == 0:
+        local_index_slot = -1
+        if indexer_local_slot_mapping_ptr is not None:
+            local_index_slot = tl.load(indexer_local_slot_mapping_ptr + tok_idx)
         if indexer_slot_mapping_ptr is None:
-            if index_k_out_ptr is None:
+            if index_k_out_ptr is None and indexer_local_slot_mapping_ptr is None:
                 return
-        elif tl.load(indexer_slot_mapping_ptr + tok_idx) < 0:
-            return
+        elif tl.load(indexer_slot_mapping_ptr + tok_idx) < 0:  # noqa: SIM102
+            # Tokens this rank does not own only run for the step-local copy
+            # (nested scalar branches keep the constexpr pointer checks apart).
+            if local_index_slot < 0:
+                return
     else:
         if slot_mapping_ptr is None:
             if kv_out_ptr is None and kpe_out_ptr is None and index_k_out_ptr is None:
@@ -395,17 +408,34 @@ def _fused_norm_rope_kernel(
         # PCP inserts index K after gathering; other paths write it directly.
         if indexer_cache_ptr is not None and indexer_slot_mapping_ptr is not None:
             slot_idx = tl.load(indexer_slot_mapping_ptr + tok_idx)
-            _fp8_quant_and_cache_write(
-                result,
-                index_k_mask,
-                slot_idx,
-                indexer_cache_ptr,
-                indexer_cache_scale_ptr,
-                indexer_cache_block_size,
-                indexer_cache_block_stride,
-                index_k_block,
-                INDEX_K_DIM,
-            )
+            if slot_idx >= 0:
+                _fp8_quant_and_cache_write(
+                    result,
+                    index_k_mask,
+                    slot_idx,
+                    indexer_cache_ptr,
+                    indexer_cache_scale_ptr,
+                    indexer_cache_block_size,
+                    indexer_cache_block_stride,
+                    index_k_block,
+                    INDEX_K_DIM,
+                )
+        if (  # noqa: SIM102
+            indexer_local_cache_ptr is not None
+            and indexer_local_slot_mapping_ptr is not None
+        ):
+            if local_index_slot >= 0:
+                _fp8_quant_and_cache_write(
+                    result,
+                    index_k_mask,
+                    local_index_slot,
+                    indexer_local_cache_ptr,
+                    indexer_local_cache_scale_ptr,
+                    indexer_local_cache_block_size,
+                    indexer_local_cache_block_stride,
+                    index_k_block,
+                    INDEX_K_DIM,
+                )
 
 
 def fused_norm_rope(
@@ -438,6 +468,8 @@ def fused_norm_rope(
     index_k_out: torch.Tensor | None = None,
     materialize_nonlocal_mla_inputs: bool = False,
     indexer_slot_mapping: torch.Tensor | None = None,
+    indexer_local_cache: torch.Tensor | None = None,
+    indexer_local_slot_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert positions.ndim == 1
     assert q_c.ndim == 2
@@ -465,6 +497,8 @@ def fused_norm_rope(
     # HAS_INDEXER and never dereference them.
     if not has_indexer:
         indexer_k_cache = None
+        indexer_local_cache = None
+        indexer_local_slot_mapping = None
         index_k = _dummy((1, 1), q_c.dtype, device)
         index_k_layer_norm_w = _dummy((1,), torch.float32, device)
         index_k_layer_norm_bias = _dummy((1,), torch.float32, device)
@@ -493,6 +527,27 @@ def fused_norm_rope(
         idx_cache_scale_view = None
         idx_cache_block_size = 1
         idx_cache_block_stride = 0
+
+    # --- Step-local index K copy setup (same page layout as the cache) ---
+    if (indexer_local_cache is None) != (indexer_local_slot_mapping is None):
+        raise ValueError(
+            "The step-local index K copy needs both its cache and slot mapping"
+        )
+    if indexer_local_cache is not None:
+        assert indexer_local_slot_mapping is not None
+        if indexer_local_slot_mapping.shape[0] < num_tokens:
+            raise ValueError("Local index slot mapping must cover every token")
+        local_cache_scale_view = indexer_local_cache.view(torch.uint8).view(
+            torch.float32
+        )
+        local_cache_block_size = indexer_local_cache.shape[1]
+        local_cache_block_stride = indexer_local_cache.stride(0)
+        if indexer_local_cache.dtype == torch.uint8:
+            indexer_local_cache = indexer_local_cache.view(torch.float8_e4m3fn)
+    else:
+        local_cache_scale_view = None
+        local_cache_block_size = 1
+        local_cache_block_stride = 0
 
     # --- MLA KV cache setup ---
     mla_cache_ds_mla = mla_kv_cache_dtype == "fp8_ds_mla"
@@ -591,6 +646,11 @@ def fused_norm_rope(
         idx_cache_scale_view,
         idx_cache_block_size,
         idx_cache_block_stride,
+        indexer_local_slot_mapping,
+        indexer_local_cache,
+        local_cache_scale_view,
+        local_cache_block_size,
+        local_cache_block_stride,
         # MLA KV cache
         mla_kv_cache,
         mla_block_size,

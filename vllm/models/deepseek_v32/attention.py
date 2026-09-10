@@ -411,10 +411,25 @@ class DeepseekV32Attention(MLAAttention):
             indexer_softmax_scale = 0.0
             indexer_n_head_scale = 0.0
 
+        # Local-context indexer route: the step-local key copy and its slots
+        # come from the indexer metadata (None outside eligible prefills).
+        indexer_context_cache = None
+        indexer_context_slots = None
+        if has_indexer and isinstance(attn_metadata_raw, dict) and self.indexer:
+            indexer_prefill = getattr(
+                attn_metadata_raw.get(self.indexer.k_cache.prefix), "prefill", None
+            )
+            context_slots = getattr(indexer_prefill, "context_slot_mapping", None)
+            if context_slots is not None:
+                indexer_context_cache = getattr(indexer_prefill, "context_cache", None)
+                indexer_context_slots = context_slots
+
         if attn_metadata is None or self.use_pcp:
             mla_kv_cache = None
             mla_k_scale = None
             indexer_k_cache = None
+            indexer_context_cache = None
+            indexer_context_slots = None
             mla_slot = None
         elif self._native_packed_kv_update:
             # Keep the fused indexer-cache write, but let the sparse backend
@@ -464,6 +479,8 @@ class DeepseekV32Attention(MLAAttention):
             k_pe_out=k_pe_out,
             index_k_out=index_k_out,
             materialize_nonlocal_mla_inputs=self.impl.dcp_world_size > 1,
+            indexer_local_cache=indexer_context_cache,
+            indexer_local_slot_mapping=indexer_context_slots,
         )
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)

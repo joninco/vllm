@@ -25,6 +25,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepSeekV32IndexerDecodeMetadata,
     DeepseekV32IndexerMetadata,
     DeepseekV32IndexerMetadataBuilder,
+    DeepseekV32IndexerPrefillChunkMetadata,
     split_indexer_prefill_chunks,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -829,6 +830,73 @@ class B12xSparseIndexer(nn.Module):
             compile=compile,
         )
 
+    def _local_context_eligible(
+        self,
+        chunk: DeepseekV32IndexerPrefillChunkMetadata,
+        context_cache: torch.Tensor | None,
+        metadata: DeepseekV32IndexerMetadata,
+    ) -> bool:
+        """Whether ``chunk`` scores against the step-local key copy.
+
+        The route replaces the sharded scoring and cross-rank candidate merge
+        for a request whose whole context is among the step's tokens (see
+        ``DeepseekV32IndexerMetadataBuilder._assign_local_context``). Decode
+        rows and captured streams keep the sharded path: the copy is written
+        by the eager prefill kernel of the same step.
+        """
+        return (
+            self.dcp_world_size > 1
+            and context_cache is not None
+            and getattr(chunk, "context_base_page", -1) >= 0
+            and chunk.context_seq_lens is not None
+            and chunk.context_block_table is not None
+            and metadata.decode is None
+            and not _is_current_stream_capturing(self.topk_indices_buffer)
+        )
+
+    def _run_local_context_chunk(
+        self,
+        chunk: DeepseekV32IndexerPrefillChunkMetadata,
+        context_cache: torch.Tensor,
+        q_quant: torch.Tensor,
+        weights: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Score every row of ``chunk`` against the step-local key copy.
+
+        Rows keep their request-relative causal bounds and the selection is
+        emitted as logical positions, which equal global token ids because
+        the request has no cached history. No candidate is exchanged.
+        """
+        start, end = chunk.token_start, chunk.token_end
+        rows = end - start
+        assert chunk.context_seq_lens is not None
+        assert chunk.context_block_table is not None
+        seq_lens = chunk.context_seq_lens
+        pages = int(chunk.context_block_table.shape[1])
+        block_table = chunk.context_block_table.expand(rows, pages)
+        plan = self._get_plan("prefill", rows)
+        _run_paged_topk(
+            module=self._module,
+            plan=plan,
+            q=q_quant[start:end].contiguous(),
+            weights=weights[start:end].contiguous(),
+            kv_cache=context_cache,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            active_width=self.active_width_cap,
+            output=output,
+            return_scores=False,
+        )
+        if self._sorts(plan):
+            b12x_topk_sort.sort_convert(
+                output,
+                seq_lens,
+                block_table,
+                _INDEX_PAGE_SIZE,
+                self.max_model_len,
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -855,6 +923,7 @@ class B12xSparseIndexer(nn.Module):
         metadata = cast(DeepseekV32IndexerMetadata, attn_metadata[self.k_cache.prefix])
 
         if metadata.prefill is not None:
+            context_cache = getattr(metadata.prefill, "context_cache", None)
             for chunk in metadata.prefill.chunks:
                 if chunk.num_reqs != 1:
                     raise RuntimeError(
@@ -862,6 +931,11 @@ class B12xSparseIndexer(nn.Module):
                     )
                 start, end = chunk.token_start, chunk.token_end
                 full_output = self.topk_indices_buffer[start:end, : self.topk_tokens]
+                if self._local_context_eligible(chunk, context_cache, metadata):
+                    self._run_local_context_chunk(
+                        chunk, context_cache, q_quant, weights, full_output
+                    )
+                    continue
                 query_group = getattr(self, "_prefill_query_group", None)
                 split = (
                     getattr(self, "attention_dcp_world_size", self.dcp_world_size) > 1
