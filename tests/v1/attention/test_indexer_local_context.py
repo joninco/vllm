@@ -72,10 +72,15 @@ def test_assign_marks_fresh_requests_and_keeps_history_chunks_sharded():
     builder._assign_local_context(prefill, starts, seq_lens, 190)
 
     assert prefill.context_cache is builder.context_cache
+    # The producer runs over the step's padded rows: the mapping keeps the
+    # buffer's full length and marks every row beyond the step's tokens.
+    assert prefill.context_slot_mapping is builder.context_slot_mapping_buffer
     slots = prefill.context_slot_mapping.tolist()
+    assert len(slots) == 256
     assert slots[:100] == list(range(100))
     assert slots[100:120] == [-1] * 20
     assert slots[120:190] == list(range(2 * PAGE, 2 * PAGE + 70))
+    assert slots[190:] == [-1] * 66
 
     first, history, part_a, part_b = chunks
     assert first.context_base_page == 0
@@ -89,6 +94,18 @@ def test_assign_marks_fresh_requests_and_keeps_history_chunks_sharded():
     assert part_a.context_seq_lens.tolist() == list(range(1, 41))
     assert part_b.context_seq_lens.tolist() == list(range(41, 71))
     assert part_b.context_block_table.tolist() == [[2, 3]]
+
+
+def test_assign_clears_stale_slots_beyond_the_step():
+    builder = make_builder()
+    builder.context_slot_mapping_buffer.fill_(5)
+    prefill = DeepseekV32IndexerPrefillMetadata([chunk(0, 8, 8)])
+    builder._assign_local_context(
+        prefill, torch.tensor([0, 8], dtype=torch.int32), torch.tensor([8]), 8
+    )
+    slots = prefill.context_slot_mapping.tolist()
+    assert slots[:8] == list(range(8))
+    assert slots[8:] == [-1] * 248
 
 
 def test_assign_without_fresh_requests_leaves_prefill_metadata_untouched():

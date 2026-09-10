@@ -956,8 +956,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             chunk.context_block_table = arange[base : base + pages].view(1, pages)
         if not base_pages:
             return
-        mapping = self.context_slot_mapping_buffer[:num_tokens]
-        mapping.copy_(slots, non_blocking=True)
+        # The producer runs over the padded token count of the step, so the
+        # mapping keeps its full length with -1 beyond the step's tokens.
+        mapping = self.context_slot_mapping_buffer
+        mapping[:num_tokens].copy_(slots, non_blocking=True)
+        mapping[num_tokens:].fill_(-1)
         prefill.context_cache = self.context_cache
         prefill.context_slot_mapping = mapping
 
