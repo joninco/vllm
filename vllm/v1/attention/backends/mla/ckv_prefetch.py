@@ -29,12 +29,21 @@ class OrderedStream(Protocol):
 
 @dataclass(frozen=True)
 class CKVPrefetchPlan:
+    """Per-lane ring geometry; ``effective_depth`` is the largest lane depth.
+
+    ``lane_depths`` holds one lookahead depth per model lane. A lane whose
+    model has ``n`` layers can never prefetch more than ``n - 1`` layers
+    ahead, so its ring is sized to ``min(depth, n - 1) + 1`` slots; the
+    single-layer drafter lane therefore reserves depth-zero storage only.
+    """
+
     effective_depth: int
     dcp_world_size: int
     local_capacity: int
     record_bytes: int
     num_ubatches: int
     num_lanes: int
+    lane_depths: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -51,6 +60,19 @@ class CKVPrefetchPlan:
             raise ValueError(
                 "CKV reservation requires non-negative depth and positive geometry"
             )
+        if not self.lane_depths:
+            object.__setattr__(
+                self, "lane_depths", (self.effective_depth,) * self.num_lanes
+            )
+        if len(self.lane_depths) != self.num_lanes or any(
+            depth < 0 or depth > self.effective_depth for depth in self.lane_depths
+        ):
+            raise ValueError(
+                "CKV lane depths must give one depth per lane, each between "
+                "zero and the effective depth"
+            )
+        if self.effective_depth and max(self.lane_depths) != self.effective_depth:
+            raise ValueError("CKV effective depth must equal the deepest lane")
 
     @classmethod
     def create(
@@ -63,8 +85,14 @@ class CKVPrefetchPlan:
         record_bytes: int,
         num_ubatches: int = 1,
         num_lanes: int = 1,
+        lane_layer_counts: tuple[int, ...] | None = None,
     ) -> CKVPrefetchPlan:
-        """Choose lookahead within a per-lane budget; zero means uncapped."""
+        """Choose lookahead within a per-lane budget; zero means uncapped.
+
+        ``lane_layer_counts`` gives the number of attention layers executed in
+        each model lane; a lane's depth is bounded by one less than its layer
+        count because lookahead targets later layers of the same lane.
+        """
         if requested_depth < 0 or budget_bytes < 0:
             raise ValueError("CKV depth and budget must be non-negative")
         if (
@@ -82,8 +110,48 @@ class CKVPrefetchPlan:
         depth = requested_depth
         if budget_bytes:
             depth = min(depth, (budget_bytes // unit - 1) // dcp_world_size - 1)
+        if lane_layer_counts is None:
+            lane_depths = (depth,) * num_lanes
+        else:
+            if len(lane_layer_counts) != num_lanes or any(
+                layers < 1 for layers in lane_layer_counts
+            ):
+                raise ValueError(
+                    "CKV lane layer counts must name one positive count per lane"
+                )
+            lane_depths = tuple(min(depth, layers - 1) for layers in lane_layer_counts)
         return cls(
-            depth, dcp_world_size, local_capacity, record_bytes, num_ubatches, num_lanes
+            max(lane_depths),
+            dcp_world_size,
+            local_capacity,
+            record_bytes,
+            num_ubatches,
+            num_lanes,
+            lane_depths,
+        )
+
+    def lane_depth(self, model_lane: int) -> int:
+        if not 0 <= model_lane < self.num_lanes:
+            raise ValueError(f"CKV model lane {model_lane} is outside the reservation")
+        return self.lane_depths[model_lane]
+
+    def lane_ring_slots(self, model_lane: int) -> int:
+        return self.lane_depth(model_lane) + 1
+
+    def lane_nbytes_for(self, model_lane: int) -> int:
+        return (
+            (1 + self.dcp_world_size * self.lane_ring_slots(model_lane))
+            * self.local_capacity
+            * self.record_bytes
+        )
+
+    def lane_offset(self, ubatch: int, model_lane: int) -> int:
+        """Byte offset of one lane's storage; ubatches repeat the lane layout."""
+        if not 0 <= ubatch < self.num_ubatches:
+            raise ValueError(f"CKV ubatch {ubatch} is outside the reservation")
+        per_ubatch = sum(self.lane_nbytes_for(lane) for lane in range(self.num_lanes))
+        return ubatch * per_ubatch + sum(
+            self.lane_nbytes_for(lane) for lane in range(model_lane)
         )
 
     @property
@@ -92,6 +160,7 @@ class CKVPrefetchPlan:
 
     @property
     def lane_nbytes(self) -> int:
+        """Storage of the deepest lane; per-lane sizes come from ``lane_nbytes_for``."""
         return (
             (1 + self.dcp_world_size * self.ring_slots)
             * self.local_capacity
@@ -100,7 +169,9 @@ class CKVPrefetchPlan:
 
     @property
     def total_nbytes(self) -> int:
-        return self.lane_nbytes * self.num_ubatches * self.num_lanes
+        return self.num_ubatches * sum(
+            self.lane_nbytes_for(lane) for lane in range(self.num_lanes)
+        )
 
 
 class CKVWorkspacePool:
@@ -121,8 +192,8 @@ class CKVWorkspacePool:
         if lane in self._leased:
             raise RuntimeError(f"CKV execution lane {lane} already has a storage lease")
         self._leased.add(lane)
-        offset = (ubatch * self.plan.num_lanes + model_lane) * self.plan.lane_nbytes
-        return self.storage.narrow(0, offset, self.plan.lane_nbytes)
+        offset = self.plan.lane_offset(ubatch, model_lane)
+        return self.storage.narrow(0, offset, self.plan.lane_nbytes_for(model_lane))
 
     def _release(self, lane: tuple[int, int]) -> None:
         self._leased.remove(lane)
@@ -186,7 +257,9 @@ class CKVPrefetchState:
         self.storage = pool.acquire(lane)
         self.layer_caches: dict[int, torch.Tensor] = {}
         self.pending: dict[int, int] = {}
-        self._slots: list[_Slot | None] = [None] * pool.plan.ring_slots
+        self.ring_slots = pool.plan.lane_ring_slots(lane[1])
+        self.lookahead_depth = pool.plan.lane_depth(lane[1])
+        self._slots: list[_Slot | None] = [None] * self.ring_slots
         self._staging_writer: CompletionEvent | None = None
         self._writing: int | None = None
         self._last_layer: int | None = None
@@ -221,7 +294,7 @@ class CKVPrefetchState:
         """Return shared staging and one fixed-capacity gathered-cache view."""
         self._check_open()
         plan = self.pool.plan
-        if not 0 <= slot < plan.ring_slots:
+        if not 0 <= slot < self.ring_slots:
             raise ValueError(f"CKV ring slot {slot} is outside the reservation")
         unit = plan.local_capacity * plan.record_bytes
         staging = self.storage[:unit].view(plan.local_capacity, plan.record_bytes)
@@ -261,7 +334,7 @@ class CKVPrefetchState:
         self._synchronize()
         self.layer_caches.clear()
         self.pending.clear()
-        self._slots = [None] * self.pool.plan.ring_slots
+        self._slots = [None] * self.ring_slots
         self._staging_writer = None
         self._last_layer = None
 
@@ -278,7 +351,7 @@ class CKVPrefetchState:
         """Stop lookahead at an undiscovered cache; skip queued layers."""
         self._check_open()
         targets = []
-        for target in range(layer + 1, layer + self.pool.plan.effective_depth + 1):
+        for target in range(layer + 1, layer + self.lookahead_depth + 1):
             if target not in self.layer_caches:
                 break
             if target not in self.pending:
@@ -293,7 +366,7 @@ class CKVPrefetchState:
         if layer < 0 or layer in self.pending:
             raise ValueError(f"CKV gather layer {layer} is invalid or already pending")
         self.order_staging(stream)
-        index = layer % self.pool.plan.ring_slots
+        index = layer % self.ring_slots
         previous = self._slots[index]
         if previous is not None:
             if previous.layer in self.pending:
@@ -336,7 +409,7 @@ class CKVPrefetchState:
         self._check_open()
         if event is None:
             raise ValueError("CKV consumer requires a recorded completion event")
-        slot = self._slots[layer % self.pool.plan.ring_slots]
+        slot = self._slots[layer % self.ring_slots]
         if slot is None or slot.layer != layer or not slot.consuming:
             raise RuntimeError("CKV consumer completion has no matching reader")
         if slot.consumer is not None:

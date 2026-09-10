@@ -136,7 +136,9 @@ def test_actual_policy_dispatch_and_independent_roles(monkeypatch, trace, kind):
         assert any(name == "cache_produce" for name, _ in events)
     else:
         assert fields["ownership_enabled"] == 0
-        assert dispatch["route"] == 1
+        # Mixed rows above the captured token sizes keep the AG/RS contract of
+        # the configured base backend; MTP and decode batches stay configured.
+        assert dispatch["route"] == (4 if kind == "mixed" else 1)
         assert not any(name == "cache_produce" for name, _ in events)
         assert not {"lease", "slot", "use"} & fields.keys()
         assert not {"lease", "slot", "use"} & dispatch.keys()

@@ -579,7 +579,7 @@ def install_state_trace(state, trace: PrefillTrace) -> None:
     state._prefill_trace_installed = True
     trace._leases += 1
     lease = trace._leases
-    uses = [0] * state.pool.plan.ring_slots
+    uses = [0] * state.ring_slots
     base = dict(
         lease=lease,
         generation=state.generation,
@@ -730,7 +730,7 @@ def install_backend_trace(impl, trace: PrefillTrace) -> None:
         with trace.scope("dispatch", route=2):
             result = original_consume(cache, metadata, layer, original_cache)
         _, state, layer_idx = result
-        slot = layer_idx % state.pool.plan.ring_slots
+        slot = layer_idx % state.ring_slots
         trace.set_owner(
             **state._prefill_trace_identity,
             slot=slot,
@@ -753,7 +753,7 @@ def install_backend_trace(impl, trace: PrefillTrace) -> None:
                 asynchronous=asynchronous,
             )
         source_layer = trace.current_fields.get("layer", -1)
-        slot = layer_idx % state.pool.plan.ring_slots
+        slot = layer_idx % state.ring_slots
         use = state._prefill_trace_uses[slot] + 1
         with trace.scope(
             "history_gather" if asynchronous else "full_gather",

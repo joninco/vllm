@@ -184,6 +184,24 @@ def _selected_index_block_stride_rows(
     return block_size
 
 
+def _ckv_lane_layer_counts(vllm_config: VllmConfig) -> tuple[int, int]:
+    """Attention layer counts of the target lane and the drafter lane."""
+    target_layers = max(
+        1, int(getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 1))
+    )
+    draft_layers = target_layers
+    spec_config = vllm_config.speculative_config
+    draft_model_config = getattr(spec_config, "draft_model_config", None)
+    if draft_model_config is not None:
+        draft_hf = draft_model_config.hf_text_config
+        draft_layers = int(
+            getattr(draft_hf, "num_nextn_predict_layers", 0)
+            or getattr(draft_hf, "num_hidden_layers", 0)
+            or 1
+        )
+    return target_layers, max(1, draft_layers)
+
+
 def _max_speculative_decode_query_len(vllm_config: VllmConfig) -> int:
     spec_config = vllm_config.speculative_config
     if spec_config is None:
@@ -1264,6 +1282,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 )
         self._max_tokens = max_tokens
         self._max_seqs = max_seqs
+        # Model lane 0 executes the target model; lane 1, when the runner
+        # reserves it, executes the drafter. Lookahead cannot exceed a lane's
+        # layer count minus one, so the single-layer drafter keeps depth zero.
+        self._ckv_lane_layer_counts = _ckv_lane_layer_counts(vllm_config)
         self._max_speculative_decode_query_len = _max_speculative_decode_query_len(
             vllm_config
         )
@@ -1432,15 +1454,25 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         )
         if requested_depth < 0:
             raise ValueError("CKV prefetch depth must be non-negative")
-        geometry = dict(
+        lane_layer_counts: tuple[int, ...] | None = None
+        recorded_counts = getattr(self, "_ckv_lane_layer_counts", None)
+        if recorded_counts is not None:
+            # Lanes beyond the recorded target/drafter pair keep the target depth.
+            lane_layer_counts = tuple(
+                recorded_counts[lane]
+                if lane < len(recorded_counts)
+                else recorded_counts[0]
+                for lane in range(num_lanes)
+            )
+        plan = CKVPrefetchPlan.create(
+            requested_depth=0,
+            budget_bytes=budget_bytes,
             dcp_world_size=self.dcp_world_size,
             local_capacity=self._ckv_local_capacity,
             record_bytes=self._cache_record_bytes,
             num_ubatches=num_ubatches,
             num_lanes=num_lanes,
-        )
-        plan = CKVPrefetchPlan.create(
-            requested_depth=0, budget_bytes=budget_bytes, **geometry
+            lane_layer_counts=lane_layer_counts,
         )
         if requested_depth and (
             budget_bytes == 0 or budget_bytes >= current_bytes + plan.lane_nbytes
@@ -1448,7 +1480,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             plan = CKVPrefetchPlan.create(
                 requested_depth=requested_depth,
                 budget_bytes=budget_bytes - current_bytes if budget_bytes else 0,
-                **geometry,
+                dcp_world_size=self.dcp_world_size,
+                local_capacity=self._ckv_local_capacity,
+                record_bytes=self._cache_record_bytes,
+                num_ubatches=num_ubatches,
+                num_lanes=num_lanes,
+                lane_layer_counts=lane_layer_counts,
             )
         current_capacity = self._ckv_current_capacity if plan.effective_depth else 0
         key = (plan, current_capacity)
@@ -1488,9 +1525,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
             reservations[key] = reservation
             logger.info(
-                "Reserved CKV prefill storage: depth=%d lanes=%d bytes=%d "
-                "including native current-chunk exchange",
+                "Reserved CKV prefill storage: depth=%d lane_depths=%s lanes=%d "
+                "bytes=%d including native current-chunk exchange",
                 plan.effective_depth,
+                list(plan.lane_depths),
                 plan.num_ubatches * plan.num_lanes,
                 plan.total_nbytes + current_local.numel() + current_gathered.numel(),
             )
@@ -1870,9 +1908,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         for ubatch in range(plan.num_ubatches):
             for model_lane in range(plan.num_lanes):
                 lane = (ubatch, model_lane)
-                offset = (ubatch * plan.num_lanes + model_lane) * plan.lane_nbytes
                 storage = reservation.registry.pool.storage.narrow(
-                    0, offset, plan.lane_nbytes
+                    0,
+                    plan.lane_offset(ubatch, model_lane),
+                    plan.lane_nbytes_for(model_lane),
                 )
                 local = storage[:unit].view(plan.local_capacity, plan.record_bytes)
                 local.zero_()
@@ -1882,7 +1921,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                         unit + slot * unit * plan.dcp_world_size,
                         unit * plan.dcp_world_size,
                     ).view(plan.dcp_world_size * plan.local_capacity, plan.record_bytes)
-                    for slot in range(plan.ring_slots)
+                    for slot in range(plan.lane_ring_slots(model_lane))
                 ]
                 stream_role = 0
                 for slot, gathered in enumerate(targets):
@@ -1892,7 +1931,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                             local[:count].view(-1),
                             gathered[: plan.dcp_world_size * count].view(-1),
                         )
-                if prefetch_group is not None:
+                # A lane without lookahead never gathers on the prefetch stream.
+                if prefetch_group is not None and plan.lane_depth(model_lane):
                     slot = -1
                     current_local = reservation.current_local[ubatch, model_lane]
                     current_local.zero_()
@@ -1946,10 +1986,10 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         main.synchronize()
         reservation.collectives_warmed = True
         logger.info(
-            "Warmed CKV all-gather paths: rank_spans=%s ring_slots=%d lanes=%d "
+            "Warmed CKV all-gather paths: rank_spans=%s lane_ring_slots=%s lanes=%d "
             "prefetch_streams=%d current_rank_capacity=%d",
             sizes,
-            plan.ring_slots,
+            [plan.lane_ring_slots(lane) for lane in range(plan.num_lanes)],
             plan.num_ubatches * plan.num_lanes,
             len(reservation.gather_streams),
             reservation.current_local.shape[-2],

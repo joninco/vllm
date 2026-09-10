@@ -1291,6 +1291,62 @@ def test_full_ckv_reservation_is_shared_and_charged_for_every_lane(
     first.reset_kv_cache_binding_state()
 
 
+def test_full_ckv_reservation_gives_the_single_layer_drafter_lane_no_lookahead(
+    monkeypatch,
+) -> None:
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    manager = WorkspaceManager(torch.device("cpu"), num_ubatches=1, num_lanes=2)
+    monkeypatch.setattr(b12x_mla_sparse, "current_workspace_manager", lambda: manager)
+    monkeypatch.setenv("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", "1")
+    monkeypatch.setenv("VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB", "0")
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.ensure_dcp_ckv_prefetch_group",
+        lambda: None,
+        raising=False,
+    )
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._is_glm_dsa = True
+    impl.dcp_world_size = 4
+    impl._ckv_local_capacity = 8
+    impl._ckv_current_capacity = 8
+    impl._cache_record_bytes = 656
+    impl._max_tokens = 32
+    impl._ckv_lane_layer_counts = (78, 1)
+    impl._decode_plan = SimpleNamespace(
+        caps=SimpleNamespace(device=torch.device("cpu"))
+    )
+    impl._reserve_ckv_prefetch()
+    plan = impl._ckv_reservation.registry.pool.plan
+    assert plan.lane_depths == (1, 0) and plan.effective_depth == 1
+    # Target lane: staging plus two ring slots; drafter lane: staging plus one.
+    assert (
+        impl._ckv_reservation.registry.pool.storage.numel()
+        == ((1 + 4 * 2) + (1 + 4 * 1)) * 8 * 656
+    )
+    impl.reset_kv_cache_binding_state()
+
+
+def test_ckv_lane_layer_counts_read_target_and_drafter_layers() -> None:
+    target = SimpleNamespace(num_hidden_layers=78)
+    draft = SimpleNamespace(num_hidden_layers=78, num_nextn_predict_layers=1)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=target),
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_text_config=draft)
+        ),
+    )
+    assert b12x_mla_sparse._ckv_lane_layer_counts(config) == (78, 1)
+    config.speculative_config = None
+    assert b12x_mla_sparse._ckv_lane_layer_counts(config) == (78, 78)
+    config.speculative_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(num_hidden_layers=2)
+        )
+    )
+    assert b12x_mla_sparse._ckv_lane_layer_counts(config) == (78, 2)
+
+
 @pytest.mark.parametrize("record_bytes", [656, 368])
 def test_full_ckv_current_chunk_copies_producer_bytes_without_requantization(
     monkeypatch, record_bytes

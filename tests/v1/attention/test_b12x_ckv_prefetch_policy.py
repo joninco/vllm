@@ -80,6 +80,54 @@ def test_budget_counts_staging_every_ring_slot_and_every_lane():
     assert make_plan(budget_bytes=5 * 16).effective_depth == 0
 
 
+def test_single_layer_lane_keeps_depth_zero_storage():
+    plan = make_plan(requested_depth=1, lane_layer_counts=(78, 1))
+    assert plan.lane_depths == (1, 0)
+    assert plan.effective_depth == 1
+    assert plan.lane_ring_slots(0) == 2 and plan.lane_ring_slots(1) == 1
+    assert plan.lane_nbytes_for(0) == 9 * 16 and plan.lane_nbytes_for(1) == 5 * 16
+    assert plan.total_nbytes == 14 * 16
+    assert plan.lane_offset(0, 1) == 9 * 16
+    two = make_plan(requested_depth=1, lane_layer_counts=(78, 1), num_ubatches=2)
+    assert two.total_nbytes == 2 * 14 * 16
+    assert two.lane_offset(1, 0) == 14 * 16 and two.lane_offset(1, 1) == 23 * 16
+    assert make_plan(requested_depth=3, lane_layer_counts=(3, 2)).lane_depths == (2, 1)
+    with pytest.raises(ValueError, match="one positive count per lane"):
+        make_plan(lane_layer_counts=(78,))
+    with pytest.raises(ValueError, match="one positive count per lane"):
+        make_plan(lane_layer_counts=(78, 0))
+    with pytest.raises(ValueError, match="deepest lane"):
+        CKVPrefetchPlan(2, 4, 2, 8, 1, 2, (1, 0))
+    with pytest.raises(ValueError, match="one depth per lane"):
+        CKVPrefetchPlan(1, 4, 2, 8, 1, 2, (1,))
+
+
+def test_drafter_lane_state_uses_its_own_ring_and_no_lookahead():
+    plan = make_plan(requested_depth=1, lane_layer_counts=(78, 1))
+    registry = CKVPrefetchRegistry(CKVWorkspacePool(plan, torch.device("cpu")))
+    workspace = torch.empty(32)
+    target = registry.for_workspace(workspace, lane=(0, 0))
+    drafter = registry.for_workspace(workspace, lane=(0, 1))
+    assert target.ring_slots == 2 and target.lookahead_depth == 1
+    assert drafter.ring_slots == 1 and drafter.lookahead_depth == 0
+    assert drafter.storage.numel() == 5 * 16
+    assert drafter.storage.data_ptr() == target.storage.data_ptr() + 9 * 16
+    with pytest.raises(ValueError, match="outside the reservation"):
+        drafter.views(1)
+    log: list[tuple[str, ...]] = []
+    main = Stream("main", log)
+    drafter.register_cache(78, torch.empty(1))
+    drafter.register_cache(79, torch.empty(1))
+    assert drafter.targets(78) == []
+    target.register_cache(0, torch.empty(1))
+    target.register_cache(1, torch.empty(1))
+    assert target.targets(0) == [1]
+    gather(drafter, 78, main, main, log)
+    assert drafter.consume(78, main).shape == (8, 8)
+    drafter.finish_consumer(78, Event("consume-78", log))
+    registry.clear()
+
+
 @pytest.mark.parametrize("budget", [1, 5 * 16 - 1])
 def test_positive_budget_rejects_mandatory_storage_shortfall(budget):
     with pytest.raises(ValueError, match="mandatory.*80 bytes per lane"):
