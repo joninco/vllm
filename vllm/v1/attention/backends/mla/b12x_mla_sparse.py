@@ -724,9 +724,11 @@ class B12xMLASparseMetadataBuilder(
         ):
             raise ValueError(dcp_error)
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        # All step-dependent state is persistent. Generic DSA DCP additionally
-        # refreshes its rank-local sequence lengths in place between steps.
-        self.supports_draft_decode_metadata_update = True
+        # All step-dependent state is persistent at DCP=1. Under DCP the
+        # decode kernels bind per-token lengths that ``build`` localizes from
+        # the positions into the builder's buffer; an in-place refresh of the
+        # per-request lengths would leave them stale, so draft steps rebuild.
+        self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         scheduler_config = vllm_config.scheduler_config
         max_tokens = scheduler_config.max_num_batched_tokens
