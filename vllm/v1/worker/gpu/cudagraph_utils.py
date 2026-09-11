@@ -41,7 +41,11 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup, unbind_kv_cache
-from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
+from vllm.v1.worker.workspace import (
+    collect_cuda_graph_capture_resources,
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -269,6 +273,7 @@ class CudaGraphManager:
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         full_capture_request_sizes: frozenset[int] | None = None,
+        specialize_full_decode: bool = False,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -279,6 +284,7 @@ class CudaGraphManager:
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
         self.full_capture_request_sizes = full_capture_request_sizes
+        self.specialize_full_decode = specialize_full_decode
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -343,7 +349,9 @@ class CudaGraphManager:
         max_decode_tokens = self.max_num_reqs * self.decode_query_len
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
-        separate_decode_routine = self.cudagraph_mode.separate_routine()
+        separate_decode_routine = self.cudagraph_mode.separate_routine() or (
+            self.cudagraph_mode == CUDAGraphMode.FULL and self.specialize_full_decode
+        )
         max_cg_capture_size = self.compilation_config.max_cudagraph_capture_size
 
         descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
@@ -479,6 +487,12 @@ class CudaGraphManager:
                 # num_tokens. Group them so each graph covers the same candidate range.
                 for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
                     matching = list(group)
+                    matching.sort(
+                        key=lambda d: (
+                            d.uniform_token_count is None,
+                            d.max_query_len is None,
+                        )
+                    )
                     for i in range(current_range_start, num_tokens + 1):
                         key = (i, num_active_loras)
                         self._candidates.setdefault(key, []).extend(matching)
@@ -659,6 +673,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        specialize_full_decode: bool = False,
     ):
         super().__init__(
             vllm_config,
@@ -667,6 +682,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             decode_query_len,
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
+            specialize_full_decode=specialize_full_decode,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
@@ -739,9 +755,14 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = None
-                if cg_mode == CUDAGraphMode.PIECEWISE:
+                if (
+                    cg_mode == CUDAGraphMode.PIECEWISE
+                    or desc.cg_mode == CUDAGraphMode.FULL
+                ):
                     batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens,
+                        num_reqs=desc.num_reqs,
+                        uniform=desc.uniform_token_count is not None,
                         has_lora=has_lora,
                         num_active_loras=desc.num_active_loras,
                     )
@@ -1103,6 +1124,10 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         speculator.reset_attn()
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
+    # The profiling capture locked the workspace for graphs that no longer
+    # exist; the warmups before the real capture may still grow it.
+    if is_workspace_manager_initialized() and current_workspace_manager().is_locked():
+        current_workspace_manager().unlock()
     gc.collect()
     torch.accelerator.synchronize()
     torch.accelerator.empty_cache()
