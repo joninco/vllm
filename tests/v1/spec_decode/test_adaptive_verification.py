@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
@@ -34,6 +36,65 @@ def make_manager(
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
     return manager
+
+
+@pytest.mark.parametrize("world_size,expected_budget", [(1, 0), (2, 1)])
+def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
+    monkeypatch, world_size, expected_budget
+):
+    # One FP32 ULP across a utility threshold changes the graph's token count.
+    local = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(0.0))]])
+    leader = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(1.0))]])
+    manager = make_manager(local.numpy().copy(), np.array([1.0, 1.0, 1.5]))
+    manager.req_states.device = torch.device("cpu")
+    manager._confidence_probs = torch.empty_like(local)
+    manager._pending_resets = []
+
+    class CopyBuffer:
+        """Synchronous CPU double for a confidence snapshot transfer buffer."""
+
+        def __init__(self):
+            """Allocate independent source and destination snapshot storage."""
+            self.np = np.ones((1, 1), dtype=np.float32)
+            self.gpu = torch.empty_like(local)
+
+        def copy_to_cpu(self):
+            """Copy the synchronized snapshot into the CPU selection buffer."""
+            self.np[:] = self.gpu.numpy()
+
+    manager._stale_confidences = [CopyBuffer(), CopyBuffer()]
+    manager._copy_events = [
+        SimpleNamespace(synchronize=lambda: None, record=lambda: None) for _ in range(2)
+    ]
+    manager._copy_stream = SimpleNamespace(wait_stream=lambda _stream: None)
+    calls = []
+
+    def broadcast(tensor, src):
+        assert src == 0
+        calls.append(tensor)
+        tensor.copy_(leader)
+
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=world_size, broadcast=broadcast),
+    )
+    monkeypatch.setattr(adaptive_module, "gpu_sync_allowed", nullcontext)
+    monkeypatch.setattr(adaptive_module.torch.cuda, "current_stream", lambda _: None)
+    monkeypatch.setattr(adaptive_module, "stream", lambda *_: nullcontext())
+    batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([0]))
+
+    # Two records expose the completed previous-step snapshot to CPU selection.
+    for _ in range(2):
+        manager.record_confidences(local, batch)
+    expected = leader if world_size > 1 else local
+    torch.testing.assert_close(manager._confidence_probs, expected, rtol=0, atol=0)
+    np.testing.assert_array_equal(
+        manager._stale_confidences[manager._stale_idx].np, expected.numpy()
+    )
+    assert manager.get_num_tokens({"low": 2}, {"low": [7]}) == 1 + expected_budget
+    assert len(calls) == (2 if world_size > 1 else 0)
+    assert local.item() < 0.5  # The caller's proposal confidence is not mutated.
 
 
 @pytest.mark.parametrize(
@@ -339,3 +400,113 @@ def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
     # (request, position) keys, so the kernel can mask rows the compacted
     # device layout no longer has room for.
     assert mapping == [0, 1, 2, 3, 4, 5, 6]
+
+
+def _run_tp_confidence_consistency(rank, port):
+    import torch
+    import torch.distributed as dist
+
+    from tests.utils import init_test_distributed_environment
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        get_tp_group,
+    )
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    with set_current_vllm_config(VllmConfig()), torch.no_grad():
+        try:
+            init_test_distributed_environment(2, 1, rank, str(port), local_rank=rank)
+            state = SimpleNamespace(
+                device=device,
+                max_num_reqs=2,
+                num_speculative_steps=5,
+                req_id_to_index={"r": 0, "s": 1},
+                num_computed_tokens_np=np.array([100, 100], dtype=np.int32),
+                prefill_len=SimpleNamespace(np=np.ones(2, dtype=np.int32)),
+            )
+            manager = AdaptiveVerificationManager(
+                state,
+                torch.zeros(3, dtype=torch.int32, device=device),
+                num_bonus_tokens=1,
+                max_total_logits=6,
+            )
+            manager.add_request(0)
+            manager.add_request(1)
+            manager.cost_tables = (
+                np.array([0.0, 0.2, 0.2]),
+                np.array([0.0, 0.9, 1.0, 1.48, 1.48, 3.0, 3.0]),
+            )
+            batch = SimpleNamespace(
+                num_reqs=1,
+                idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+            )
+            confidence = torch.tensor(
+                [[0.8, 0.6, 0.502 if rank == 0 else 0.498, 0.2, 0.2]],
+                dtype=torch.float32,
+                device=device,
+            )
+            # Publish through the real GPU/D2H path twice to consume a landed
+            # stale slot. Small rank-local differences straddle a graph budget.
+            for _ in range(2):
+                manager.record_confidences(confidence, batch)
+            tokens = manager.get_num_tokens({"r": 6}, {"r": [1] * 5})
+            counts = [None, None]
+            dist.all_gather_object(counts, tokens, group=get_tp_group().cpu_group)
+            assert counts == [4, 4], counts
+            manager.reallocate_drafts(["r"], batch.idx_mapping)
+            torch.cuda.synchronize(device)
+            assert manager.query_start_loc[:2].tolist() == [0, 4]
+
+            # A shared total is insufficient: each request's GPU allocation
+            # must agree too, even when local confidence rankings are reversed.
+            manager._max_total_logits = 3
+            manager.cost_tables = (
+                np.array([0.0, 0.2, 0.2]),
+                np.array([0.0, 0.9, 1.0, 1.1, 3.0, 3.0, 3.0]),
+            )
+            batch = SimpleNamespace(
+                num_reqs=2,
+                idx_mapping=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            )
+            confidence = torch.tensor(
+                [[0.9, 0.1, 0.1, 0.1, 0.1], [0.4, 0.1, 0.1, 0.1, 0.1]]
+                if rank == 0
+                else [[0.1, 0.1, 0.1, 0.1, 0.1], [0.9, 0.1, 0.1, 0.1, 0.1]],
+                dtype=torch.float32,
+                device=device,
+            )
+            for _ in range(2):
+                manager.record_confidences(confidence, batch)
+            assert (
+                manager.get_num_tokens({"r": 6, "s": 6}, {"r": [1] * 5, "s": [1] * 5})
+                == 3
+            )
+            manager.reallocate_drafts(["r", "s"], batch.idx_mapping)
+            torch.cuda.synchronize(device)
+            boundaries = [None, None]
+            dist.all_gather_object(
+                boundaries,
+                manager.query_start_loc.tolist(),
+                group=get_tp_group().cpu_group,
+            )
+            assert boundaries == [[0, 2, 3], [0, 2, 3]]
+        finally:
+            torch.cuda.synchronize(device)
+            destroy_model_parallel()
+            destroy_distributed_environment()
+
+
+@pytest.mark.distributed(num_gpus=2)
+def test_tp_confidence_publication_keeps_graph_and_request_budgets_consistent():
+    import torch
+
+    from tests.utils import get_open_port
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    torch.multiprocessing.spawn(
+        _run_tp_confidence_consistency, args=(get_open_port(),), nprocs=2, join=True
+    )

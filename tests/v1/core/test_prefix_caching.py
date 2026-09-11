@@ -48,6 +48,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpecKind,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 
@@ -135,6 +136,128 @@ def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
             )
         ],
     )
+
+
+@pytest.mark.parametrize("dcp", [1, 4])
+def test_external_boundary_import_is_private_until_all_ranks_complete(dcp):
+    config = make_kv_cache_config_hybrid_model(4, 64, 2, "mamba")
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=128,
+        hash_block_size=4,
+        enable_boundary_checkpoints=True,
+        dcp_world_size=dcp,
+    )
+    request = make_request("external-consumer", list(range(11)), 4, sha256)
+    positions = manager.boundary_checkpoint_page_positions(11)
+    assert positions[0] == tuple(range((11 + 4 * dcp - 1) // (4 * dcp)))
+    assert positions[1:] == ((2,), (2,))
+    free = manager.block_pool.get_num_free_blocks()
+    checkpoint = manager.reserve_external_boundary_checkpoint(
+        request,
+        11,
+        positions,
+        draft_prefix_len=10,
+        kind="prompt",
+        num_ranks=4,
+    )
+    assert checkpoint is not None
+    assert len(checkpoint.dependencies) == sum(map(len, positions)) + 1
+    assert manager.block_pool.get_num_free_blocks() == free - len(
+        checkpoint.dependencies
+    )
+    assert manager.get_computed_blocks(request)[1] == 0
+    assert not manager.reset_prefix_cache()
+    for rank in (0, 1, 1, 2):
+        assert not manager.acknowledge_external_boundary_checkpoint(
+            checkpoint.checkpoint_id, rank
+        )
+        assert manager.get_computed_blocks(request)[1] == 0
+    assert manager.acknowledge_external_boundary_checkpoint(checkpoint.checkpoint_id, 3)
+    blocks, hits, _ = manager.get_computed_blocks(request)
+    assert hits == 11
+    assert request.boundary_checkpoint == checkpoint
+    assert (
+        tuple(tuple(block.block_id for block in group) for group in blocks.blocks)
+        == checkpoint.block_ids
+    )
+    assert manager.block_pool.get_num_free_blocks() == free
+    assert not manager.acknowledge_external_boundary_checkpoint(
+        checkpoint.checkpoint_id, 3
+    )
+
+
+def test_external_boundary_import_rejects_missing_pages_and_releases_cancellation():
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(4, 16),
+        max_model_len=128,
+        hash_block_size=4,
+        enable_boundary_checkpoints=True,
+    )
+    request = make_request("external-consumer", list(range(11)), 4, sha256)
+    free = manager.block_pool.get_num_free_blocks()
+    with pytest.raises(ValueError, match="every live cache page"):
+        manager.reserve_external_boundary_checkpoint(
+            request, 11, ((0, 2),), draft_prefix_len=11, kind="prompt", num_ranks=4
+        )
+    assert manager.block_pool.get_num_free_blocks() == free
+    checkpoint = manager.reserve_external_boundary_checkpoint(
+        request, 11, ((0, 1, 2),), draft_prefix_len=11, kind="prompt", num_ranks=4
+    )
+    assert checkpoint is not None
+    manager.acknowledge_external_boundary_checkpoint(checkpoint.checkpoint_id, 0)
+    manager.discard_external_boundary_checkpoint(checkpoint.checkpoint_id)
+    assert manager.block_pool.get_num_free_blocks() == free
+    assert manager.get_computed_blocks(request)[1] == 0
+    assert not manager.acknowledge_external_boundary_checkpoint(
+        checkpoint.checkpoint_id, 1
+    )
+
+
+def test_invalidated_external_import_keeps_pins_until_all_rank_copies_drain():
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(4, 16),
+        max_model_len=128,
+        hash_block_size=4,
+        enable_boundary_checkpoints=True,
+    )
+    request = make_request("external-consumer", list(range(11)), 4, sha256)
+    free = manager.block_pool.get_num_free_blocks()
+    checkpoint = manager.reserve_external_boundary_checkpoint(
+        request, 11, ((0, 1, 2),), draft_prefix_len=11, kind="prompt", num_ranks=4
+    )
+    assert checkpoint is not None
+    cache = manager.boundary_checkpoints
+    assert cache is not None
+    cache.invalidate_block(checkpoint.auxiliary_block_ids[0])
+    for rank in range(4):
+        assert not manager.acknowledge_external_boundary_checkpoint(
+            checkpoint.checkpoint_id, rank
+        )
+        assert cache.is_pending(checkpoint.checkpoint_id) == (rank < 3)
+        assert manager.get_computed_blocks(request)[1] == 0
+        if rank < 3:
+            assert manager.block_pool.get_num_free_blocks() < free
+    assert manager.block_pool.get_num_free_blocks() == free
+    assert manager.reset_prefix_cache()
+
+
+def test_external_boundary_import_does_not_partially_allocate_when_pool_is_full():
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(4, 4),
+        max_model_len=128,
+        hash_block_size=4,
+        enable_boundary_checkpoints=True,
+    )
+    request = make_request("external-consumer", list(range(11)), 4, sha256)
+    free = manager.block_pool.get_num_free_blocks()
+    assert (
+        manager.reserve_external_boundary_checkpoint(
+            request, 11, ((0, 1, 2),), draft_prefix_len=11, kind="prompt", num_ranks=4
+        )
+        is None
+    )
+    assert manager.block_pool.get_num_free_blocks() == free
 
 
 def make_kv_cache_config_hybrid_model(
@@ -3362,6 +3485,162 @@ def test_hybrid_local_kv_retention_interval_survives_recycling():
     assert [len(blocks) for blocks in computed_blocks.blocks] == [4, 16, 128, 256]
 
 
+def make_ced_kv_cache_config(*, ced: bool = True) -> KVCacheConfig:
+    global_spec = MLAAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    encoder_spec = SlidingWindowMLASpec(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=128,
+    )
+    decoder_spec = (
+        replace(encoder_spec, prefix_cache_enabled=False, prefill_replay_window=128)
+        if ced
+        else encoder_spec
+    )
+    return KVCacheConfig(
+        num_blocks=1024,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["global"], global_spec),
+            KVCacheGroupSpec(["encoder"], encoder_spec),
+            KVCacheGroupSpec(["decoder"], decoder_spec),
+            KVCacheGroupSpec(["draft"], replace(decoder_spec, extra_retained_tokens=1)),
+        ],
+        prefix_cache_retention_interval=0,
+    )
+
+
+def test_ced_private_swa_never_publishes_unwritten_prefix():
+    manager = make_kv_cache_manager(
+        make_ced_kv_cache_config(), max_model_len=8192, hash_block_size=32
+    )
+    tokens = list(range(4160))
+    producer = make_request("producer", tokens, 32, sha256)
+    allocated = manager.allocate_slots(producer, len(tokens))
+    assert allocated is not None
+
+    # Allocation alone previously published decoder pages even though CED only
+    # writes the final 128 rows. A repeated prompt needs encoder state at 3968,
+    # before the decoder's materialized suffix [4032, 4160).
+    pool = manager.block_pool
+    for block_hash in producer.block_hashes:
+        for group_id in (2, 3):
+            assert pool.get_cached_block(block_hash, [group_id]) is None
+    for group_id in (2, 3):
+        assert all(block.block_hash is None for block in allocated.blocks[group_id])
+
+    consumer = make_request("consumer", tokens, 32, sha256)
+    hits, hit_tokens, _ = manager.get_computed_blocks(consumer)
+    assert hit_tokens == 3968
+    assert len(hits.blocks[0]) == 31
+    assert [i for i, block in enumerate(hits.blocks[1]) if not block.is_null] == list(
+        range(120, 124)
+    )
+    assert not hits.blocks[2] and not hits.blocks[3]
+
+    producer_private_ids = {
+        block.block_id for group_id in (2, 3) for block in allocated.blocks[group_id]
+    }
+    free_before = pool.get_num_free_blocks()
+    fresh = manager.allocate_slots(consumer, len(tokens) - hit_tokens, hit_tokens, hits)
+    assert fresh is not None
+    assert free_before - pool.get_num_free_blocks() == sum(
+        len(blocks) for blocks in fresh.blocks
+    )
+    for group_id in (2, 3):
+        blocks = manager.coordinator.single_type_managers[group_id].req_to_blocks[
+            consumer.request_id
+        ]
+        assert all(not block.is_null for block in blocks[hit_tokens // 32 :])
+        assert producer_private_ids.isdisjoint(
+            block.block_id for block in blocks if not block.is_null
+        )
+        assert all(block.block_hash is None for block in blocks if not block.is_null)
+
+    # Same-request short continuation must retain its written decoder tail,
+    # even though that tail is never available for cross-request reuse.
+    consumer.num_computed_tokens = len(tokens)
+    consumer.append_output_token_ids(7)
+    previous_tail = [
+        manager.coordinator.single_type_managers[gid].req_to_blocks[
+            consumer.request_id
+        ][-1]
+        for gid in (2, 3)
+    ]
+    assert manager.allocate_slots(consumer, 1) is not None
+    for group_id, tail in zip((2, 3), previous_tail):
+        blocks = manager.coordinator.single_type_managers[group_id].req_to_blocks[
+            consumer.request_id
+        ]
+        assert blocks[len(tokens) // 32 - 1] is tail
+        assert tail.ref_cnt == 1
+        assert tail.block_hash is None
+
+
+@pytest.mark.parametrize(
+    ("prompt_length", "expected_hit"), [(96, 0), (128, 0), (256, 128)]
+)
+def test_ced_prefix_replays_short_prompt_boundary(prompt_length, expected_hit):
+    manager = make_kv_cache_manager(
+        make_ced_kv_cache_config(), max_model_len=8192, hash_block_size=32
+    )
+    tokens = list(range(prompt_length))
+    producer = make_request("producer", tokens, 32, sha256)
+    assert manager.allocate_slots(producer, len(tokens)) is not None
+    manager.free(producer)
+    consumer = make_request("consumer", tokens, 32, sha256)
+    hits, hit_tokens, _ = manager.get_computed_blocks(consumer)
+    assert hit_tokens == expected_hit
+    assert not hits.blocks[2] and not hits.blocks[3]
+    assert (
+        manager.allocate_slots(consumer, prompt_length - hit_tokens, hit_tokens, hits)
+        is not None
+    )
+
+
+def test_default_mla_prefix_keeps_one_token_replay():
+    manager = make_kv_cache_manager(
+        make_ced_kv_cache_config(ced=False),
+        max_model_len=8192,
+        hash_block_size=32,
+    )
+    tokens = list(range(4160))
+    producer = make_request("producer", tokens, 32, sha256)
+    assert manager.allocate_slots(producer, len(tokens)) is not None
+    manager.free(producer)
+    consumer = make_request("consumer", tokens, 32, sha256)
+    hits, hit_tokens, _ = manager.get_computed_blocks(consumer)
+    assert hit_tokens == 4096
+    for group_id in (1, 2, 3):
+        assert any(not block.is_null for block in hits.blocks[group_id])
+
+
+@pytest.mark.parametrize("with_global", [False, True])
+def test_ced_lookup_without_encoder_group(with_global):
+    config = make_ced_kv_cache_config()
+    config.kv_cache_groups = [
+        *([config.kv_cache_groups[0]] if with_global else []),
+        config.kv_cache_groups[2],
+    ]
+    manager = make_kv_cache_manager(config, max_model_len=8192, hash_block_size=32)
+    tokens = list(range(512))
+    producer = make_request("producer", tokens, 32, sha256)
+    assert manager.allocate_slots(producer, len(tokens)) is not None
+    manager.free(producer)
+    consumer = make_request("consumer", tokens, 32, sha256)
+    hits, hit_tokens, _ = manager.get_computed_blocks(consumer)
+    assert hit_tokens == (384 if with_global else 0)
+    assert not hits.blocks[-1]
+    assert (
+        manager.allocate_slots(consumer, len(tokens) - hit_tokens, hit_tokens, hits)
+        is not None
+    )
+
+
 def test_hybrid_local_kv_retention_latest_only_reuses_replay_boundary():
     """Verify latest-only retention reuses only the replayable prompt boundary."""
     block_size = 8
@@ -4578,6 +4857,83 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
     assert retained(64) == {3, 7, 11, 14, 15}
     # interval 0 -> only the latest replay boundary (block 14).
     assert retained(0) == {14}
+
+
+@pytest.mark.parametrize("draft_slots", [0, 3, 7])
+@pytest.mark.parametrize("dcp", [1, 4])
+def test_mamba_packed_prefill_preserves_block_tables_and_releases_old_states(
+    draft_slots, dcp
+):
+    """Dense checkpoint output must not relocate worker-visible scratch columns."""
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((2, 2),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=draft_slots,
+        num_prefill_checkpoint_blocks=4,
+    )
+    pool = BlockPool(64, enable_caching=True, hash_block_size=16)
+    manager = MambaManager(
+        spec,
+        pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=64,
+        dcp_world_size=dcp,
+    )
+    request_id = "packed-state-query"
+    count = manager.get_num_blocks_to_allocate(request_id, 64, (), 0, 0, 64)
+    assert count == 4 + draft_slots
+    first = manager.allocate_new_blocks(request_id, 64, 64)
+    assert len(first) == count
+    assert all(not block.is_null for block in manager.req_to_blocks[request_id])
+    manager.remove_skipped_blocks(request_id, 64)
+    table = list(manager.req_to_blocks[request_id])
+    assert all(block.is_null for block in table[:3])
+    assert not table[3].is_null
+    count = manager.get_num_blocks_to_allocate(request_id, 128, (), 64, 64, 128)
+    assert count == 4
+    appended = manager.allocate_new_blocks(request_id, 128, 128)
+    assert len(appended) == count
+    assert manager.req_to_blocks[request_id][: len(table)] == table
+    for column in spec.prefill_checkpoint_indices(64, 128):
+        assert not manager.req_to_blocks[request_id][column].is_null
+    manager.remove_skipped_blocks(request_id, 128)
+    assert all(block.is_null for block in manager.req_to_blocks[request_id][:7])
+    remaining = manager.pop_blocks_for_free(request_id)
+    pool.free_blocks(remaining)
+    assert pool.get_num_free_blocks() == 63
+
+
+def test_mamba_packed_prefill_bounds_admission_to_one_query():
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((2, 2),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=4,
+    )
+    manager = MambaManager(
+        spec,
+        BlockPool(64, True, 16),
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=64,
+    )
+    assert (
+        manager.get_num_blocks_to_allocate(
+            "admission", 1000000, (), 0, 0, 1000000, apply_admission_cap=True
+        )
+        == 5
+    )
+    with pytest.raises(ValueError, match="declared capacity"):
+        spec.prefill_checkpoint_indices(0, 96)
+    assert spec.prefill_checkpoint_indices(17, 64) == ()
 
 
 def test_mamba_reachable_block_mask_pins_shared_prefix():
