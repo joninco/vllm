@@ -333,6 +333,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_SHARED_EXPERTS_RETAIN_OUTPUT: bool = True
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
@@ -2192,6 +2193,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
+    ),
+    # Records the shared-expert output, computed on the auxiliary stream, on
+    # the caller stream so the allocator cannot hand its storage to a later
+    # auxiliary-stream allocation while the caller's read is still queued.
+    # Inside a CUDA graph capture the allocator defers such a release until the
+    # capture ends, so every captured graph retains one shared-expert output
+    # per MoE layer. A model whose only auxiliary-stream user is the shared
+    # expert path, joined to the caller stream at the start of every MoE block,
+    # may set this to 0: the join already orders the reuse.
+    "VLLM_SHARED_EXPERTS_RETAIN_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_SHARED_EXPERTS_RETAIN_OUTPUT", "1"))
     ),
     # Emergency rollback for the DeepSeek-V4 NVIDIA MegaMoE path. By default,
     # DeepGEMM computes replicated FP8 shared experts in the same persistent
