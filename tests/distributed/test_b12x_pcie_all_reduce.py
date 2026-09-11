@@ -174,6 +174,29 @@ def test_dma_capacity_includes_fp32_without_inflating_bf16(
     assert communicator._dma.prepare_eager_replay.call_args_list == expected
 
 
+@pytest.mark.parametrize("codec", ["i8_ring", "ring", " I8 "])
+def test_quantized_wire_plans_the_model_dtype_only(
+    dma_config: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, codec: str
+) -> None:
+    # A wire codec cannot carry FP32 reductions faithfully, so the plan holds
+    # the model dtype alone and the ring slab keeps its model-dtype size.
+    monkeypatch.setattr(b12x_pcie_all_reduce.envs, "VLLM_PCIE_DMA_FP8", codec)
+    assert _dma_capacity_plan() == {torch.bfloat16: 20_971_520}
+    monkeypatch.setattr(b12x_pcie_all_reduce.envs, "VLLM_PCIE_DMA_MIN_BYTES", "6MB")
+    communicator, _ = _make_communicator()
+    communicator.device_group = object()
+    communicator.device = torch.device("cpu")
+    communicator._all_ranks_succeeded = lambda error: error is None
+    dma_cls = MagicMock()
+    dma_cls.return_value.wire_mode = "int8-ring"
+
+    communicator._initialize_dma(dma_cls)
+
+    assert dma_cls.call_args.kwargs["max_bytes"] == 40 << 20
+    assert communicator._dma is dma_cls.return_value
+    communicator._dma.prepare_eager_replay.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("draft_dtype", "draft_hidden", "expected"),
     [
