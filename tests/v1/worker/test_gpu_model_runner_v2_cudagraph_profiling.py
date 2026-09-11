@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 
 from vllm.compilation.counter import compilation_counter
 from vllm.config.compilation import CUDAGraphMode
@@ -642,3 +643,76 @@ def test_legacy_profile_tears_down_after_partial_init_error(monkeypatch):
     assert not hasattr(runner, "kv_cache_config")
     assert runner.cache_config.num_gpu_blocks is None
     assert runner._mamba_bufs is None
+
+
+@pytest.fixture
+def cpu_workspace_manager():
+    from vllm.v1.worker import workspace
+
+    workspace.reset_workspace_manager()
+    workspace.init_workspace_manager(torch.device("cpu"))
+    try:
+        yield workspace.current_workspace_manager()
+    finally:
+        workspace.reset_workspace_manager()
+
+
+def _make_capture_runner(monkeypatch) -> Any:
+    """A runner whose real ``capture_model`` drives a no-op graph manager."""
+    _patch_module(monkeypatch)
+    monkeypatch.setattr(mrv2.torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        mrv2.torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
+    )
+    runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL)
+    manager = _FakeCudaGraphManager(needs_capture=True, num_full_descs=2)
+    manager.capture = lambda *args, **kwargs: None
+    runner.cudagraph_manager = manager
+    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
+    runner.lora_config = None
+    runner.speculator = None
+    runner.adaptive_verification = None
+    runner.model = None
+    runner.input_buffers = None
+    runner.intermediate_tensors = None
+    runner.block_tables = None
+    runner.attn_groups = None
+    runner.kv_cache_config = None
+    runner.use_aux_hidden_state_outputs = False
+    return runner
+
+
+def test_capture_model_locks_workspace_growth(monkeypatch, cpu_workspace_manager):
+    """Captured graphs bake in workspace addresses: growth must raise, not
+    reallocate the storage the graphs replay into."""
+    runner = _make_capture_runner(monkeypatch)
+    cpu_workspace_manager.get_simultaneous(((1024,), torch.uint8))
+    assert not cpu_workspace_manager.is_locked()
+
+    runner.capture_model()
+
+    assert cpu_workspace_manager.is_locked()
+    before = cpu_workspace_manager.get_simultaneous(((512,), torch.uint8))[0]
+    with pytest.raises(AssertionError, match="locked"):
+        cpu_workspace_manager.get_simultaneous(((1 << 20,), torch.uint8))
+    after = cpu_workspace_manager.get_simultaneous(((512,), torch.uint8))[0]
+    assert after.data_ptr() == before.data_ptr()
+
+
+def test_profiling_teardown_unlocks_workspace(monkeypatch, cpu_workspace_manager):
+    """The memory-profiling capture discards its graphs, so the warmups that
+    follow may still grow the workspace before the real capture locks it."""
+    teardown = cgu._teardown_profiling_state
+    runner = _make_capture_runner(monkeypatch)
+    runner.compilation_config.static_forward_context = {}
+    runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
+    runner.attn_groups = []
+    monkeypatch.setattr(cgu.torch.accelerator, "synchronize", lambda: None)
+    runner.capture_model()
+    assert cpu_workspace_manager.is_locked()
+
+    teardown(runner)
+
+    assert not cpu_workspace_manager.is_locked()
+    cpu_workspace_manager.get_simultaneous(((1 << 20,), torch.uint8))
