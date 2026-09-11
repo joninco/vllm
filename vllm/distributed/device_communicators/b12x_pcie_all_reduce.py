@@ -147,8 +147,23 @@ def _dma_min_bytes() -> int | None:
     return value
 
 
+def _dma_wire_is_lossless() -> bool:
+    """True when the DMA ring carries values verbatim (no wire codec)."""
+    configured = (envs.VLLM_PCIE_DMA_FP8 or "").strip().lower()
+    return configured in ("", "0", "false", "off", "no")
+
+
 def _dma_capacity_plan() -> dict[torch.dtype, int] | None:
-    """Plan static per-dtype element bounds, including FP32 reductions."""
+    """Plan static per-dtype element bounds.
+
+    The ring carries the model dtype (and the draft model's). FP32 reductions
+    are planned only on the lossless wire: a quantized wire codec cannot carry
+    them faithfully, and the ring slab and codec staging are sized by the
+    widest planned dtype, so an unused FP32 plan would double them before the
+    startup memory check (about 217 MiB more per GPU at 8,192 batched tokens
+    and a 6,144-wide hidden state), which a launch at 0.975 GPU memory
+    utilization cannot spare.
+    """
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
@@ -166,12 +181,14 @@ def _dma_capacity_plan() -> dict[torch.dtype, int] | None:
         model_configs.append(draft_config)
 
     max_tokens = config.scheduler_config.max_num_batched_tokens
+    plan_fp32 = _dma_wire_is_lossless()
     capacities: dict[torch.dtype, int] = {}
     for model_config in model_configs:
         elements = max_tokens * model_config.get_hidden_size()
         dtype = model_config.dtype
         capacities[dtype] = max(capacities.get(dtype, 0), elements)
-        capacities[torch.float32] = max(capacities.get(torch.float32, 0), elements)
+        if plan_fp32:
+            capacities[torch.float32] = max(capacities.get(torch.float32, 0), elements)
     return capacities
 
 
