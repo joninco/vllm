@@ -19,7 +19,9 @@ import vllm.v1.attention.backends.mla.b12x_mla_sparse as sparse
 
 
 def _vllm_config(dcp_world_size: int) -> SimpleNamespace:
-    parallel_config = SimpleNamespace(decode_context_parallel_size=dcp_world_size)
+    parallel_config = SimpleNamespace(
+        decode_context_parallel_size=dcp_world_size, enable_dbo=False
+    )
     return SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(model_type="glm_moe_dsa"),

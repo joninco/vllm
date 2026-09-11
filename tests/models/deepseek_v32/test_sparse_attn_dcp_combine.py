@@ -224,14 +224,22 @@ class _ReferenceCollectives:
         return self.lses.flatten(0, 1)
 
     def reduce_scatter(self, local_output, dim):
-        assert dim == 1
+        # Token-major input scatters heads along dim 1; the SM120 path hands
+        # over a head-major copy and scatters along dim 0, then transposes
+        # the result back.
+        assert dim in (0, 1)
+        if dim == 0:
+            local_output = local_output.transpose(0, 1)
         torch.testing.assert_close(
             local_output, self.corrected[self.rank_in_group], atol=2e-6, rtol=2e-5
         )
         terms = self.corrected.clone()
         terms[self.rank_in_group] = local_output
         first = self.rank_in_group * _HEADS
-        return terms.sum(0)[:, first : first + _HEADS].contiguous()
+        result = terms.sum(0)[:, first : first + _HEADS]
+        if dim == 0:
+            result = result.transpose(0, 1)
+        return result.contiguous()
 
 
 def _through_mtp_block(monkeypatch, attend, rows, device):
