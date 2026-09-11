@@ -167,7 +167,7 @@ from vllm.v1.worker.utils import (
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
 )
-from vllm.v1.worker.workspace import use_workspace_lane
+from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
@@ -586,6 +586,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_blocks_per_group.append(max_num_blocks)
 
         target_attn_layer_names = None
+        layer_vllm_configs = {}
         if isinstance(self.speculator, DraftModelSpeculator):
             # Adaptive verification validates target attention separately.
             target_attn_layer_names = {
@@ -593,10 +594,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for group in self.kv_cache_config.kv_cache_groups
                 for layer_name in group.layer_names
             } - self.speculator.draft_attn_layer_names
+            if (
+                self.speculator.draft_model_config.hf_config.model_type
+                == "glm53_dspark"
+            ):
+                draft_attn_config = self.speculator.attn_vllm_config
+                layer_vllm_configs = dict.fromkeys(
+                    self.speculator.draft_attn_layer_names, draft_attn_config
+                )
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             self.kv_cache_config,
             self.vllm_config,
             self.device,
+            layer_vllm_configs=layer_vllm_configs,
         )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
@@ -659,6 +669,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
+            specialize_full_decode=self.model_state.specialize_full_decode_graphs,
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -1043,6 +1054,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         ):
                             self._dummy_run(**batch)
                     self.adaptive_verification.set_initial_cost_curves(timings)
+
+        # Captured graphs bake in workspace storage addresses; growth after
+        # this point would free that storage under the graphs.
+        lock_workspace()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]

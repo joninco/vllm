@@ -49,6 +49,24 @@ def _prefill_profile_q_rows(max_q_rows: int) -> int:
     return min(max(int(max_q_rows), 1), max(1, max_logits_elems // supertile_k))
 
 
+def _prefill_plan_row_counts(max_q_rows: int, sort_selection: bool) -> list[int]:
+    """Row counts of the prefill plans prepared before CUDA-graph capture.
+
+    Prefill chunks are sized by the logits budget against the request's
+    context, so a chunk can hold up to ``max_q_rows`` (the batched-token
+    limit) rows. Preparing a plan for that count keeps every chunk on a plan
+    whose scratch the profiling run reserved, so serving never compiles a
+    plan or grows the workspace under the captured graphs. The logits-budget
+    row count serves chunks within it, and the selection-sort gate, when it
+    lies below that count, keeps single-request chunks on a logical plan.
+    """
+    max_q_rows = max(int(max_q_rows), 1)
+    rows = {_prefill_profile_q_rows(max_q_rows), max_q_rows}
+    if sort_selection and 0 < b12x_topk_sort.MAX_TOKENS < max(rows):
+        rows.add(b12x_topk_sort.MAX_TOKENS)
+    return sorted(rows)
+
+
 def _is_current_stream_capturing(tensor: torch.Tensor) -> bool:
     return tensor.is_cuda and torch.cuda.is_current_stream_capturing()
 
@@ -458,13 +476,9 @@ class B12xSparseIndexer(nn.Module):
             rows: make_plan(mode="decode", q_rows=rows)
             for rows in self._decode_plan_sizes
         }
-        prefill_profile_rows = _prefill_profile_q_rows(max_q_rows)
-        prefill_plan_sizes = {prefill_profile_rows}
-        if self.sort_selection and 0 < b12x_topk_sort.MAX_TOKENS < prefill_profile_rows:
-            # Single-request prefill chunks within the sort gate (short
-            # prompts, short final chunks) sort through a logical plan.
-            prefill_plan_sizes.add(b12x_topk_sort.MAX_TOKENS)
-        self._prefill_plan_sizes = sorted(prefill_plan_sizes)
+        self._prefill_plan_sizes = _prefill_plan_row_counts(
+            max_q_rows, self.sort_selection
+        )
         self._prefill_plans = {
             rows: make_plan(mode="prefill", q_rows=rows)
             for rows in self._prefill_plan_sizes
