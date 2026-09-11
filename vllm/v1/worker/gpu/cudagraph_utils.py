@@ -41,7 +41,11 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup, unbind_kv_cache
-from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
+from vllm.v1.worker.workspace import (
+    collect_cuda_graph_capture_resources,
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -1103,6 +1107,10 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         speculator.reset_attn()
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
+    # The profiling capture locked the workspace for graphs that no longer
+    # exist; the warmups before the real capture may still grow it.
+    if is_workspace_manager_initialized() and current_workspace_manager().is_locked():
+        current_workspace_manager().unlock()
     gc.collect()
     torch.accelerator.synchronize()
     torch.accelerator.empty_cache()
