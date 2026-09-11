@@ -1459,7 +1459,9 @@ def test_b12x_glm_dsa_full_ckv_builder_allocates_exact_selector_width(
     )
 
     assert not builder.requires_glm_next_selector_metadata
-    assert not builder.supports_draft_decode_metadata_update
+    # In-place draft refresh is advertised at DCP=1 only; under DCP the
+    # per-token lengths are localized at build time and rebuilt per step.
+    assert builder.supports_draft_decode_metadata_update is (dcp_size == 1)
     assert builder._ckv_gather_requested is (
         enabled and dcp_size > 1 and local_heads == 8 and not enable_dbo
     )
