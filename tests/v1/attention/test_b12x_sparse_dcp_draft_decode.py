@@ -24,7 +24,7 @@ def _vllm_config(dcp_world_size: int) -> SimpleNamespace:
     )
     return SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(model_type="glm_moe_dsa"),
+            hf_text_config=SimpleNamespace(model_type="glm_moe_dsa", index_topk=2048),
             get_num_attention_heads=lambda parallel: 8,
         ),
         parallel_config=parallel_config,
