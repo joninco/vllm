@@ -184,7 +184,12 @@ class SharedExperts(torch.nn.Module):
         current_stream().wait_stream(self._stream)
         # The wait orders execution, but does not prevent producer-side reuse
         # after the caller releases this tensor with consumer work still queued.
-        output.record_stream(current_stream())
+        # The record costs one output per MoE layer in every captured graph
+        # (the allocator defers the release until the capture ends); a model
+        # that joins every auxiliary-stream launch behind the caller stream
+        # may switch it off.
+        if envs.VLLM_SHARED_EXPERTS_RETAIN_OUTPUT:
+            output.record_stream(current_stream())
 
         return output
 

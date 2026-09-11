@@ -108,3 +108,53 @@ def test_shared_output_cuda_graph_replay(monkeypatch):
         hidden.fill_(value)
         graph.replay()
         torch.testing.assert_close(output, torch.full_like(output, value * 2 + 1))
+
+
+def _graph_pool_bytes() -> int:
+    """Total size of the allocator segments owned by CUDA graph private pools."""
+    return sum(
+        segment["total_size"]
+        for segment in torch.cuda.memory._snapshot()["segments"]
+        if tuple(segment["segment_pool_id"]) != (0, 0)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("retain_output", ["1", "0"])
+def test_output_retention_governs_captured_pool_growth(monkeypatch, retain_output):
+    """A captured graph retains one shared output per block only when retaining.
+
+    The allocator cannot release a stream-recorded block during capture, so
+    with retention every invocation in the graph keeps its 16 MiB output. With
+    retention off the join at the start of each invocation orders the reuse
+    and the graph holds about one output.
+    """
+    monkeypatch.setenv("VLLM_SHARED_EXPERTS_RETAIN_OUTPUT", retain_output)
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    wrapper = shared_wrapper(ConstantBytes(), monkeypatch)
+    hidden = torch.ones((1, 16), device="cuda")
+    invocations = 8
+    output_bytes = 16 * 1024 * 1024
+
+    def invoke():
+        wrapper.maybe_sync_shared_experts_stream(hidden)
+        wrapper(hidden, SharedExpertsOrder.MULTI_STREAM_OVERLAPPED)
+        return wrapper.output
+
+    for _ in range(3):
+        invoke()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    pool_before = _graph_pool_bytes()
+    with torch.cuda.graph(graph):
+        for _ in range(invocations):
+            invoke()
+    growth = _graph_pool_bytes() - pool_before
+    print({"retain_output": retain_output, "pool_growth_mib": growth / (1 << 20)})
+    if retain_output == "1":
+        assert growth >= invocations * output_bytes
+    else:
+        assert growth < 4 * output_bytes
+    graph.replay()
+    torch.accelerator.synchronize()
