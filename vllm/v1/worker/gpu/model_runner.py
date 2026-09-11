@@ -747,6 +747,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        if self.boundary_checkpoint_state is not None:
+            self.kv_connector.bind_boundary_checkpoint_state(
+                self.boundary_checkpoint_state
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -940,8 +944,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self.pooling_runner is not None
         self.pooling_runner.dummy_pooler_run(hidden_states)
 
+    def _reserve_profile_scratch(self) -> None:
+        seen: set[int] = set()
+        for module in self.compilation_config.static_forward_context.values():
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            reserve = getattr(module, "reserve_profile_scratch", None)
+            if reserve is not None:
+                reserve()
+
     @torch.inference_mode()
     def profile_run(self) -> None:
+        self._reserve_profile_scratch()
+
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -970,10 +986,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 self._dummy_pooler_run(hidden_states)
 
+        # The generic and DeepSeek-specific passes represent separate scheduler
+        # steps. Release the generic outputs so KV admission uses the larger
+        # transient peak instead of an unreachable sum of both passes.
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
+        self._profile_deepseek_v4_attention()
         self.reset_encoder_cache()
         gc.collect()
+
+    @torch.inference_mode()
+    def _profile_deepseek_v4_attention(self) -> None:
+        """Include the maximum DeepSeek V4 prefill peak in KV admission.
+
+        The generic profile omits attention and distributes its token budget
+        across requests. DeepSeek V4 can execute the complete scheduler token
+        budget as one prefill, where query projection and auxiliary-stream
+        indexer work overlap. Run that reachable shape while multimodal encoder
+        outputs from ``profile_run`` remain resident. A minimal temporary cache
+        makes attention executable without reserving the production KV pool.
+        """
+        if self.model_config.architecture not in {
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
+        }:
+            return
+
+        try:
+            _init_minimal_kv_cache_for_profiling(self, num_blocks=1)
+            self._dummy_run(
+                self.max_num_tokens,
+                skip_eplb=True,
+                is_profile=True,
+                single_request_prefill=True,
+                profile_all_kv_cache_groups=True,
+            )
+            torch.accelerator.synchronize()
+        finally:
+            _teardown_profiling_state(self)
 
     @torch.inference_mode()
     def profile_glm_dcp_attention(self) -> None:
@@ -1153,6 +1203,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.
+            if req_id in self.req_states.req_id_to_index:
+                prepare_update = getattr(
+                    self.model_state, "prepare_streaming_update", None
+                )
+                if prepare_update is not None:
+                    prepare_update(req_id)
             self._remove_request(req_id)
 
             prompt_len = new_req_data.prompt_len
@@ -1722,6 +1778,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # when encoder inputs are scheduled, because this step updates
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
+        max_cudagraph_query_len = getattr(
+            self.model_state, "max_cudagraph_query_len", None
+        )
+        exceeds_cudagraph_query_len = (
+            max_cudagraph_query_len is not None
+            and max_query_len > max_cudagraph_query_len
+        )
 
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
@@ -1731,7 +1794,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or exceeds_cudagraph_query_len,
             num_active_loras=num_active_loras,
         )
 
@@ -1763,6 +1826,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states = self.boundary_checkpoint_state.get_hidden_states(
                     checkpoint.auxiliary_block_ids[0]
                 )
+                # Connector metadata can carry stores for other requests even
+                # when this request resumes without an attention forward.
+                self.kv_connector.pre_forward(scheduler_output)
                 self.execute_model_state = ExecuteModelState(
                     input_batch=input_batch,
                     attn_metadata=None,
