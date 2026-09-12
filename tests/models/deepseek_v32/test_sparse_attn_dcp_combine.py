@@ -16,8 +16,24 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.envs import disable_envs_cache
 from vllm.models.deepseek_v32 import attention as attention_module
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
+
+
+def _override_envs(monkeypatch, name, value):
+    """Override one lazily resolved ``vllm.envs`` value for the current test.
+
+    The value goes through the environment so ``vllm.envs`` parses it the way
+    a launch would; patching the module attribute instead would leave the
+    resolved value behind as a permanent attribute after the test, hiding
+    later environment changes in the same process.
+    """
+    disable_envs_cache()
+    if isinstance(value, bool):
+        value = "1" if value else "0"
+    monkeypatch.setenv(name, str(value))
+
 
 _TOKENS = 3
 _HEADS = 2
@@ -511,10 +527,10 @@ def test_prefill_environment_controls_model_exchange(
         return output[:, :_HEADS]
 
     monkeypatch.setattr(dcp, "cp_lse_ag_out_rs", ag_rs)
-    monkeypatch.setattr(dcp.envs, "VLLM_DCP_A2A_MAX_TOKENS", cap)
-    monkeypatch.setattr(dcp.envs, "VLLM_DCP_A2A_LARGE_BACKEND", large_backend)
-    monkeypatch.setattr(dcp.envs, "VLLM_DCP_PROJECT_BEFORE_MERGE", False)
-    monkeypatch.setattr(dcp.envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", False)
+    _override_envs(monkeypatch, "VLLM_DCP_A2A_MAX_TOKENS", cap)
+    _override_envs(monkeypatch, "VLLM_DCP_A2A_LARGE_BACKEND", large_backend)
+    _override_envs(monkeypatch, "VLLM_DCP_PROJECT_BEFORE_MERGE", False)
+    _override_envs(monkeypatch, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", False)
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
         compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 4, 8, 16]),
@@ -522,7 +538,7 @@ def test_prefill_environment_controls_model_exchange(
     module._dcp_prefill_policy = manager.configure_prefill(config)
     module.dcp_manager = manager
     # Changing the environment after construction must not change batch routing.
-    monkeypatch.setattr(dcp.envs, "VLLM_DCP_A2A_MAX_TOKENS", 1)
+    _override_envs(monkeypatch, "VLLM_DCP_A2A_MAX_TOKENS", 1)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capture)
     metadata = SimpleNamespace(
         num_actual_tokens=rows,
@@ -578,8 +594,8 @@ def test_prefill_environment_controls_model_exchange(
 def test_projected_prefill_requires_backend_workspace_contract(monkeypatch):
     from vllm.v1.attention.ops import dcp
 
-    monkeypatch.setattr(dcp.envs, "VLLM_DCP_PROJECT_BEFORE_MERGE", True)
-    monkeypatch.setattr(dcp.envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", False)
+    _override_envs(monkeypatch, "VLLM_DCP_PROJECT_BEFORE_MERGE", True)
+    _override_envs(monkeypatch, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", False)
     manager = dcp.MLADCPManager.__new__(dcp.MLADCPManager)
     manager.group = SimpleNamespace(world_size=4)
     manager.use_a2a = True
@@ -595,8 +611,8 @@ def test_dcp1_prefill_configuration_ignores_projected_flags(monkeypatch):
     from vllm.v1.attention.ops import dcp
     from vllm.v1.attention.ops.dcp_prefill_policy import DCPPrefillBatch
 
-    monkeypatch.setattr(dcp.envs, "VLLM_DCP_PROJECT_BEFORE_MERGE", True)
-    monkeypatch.setattr(dcp.envs, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", True)
+    _override_envs(monkeypatch, "VLLM_DCP_PROJECT_BEFORE_MERGE", True)
+    _override_envs(monkeypatch, "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE", True)
     manager = dcp.MLADCPManager.__new__(dcp.MLADCPManager)
     manager.group = SimpleNamespace(world_size=1)
     manager.use_a2a = True
@@ -654,7 +670,7 @@ def test_projected_prefill_uses_reserved_buffers_and_projects_exactly_once(
         "VLLM_DCP_A2A_MAX_TOKENS": 16,
         "VLLM_DCP_A2A_LARGE_BACKEND": "ag_rs",
     }.items():
-        monkeypatch.setattr(dcp.envs, name, value)
+        _override_envs(monkeypatch, name, value)
     layer._dcp_prefill_policy = transport.configure_prefill(
         SimpleNamespace(
             scheduler_config=SimpleNamespace(max_num_batched_tokens=capacity),

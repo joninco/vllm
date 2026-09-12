@@ -67,6 +67,9 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
         is_encoder_decoder=False,
         dcp_size=dcp_size,
         vllm_config=vllm_config,
+        # initialize_kv_cache completes persistent attention users before
+        # replacing native caches; the stub has none.
+        _reset_attention_kv_cache_bindings=lambda: None,
     )
 
     class _CapturedWidths(Exception):

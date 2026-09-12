@@ -25,8 +25,24 @@ import torch.distributed as dist
 from tests.distributed.test_dcp_prefill_owner_merge import (
     distributed_world,  # noqa: F401
 )
+from vllm.envs import disable_envs_cache
 from vllm.v1.attention.ops import dcp
 from vllm.v1.worker import workspace
+
+
+def _override_envs(monkeypatch, name, value):
+    """Override one lazily resolved ``vllm.envs`` value for the current test.
+
+    The value goes through the environment so ``vllm.envs`` parses it the way
+    a launch would; patching the module attribute instead would leave the
+    resolved value behind as a permanent attribute after the test, hiding
+    later environment changes in the same process.
+    """
+    disable_envs_cache()
+    if isinstance(value, bool):
+        value = "1" if value else "0"
+    monkeypatch.setenv(name, str(value))
+
 
 # Module fixtures own the process groups across parametrized references.
 pytestmark = pytest.mark.skip_global_cleanup
@@ -159,7 +175,7 @@ def test_projected_workspace_matches_independent_peer_oracle(
         "VLLM_DCP_A2A_MAX_TOKENS": 16,
         "VLLM_DCP_A2A_LARGE_BACKEND": "ag_rs",
     }.items():
-        monkeypatch.setattr(dcp.envs, name, value)
+        _override_envs(monkeypatch, name, value)
     transport.configure_prefill(
         SimpleNamespace(
             scheduler_config=SimpleNamespace(max_num_batched_tokens=_CAPACITY),
