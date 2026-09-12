@@ -27,6 +27,7 @@ TORCH_PROFILE_USE_GZIP="${TORCH_PROFILE_USE_GZIP:-1}"
 TORCH_PROFILE_DEFAULT_DIR=/tmp/vllm-ds4-decode
 TORCH_PROFILE_MAX_ITERATIONS=4
 TP_SIZE="${TP_SIZE:-4}"
+DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE="${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE:-1.0}"
 
 bool_value() {
   local name=$1 value=${2,,}
@@ -56,7 +57,9 @@ usage() {
     "" \
     "Profiling starts only when triggered; enabling it does not start a capture." \
     "All other arguments are forwarded to vLLM. Equivalent environment" \
-    "variables use the TORCH_PROFILE_* names declared at the top of the script."
+    "variables use the TORCH_PROFILE_* names declared at the top of the script." \
+    "DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE controls verification trimming" \
+    "aggressiveness (default: 1.0; larger values trim more)."
 }
 
 vllm_args=()
@@ -200,7 +203,7 @@ PY
   profiler_args=(--profiler-config "${profiler_config}")
 fi
 
-speculative_config="{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_tensor_parallel_size\":${TP_SIZE},\"attention_backend\":\"B12X\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"standard\",\"enable_adaptive_verification\":true}"
+speculative_config="{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_tensor_parallel_size\":${TP_SIZE},\"attention_backend\":\"B12X\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"standard\",\"enable_adaptive_verification\":true,\"adaptive_verification_cost_scale\":${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE}}"
 command=(
   "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}"
   --served-model-name "${SERVED_MODEL_NAME}"
@@ -233,6 +236,8 @@ command=(
 cd "${SCRIPT_DIR}"
 printf 'Launching %s: TP4, GPUs %s, %s Engram, DSpark (7 draft tokens)\n' \
   "${SERVED_MODEL_NAME}" "${CUDA_VISIBLE_DEVICES}" "${ENGRAM_TABLE_MEMORY}" >&2
+printf 'DSpark adaptive verification cost scale: %s\n' \
+  "${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE}" >&2
 printf 'Endpoint: http://%s:%s/v1  |  GPU memory budget: %s\n' \
   "${HOST}" "${PORT}" "${GPU_MEMORY_UTILIZATION}" >&2
 if [[ -n "${TORCH_PROFILE_DIR}" ]]; then
