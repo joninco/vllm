@@ -36,6 +36,11 @@ _cuda_graph_capture_resources: ContextVar[list[Any] | None] = ContextVar(
 )
 
 
+def current_workspace_lane() -> int:
+    """Return the target or drafter workspace owner for this execution context."""
+    return _workspace_lane.get()
+
+
 @contextmanager
 def use_workspace_lane(lane: int) -> Iterator[None]:
     """Select an independent workspace owner for this execution context."""
@@ -88,6 +93,10 @@ class WorkspaceManager:
     Manages one workspace buffer per active ``(ubatch, lane)`` slot.
     Can be locked to prevent further growth during execution.
     """
+
+    def execution_lane_shape(self) -> tuple[int, int]:
+        """Return reserved ubatch and model-lane counts for persistent helpers."""
+        return self._num_ubatches, self._num_lanes
 
     def __init__(
         self,

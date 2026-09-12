@@ -94,6 +94,19 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
+def _has_dcp_prefill_warmup(worker: "Worker") -> bool:
+    """Detect configured DCP resources that require initialization before KV sizing."""
+    if getattr(worker.parallel_config, "decode_context_parallel_size", 1) <= 1:
+        return False
+    return any(
+        getattr(getattr(layer, "dcp_manager", None), "prefill_warmup_key", None)
+        is not None
+        or getattr(layer, "_prefill_query_bmm_module", None) is not None
+        or getattr(getattr(layer, "impl", None), "_ckv_gather_enabled", False)
+        for layer in worker.model_runner.get_model().modules()
+    )
+
+
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
     return (
@@ -204,6 +217,13 @@ class Worker(WorkerBase):
         # Worker profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
         # so we have all the information needed for proper trace naming.
+        self._prefill_trace = None
+        if envs.VLLM_DCP_PREFILL_TRACE:
+            from vllm.v1.attention.backends.mla.prefill_diagnostics import (
+                get_prefill_trace,
+            )
+
+            self._prefill_trace = get_prefill_trace()
         self.profiler: Any | None = None
         self.profiler_config = vllm_config.profiler_config
 
@@ -405,10 +425,14 @@ class Worker(WorkerBase):
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
-            # Initialize the distributed environment BEFORE taking
-            # memory snapshot
-            # This ensures NCCL buffers are allocated before we measure
-            # available memory
+            # DCP communication storage belongs inside the requested budget.
+            # A baseline before group initialization charges that storage in
+            # memory_profiling and keeps it out of the external-memory check.
+            before_distributed = None
+            if self.parallel_config.decode_context_parallel_size > 1:
+                gc.collect()
+                torch.accelerator.empty_cache()
+                before_distributed = MemorySnapshot(device=self.device)
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
@@ -423,12 +447,37 @@ class Worker(WorkerBase):
             # Set random seed.
             set_random_seed(self.model_config.seed)
 
-            # Now take memory snapshot after NCCL is initialized
             gc.collect()
             torch.accelerator.empty_cache()
 
-            # take current memory snapshot
-            self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+            after_distributed = MemorySnapshot(device=self.device)
+            self.distributed_init_memory = 0
+            if before_distributed is not None:
+                self.distributed_init_memory = max(
+                    before_distributed.free_memory - after_distributed.free_memory, 0
+                )
+                logger.info(
+                    "DCP startup memory budget components: "
+                    "free_before_distributed_init=%d bytes, "
+                    "free_after_distributed_init=%d bytes, "
+                    "distributed_init=%d bytes (included in persistent_total)",
+                    before_distributed.free_memory,
+                    after_distributed.free_memory,
+                    self.distributed_init_memory,
+                )
+            self.init_snapshot = init_snapshot = (
+                before_distributed
+                if before_distributed is not None
+                else after_distributed
+            )
+            # DCP's device-wide budget includes memory already present when
+            # profiling starts, including the worker's CUDA context. The
+            # profiler's free-memory delta excludes this initial footprint.
+            self.initial_device_memory_charge = (
+                max(init_snapshot.total_memory - init_snapshot.free_memory, 0)
+                if before_distributed is not None
+                else 0
+            )
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
@@ -529,10 +578,16 @@ class Worker(WorkerBase):
                 format_gib(sampler_workspace_bytes),
             )
 
+        profile_prefill_resources = _has_dcp_prefill_warmup(self)
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            if profile_prefill_resources and b12x_warmup(
+                self,
+                list(self.vllm_config.compilation_config.cudagraph_capture_sizes or []),
+            ):
+                self.model_runner.profile_run()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -580,7 +635,13 @@ class Worker(WorkerBase):
             # discard the cold-start high-water and measure the same model
             # profile again. Deployments without B12X kernels keep the single
             # profile.
-            if profile_cudagraphs and b12x_warmup(self, capture_sizes):
+            # Optional DCP prefill also initializes kernel, collective and BLAS
+            # state in eager launches. Charge that state before admission even when no
+            # CUDA graphs will be captured. Registry dedup prevents a second
+            # cold warmup after KV allocation.
+            if (profile_cudagraphs or profile_prefill_resources) and b12x_warmup(
+                self, capture_sizes
+            ):
                 b12x_warmup_snapshot = MemorySnapshot(device=self.device)
                 torch.accelerator.reset_peak_memory_stats(self.device)
                 self.model_runner.profile_run()
@@ -660,12 +721,14 @@ class Worker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
+        initial_device_memory_charge = getattr(self, "initial_device_memory_charge", 0)
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - late_persistent_charge
             - cudagraph_memory_estimate_applied
             - allocator_headroom_correction
+            - initial_device_memory_charge
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
@@ -712,6 +775,18 @@ class Worker(WorkerBase):
             format_gib(repeatable_allocator_headroom),
             format_gib(cudagraph_memory_estimate_applied),
         )
+        if initial_device_memory_charge:
+            logger.info(
+                "DCP KV cache memory budget component: initial_device=%d bytes "
+                "(outside persistent_total; deducted once from requested memory)",
+                initial_device_memory_charge,
+            )
+        if getattr(self, "distributed_init_memory", 0):
+            logger.info(
+                "DCP KV cache memory budget component: distributed_init=%d bytes "
+                "(subset of persistent_total; no additional deduction)",
+                self.distributed_init_memory,
+            )
         logger.info_once(
             "KV cache persistent memory detail: initialized_before_profile=%s GiB, "
             "retained_by_profile=%s GiB, torch_allocated_since_worker_init=%s "
@@ -968,6 +1043,7 @@ class Worker(WorkerBase):
                 int(self.requested_memory)
                 - non_kv_cache_memory
                 - redundancy_buffer_memory
+                - getattr(self, "initial_device_memory_charge", 0)
             )
 
             msg = (
@@ -1404,6 +1480,8 @@ class Worker(WorkerBase):
 
             # Create the profiler wrapper only on the first start call
             if self.profiler is None:
+                if getattr(self, "_prefill_trace", None) is not None:
+                    self._prefill_trace_worker_name = trace_name
                 if profiler_type == "torch":
                     self.profiler = TorchProfilerWrapper(
                         self.profiler_config,
@@ -1430,6 +1508,13 @@ class Worker(WorkerBase):
                         f"Invalid profiler value of {self.profiler_config.profiler}"
                     )
 
+            trace = getattr(self, "_prefill_trace", None)
+            if trace is not None:
+                trace.start_capture(
+                    rank=self.rank,
+                    name=getattr(self, "_prefill_trace_worker_name", trace_name),
+                    device=str(self.device),
+                )
             self.profiler.start()
         else:
             if self.profiler is None:
@@ -1438,6 +1523,15 @@ class Worker(WorkerBase):
             try:
                 self.profiler.stop()
             finally:
+                trace = getattr(self, "_prefill_trace", None)
+                if trace is not None and self.profiler_config.profiler == "torch":
+                    try:
+                        path = trace.export_manifest(
+                            self.profiler_config.torch_profiler_dir
+                        )
+                        logger.info("Prefill diagnosis manifest: %s", path)
+                    except Exception:
+                        logger.exception("Failed to export prefill diagnosis manifest")
                 if self.profiler_config.profiler == "proton":
                     # Proton output names are fixed when the wrapper is constructed.
                     # Recreate it so the next profile_prefix is honored.

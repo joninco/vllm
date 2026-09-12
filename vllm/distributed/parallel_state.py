@@ -1402,6 +1402,160 @@ def get_tp_group() -> GroupCoordinator:
 
 _DCP: GroupCoordinator | None = None
 
+_QUERY_SPLIT: GroupCoordinator | None = None
+_INDEXER_DCP: GroupCoordinator | None = None
+_INDEXER_QUERY_SPLIT: GroupCoordinator | None = None
+_DCP_CKV_PREFETCH: GroupCoordinator | None = None
+_DCP_CKV_PREFETCH_CONFIG: tuple[list[list[int]], int, str] | None = None
+
+
+def get_query_split_group() -> GroupCoordinator:
+    assert _QUERY_SPLIT is not None, "indexer query split group is not initialized"
+    return _QUERY_SPLIT
+
+
+def get_indexer_dcp_group(expected_world_size: int) -> GroupCoordinator:
+    """Select by cache geometry so draft layers retain their shard group."""
+    for group in (_INDEXER_DCP, _DCP):
+        if group is not None and group.world_size == expected_world_size:
+            return group
+    raise RuntimeError(f"No indexer shard group has world size {expected_world_size}")
+
+
+def get_indexer_query_split_group(expected_world_size: int) -> GroupCoordinator:
+    """Return the replica group paired with the specified indexer KV shards."""
+    if _INDEXER_DCP is not None and _INDEXER_DCP.world_size == expected_world_size:
+        group = _INDEXER_QUERY_SPLIT
+    elif _DCP is not None and _DCP.world_size == expected_world_size:
+        group = _QUERY_SPLIT
+    else:
+        raise RuntimeError(
+            f"No indexer query split group matches {expected_world_size} KV shards"
+        )
+    if group is None:
+        raise RuntimeError("Indexer query splitting is not initialized for this cache")
+    return group
+
+
+def get_dcp_ckv_prefetch_group() -> GroupCoordinator:
+    assert _DCP_CKV_PREFETCH is not None, "CKV prefetch group is not initialized"
+    return _DCP_CKV_PREFETCH
+
+
+def ensure_dcp_ckv_prefetch_group() -> GroupCoordinator:
+    """Create the side-stream group after a positive-depth workspace reservation.
+
+    Every worker calls this during model construction, before KV admission.
+    Runtime dispatch only uses the getter; it must never create collectives.
+    Budget-clamped depth-zero plans leave this communicator unallocated.
+    """
+    global _DCP_CKV_PREFETCH
+    if _DCP_CKV_PREFETCH is None:
+        if _DCP_CKV_PREFETCH_CONFIG is None:
+            raise RuntimeError("CKV prefetch communicator was not configured")
+        ranks, local_rank, backend = _DCP_CKV_PREFETCH_CONFIG
+        _DCP_CKV_PREFETCH = init_model_parallel_group(
+            ranks, local_rank, backend, group_name="dcp_ckv_prefetch"
+        )
+        logger.info("Created budgeted CKV prefetch communicator before KV admission")
+    return _DCP_CKV_PREFETCH
+
+
+def _destroy_dcp_prefill_groups() -> None:
+    global _QUERY_SPLIT, _INDEXER_DCP, _INDEXER_QUERY_SPLIT, _DCP_CKV_PREFETCH
+    global _DCP_CKV_PREFETCH_CONFIG
+    for group in (
+        _DCP_CKV_PREFETCH,
+        _INDEXER_QUERY_SPLIT,
+        _INDEXER_DCP,
+        _QUERY_SPLIT,
+    ):
+        if group is not None:
+            group.destroy()
+    _QUERY_SPLIT = _INDEXER_DCP = _INDEXER_QUERY_SPLIT = _DCP_CKV_PREFETCH = None
+    _DCP_CKV_PREFETCH_CONFIG = None
+
+
+def _initialize_dcp_prefill_groups(
+    *,
+    tp_ranks: list[list[int]],
+    dcp_ranks: list[list[int]],
+    dcp_size: int,
+    pcp_size: int,
+    elastic_ep: bool,
+    local_rank: int,
+    backend: str,
+    query_split: bool,
+    indexer_shards: int,
+    replicate_indexer: bool,
+    ckv_gather: bool,
+    ckv_prefetch_depth: int,
+) -> None:
+    """Create opt-in groups in an identical order on every worker rank."""
+    from vllm.distributed.dcp_prefill import (
+        build_indexer_replica_group_ranks,
+        resolve_indexer_shards,
+    )
+
+    global _QUERY_SPLIT, _INDEXER_DCP, _INDEXER_QUERY_SPLIT, _DCP_CKV_PREFETCH
+    global _DCP_CKV_PREFETCH_CONFIG
+    if any(
+        group is not None
+        for group in (
+            _QUERY_SPLIT,
+            _INDEXER_DCP,
+            _INDEXER_QUERY_SPLIT,
+            _DCP_CKV_PREFETCH,
+            _DCP_CKV_PREFETCH_CONFIG,
+        )
+    ):
+        raise RuntimeError("DCP prefill groups are already initialized")
+    shards = resolve_indexer_shards(dcp_size, indexer_shards, replicate_indexer)
+    if dcp_size == 1:
+        return
+    if ckv_gather and ckv_prefetch_depth < 0:
+        raise ValueError("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH must be nonnegative")
+    ckv_prefetch = ckv_gather and ckv_prefetch_depth > 0
+    if not (query_split or shards < dcp_size or ckv_prefetch):
+        return
+    if pcp_size != 1 or elastic_ep or not 2 <= dcp_size <= 8:
+        raise ValueError("DCP prefill groups require static DCP2–8 with PCP1")
+    full_shards, full_queries = build_indexer_replica_group_ranks(tp_ranks, dcp_size)
+    if full_shards != dcp_ranks:
+        raise ValueError("Indexer replica topology does not match DCP rank order")
+    partial_shards, partial_queries = build_indexer_replica_group_ranks(
+        tp_ranks, shards
+    )
+
+    def create(ranks: list[list[int]], name: str) -> GroupCoordinator:
+        return init_model_parallel_group(ranks, local_rank, backend, group_name=name)
+
+    try:
+        if query_split:
+            _QUERY_SPLIT = create(full_queries, "query_split")
+        if shards < dcp_size:
+            _INDEXER_DCP = create(partial_shards, "indexer_dcp")
+            if query_split:
+                _INDEXER_QUERY_SPLIT = create(partial_queries, "indexer_query_split")
+        if ckv_prefetch:
+            # The backend computes effective depth before allocating the group.
+            _DCP_CKV_PREFETCH_CONFIG = (
+                [list(ranks) for ranks in dcp_ranks],
+                local_rank,
+                backend,
+            )
+    except Exception:
+        _destroy_dcp_prefill_groups()
+        raise
+    logger.info(
+        "DCP prefill groups: DCP=%d indexer_shards=%d query_split=%s "
+        "CKV_prefetch_configured=%s",
+        dcp_size,
+        shards,
+        query_split,
+        ckv_prefetch,
+    )
+
 
 def get_dcp_group() -> GroupCoordinator:
     assert _DCP is not None, "decode context model parallel group is not initialized"
@@ -1849,6 +2003,7 @@ def initialize_model_parallel(
         group_ranks = local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
         group_ranks = [x.tolist() for x in group_ranks]
     # message queue broadcaster is only used in tensor model parallel group
+    tp_group_ranks = group_ranks
     _TP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
@@ -1873,6 +2028,24 @@ def initialize_model_parallel(
         backend,
         use_message_queue_broadcaster=True,
         group_name="dcp",
+    )
+    _initialize_dcp_prefill_groups(
+        tp_ranks=tp_group_ranks,
+        dcp_ranks=group_ranks,
+        dcp_size=dcp_size,
+        pcp_size=prefill_context_model_parallel_size,
+        elastic_ep=enable_elastic_ep,
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        query_split=envs.VLLM_DCP_QUERY_SPLIT,
+        indexer_shards=envs.VLLM_DCP_INDEXER_SHARDS,
+        replicate_indexer=envs.VLLM_DCP_REPLICATE_INDEXER_CACHE,
+        ckv_gather=envs.VLLM_B12X_MLA_CKV_GATHER,
+        ckv_prefetch_depth=(
+            envs.VLLM_B12X_MLA_CKV_PREFETCH_DEPTH
+            if envs.VLLM_B12X_MLA_CKV_GATHER
+            else 0
+        ),
     )
 
     global _PCP
@@ -2092,6 +2265,7 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    _destroy_dcp_prefill_groups()
     global _TP
 
     if _TP:

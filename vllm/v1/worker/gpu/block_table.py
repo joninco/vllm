@@ -40,7 +40,9 @@ class BlockTables:
         if group_cp_sizes is None:
             group_cp_sizes = [cp_size] * len(block_sizes)
         assert len(group_cp_sizes) == len(block_sizes)
-        assert all(group_cp_size in (1, cp_size) for group_cp_size in group_cp_sizes)
+        assert all(
+            0 < size <= cp_size and cp_size % size == 0 for size in group_cp_sizes
+        )
         self.group_cp_sizes_list = list(group_cp_sizes)
 
         self.num_kv_cache_groups = len(self.block_sizes)
@@ -120,7 +122,7 @@ class BlockTables:
         group_cp_size = self.group_cp_sizes_list[group_id]
         if group_cp_size == 1:
             return 0, 1, 1
-        return self.cp_rank, group_cp_size, self.cp_interleave
+        return self.cp_rank % group_cp_size, group_cp_size, self.cp_interleave
 
     def append_block_ids(
         self,
@@ -350,11 +352,14 @@ def _compute_slot_mappings_kernel(
             is_local = token_mask
         else:
             # Context parallelism is used.
-            virtual_block_size = kv_block_size * CP_SIZE
+            virtual_block_size = kv_block_size * group_cp_size
             virtual_block_indices = positions // virtual_block_size
             virtual_block_offsets = positions % virtual_block_size
-            is_local = virtual_block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-            rounds = virtual_block_offsets // (CP_INTERLEAVE * CP_SIZE)
+            is_local = (
+                virtual_block_offsets // CP_INTERLEAVE % group_cp_size
+                == cp_rank % group_cp_size
+            )
+            rounds = virtual_block_offsets // (CP_INTERLEAVE * group_cp_size)
             remainder = virtual_block_offsets % CP_INTERLEAVE
             local_offsets = rounds * CP_INTERLEAVE + remainder
             local_positions = virtual_block_indices * kv_block_size + local_offsets

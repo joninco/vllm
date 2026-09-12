@@ -129,13 +129,21 @@ def _fused_norm_rope_kernel(
     index_k_out_ptr,
     index_k_out_stride,
     INDEX_K_HALF_ROT_DIM: tl.constexpr,
-    # Cache params (shared by indexer K and MLA)
+    # Cache ownership can differ between attention and indexer KV groups.
     slot_mapping_ptr,
+    indexer_slot_mapping_ptr,
     # Index K FP8 cache
     indexer_cache_ptr,
     indexer_cache_scale_ptr,
     indexer_cache_block_size,
     indexer_cache_block_stride,
+    # Step-local index K copy: every token with a nonnegative local slot is
+    # written, independent of KV ownership under DCP (same page layout).
+    indexer_local_slot_mapping_ptr,
+    indexer_local_cache_ptr,
+    indexer_local_cache_scale_ptr,
+    indexer_local_cache_block_size,
+    indexer_local_cache_block_stride,
     # MLA KV cache (concat kv_c_normed + k_pe_roped, uses slot_mapping_ptr)
     mla_cache_ptr,
     mla_cache_block_size,
@@ -181,12 +189,24 @@ def _fused_norm_rope_kernel(
             )
         return
 
-    if slot_mapping_ptr is None:
-        if kv_out_ptr is None and kpe_out_ptr is None and index_k_out_ptr is None:
+    if pid == 0:
+        local_index_slot = -1
+        if indexer_local_slot_mapping_ptr is not None:
+            local_index_slot = tl.load(indexer_local_slot_mapping_ptr + tok_idx)
+        if indexer_slot_mapping_ptr is None:
+            if index_k_out_ptr is None and indexer_local_slot_mapping_ptr is None:
+                return
+        elif tl.load(indexer_slot_mapping_ptr + tok_idx) < 0:  # noqa: SIM102
+            # Tokens this rank does not own only run for the step-local copy
+            # (nested scalar branches keep the constexpr pointer checks apart).
+            if local_index_slot < 0:
+                return
+    else:
+        if slot_mapping_ptr is None:
+            if kv_out_ptr is None and kpe_out_ptr is None and index_k_out_ptr is None:
+                return
+        elif tl.load(slot_mapping_ptr + tok_idx) < 0:
             return
-    elif tl.load(slot_mapping_ptr + tok_idx) < 0:
-        # Padding
-        return
 
     if pid == 2:
         # Q RMS norm
@@ -386,19 +406,40 @@ def _fused_norm_rope_kernel(
             )
 
         # PCP inserts index K after gathering; other paths write it directly.
-        if indexer_cache_ptr is not None and slot_mapping_ptr is not None:
-            slot_idx = tl.load(slot_mapping_ptr + tok_idx)
-            _fp8_quant_and_cache_write(
-                result,
-                index_k_mask,
-                slot_idx,
-                indexer_cache_ptr,
-                indexer_cache_scale_ptr,
-                indexer_cache_block_size,
-                indexer_cache_block_stride,
-                index_k_block,
-                INDEX_K_DIM,
-            )
+        if indexer_cache_ptr is not None and indexer_slot_mapping_ptr is not None:
+            slot_idx = tl.load(indexer_slot_mapping_ptr + tok_idx)
+            if slot_idx >= 0:
+                _fp8_quant_and_cache_write(
+                    result,
+                    index_k_mask,
+                    slot_idx,
+                    indexer_cache_ptr,
+                    indexer_cache_scale_ptr,
+                    indexer_cache_block_size,
+                    indexer_cache_block_stride,
+                    index_k_block,
+                    INDEX_K_DIM,
+                )
+        # The step-local copy takes every token of a fresh request, owned by
+        # this rank or not. The slot is reloaded here because Triton scopes the
+        # prologue's value to its own branch.
+        if (  # noqa: SIM102
+            indexer_local_cache_ptr is not None
+            and indexer_local_slot_mapping_ptr is not None
+        ):
+            local_slot = tl.load(indexer_local_slot_mapping_ptr + tok_idx)
+            if local_slot >= 0:
+                _fp8_quant_and_cache_write(
+                    result,
+                    index_k_mask,
+                    local_slot,
+                    indexer_local_cache_ptr,
+                    indexer_local_cache_scale_ptr,
+                    indexer_local_cache_block_size,
+                    indexer_local_cache_block_stride,
+                    index_k_block,
+                    INDEX_K_DIM,
+                )
 
 
 def fused_norm_rope(
@@ -417,7 +458,7 @@ def fused_norm_rope(
     index_k_layer_norm_eps: float,
     index_k_rope_cos_sin_cache: torch.Tensor | None,
     topk_indices_buffer: torch.Tensor,
-    # Cache params for fused writes (single slot_mapping for both caches)
+    # Attention slots; indexer slots default to the same mapping.
     slot_mapping: torch.Tensor | None = None,
     indexer_k_cache: torch.Tensor | None = None,
     mla_kv_cache: torch.Tensor | None = None,
@@ -429,12 +470,26 @@ def fused_norm_rope(
     kv_c_out: torch.Tensor | None = None,
     k_pe_out: torch.Tensor | None = None,
     index_k_out: torch.Tensor | None = None,
+    materialize_nonlocal_mla_inputs: bool = False,
+    indexer_slot_mapping: torch.Tensor | None = None,
+    indexer_local_cache: torch.Tensor | None = None,
+    indexer_local_slot_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert positions.ndim == 1
     assert q_c.ndim == 2
     assert kv_c.ndim == 2
     assert k_pe.ndim == 2
     assert topk_indices_buffer.ndim == 2
+    if materialize_nonlocal_mla_inputs and (kv_c_out is None or k_pe_out is None):
+        raise ValueError(
+            "Nonlocal MLA inputs require both normalized KV and RoPE outputs"
+        )
+    if (
+        materialize_nonlocal_mla_inputs
+        and q_c_out is not None
+        and q_c_out.untyped_storage().data_ptr() == q_c.untyped_storage().data_ptr()
+    ):
+        raise ValueError("Nonlocal query output must not share storage with its input")
 
     num_tokens = positions.shape[0]
     q_dim = q_c.shape[-1]
@@ -446,6 +501,8 @@ def fused_norm_rope(
     # HAS_INDEXER and never dereference them.
     if not has_indexer:
         indexer_k_cache = None
+        indexer_local_cache = None
+        indexer_local_slot_mapping = None
         index_k = _dummy((1, 1), q_c.dtype, device)
         index_k_layer_norm_w = _dummy((1,), torch.float32, device)
         index_k_layer_norm_bias = _dummy((1,), torch.float32, device)
@@ -454,14 +511,17 @@ def fused_norm_rope(
     assert index_k_rope_cos_sin_cache is not None
     index_k_dim = index_k.shape[-1]
     topk = topk_indices_buffer.shape[-1]
-    if indexer_k_cache is not None or mla_kv_cache is not None:
+    if indexer_slot_mapping is None:
+        indexer_slot_mapping = slot_mapping
+    if mla_kv_cache is not None:
         assert slot_mapping is not None
-    else:
+    if indexer_k_cache is None and mla_kv_cache is None:
         slot_mapping = None
+        indexer_slot_mapping = None
 
     # --- Indexer K cache setup ---
     if indexer_k_cache is not None:
-        assert slot_mapping is not None
+        assert indexer_slot_mapping is not None
         idx_cache_scale_view = indexer_k_cache.view(torch.uint8).view(torch.float32)
         idx_cache_block_size = indexer_k_cache.shape[1]
         idx_cache_block_stride = indexer_k_cache.stride(0)
@@ -471,6 +531,27 @@ def fused_norm_rope(
         idx_cache_scale_view = None
         idx_cache_block_size = 1
         idx_cache_block_stride = 0
+
+    # --- Step-local index K copy setup (same page layout as the cache) ---
+    if (indexer_local_cache is None) != (indexer_local_slot_mapping is None):
+        raise ValueError(
+            "The step-local index K copy needs both its cache and slot mapping"
+        )
+    if indexer_local_cache is not None:
+        assert indexer_local_slot_mapping is not None
+        if indexer_local_slot_mapping.shape[0] < num_tokens:
+            raise ValueError("Local index slot mapping must cover every token")
+        local_cache_scale_view = indexer_local_cache.view(torch.uint8).view(
+            torch.float32
+        )
+        local_cache_block_size = indexer_local_cache.shape[1]
+        local_cache_block_stride = indexer_local_cache.stride(0)
+        if indexer_local_cache.dtype == torch.uint8:
+            indexer_local_cache = indexer_local_cache.view(torch.float8_e4m3fn)
+    else:
+        local_cache_scale_view = None
+        local_cache_block_size = 1
+        local_cache_block_stride = 0
 
     # --- MLA KV cache setup ---
     mla_cache_ds_mla = mla_kv_cache_dtype == "fp8_ds_mla"
@@ -564,11 +645,17 @@ def fused_norm_rope(
         index_k_rope_cos_sin_cache.shape[-1] // 2,
         # Cache params
         slot_mapping,
+        indexer_slot_mapping,
         indexer_k_cache,
         idx_cache_scale_view,
         idx_cache_block_size,
         idx_cache_block_stride,
-        # MLA KV cache (uses same slot_mapping)
+        indexer_local_slot_mapping,
+        indexer_local_cache,
+        local_cache_scale_view,
+        local_cache_block_size,
+        local_cache_block_stride,
+        # MLA KV cache
         mla_kv_cache,
         mla_block_size,
         mla_block_stride,
@@ -590,6 +677,31 @@ def fused_norm_rope(
         USE_PDL=use_pdl,
         launch_pdl=use_pdl,
     )
+    if materialize_nonlocal_mla_inputs and slot_mapping is not None:
+        # DCP marks nonlocal cache slots negative, but every rank needs every
+        # query. Uncached dispatch preserves the norm/RoPE arithmetic while
+        # the cache-writing launch above remains restricted to local rows.
+        q_c_out = fused_norm_rope(
+            positions,
+            q_c,
+            q_rms_norm_w,
+            q_rms_eps,
+            kv_c,
+            kv_rms_norm_w,
+            kv_rms_eps,
+            k_pe,
+            k_rope_cos_sin_cache,
+            None,
+            None,
+            None,
+            index_k_layer_norm_eps,
+            None,
+            topk_indices_buffer,
+            has_indexer=False,
+            q_c_out=q_c_out,
+            kv_c_out=kv_c_out,
+            k_pe_out=k_pe_out,
+        )
     return q_c_out
 
 

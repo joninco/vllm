@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, TypeVar
 import torch
 from typing_extensions import Self
 
+from vllm.distributed.indexer_kv_geometry import effective_kv_shards
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import get_dtype_size
@@ -242,6 +243,8 @@ class KVCacheSpec:
         return all(
             isinstance(spec, uniform_type_base_spec)
             and getattr(spec, "dcp_replicated", False) == dcp_replicated
+            and getattr(spec, "dcp_kv_shard_count", None)
+            == getattr(self, "dcp_kv_shard_count", None)
             for spec in kv_cache_specs.values()
         )
 
@@ -405,6 +408,8 @@ class AttentionSpec(KVCacheSpec):
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
     dcp_replicated: bool = False
     """Whether every DCP rank stores the complete KV cache for this layer."""
+    dcp_kv_shard_count: int | None = None
+    """Explicit per-group KV shards; None inherits attention DCP geometry."""
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -443,10 +448,8 @@ class AttentionSpec(KVCacheSpec):
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         parallel_config = vllm_config.parallel_config
-        kv_shard_count = (
-            1
-            if getattr(self, "dcp_replicated", False)
-            else parallel_config.decode_context_parallel_size
+        kv_shard_count = effective_kv_shards(
+            self, parallel_config.decode_context_parallel_size
         )
         return cdiv(max_len, self.block_size * kv_shard_count)
 
@@ -480,8 +483,7 @@ class FullAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        if dcp_world_size > 1 and not self.dcp_replicated:
-            max_model_len = cdiv(max_model_len, dcp_world_size)
+        max_model_len = cdiv(max_model_len, effective_kv_shards(self, dcp_world_size))
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
     @classmethod
@@ -539,6 +541,7 @@ class FullAttentionSpec(AttentionSpec):
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
             dcp_replicated=dcp_replicated.pop(),
+            dcp_kv_shard_count=specs[0].dcp_kv_shard_count,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -630,6 +633,7 @@ class MLAAttentionSpec(FullAttentionSpec):
                 spec.non_causal_multi_token_decode for spec in specs
             ),
             dcp_replicated=dcp_replicated_set.pop(),
+            dcp_kv_shard_count=specs[0].dcp_kv_shard_count,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -686,6 +690,7 @@ class RSWASpec(FullAttentionSpec):
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
             dcp_replicated=base.dcp_replicated,
+            dcp_kv_shard_count=base.dcp_kv_shard_count,
             rswa_window=rswa_windows.pop(),
         )
 
@@ -887,6 +892,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
             dcp_replicated=dcp_replicated_set.pop(),
+            dcp_kv_shard_count=specs[0].dcp_kv_shard_count,
             prefix_cache_enabled=specs[0].prefix_cache_enabled,
             prefill_replay_window=specs[0].prefill_replay_window,
         )
@@ -1063,6 +1069,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             non_causal=any(spec.non_causal for spec in specs),
             dcp_replicated=dcp_replicated.pop(),
+            dcp_kv_shard_count=specs[0].dcp_kv_shard_count,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -1108,6 +1115,15 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             getattr(spec, "dcp_replicated", False)
             for spec in self.kv_cache_specs.values()
         )
+
+    @property
+    def dcp_kv_shard_count(self) -> int | None:
+        counts = {
+            getattr(spec, "dcp_kv_shard_count", None)
+            for spec in self.kv_cache_specs.values()
+        }
+        assert len(counts) == 1, "A cache group must use one KV shard count"
+        return counts.pop()
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(

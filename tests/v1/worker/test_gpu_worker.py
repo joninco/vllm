@@ -95,6 +95,10 @@ def test_startup_plan_apply_gate(plan_env):
 )
 @pytest.mark.parametrize("estimate_graphs", [False, True])
 @pytest.mark.parametrize("resolves_kernels", [True, False])
+@pytest.mark.parametrize("initial_device_charge", [0, 3])
+@pytest.mark.parametrize(
+    "execution_mode", ["graphs", "eager_projected", "eager_disabled"]
+)
 def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     monkeypatch,
     final_free_memory,
@@ -102,6 +106,8 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     expected_available_memory,
     estimate_graphs,
     resolves_kernels,
+    initial_device_charge,
+    execution_mode,
 ):
     """KV sizing must retain the warmed allocator and graph high-waters and
     the persistent allocations made after the activation profile, charging
@@ -112,6 +118,9 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     otherwise the single profile's headroom stands and no correction is
     subtracted."""
     events: list[object] = []
+    profile_graphs = execution_mode == "graphs"
+    needs_warmup = execution_mode != "eager_disabled"
+    did_warmup = needs_warmup and resolves_kernels
     first_profile = SimpleNamespace(
         free_memory=84,
         torch_allocated=7,
@@ -138,7 +147,7 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     )
     snapshots = iter(
         [first_profile, after_warmup, repeatable_profile, final]
-        if resolves_kernels
+        if did_warmup
         else [first_profile, final]
     )
 
@@ -150,7 +159,15 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
         events.append("reserve_sampler_workspace")
         return 0
 
+    configured_layer = SimpleNamespace(
+        dcp_manager=SimpleNamespace(
+            prefill_warmup_key=("projected",)
+            if execution_mode == "eager_projected"
+            else None
+        )
+    )
     model_runner = SimpleNamespace(
+        get_model=lambda: SimpleNamespace(modules=lambda: [configured_layer]),
         model_memory_usage=0,
         reserve_sampler_workspace=reserve_sampler_workspace,
         profile_run=lambda: events.append("profile_run"),
@@ -189,12 +206,17 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
             non_torch_memory=1,
         ),
         requested_memory=90,
+        initial_device_memory_charge=initial_device_charge,
         device="cuda:0",
         model_config=SimpleNamespace(multimodal_config=None),
-        parallel_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(
-                cudagraph_mode=gpu_worker.CUDAGraphMode.PIECEWISE,
+                cudagraph_mode=(
+                    gpu_worker.CUDAGraphMode.PIECEWISE
+                    if profile_graphs
+                    else gpu_worker.CUDAGraphMode.NONE
+                ),
                 cudagraph_capture_sizes=[8, 4],
             )
         ),
@@ -245,16 +267,16 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     # count as late persistent memory.
     repeated_profile: list[object] = (
         [("reset_peak", "cuda:0"), "profile_run", "profile_glm_dcp_attention"]
-        if resolves_kernels
+        if did_warmup
         else []
     )
     assert events == [
         "reserve_sampler_workspace",
         "profile_run",
         "profile_glm_dcp_attention",
-        ("b12x_warmup", (8, 4)),
+        *([("b12x_warmup", (8, 4))] if needs_warmup else []),
         *repeated_profile,
-        "profile_cudagraph_memory",
+        *(["profile_cudagraph_memory"] if profile_graphs else []),
         "empty_cache",
     ]
     # The repeatable profile retained seven bytes above its cleanup state.
@@ -262,25 +284,37 @@ def test_kv_memory_profile_uses_repeatable_peak_before_cudagraphs(
     # of allocator-reservation headroom to deduct from KV capacity, plus the
     # free memory retained after the activation profile. Without the repeat
     # those two bytes are not deducted.
-    headroom_correction = 2 if resolves_kernels else 0
+    headroom_correction = 2 if did_warmup else 0
     late_persistent_memory = 80 - final_free_memory
-    if estimate_graphs:
-        assert available == expected_available_memory + 2 - headroom_correction
+    if estimate_graphs and profile_graphs:
+        assert (
+            available
+            == expected_available_memory
+            + 2
+            - headroom_correction
+            - initial_device_charge
+        )
     else:
-        assert available == 80 - headroom_correction - late_persistent_memory
+        assert (
+            available
+            == 80 - headroom_correction - late_persistent_memory - initial_device_charge
+        )
     # The activation peak stays activation-only (the repeatable allocator
     # headroom, seven bytes here, or the single profile's five); post-capture
     # recommendations add measured graph memory to it, and the admission
     # budget subtracts the estimate separately.
     assert worker.peak_activation_memory == 5 + headroom_correction
     assert worker.total_consumed == 10 + late_persistent_memory
-    assert worker.cudagraph_memory_estimate == cudagraph_estimate
+    assert worker.cudagraph_memory_estimate == (
+        cudagraph_estimate if profile_graphs else 0
+    )
 
 
 @pytest.mark.parametrize("estimated_gib", [0, 4])
 @pytest.mark.parametrize("measured_gib", [3, 7])
+@pytest.mark.parametrize("initial_device_charge", [0, 512 * (1 << 20)])
 def test_post_capture_recommendation_counts_measured_graph_memory_once(
-    monkeypatch, estimated_gib, measured_gib
+    monkeypatch, estimated_gib, measured_gib, initial_device_charge
 ):
     """The saved KV budget uses measured graph storage, not its estimate."""
     compilation = SimpleNamespace(
@@ -304,6 +338,7 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
             free_memory=100 * GiB_bytes, total_memory=100 * GiB_bytes
         ),
         requested_memory=90 * GiB_bytes,
+        initial_device_memory_charge=initial_device_charge,
         total_consumed=10 * GiB_bytes,
         peak_activation_memory=5 * GiB_bytes,
         cudagraph_memory_estimate=estimated_gib * GiB_bytes,
@@ -333,4 +368,159 @@ def test_post_capture_recommendation_counts_measured_graph_memory_once(
 
     gpu_worker.Worker.compile_or_warm_up_model(worker)
 
-    assert saved == [(90 - 10 - 5 - measured_gib) * GiB_bytes - 150 * (1 << 20)]
+    assert saved == [
+        (90 - 10 - 5 - measured_gib) * GiB_bytes
+        - 150 * (1 << 20)
+        - initial_device_charge
+    ]
+
+
+@pytest.mark.parametrize("dcp_size", [1, 4])
+@pytest.mark.parametrize("external_shortfall", [False, True])
+def test_dcp_startup_charges_communicators_inside_requested_memory(
+    monkeypatch,
+    dcp_size,
+    external_shortfall,
+):
+    import torch
+
+    from vllm.utils.mem_utils import MemorySnapshot
+    from vllm.v1.worker import gpu_model_runner
+
+    total = 100 * GiB_bytes
+    requested = 97.5 * GiB_bytes
+    before_free = int(requested + (150 if not external_shortfall else -10) * 1024**2)
+    owned = 350 * 1024**2
+    before = MemorySnapshot(
+        device="cuda:0", auto_measure=False, total_memory=total, free_memory=before_free
+    )
+    after = MemorySnapshot(
+        device="cuda:0",
+        auto_measure=False,
+        total_memory=total,
+        free_memory=before_free - owned,
+    )
+    snapshots = iter([before, after] if dcp_size > 1 else [after])
+    parallel = SimpleNamespace(
+        distributed_executor_backend="external_launcher",
+        data_parallel_backend="mp",
+        assigned_physical_gpu_ids=None,
+        enable_dbo=False,
+        decode_context_parallel_size=dcp_size,
+    )
+    config = SimpleNamespace(parallel_config=parallel)
+    worker = SimpleNamespace(
+        device_config=SimpleNamespace(device_type="cuda"),
+        parallel_config=parallel,
+        vllm_config=config,
+        local_rank=0,
+        rank=1,
+        distributed_init_method="unused",
+        use_v2_model_runner=False,
+        model_config=SimpleNamespace(dtype=torch.bfloat16, seed=0),
+        cache_config=SimpleNamespace(gpu_memory_utilization=0.975),
+    )
+    monkeypatch.setattr(gpu_worker, "MemorySnapshot", lambda **kw: next(snapshots))
+    monkeypatch.setattr(
+        gpu_worker, "init_worker_distributed_environment", lambda *a: None
+    )
+    monkeypatch.setattr(gpu_worker, "set_random_seed", lambda *a: None)
+    monkeypatch.setattr(gpu_worker, "init_workspace_manager", lambda *a: None)
+    monkeypatch.setattr(gpu_worker, "_num_workspace_lanes", lambda *a: 1)
+    monkeypatch.setattr(
+        gpu_worker,
+        "current_platform",
+        SimpleNamespace(
+            logical_device_id_to_visible_device_id=lambda rank: rank,
+            check_if_supports_dtype=lambda dtype: None,
+            dist_backend="nccl",
+        ),
+    )
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 8)
+    monkeypatch.setattr(torch.accelerator, "set_device_index", lambda *a: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(gpu_model_runner, "GPUModelRunner", lambda *a: None)
+    if external_shortfall or dcp_size == 1:
+        with pytest.raises(ValueError, match="Free memory on device"):
+            gpu_worker.Worker.init_device(worker)
+    else:
+        gpu_worker.Worker.init_device(worker)
+        assert worker.requested_memory == requested
+        assert worker.distributed_init_memory == owned
+        # The profiler's baseline includes communicator bytes once in the
+        # free-memory delta used to subtract non-KV storage from the request.
+        assert worker.init_snapshot is before
+        free_after_model = after.free_memory - 60 * GiB_bytes
+        consumed = worker.init_snapshot.free_memory - free_after_model
+        assert consumed == 60 * GiB_bytes + owned
+        assert worker.requested_memory - consumed == requested - 60 * GiB_bytes - owned
+    assert worker.initial_device_memory_charge == (
+        total - before_free if dcp_size > 1 else 0
+    )
+
+
+def test_dcp1_does_not_inspect_projected_prefill_resources():
+    worker = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        model_runner=None,
+    )
+    assert not gpu_worker._has_dcp_prefill_warmup(worker)
+
+
+@pytest.mark.parametrize("mechanism", ["projected", "query_bmm", "ckv", "disabled"])
+def test_eager_prefill_warmup_gate_uses_configured_mechanisms(mechanism):
+    layer = SimpleNamespace(
+        dcp_manager=SimpleNamespace(
+            prefill_warmup_key=("projected",) if mechanism == "projected" else None
+        ),
+        _prefill_query_bmm_module=object() if mechanism == "query_bmm" else None,
+        impl=SimpleNamespace(_ckv_gather_enabled=mechanism == "ckv"),
+    )
+    worker = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        model_runner=SimpleNamespace(
+            get_model=lambda: SimpleNamespace(modules=lambda: [layer])
+        ),
+    )
+    assert gpu_worker._has_dcp_prefill_warmup(worker) == (mechanism != "disabled")
+
+
+@pytest.mark.parametrize("resolves_kernels", [False, True])
+def test_explicit_kv_budget_initializes_opted_prefill_before_return(
+    monkeypatch, resolves_kernels
+):
+    events = []
+    layer = SimpleNamespace(_prefill_query_bmm_module=object())
+    worker = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=4),
+        cache_config=SimpleNamespace(kv_cache_memory_bytes=4096),
+        init_snapshot=SimpleNamespace(free_memory=8192),
+        model_config=SimpleNamespace(multimodal_config=None),
+        model_runner=SimpleNamespace(
+            get_model=lambda: SimpleNamespace(modules=lambda: [layer]),
+            profile_run=lambda: events.append("profile"),
+        ),
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(cudagraph_capture_sizes=[])
+        ),
+    )
+    monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", lambda _: None)
+
+    def warmup(worker, sizes):
+        assert sizes == []
+        events.append("warmup")
+        return resolves_kernels
+
+    def budget(requested, *args):
+        events.append("admit")
+        return requested
+
+    monkeypatch.setattr(gpu_worker, "b12x_warmup", warmup)
+    monkeypatch.setattr(gpu_worker, "reserve_mm_ipc_gpu_memory", budget)
+    assert gpu_worker.Worker.determine_available_memory(worker) == 4096
+    assert events == [
+        "profile",
+        "warmup",
+        *(["profile"] if resolves_kernels else []),
+        "admit",
+    ]

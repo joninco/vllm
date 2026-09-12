@@ -31,6 +31,7 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.indexer_kv_geometry import effective_kv_shards
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -349,6 +350,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
 
+        from vllm.v1.worker.prefill_diagnostics import (
+            install_prefill_runner_diagnostics,
+        )
+
+        install_prefill_runner_diagnostics(self, request_state_runner=True)
+
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len
@@ -499,6 +506,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         get_offloader().post_init()
 
+        from vllm.v1.attention.ops.b12x_dcp import initialize_b12x_dcp_transport
+
+        self.b12x_dcp_transport = initialize_b12x_dcp_transport(
+            self.vllm_config, self.device
+        )
+
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -539,9 +552,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
 
+    def _reset_attention_kv_cache_bindings(self) -> None:
+        """Complete persistent attention users before replacing native caches."""
+        hooks = {
+            hook
+            for layer in self.compilation_config.static_forward_context.values()
+            if (
+                hook := getattr(
+                    getattr(layer, "impl", None), "reset_kv_cache_binding_state", None
+                )
+            )
+            is not None
+        }
+        for hook in hooks:
+            hook()
+
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, is_profiling: bool = False
     ) -> None:
+        self._reset_attention_kv_cache_bindings()
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
@@ -561,9 +590,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
-            group_cp_sizes.append(
-                1 if getattr(spec, "dcp_replicated", False) else self.dcp_size
-            )
+            group_cp_sizes.append(effective_kv_shards(spec, self.dcp_size))
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(
@@ -679,6 +706,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
             self.speculator.init_cudagraph_manager(cudagraph_mode)
+
+        transport = getattr(self, "b12x_dcp_transport", None)
+        if transport is not None:
+            transport.bind_graph_manager(
+                self.cudagraph_manager, "target", profiling=is_profiling
+            )
+            if self.speculator is not None:
+                transport.bind_graph_manager(
+                    self.speculator.prefill_cudagraph_manager,
+                    "draft_prefill",
+                    profiling=is_profiling,
+                )
+                transport.bind_graph_manager(
+                    self.speculator.decode_cudagraph_manager,
+                    "draft_decode",
+                    profiling=is_profiling,
+                )
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(
@@ -989,17 +1033,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         its token budget across many requests. A GLM sparse-MLA prefill can put
         the complete scheduler budget in one request, causing the DCP query
         all-gather to require substantially more temporary memory. Bind a
-        minimal split cache, execute that shape, then release all temporary
+        minimal temporary cache, execute that shape, then release all temporary
         cache and backend state before production cache allocation.
         """
         if (
-            self.model_config.architecture != "Glm5NextForConditionalGeneration"
+            self.model_config.architecture
+            not in ("Glm5NextForConditionalGeneration", "GlmMoeDsaForCausalLM")
             or self.dcp_size <= 1
         ):
             return
 
         _init_minimal_kv_cache_for_profiling(self)
         try:
+            # Native-cache collectives must be initialized before this first
+            # real prefill; their allocations belong to the admission profile.
+            for layer in self.compilation_config.static_forward_context.values():
+                prepare = getattr(
+                    getattr(layer, "impl", None), "prepare_profile_collectives", None
+                )
+                if callable(prepare):
+                    prepare()
             self._dummy_run(
                 self.max_num_tokens,
                 context_len=self.dcp_size * self.cp_interleave,
@@ -2327,6 +2380,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.synchronize()
         self.cudagraph_manager = None
         self.boundary_checkpoint_state = None
+        self._reset_attention_kv_cache_bindings()
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):

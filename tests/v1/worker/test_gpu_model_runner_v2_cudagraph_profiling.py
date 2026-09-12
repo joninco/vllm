@@ -142,6 +142,55 @@ def test_profile_cudagraph_memory_disabled_returns_zero(monkeypatch):
     assert runner.events == []
 
 
+def test_transport_scope_covers_warmup_and_full_capture(monkeypatch):
+    manager = _FakeCudaGraphManager(True, 1)
+    manager.device = "cpu"
+    desc = cgu.BatchExecutionDescriptor(CUDAGraphMode.FULL, 4, 1, 4)
+    manager._capture_descs = {CUDAGraphMode.FULL: [desc]}
+    events = []
+    active = False
+
+    @contextlib.contextmanager
+    def scope(descriptor):
+        nonlocal active
+        assert descriptor == desc
+        active = True
+        events.append("enter")
+        try:
+            yield
+        finally:
+            active = False
+            events.append("exit")
+
+    def create_forward(descriptor, warmup):
+        def forward(mode):
+            assert active
+            events.append("warmup" if warmup else "capture")
+
+        return forward
+
+    manager.b12x_dcp_capture_scope = scope
+    monkeypatch.setattr(cgu, "graph_capture", lambda **kw: contextlib.nullcontext())
+    monkeypatch.setattr(cgu, "is_global_first_rank", lambda: False)
+    monkeypatch.setattr(cgu, "set_graph_pool_id", lambda pool: None)
+    monkeypatch.setattr(cgu.torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(cgu.torch.cuda, "CUDAGraph", object)
+    monkeypatch.setattr(cgu.torch.cuda, "graph", lambda *a: contextlib.nullcontext())
+    monkeypatch.setattr(
+        cgu,
+        "get_offloader",
+        lambda: SimpleNamespace(
+            sync_prev_onload=lambda: None,
+            join_after_forward=lambda: None,
+        ),
+    )
+    with compilation_counter.expect(num_cudagraph_captured=1):
+        manager.capture(create_forward)
+    assert events == ["enter", "warmup", "capture", "exit"]
+    assert not active
+    assert desc in manager.graphs
+
+
 def test_profile_cudagraph_memory_no_graphs_tears_down(monkeypatch):
     _patch_module(monkeypatch)
     runner = _make_profiling_runner(CUDAGraphMode.FULL, needs_capture=False)
