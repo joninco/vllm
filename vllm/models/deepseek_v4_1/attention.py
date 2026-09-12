@@ -27,6 +27,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4_1.b12x_layers import (
     B12xFP8LinearMethod,
     B12xLinearMethod,
@@ -331,7 +332,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self._context[prefix] = self
         self.kv_cache = torch.tensor([])
         self.attn_sink = nn.Parameter(
-            torch.empty(self.n_local_heads, dtype=torch.float32), requires_grad=False
+            torch.full((self.n_local_heads,), -float("inf"), dtype=torch.float32),
+            requires_grad=False,
         )
         self.fused_wqa_wkv = MergedColumnParallelLinear(
             hf.hidden_size,
@@ -371,6 +373,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             reduce_results=False,
         )
         self.wo_b.quant_method = _WOProjectionWeightMethod(self.wo_b.quant_method)
+        if getattr(hf, "original_num_attention_heads", hf.num_attention_heads) != (
+            hf.num_attention_heads
+        ):
+            for linear in (self.wq_b, self.wo_a, self.wo_b):
+                for param in linear.parameters():
+                    set_weight_attrs(param, {"allow_tp_padding": True})
         self._wo_projection_weights = None
         for linear in (self.fused_wqa_wkv, self.wq_b):
             _native_linear(linear)
@@ -504,14 +512,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 )
             )
             self._plans[mode] = plan
-            metadata_specs = (
+            metadata_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
                 ((capacity, self.swa_width), torch.int32),
                 ((capacity,), torch.int32),
                 ((capacity,), torch.int32),
-            )
+            ]
             if self.compress_ratio:
-                metadata_specs += (((capacity, self._main_width), torch.int32),)
-            workspace_specs = metadata_specs + tuple(plan.shapes_and_dtypes())
+                metadata_specs.append(((capacity, self._main_width), torch.int32))
+            workspace_specs = tuple(metadata_specs) + tuple(plan.shapes_and_dtypes())
             self._attention_workspace_specs[mode] = workspace_specs
             current_workspace_manager().get_simultaneous(*workspace_specs)
         if self.topk_indices_buffer is None and self.is_index_source:
@@ -618,6 +626,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or self.compressor is None:
             return
+        indexer = self.indexer
+        if indexer is None:
+            raise RuntimeError("V4.1 global KV source requires an indexer")
         rows = hidden_states.shape[0]
         # These are deliberately original metadata, never the decoder views.
         main = metadata[self._owner().prefix]
@@ -628,17 +639,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         latent, slots = self.compressor(hidden_states, main, state)
         # Index K consumes the ordinary-normalized PRE-RoPE latent.
-        key = self.indexer.k_norm(self.indexer.wk(latent))
+        key = indexer.k_norm(indexer.wk(latent))
         key = _rotated(
             key,
             positions,
             self.rotary_emb.cos_sin_cache,
             ratio=self.compress_ratio,
         )
-        index_meta = metadata[self.indexer.k_cache.prefix]
+        index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
         dsa_indexer.quantize_write_index_k_mxfp4(
             key,
-            index_k_cache=self.indexer.k_cache.kv_cache,
+            index_k_cache=indexer.k_cache.kv_cache,
             slot_mapping=index_meta.slot_mapping[:rows],
             page_size=self._index_page,
         )

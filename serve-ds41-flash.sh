@@ -12,9 +12,9 @@ MODEL_PATH="${MODEL_PATH:-/data/cache/huggingface/hub/models--deepseek-ai--DeepS
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-DeepSeek-V4.1-Flash}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.98}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-auto}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-2}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}"
 ENGRAM_TABLE_MEMORY="${ENGRAM_TABLE_MEMORY:-disk}"
@@ -215,7 +215,7 @@ command=(
   --max-model-len "${MAX_MODEL_LEN}"
   --max-num-seqs "${MAX_NUM_SEQS}"
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
-  --max_cudagraph_capture_size 128
+  --max_cudagraph_capture_size 24
   --generation-config vllm
   --limit-mm-per-prompt '{"image":2}'
   --engram-config "{\"cpu_offload\":false,\"table_memory\":\"${ENGRAM_TABLE_MEMORY}\"}"
