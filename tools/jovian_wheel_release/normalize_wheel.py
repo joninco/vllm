@@ -62,7 +62,10 @@ def rewrite_requirements(
         if name == "torchaudio":
             seen.add(name)
             continue
-        if name in EXTERNAL_DEVICE_BACKENDS and requirement.marker is None:
+        is_declared_extra = requirement.marker is not None and "extra" in str(
+            requirement.marker
+        )
+        if name in EXTERNAL_DEVICE_BACKENDS and not is_declared_extra:
             seen.add(name)
             continue
         replacement = replacements.get(name)

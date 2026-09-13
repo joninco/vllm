@@ -29,7 +29,7 @@ Requires-Dist: tilelang==0.1.12
 Requires-Dist: fastsafetensors>=0.3.3
 Requires-Dist: fastsafetensors>=0.3.3; extra == "fastsafetensors"
 Requires-Dist: quack-kernels==0.6.4
-Requires-Dist: tokenspeed-mla==0.1.8
+Requires-Dist: tokenspeed-mla==0.1.8; platform_system == "Linux"
 Requires-Dist: humming-kernels[cu13]==0.1.12
 Requires-Dist: click>=8
 
