@@ -29,9 +29,8 @@ restore_generated_sources
 trap save_generated_sources EXIT
 
 # CMake records generator hashes in its persistent cache. A clean source tree
-# does not contain the generated files, so discard the configuration cache when
-# no generated source cache is available. Compiled objects remain available to
-# the newly configured Ninja graph.
+# lacks generated files, so discard only its configuration when the generated
+# source cache is empty. Compiled objects remain available to the next graph.
 if ! test -f "${dense_source}/kernel_selector.h" \
   || ! test -f "${moe_source}/kernel_selector.h"; then
   while IFS= read -r -d '' cmake_cache; do
@@ -41,10 +40,20 @@ fi
 
 env -u PYTHONPATH \
   VLLM_TARGET_DEVICE=cuda \
-  VLLM_VERSION_OVERRIDE="${VLLM_PACKAGE_VERSION:?}" \
-  CMAKE_ARGS='-DCMAKE_CUDA_ARCHITECTURES=120 -DFETCHCONTENT_BASE_DIR=/tmp/vllm-fetchcontent' \
+  CMAKE_ARGS='-DCMAKE_CUDA_ARCHITECTURES=120a -DFETCHCONTENT_BASE_DIR=/tmp/vllm-fetchcontent' \
   MAX_JOBS="${BUILD_JOBS:?}" \
-  /opt/venv/bin/python -m pip wheel \
-    --no-build-isolation --no-deps --wheel-dir /wheelhouse .
+  uv build \
+    --wheel \
+    --no-build-isolation \
+    --python /build-venv/bin/python \
+    --out-dir /wheelhouse \
+    /src/vllm
 
 test "$(find /wheelhouse -maxdepth 1 -name 'vllm-*.whl' | wc -l)" -eq 1
+/build-venv/bin/python tools/jovian_wheel_release/normalize_wheel.py \
+  --wheel /wheelhouse/vllm-*.whl \
+  --torch-version 2.14.0a0+4fdf77b940.nv26.8.63802676 \
+  --torchvision-version 0.29.0a0+0bc41e67.nv26.8.63802676 \
+  --flashinfer-version 0.6.18 \
+  --tvm-ffi-version 0.1.13.post3 \
+  --source-date-epoch "${SOURCE_DATE_EPOCH:?}"

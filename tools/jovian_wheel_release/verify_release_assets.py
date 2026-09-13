@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Verify an immutable Jovian application-wheel release asset set."""
+"""Verify immutable vLLM wheel release assets before publication or promotion."""
 
 from __future__ import annotations
 
@@ -13,100 +13,52 @@ from pathlib import Path
 
 
 def sha256(path: Path) -> str:
-    """Return the hexadecimal SHA-256 digest of one file.
-
-    Args:
-        path: File whose bytes are hashed.
-
-    Returns:
-        The lowercase hexadecimal digest.
-    """
+    """Return a file's lowercase SHA-256 digest."""
     digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(8 * 1024 * 1024):
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def checksum_entries(path: Path) -> dict[str, str]:
-    """Read sha256sum output and reject non-basename paths.
-
-    Args:
-        path: File containing sha256sum-compatible records.
-
-    Returns:
-        A mapping from release-asset basenames to hexadecimal digests.
-
-    Raises:
-        ValueError: A record names a path, repeats a name, or is malformed.
-    """
-    entries: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        digest, declared_path = line.split(maxsplit=1)
-        name = declared_path.lstrip("* ")
-        if Path(name).name != name or name in entries:
-            raise ValueError(f"invalid checksum member: {name}")
-        entries[name] = digest
-    return entries
-
-
 def verify_release(
     directory: Path,
-    vllm_commit: str,
-    b12x_commit: str,
-    lmcache_commit: str,
+    source_commit: str,
+    beta_tag: str,
+    *,
+    promotion: bool = False,
 ) -> None:
-    """Verify source identity, exact membership, and the archive digest.
-
-    Args:
-        directory: Directory containing the downloaded release assets.
-        vllm_commit: Expected full vLLM source commit.
-        b12x_commit: Expected full B12X source commit.
-        lmcache_commit: Expected full LMCache source commit.
-
-    Raises:
-        ValueError: Source identity, asset membership, or archive digest differs
-            from the expected release contract.
-    """
-    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-    expected_source = {
-        "vllm": vllm_commit,
-        "b12x": b12x_commit,
-        "lmcache": lmcache_commit,
-    }
-    for component, commit in expected_source.items():
-        if manifest["source"][component]["commit"] != commit:
-            raise ValueError(f"{component} source commit mismatch")
-
-    archive = (
-        f"jovian-judgement-wheels-{vllm_commit}-b12x-{b12x_commit}"
-        f"-lmcache-{lmcache_commit}.tar.zst"
-    )
-    expected = {"manifest.json", archive, f"{archive}.sha256"}
-    actual = {path.name for path in directory.iterdir() if path.is_file()}
-    if actual != expected:
-        raise ValueError(
-            f"release asset set mismatch: missing={sorted(expected - actual)}, "
-            f"extra={sorted(actual - expected)}"
-        )
-    checksums = checksum_entries(directory / f"{archive}.sha256")
-    if checksums != {archive: sha256(directory / archive)}:
-        raise ValueError("application archive digest mismatch")
+    """Verify source identity and every wheel digest declared by a release."""
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest["schema"] != "local-inference-vllm-wheel-release/v2":
+        raise ValueError("release schema mismatch")
+    if manifest["source"]["commit"] != source_commit:
+        raise ValueError("source commit mismatch")
+    if manifest["release_tag"] != beta_tag:
+        raise ValueError("beta tag mismatch")
+    for package in manifest["packages"]:
+        wheel = directory / package["file"]
+        if not wheel.is_file():
+            wheel = directory / "wheels" / package["file"]
+        if not wheel.is_file() or sha256(wheel) != package["sha256"]:
+            raise ValueError(f"wheel digest mismatch: {package['file']}")
+    if promotion and not (directory / "stable-promotion.json").is_file():
+        raise ValueError("stable promotion record missing")
 
 
 def main() -> None:
     """Parse command-line arguments and enforce the release contract."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, required=True)
-    parser.add_argument("--vllm-commit", required=True)
-    parser.add_argument("--b12x-commit", required=True)
-    parser.add_argument("--lmcache-commit", required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--beta-tag", required=True)
+    parser.add_argument("--promotion", action="store_true")
     args = parser.parse_args()
     verify_release(
         args.directory,
-        args.vllm_commit,
-        args.b12x_commit,
-        args.lmcache_commit,
+        args.source_commit,
+        args.beta_tag,
+        promotion=args.promotion,
     )
 
 
