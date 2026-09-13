@@ -28,7 +28,7 @@ COPY --from=rust /usr/local/rustup /usr/local/rustup
 COPY tools/jovian_wheel_release/build-requirements.lock /tmp/build-requirements.lock
 RUN test "$(sha256sum /usr/local/bin/uv | awk '{print $1}')" = "${UV_SHA256}" \
     && test "$(rustc --version | awk '{print $2}')" = 1.95.0 \
-    && uv venv --python /usr/local/bin/python --system-site-packages /build-venv \
+    && uv venv --python /usr/bin/python --system-site-packages /build-venv \
     && uv pip install --python /build-venv/bin/python \
       --require-hashes --no-deps -r /tmp/build-requirements.lock
 
