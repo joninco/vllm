@@ -23,6 +23,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Build and verify the application wheel bundle
         run: tools/jovian_wheel_release/build_bundle.sh
@@ -33,15 +34,23 @@ jobs:
         run: |
           manifest=dist/jovian-wheel-release/bundle/manifest.json
           b12x_commit=$(jq -r '.source.b12x.commit' "${manifest}")
-          tag="jovian-wheels-${GITHUB_SHA}-b12x-${b12x_commit}"
-          archive="dist/jovian-wheel-release/jovian-judgement-wheels-${GITHUB_SHA}-b12x-${b12x_commit}.tar.zst"
+          lmcache_commit=$(jq -r '.source.lmcache.commit' "${manifest}")
+          tag="jovian-wheels-${GITHUB_SHA}-b12x-${b12x_commit}-lmcache-${lmcache_commit}"
+          archive="dist/jovian-wheel-release/jovian-judgement-wheels-${GITHUB_SHA}-b12x-${b12x_commit}-lmcache-${lmcache_commit}.tar.zst"
           if gh release view "${tag}" >/dev/null 2>&1; then
-            echo "Immutable release ${tag} already exists; no assets were replaced."
+            mkdir existing-release
+            gh release download "${tag}" --dir existing-release
+            python tools/jovian_wheel_release/verify_release_assets.py \
+              --directory existing-release \
+              --vllm-commit "${GITHUB_SHA}" \
+              --b12x-commit "${b12x_commit}" \
+              --lmcache-commit "${lmcache_commit}"
+            echo "Immutable release ${tag} satisfies the application-wheel contract."
           else
             gh release create "${tag}" \
               --target "${GITHUB_SHA}" \
               --prerelease \
-              --title "Jovian Judgement wheels ${GITHUB_SHA:0:12} / B12X ${b12x_commit:0:12}" \
+              --title "Jovian application wheels ${GITHUB_SHA:0:12}" \
               --notes-file dist/jovian-wheel-release/release-notes.md \
               "${archive}" "${archive}.sha256" \
               "${manifest}"

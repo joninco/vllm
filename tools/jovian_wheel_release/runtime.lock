@@ -17,5 +17,7 @@ flashinfer.python.sha256=3a5b1143d8b933d71881c2d71a2c0677360528344813be1893bafa9
 flashinfer.jit-cache.sha256=9d08679e4ba3cc7c49c5f8035268b7958e9c4d8c7a5e8cd842211da46007809f
 b12x.repository=https://github.com/local-inference-lab/b12x.git
 b12x.ref=master
+lmcache.repository=https://github.com/local-inference-lab/LMCache.git
+lmcache.ref=dev
 uv.version=0.11.30
 uv.sha256=9a4299a0c3bcc01012acbcdae7b5655e5087e0e5d87459306736a1420a902b81

@@ -22,7 +22,7 @@ assert torch._C._GLIBCXX_USE_CXX11_ABI
 for package in manifest["packages"]:
     assert importlib.metadata.version(package["name"]) == package["version"]
 
-for module in ("b12x", "flashinfer", "vllm", "vllm._C_stable_libtorch"):
+for module in ("b12x", "flashinfer", "lmcache", "vllm", "vllm._C_stable_libtorch"):
     importlib.import_module(module)
 
 print("Jovian Judgement application wheel bundle: PASS")

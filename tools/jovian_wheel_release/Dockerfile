@@ -39,12 +39,11 @@ ARG VLLM_PACKAGE_VERSION
 ARG VLLM_SOURCE_DATE_EPOCH
 ARG BUILD_JOBS=64
 COPY . /src/vllm
+COPY tools/jovian_wheel_release/build-requirements.lock /tmp/build-requirements.lock
 WORKDIR /src/vllm
 RUN --mount=type=cache,id=jovian-wheel-pip,target=/root/.cache/pip,sharing=locked \
     env -u PYTHONPATH /opt/venv/bin/python -m pip install \
-      'cmake>=3.26.1' ninja 'packaging>=24.2' \
-      'setuptools>=77.0.3,<81.0.0' 'setuptools-scm>=8.0' \
-      'setuptools-rust>=1.9.0' wheel jinja2
+      --require-hashes --no-deps -r /tmp/build-requirements.lock
 RUN --mount=type=cache,id=jovian-vllm-native-cu133-torch213-sm120,target=/src/vllm/build,sharing=locked \
     --mount=type=cache,id=jovian-vllm-fetchcontent-cu133,target=/tmp/vllm-fetchcontent,sharing=locked \
     --mount=type=cache,id=jovian-vllm-generated-cu133-torch213-sm120,target=/tmp/vllm-generated,sharing=locked \
@@ -57,9 +56,23 @@ RUN --mount=type=cache,id=jovian-vllm-native-cu133-torch213-sm120,target=/src/vl
     BUILD_JOBS="${BUILD_JOBS}" \
     tools/jovian_wheel_release/build_vllm_wheel.sh
 
+FROM build-environment AS lmcache-wheel
+
+ARG LMCACHE_SOURCE_DATE_EPOCH
+COPY --from=lmcache_source / /src/lmcache
+WORKDIR /src/lmcache
+RUN --mount=type=cache,id=jovian-wheel-pip,target=/root/.cache/pip,sharing=locked \
+    mkdir -p /wheelhouse \
+    && env -u PYTHONPATH \
+      SOURCE_DATE_EPOCH="${LMCACHE_SOURCE_DATE_EPOCH}" \
+      /opt/venv/bin/python -m pip wheel \
+      --no-build-isolation --no-deps --wheel-dir /wheelhouse . \
+    && test "$(find /wheelhouse -maxdepth 1 -name 'lmcache-*.whl' | wc -l)" -eq 1
+
 FROM ${FLASHINFER_ARTIFACT_IMAGE} AS flashinfer-wheels
 
 FROM scratch AS wheelhouse
 COPY --from=vllm-wheel /wheelhouse/ /wheels/
 COPY --from=b12x-wheel /wheelhouse/ /wheels/
+COPY --from=lmcache-wheel /wheelhouse/ /wheels/
 COPY --from=flashinfer-wheels /opt/flashinfer-wheels/ /wheels/

@@ -18,8 +18,22 @@ builder_image=$(lock_value builder.image)
 flashinfer_image=$(lock_value flashinfer.artifact.image)
 b12x_repository=$(lock_value b12x.repository)
 b12x_ref=$(lock_value b12x.ref)
+lmcache_repository=$(lock_value lmcache.repository)
+lmcache_ref=$(lock_value lmcache.ref)
 expected_uv_version=$(lock_value uv.version)
 expected_uv_sha256=$(lock_value uv.sha256)
+foundation_python_path=$(lock_value foundation.python-path)
+python_version=$(lock_value python.version)
+cuda_version=$(lock_value cuda.version)
+pytorch_version=$(lock_value pytorch.version)
+pytorch_commit=$(lock_value pytorch.commit)
+nccl_version=$(lock_value nccl.version)
+nccl_commit=$(lock_value nccl.commit)
+cutlass_dsl_version=$(lock_value cutlass-dsl.version)
+flashinfer_commit=$(lock_value flashinfer.commit)
+build_requirements_sha256=$(
+  sha256sum "${tool_dir}/build-requirements.lock" | awk '{print $1}'
+)
 uv_binary=${UV_BIN:-uv}
 
 if ! uv_path=$(command -v "${uv_binary}"); then
@@ -32,7 +46,7 @@ test "$(sha256sum "${uv_path}" | awk '{print $1}')" = "${expected_uv_sha256}"
 vllm_commit=$(git -C "${repo_root}" rev-parse HEAD)
 vllm_tree=$(git -C "${repo_root}" rev-parse 'HEAD^{tree}')
 vllm_source_date_epoch=$(git -C "${repo_root}" show -s --format=%ct HEAD)
-test -z "$(git -C "${repo_root}" status --porcelain --untracked-files=no)"
+test -z "$(git -C "${repo_root}" status --porcelain)"
 vllm_version="0.26.1rc0+jj.g${vllm_commit:0:12}"
 
 work_dir=$(mktemp -d -p "${RUNNER_TEMP:-/tmp}" jovian-wheel-build.XXXXXX)
@@ -46,6 +60,14 @@ b12x_commit=$(git -C "${work_dir}/b12x" rev-parse HEAD)
 b12x_tree=$(git -C "${work_dir}/b12x" rev-parse 'HEAD^{tree}')
 b12x_source_date_epoch=$(git -C "${work_dir}/b12x" show -s --format=%ct HEAD)
 
+git init --quiet "${work_dir}/lmcache"
+git -C "${work_dir}/lmcache" remote add origin "${lmcache_repository}"
+git -C "${work_dir}/lmcache" fetch --depth=1 --filter=blob:none origin "${lmcache_ref}"
+git -C "${work_dir}/lmcache" checkout --detach FETCH_HEAD
+lmcache_commit=$(git -C "${work_dir}/lmcache" rev-parse HEAD)
+lmcache_tree=$(git -C "${work_dir}/lmcache" rev-parse 'HEAD^{tree}')
+lmcache_source_date_epoch=$(git -C "${work_dir}/lmcache" show -s --format=%ct HEAD)
+
 if test -e "${output_dir}"; then
   printf 'Output path already exists: %s\n' "${output_dir}" >&2
   exit 1
@@ -55,11 +77,13 @@ mkdir -p "${output_dir}/raw"
 DOCKER_BUILDKIT=1 docker buildx build \
   --file "${tool_dir}/Dockerfile" \
   --build-context "b12x_source=${work_dir}/b12x" \
+  --build-context "lmcache_source=${work_dir}/lmcache" \
   --build-arg "BUILDER_IMAGE=${builder_image}" \
   --build-arg "FLASHINFER_ARTIFACT_IMAGE=${flashinfer_image}" \
   --build-arg "VLLM_PACKAGE_VERSION=${vllm_version}" \
   --build-arg "VLLM_SOURCE_DATE_EPOCH=${vllm_source_date_epoch}" \
   --build-arg "B12X_SOURCE_DATE_EPOCH=${b12x_source_date_epoch}" \
+  --build-arg "LMCACHE_SOURCE_DATE_EPOCH=${lmcache_source_date_epoch}" \
   --build-arg "BUILD_JOBS=${build_jobs}" \
   --target wheelhouse \
   --output "type=local,dest=${output_dir}/raw" \
@@ -80,7 +104,8 @@ test "$(sha256sum "${flashinfer_python_wheel}" | awk '{print $1}')" = \
 test "$(sha256sum "${flashinfer_jit_wheel}" | awk '{print $1}')" = \
   "$(lock_value flashinfer.jit-cache.sha256)"
 
-cp "${lock_path}" "${output_dir}/bundle/runtime.lock"
+cp "${lock_path}" "${tool_dir}/build-requirements.lock" \
+  "${output_dir}/bundle/"
 cp "${tool_dir}/install.sh" "${tool_dir}/verify_install.py" \
   "${output_dir}/bundle/"
 chmod 0755 "${output_dir}/bundle/install.sh"
@@ -109,7 +134,7 @@ while IFS= read -r wheel; do
     <<<"${packages_json}")
 done < <(find "${wheel_dir}" -maxdepth 1 -type f -name '*.whl' | sort)
 
-test "$(jq length <<<"${packages_json}")" -eq 4
+test "$(jq length <<<"${packages_json}")" -eq 5
 
 jq -n \
   --arg status research-only \
@@ -119,17 +144,21 @@ jq -n \
   --arg b12x_repository "${b12x_repository}" \
   --arg b12x_commit "${b12x_commit}" \
   --arg b12x_tree "${b12x_tree}" \
+  --arg lmcache_repository "${lmcache_repository}" \
+  --arg lmcache_commit "${lmcache_commit}" \
+  --arg lmcache_tree "${lmcache_tree}" \
   --arg builder_image "${builder_image}" \
-  --arg foundation_python_path "$(lock_value foundation.python-path)" \
-  --arg python_version "$(lock_value python.version)" \
-  --arg cuda_version "$(lock_value cuda.version)" \
-  --arg pytorch_version "$(lock_value pytorch.version)" \
-  --arg pytorch_commit "$(lock_value pytorch.commit)" \
-  --arg nccl_version "$(lock_value nccl.version)" \
-  --arg nccl_commit "$(lock_value nccl.commit)" \
-  --arg cutlass_dsl_version "$(lock_value cutlass-dsl.version)" \
+  --arg foundation_python_path "${foundation_python_path}" \
+  --arg python_version "${python_version}" \
+  --arg cuda_version "${cuda_version}" \
+  --arg pytorch_version "${pytorch_version}" \
+  --arg pytorch_commit "${pytorch_commit}" \
+  --arg nccl_version "${nccl_version}" \
+  --arg nccl_commit "${nccl_commit}" \
+  --arg cutlass_dsl_version "${cutlass_dsl_version}" \
   --arg flashinfer_image "${flashinfer_image}" \
-  --arg flashinfer_commit "$(lock_value flashinfer.commit)" \
+  --arg flashinfer_commit "${flashinfer_commit}" \
+  --arg build_requirements_sha256 "${build_requirements_sha256}" \
   --argjson packages "${packages_json}" \
   '{
     schema: "local-inference-jovian-wheel-bundle/v1",
@@ -138,10 +167,16 @@ jq -n \
     source: {
       vllm: {repository: $vllm_repository, commit: $vllm_commit, tree: $vllm_tree},
       b12x: {repository: $b12x_repository, commit: $b12x_commit, tree: $b12x_tree},
+      lmcache: {
+        repository: $lmcache_repository,
+        commit: $lmcache_commit,
+        tree: $lmcache_tree
+      },
       flashinfer: {
         artifact_image: $flashinfer_image,
         commit: $flashinfer_commit
-      }
+      },
+      build_requirements_sha256: $build_requirements_sha256
     },
     runtime: {
       builder_image: $builder_image,
@@ -163,7 +198,7 @@ jq -n \
   find wheels -maxdepth 1 -type f -name '*.whl' -print0 \
     | sort -z \
     | xargs -0 sha256sum
-  sha256sum manifest.json requirements-wheelhouse.txt runtime.lock \
+  sha256sum build-requirements.lock manifest.json requirements-wheelhouse.txt runtime.lock \
     install.sh verify_install.py
 ) > "${output_dir}/bundle/SHA256SUMS"
 
@@ -173,9 +208,9 @@ docker run --rm \
   -v "${output_dir}/bundle:/bundle:ro" \
   -v "${uv_path}:/usr/local/bin/uv:ro" \
   "${builder_image}" \
-  -lc 'unset PYTHONPATH; /bundle/install.sh /tmp/jovian-wheel-venv'
+  -lc 'unset PYTHONPATH; uv venv --python 3.12 --system-site-packages /tmp/jovian-wheel-venv; /bundle/install.sh /tmp/jovian-wheel-venv'
 
-archive_name="jovian-judgement-wheels-${vllm_commit}-b12x-${b12x_commit}.tar.zst"
+archive_name="jovian-judgement-wheels-${vllm_commit}-b12x-${b12x_commit}-lmcache-${lmcache_commit}.tar.zst"
 tar --sort=name \
   --mtime="@${vllm_source_date_epoch}" \
   --owner=0 \
@@ -184,8 +219,10 @@ tar --sort=name \
   --zstd \
   -C "${output_dir}/bundle" \
   -cf "${output_dir}/${archive_name}" .
-sha256sum "${output_dir}/${archive_name}" > \
-  "${output_dir}/${archive_name}.sha256"
+(
+  cd "${output_dir}"
+  sha256sum "${archive_name}"
+) > "${output_dir}/${archive_name}.sha256"
 
 jq -r '
   "Status: **research-only**\n\n" +
@@ -194,6 +231,7 @@ jq -r '
   "CUDA runtime.\n\n" +
   "- vLLM commit: `" + .source.vllm.commit + "`\n" +
   "- B12X commit: `" + .source.b12x.commit + "`\n" +
+  "- LMCache commit: `" + .source.lmcache.commit + "`\n" +
   "- FlashInfer commit: `" + .source.flashinfer.commit + "`\n\n" +
   "Extract the archive and run `./install.sh /path/to/venv` inside the " +
   "compatible runtime foundation. The installer verifies every bundled " +
