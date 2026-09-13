@@ -226,6 +226,7 @@ class B12xPcieAllReduce:
         self._dma: Any | None = None
         self._is_capturing = False
         self._capture_stream: torch.cuda.Stream | None = None
+        self.fused_max_rows = 0
 
         if device_group is None:
             logger.warning("B12X PCIe all-reduce requires a CUDA process group.")
@@ -279,6 +280,11 @@ class B12xPcieAllReduce:
 
         assert runtime is not None
         self._runtime = runtime
+        # Row capacity of the fused all-reduce + RMSNorm kernel (one CTA per
+        # row); zero when the runtime does not publish one.
+        max_rows = getattr(runtime, "fused_max_rows", None)
+        if isinstance(max_rows, int) and max_rows > 0:
+            self.fused_max_rows = max_rows
         self._initialize_dma(dma_cls)
         self._twoshot: Any | None = None
         self.twoshot_max_bytes = 0
@@ -490,6 +496,8 @@ class B12xPcieAllReduce:
             return "size-limit"
         if inp.ndim == 0:
             return "scalar-input"
+        if self.fused_max_rows and inp.numel() // inp.shape[-1] > self.fused_max_rows:
+            return "row-limit"
         if residual.shape != inp.shape:
             return "residual-shape"
         if residual.dtype != inp.dtype:

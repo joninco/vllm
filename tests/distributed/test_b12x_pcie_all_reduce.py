@@ -38,7 +38,10 @@ from ..utils import (
 
 
 def _make_communicator(
-    *, allreduce_max_bytes: int = 64, fused_max_bytes: int = 64
+    *,
+    allreduce_max_bytes: int = 64,
+    fused_max_bytes: int = 64,
+    fused_max_rows: int = 64,
 ) -> tuple[B12xPcieAllReduce, MagicMock]:
     runtime = MagicMock()
     runtime.for_stream.return_value.should_allreduce.return_value = True
@@ -52,6 +55,7 @@ def _make_communicator(
     communicator._capture_stream = None
     communicator.allreduce_max_bytes = allreduce_max_bytes
     communicator.fused_max_bytes = fused_max_bytes
+    communicator.fused_max_rows = fused_max_rows
     communicator._twoshot = None
     communicator.twoshot_max_bytes = 0
     return communicator, runtime
@@ -338,6 +342,50 @@ def test_fused_allreduce_accepts_split_view_residual(rows: int) -> None:
         out=inp,
         residual_out=residual,
         stream=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"), [(64, "fused"), (65, "row-limit"), (128, "row-limit")]
+)
+def test_fused_allreduce_respects_the_runtime_row_capacity(
+    rows: int, expected: str
+) -> None:
+    """The byte limit alone does not bound rows: a 768 KB limit admits 64 rows
+    of hidden 6144, and inputs with more rows than the fused kernel's CTA
+    capacity must take the next collective instead of raising in the kernel."""
+
+    communicator, runtime = _make_communicator(
+        fused_max_bytes=1 << 20, fused_max_rows=64
+    )
+    inp = torch.randn(rows, 8)
+    residual = torch.randn_like(inp)
+    weight = torch.randn(8)
+
+    assert (
+        communicator.fused_add_rms_norm_dispatch_reason(inp, residual, weight, 1e-6)
+        == expected
+    )
+    assert communicator.try_fused_add_rms_norm(inp, residual, weight, 1e-6) == (
+        expected == "fused"
+    )
+    if expected != "fused":
+        runtime.all_reduce_fused_add_rms_norm.assert_not_called()
+
+
+def test_fused_allreduce_without_a_published_row_capacity_keeps_the_byte_limit() -> (
+    None
+):
+    communicator, _runtime = _make_communicator(
+        fused_max_bytes=1 << 20, fused_max_rows=0
+    )
+    inp = torch.randn(96, 8)
+    residual = torch.randn_like(inp)
+    weight = torch.randn(8)
+
+    assert (
+        communicator.fused_add_rms_norm_dispatch_reason(inp, residual, weight, 1e-6)
+        == "fused"
     )
 
 
