@@ -515,6 +515,27 @@ class CudaGraphManager:
             }
         )
 
+    def uniform_full_decode_token_counts(self) -> tuple[int, ...]:
+        """Return the token counts of the uniform FULL decode graphs to capture.
+
+        These graphs pad every request to the same query length and run without
+        active LoRA adapters; each exchanges one attention row per token. The
+        result is ascending and unique.
+
+        Returns:
+            Token counts of FULL-mode descriptors with a uniform token count.
+        """
+        return tuple(
+            sorted(
+                {
+                    desc.num_tokens
+                    for desc in self._capture_descs.get(CUDAGraphMode.FULL, [])
+                    if desc.uniform_token_count is not None
+                    and not desc.num_active_loras
+                }
+            )
+        )
+
     def reset_graphs(self) -> None:
         """Destroy FULL graph executables while retaining captured resources."""
         for graph in self.graphs.values():
