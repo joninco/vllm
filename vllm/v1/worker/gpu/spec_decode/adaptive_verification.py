@@ -273,17 +273,31 @@ class AdaptiveVerificationManager:
             max_batch_tokens,
             self._cudagraph_limit,
         )
-        self.verify_cost_tables_by_num_reqs = {
-            num_reqs: build_cost_tables_from_curves(
-                draft_curve,
-                req_verify_curve,
-                max_num_reqs,
-                max_batch_tokens,
-                self._cudagraph_limit,
-            )[1]
-            for num_reqs, req_verify_curve in (verify_curves_by_num_reqs or {}).items()
-            if req_verify_curve
-        }
+        # FULL replay pads both tokens and requests. A request count may have
+        # only one exact shape; extending that point prices all larger graphs
+        # as free verification. Follow the smallest compatible padded shape.
+        full_shapes = sorted(
+            (num_tokens, padded_reqs, cost)
+            for padded_reqs, curve in (verify_curves_by_num_reqs or {}).items()
+            for num_tokens, cost in curve
+        )
+        self.verify_cost_tables_by_num_reqs = {}
+        for num_reqs in range(1, max_num_reqs + 1):
+            curve: dict[int, float] = {}
+            for num_tokens, padded_reqs, cost in full_shapes:
+                if padded_reqs >= num_reqs:
+                    curve.setdefault(num_tokens, cost)
+            if not curve:
+                continue
+            xs = np.asarray(list(curve))
+            ys = np.maximum.accumulate(list(curve.values()))
+            limit = min(int(xs[-1]), max_batch_tokens)
+            table = self.cost_tables[1].copy()
+            table[: limit + 1] = np.maximum(
+                ys[np.searchsorted(xs, np.arange(limit + 1), side="left")], 1e-6
+            )
+            # Beyond the captured shapes, retain the measured eager costs.
+            self.verify_cost_tables_by_num_reqs[num_reqs] = table
         logger.debug(
             "DSpark cost tables: %s; per-request verify tables: %s",
             self.cost_tables,
