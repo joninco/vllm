@@ -13,7 +13,14 @@ from pathlib import Path
 
 
 def sha256(path: Path) -> str:
-    """Return the hexadecimal SHA-256 digest of one file."""
+    """Return the hexadecimal SHA-256 digest of one file.
+
+    Args:
+        path: File whose bytes are hashed.
+
+    Returns:
+        The lowercase hexadecimal digest.
+    """
     digest = hashlib.sha256()
     with path.open("rb") as source:
         while chunk := source.read(8 * 1024 * 1024):
@@ -22,7 +29,17 @@ def sha256(path: Path) -> str:
 
 
 def checksum_entries(path: Path) -> dict[str, str]:
-    """Read sha256sum output and reject non-basename paths."""
+    """Read sha256sum output and reject non-basename paths.
+
+    Args:
+        path: File containing sha256sum-compatible records.
+
+    Returns:
+        A mapping from release-asset basenames to hexadecimal digests.
+
+    Raises:
+        ValueError: A record names a path, repeats a name, or is malformed.
+    """
     entries: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         digest, declared_path = line.split(maxsplit=1)
@@ -39,7 +56,18 @@ def verify_release(
     b12x_commit: str,
     lmcache_commit: str,
 ) -> None:
-    """Verify source identity, exact membership, and the archive digest."""
+    """Verify source identity, exact membership, and the archive digest.
+
+    Args:
+        directory: Directory containing the downloaded release assets.
+        vllm_commit: Expected full vLLM source commit.
+        b12x_commit: Expected full B12X source commit.
+        lmcache_commit: Expected full LMCache source commit.
+
+    Raises:
+        ValueError: Source identity, asset membership, or archive digest differs
+            from the expected release contract.
+    """
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     expected_source = {
         "vllm": vllm_commit,
