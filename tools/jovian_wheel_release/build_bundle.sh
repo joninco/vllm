@@ -66,6 +66,14 @@ if grep -Fq 'Requires-Dist: torchaudio' <<<"${metadata}"; then
   printf 'The normalized wheel must not require the unsupported audio extra.\n' >&2
   exit 1
 fi
+for package in apache-tvm-ffi tilelang tokenspeed-mla humming-kernels \
+  quack-kernels torchcodec PyNvVideoCodec; do
+  if grep -Fiq "Requires-Dist: ${package}" <<<"${metadata}"; then
+    printf 'The Qwen SM120 wheel must not require unused backend %s.\n' \
+      "${package}" >&2
+    exit 1
+  fi
+done
 
 digest=$(sha256sum "${wheel}" | awk '{print $1}')
 file=$(basename "${wheel}")
@@ -93,14 +101,16 @@ jq -n \
   --arg cuda_arch_list "$(lock_value cuda.arch-list)" \
   --arg cutlass_scaled_mm_c2x "$(lock_value build.cutlass-scaled-mm-c2x)" \
   '{schema: "local-inference-vllm-wheel-release/v2", status: $status,
-    scope: "vLLM native and Python runtime for the declared foundation ABI",
+    scope: "vLLM native and Python runtime for Qwen3.8 SM120 serving",
     source: {repository: $repository, commit: $commit, tree: $tree},
     package_version: $package_version, release_tag: $release_tag,
     runtime: {builder_image: $builder_image, rust_image: $rust_image,
       uv_image: $uv_image, python: $python, cuda: $cuda, pytorch: $pytorch,
       pytorch_commit: $pytorch_commit, cuda_arch_list: $cuda_arch_list,
       cutlass_scaled_mm_c2x: $cutlass_scaled_mm_c2x,
-      unsupported_extras: ["audio"]},
+      unsupported_extras: ["audio", "video"],
+      external_device_backends: ["tilelang", "tokenspeed-mla",
+        "humming-kernels", "quack-kernels"]},
     packages: [{name: "vllm", version: $package_version, file: $file,
       sha256: $sha256, url: $url}]}' \
   > "${output_dir}/bundle/manifest.json"
@@ -124,8 +134,10 @@ Status: **research-only**
 This release contains vLLM ${package_version} from source commit
 \`${source_commit}\` for Python 3.12, CUDA 13.4.1, NVIDIA PyTorch 26.08, the
 C++11 ABI, and SM120a. Foundation and third-party dependency wheels are not
-included. Audio serving is unsupported because NVIDIA PyTorch 26.08 does not
-provide a matching TorchAudio package.
+included. The wheel metadata installs the Qwen3.8 SM120 execution profile;
+TileLang, Tokenspeed, Humming, and QuACK remain separate backend packages.
+Audio and video serving are unsupported because the foundation does not ship
+matching TorchAudio or video-decoder packages.
 EOF
 
 printf '%s\n' "${output_dir}/bundle"

@@ -55,5 +55,4 @@ test "$(find /wheelhouse -maxdepth 1 -name 'vllm-*.whl' | wc -l)" -eq 1
   --torch-version 2.14.0a0+4fdf77b940.nv26.8.63802676 \
   --torchvision-version 0.29.0a0+0bc41e67.nv26.8.63802676 \
   --flashinfer-version 0.6.18 \
-  --tvm-ffi-version 0.1.13.post3 \
   --source-date-epoch "${SOURCE_DATE_EPOCH:?}"

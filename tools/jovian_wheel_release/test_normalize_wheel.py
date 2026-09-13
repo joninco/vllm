@@ -23,6 +23,14 @@ Requires-Dist: torchvision==0.28.0
 Requires-Dist: torchaudio==2.11.0
 Requires-Dist: flashinfer-python==0.6.17
 Requires-Dist: apache-tvm-ffi==0.1.11
+Requires-Dist: torchcodec>=0.14
+Requires-Dist: PyNvVideoCodec==2.0.4
+Requires-Dist: tilelang==0.1.12
+Requires-Dist: fastsafetensors>=0.3.3
+Requires-Dist: fastsafetensors>=0.3.3; extra == "fastsafetensors"
+Requires-Dist: quack-kernels==0.6.4
+Requires-Dist: tokenspeed-mla==0.1.8
+Requires-Dist: humming-kernels[cu13]==0.1.12
 Requires-Dist: click>=8
 
 """
@@ -31,17 +39,17 @@ Requires-Dist: click>=8
         torch_version="2.14.0a0+nv",
         torchvision_version="0.29.0a0+nv",
         flashinfer_version="0.6.18",
-        tvm_ffi_version="0.1.13.post3",
     )
     message = BytesParser(policy=compat32).parsebytes(output)
     assert message.get_all("Requires-Dist") == [
         "torch==2.14.0a0+nv",
         "torchvision==0.29.0a0+nv",
         "flashinfer-python==0.6.18",
-        "apache-tvm-ffi==0.1.13.post3",
+        'fastsafetensors>=0.3.3; extra == "fastsafetensors"',
         "click>=8",
     ]
-    assert message["X-Local-Inference-Unsupported-Extra"] == "audio"
+    assert message["X-Local-Inference-Runtime-Profile"] == "qwen38-sm120"
+    assert message["X-Local-Inference-Unsupported-Extra"] == "audio,video"
 
 
 def test_native_library_paths_are_relative_to_site_packages() -> None:

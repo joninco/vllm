@@ -22,6 +22,22 @@ from pathlib import Path
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
+# These CUDA requirements activate independent execution or media backends.
+# The SM120 Qwen serving bundle does not use them, and TileLang and Tokenspeed
+# require an apache-tvm-ffi release that conflicts with the CUDA 13.4
+# foundation.  Keep dependency metadata for explicitly declared extras, but do
+# not make the unused backends mandatory for the Qwen runtime profile.
+EXTERNAL_DEVICE_BACKENDS = {
+    "apache-tvm-ffi",
+    "fastsafetensors",
+    "humming-kernels",
+    "pynvvideocodec",
+    "quack-kernels",
+    "tilelang",
+    "tokenspeed-mla",
+    "torchcodec",
+}
+
 
 def rewrite_requirements(
     metadata: bytes,
@@ -29,7 +45,6 @@ def rewrite_requirements(
     torch_version: str,
     torchvision_version: str,
     flashinfer_version: str,
-    tvm_ffi_version: str,
 ) -> bytes:
     """Return wheel metadata with dependencies matching the foundation ABI."""
     message = BytesParser(policy=compat32).parsebytes(metadata)
@@ -38,7 +53,6 @@ def rewrite_requirements(
         "torch": f"torch=={torch_version}",
         "torchvision": f"torchvision=={torchvision_version}",
         "flashinfer-python": f"flashinfer-python=={flashinfer_version}",
-        "apache-tvm-ffi": f"apache-tvm-ffi=={tvm_ffi_version}",
     }
     seen: set[str] = set()
     rewritten: list[str] = []
@@ -48,6 +62,9 @@ def rewrite_requirements(
         if name == "torchaudio":
             seen.add(name)
             continue
+        if name in EXTERNAL_DEVICE_BACKENDS and requirement.marker is None:
+            seen.add(name)
+            continue
         replacement = replacements.get(name)
         if replacement is not None:
             seen.add(name)
@@ -55,7 +72,7 @@ def rewrite_requirements(
         else:
             rewritten.append(value)
 
-    expected = {*replacements, "torchaudio"}
+    expected = {*replacements, "torchaudio", *EXTERNAL_DEVICE_BACKENDS}
     if seen != expected:
         missing = sorted(expected - seen)
         raise ValueError(f"vLLM dependency contract changed; missing {missing}")
@@ -64,7 +81,8 @@ def rewrite_requirements(
     for requirement in rewritten:
         message["Requires-Dist"] = requirement
     message["X-Local-Inference-Runtime"] = "jovian-cu134-torch214-cxx11"
-    message["X-Local-Inference-Unsupported-Extra"] = "audio"
+    message["X-Local-Inference-Runtime-Profile"] = "qwen38-sm120"
+    message["X-Local-Inference-Unsupported-Extra"] = "audio,video"
     return message.as_bytes(policy=compat32.clone(max_line_length=0))
 
 
@@ -161,7 +179,6 @@ def normalize_wheel(
     torch_version: str,
     torchvision_version: str,
     flashinfer_version: str,
-    tvm_ffi_version: str,
     source_date_epoch: int,
 ) -> dict[str, str]:
     """Normalize one vLLM wheel in place and return packaged ELF runpaths."""
@@ -179,7 +196,6 @@ def normalize_wheel(
                 torch_version=torch_version,
                 torchvision_version=torchvision_version,
                 flashinfer_version=flashinfer_version,
-                tvm_ffi_version=tvm_ffi_version,
             )
         )
         runpaths = patch_elf_runpaths(root)
@@ -195,7 +211,6 @@ def main() -> None:
     parser.add_argument("--torch-version", required=True)
     parser.add_argument("--torchvision-version", required=True)
     parser.add_argument("--flashinfer-version", required=True)
-    parser.add_argument("--tvm-ffi-version", required=True)
     parser.add_argument("--source-date-epoch", type=int, required=True)
     args = parser.parse_args()
     runpaths = normalize_wheel(
@@ -203,7 +218,6 @@ def main() -> None:
         torch_version=args.torch_version,
         torchvision_version=args.torchvision_version,
         flashinfer_version=args.flashinfer_version,
-        tvm_ffi_version=args.tvm_ffi_version,
         source_date_epoch=args.source_date_epoch,
     )
     for path, rpath in runpaths.items():
