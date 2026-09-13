@@ -12,6 +12,7 @@ FROM ${BUILDER_IMAGE} AS wheels
 ARG BUILD_JOBS=64
 ARG SOURCE_DATE_EPOCH
 ARG UV_SHA256
+ARG VLLM_BUILD_CUTLASS_SCALED_MM_C2X
 ENV PATH=/build-venv/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
@@ -20,6 +21,7 @@ ENV PATH=/build-venv/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/us
     CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
     MAX_JOBS=${BUILD_JOBS} \
     NVCC_THREADS=4 \
+    VLLM_BUILD_CUTLASS_SCALED_MM_C2X=${VLLM_BUILD_CUTLASS_SCALED_MM_C2X} \
     TORCH_NIGHTLY=1
 
 COPY --from=uv /uv /usr/local/bin/uv

@@ -38,6 +38,7 @@ docker buildx build \
   --build-arg "UV_SHA256=$(lock_value uv.sha256)" \
   --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
   --build-arg "BUILD_JOBS=${build_jobs}" \
+  --build-arg "VLLM_BUILD_CUTLASS_SCALED_MM_C2X=$(lock_value build.cutlass-scaled-mm-c2x)" \
   --target export \
   --output "type=local,dest=${output_dir}/raw" \
   "${repo_root}"
@@ -90,6 +91,7 @@ jq -n \
   --arg pytorch "$(lock_value pytorch.version)" \
   --arg pytorch_commit "$(lock_value pytorch.commit)" \
   --arg cuda_arch_list "$(lock_value cuda.arch-list)" \
+  --arg cutlass_scaled_mm_c2x "$(lock_value build.cutlass-scaled-mm-c2x)" \
   '{schema: "local-inference-vllm-wheel-release/v2", status: $status,
     scope: "vLLM native and Python runtime for the declared foundation ABI",
     source: {repository: $repository, commit: $commit, tree: $tree},
@@ -97,6 +99,7 @@ jq -n \
     runtime: {builder_image: $builder_image, rust_image: $rust_image,
       uv_image: $uv_image, python: $python, cuda: $cuda, pytorch: $pytorch,
       pytorch_commit: $pytorch_commit, cuda_arch_list: $cuda_arch_list,
+      cutlass_scaled_mm_c2x: $cutlass_scaled_mm_c2x,
       unsupported_extras: ["audio"]},
     packages: [{name: "vllm", version: $package_version, file: $file,
       sha256: $sha256, url: $url}]}' \

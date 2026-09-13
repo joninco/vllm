@@ -7,6 +7,7 @@ uv.image=ghcr.io/astral-sh/uv@sha256:173b74e36e4bddd0546771a7041cae9f65b3ad28964
 uv.version=0.11.30
 uv.sha256=d802a8d29eb5f80819a68317a93b926fcb67d5d27963c5f3f088f1d14a91a2cf
 buildx.builder=lil-wheel-cu134-sm120
+build.cutlass-scaled-mm-c2x=OFF
 python.version=3.12
 cuda.version=13.4.1
 pytorch.version=2.14.0a0+4fdf77b940.nv26.8.63802676

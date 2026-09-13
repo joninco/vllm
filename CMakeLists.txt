@@ -31,6 +31,8 @@ endif()
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+option(VLLM_BUILD_CUTLASS_SCALED_MM_C2X
+  "Build CUTLASS 2.x scaled-mm kernels for pre-SM90 NVIDIA GPUs" ON)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
@@ -907,8 +909,14 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # For the cutlass_scaled_mm kernels we want to build the c2x (CUTLASS 2.x)
   # kernels for the remaining archs that are not already built for 3x.
   # (Build 8.9 for FP8)
-  cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
-    "7.5;8.0;8.7;8.9+PTX" "${CUDA_ARCHS}")
+  if(VLLM_BUILD_CUTLASS_SCALED_MM_C2X)
+    cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
+      "7.5;8.0;8.7;8.9+PTX" "${CUDA_ARCHS}")
+  else()
+    set(SCALED_MM_2X_ARCHS)
+    message(STATUS "Not building scaled_mm_c2x because "
+                   "VLLM_BUILD_CUTLASS_SCALED_MM_C2X is OFF")
+  endif()
   # subtract out the archs that are already built for 3x
   list(REMOVE_ITEM SCALED_MM_2X_ARCHS ${SCALED_MM_3X_ARCHS})
   if (SCALED_MM_2X_ARCHS)
