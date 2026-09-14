@@ -66,14 +66,14 @@ jobs:
             "${output}"/bundle/runtime.lock \
             "${output}"/vllm-jovian-cu134-*.tar.zst \
             "${output}"/vllm-jovian-cu134-*.tar.zst.sha256 built-release/
-          uv run --isolated --python 3.12 \
+          uv run --no-project --isolated --python 3.12 \
             tools/jovian_wheel_release/verify_release_assets.py \
             --directory built-release \
             --source-commit "${GITHUB_SHA}" --beta-tag "${tag}"
           if gh release view "${tag}" >/dev/null 2>&1; then
             mkdir existing-release
             gh release download "${tag}" --dir existing-release
-            uv run --isolated --python 3.12 \
+            uv run --no-project --isolated --python 3.12 \
               tools/jovian_wheel_release/verify_release_assets.py \
               --directory existing-release \
               --source-commit "${GITHUB_SHA}" \
@@ -120,7 +120,7 @@ jobs:
           stable_tag="${GITHUB_REF_NAME}"
           mkdir assets
           gh release download "${beta_tag}" --dir assets
-          uv run --isolated --python 3.12 \
+          uv run --no-project --isolated --python 3.12 \
             tools/jovian_wheel_release/verify_release_assets.py \
             --directory assets \
             --source-commit "${GITHUB_SHA}" \
@@ -128,7 +128,7 @@ jobs:
           if gh release view "${stable_tag}" >/dev/null 2>&1; then
             mkdir existing-stable-release
             gh release download "${stable_tag}" --dir existing-stable-release
-            uv run --isolated --python 3.12 \
+            uv run --no-project --isolated --python 3.12 \
               tools/jovian_wheel_release/verify_release_assets.py \
               --directory existing-stable-release \
               --source-commit "${GITHUB_SHA}" \
@@ -149,7 +149,7 @@ jobs:
               source_manifest_sha256: $source_manifest_sha256,
               invariant: "Wheel bytes are unchanged from the source beta; GPU qualification belongs to the assembled runtime."}' \
             > assets/stable-promotion.json
-          uv run --isolated --python 3.12 \
+          uv run --no-project --isolated --python 3.12 \
             tools/jovian_wheel_release/verify_release_assets.py \
             --directory assets --source-commit "${GITHUB_SHA}" \
             --beta-tag "${beta_tag}" --promotion --reference-directory source-beta
