@@ -115,7 +115,8 @@ def test_native_small_vision_block_aligner_and_image_isolation():
     assert result is not None
     with torch.no_grad():
         warm = torch.randn(7 * 11, 3, 2, 2, device="cuda", dtype=torch.bfloat16)
-        patches = torch.randn(4 * 7, 3, 2, 2, device="cuda", dtype=torch.bfloat16)
+        patches = torch.randn(4 * 7 + 1, 3, 2, 2, device="cuda", dtype=torch.bfloat16)[1:]
+        assert patches.data_ptr() % 16 == 8
         session.freeze()
         aligner(vision(warm, 7, 11), 7, 11)
         encoded = vision(patches, 4, 7)
@@ -150,8 +151,15 @@ def test_native_small_vision_block_aligner_and_image_isolation():
 
 
 @pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize(
+    "in_features,out_features,max_rows,offset",
+    [(128, 80, 33, 0), (588, 1024, 128, 1)],
+    ids=["aligned", "offset_patch"],
+)
 @torch.no_grad()
-def test_vision_linear_prepares_bias_and_replays_into_caller_output(bias):
+def test_vision_linear_prepares_bias_and_replays_into_caller_output(
+    bias, in_features, out_features, max_rows, offset,
+):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x vision requires SM12x")
     from b12x.preparation import PreparationSession
@@ -160,21 +168,28 @@ def test_vision_linear_prepares_bias_and_replays_into_caller_output(bias):
     from vllm.utils.b12x import B12xWorkload
 
     device = torch.device("cuda", torch.cuda.current_device())
-    layer = _Linear(128, 80, bias=bias).to(device)
+    layer = _Linear(in_features, out_features, bias=bias).to(device)
     layer.weight.normal_(std=0.125)
     if layer.bias is not None:
         layer.bias.normal_(std=0.125)
-    source = torch.randn(33, 128, device=device, dtype=torch.bfloat16).mul_(0.125)
-    output = torch.empty(33, 80, device=device, dtype=torch.bfloat16)
+    source = torch.randn(
+        max_rows + offset, in_features, device=device, dtype=torch.bfloat16,
+    ).mul_(0.125)[offset:]
+    if offset:
+        assert source.data_ptr() % 16 == 8
+    output = torch.empty(max_rows, out_features, device=device, dtype=torch.bfloat16)
     workload = B12xWorkload(
-        stage="weights", token_counts=(1, 8, 33), fixed_token_counts=(1, 8),
-        output_dtype=torch.bfloat16, max_tokens=33, max_seqs=1, max_model_len=33,
+        stage="weights", token_counts=(1, 8, max_rows), fixed_token_counts=(1, 8),
+        output_dtype=torch.bfloat16, max_tokens=max_rows, max_seqs=1,
+        max_model_len=max_rows,
     )
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        allocated_before = torch.cuda.memory_allocated(device)
         session.prepare(tuple(
             request for unit in _units_from_modules(layer, workload)
             for request in unit.requests
         ))
+        assert torch.cuda.memory_allocated(device) == allocated_before
         session.freeze()
         launch = torch.compile(layer, fullgraph=True)
         for rows in (1, 8, 17, 33):

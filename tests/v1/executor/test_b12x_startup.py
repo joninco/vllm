@@ -179,6 +179,9 @@ def test_progress_aggregates_candidate_shards_and_physical_compilations() -> Non
                 request_name="shared-query",
                 candidate_count=96,
                 candidates_prepared=96,
+                batch_index=rank + 1,
+                batch_candidates=1,
+                tuning_rank=rank,
                 measured_candidates=96 * rank,
                 compilations=300 + rank,
                 active_compilations=rank,
@@ -196,7 +199,10 @@ def test_progress_aggregates_candidate_shards_and_physical_compilations() -> Non
     assert progress.measured_candidates == 96
     assert progress.compilations == 601
     assert progress.active_compilations == 1
-    assert progress.latest_round_us == (1.0, 2.0)
+    assert progress.latest_round_us == (1.0,)
+    assert progress.batch_index == 1
+    assert progress.batch_candidates == 1
+    assert progress.tuning_rank == 0
     assert progress.elapsed_seconds == 2.0
 
 

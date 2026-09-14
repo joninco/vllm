@@ -189,7 +189,7 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
 
     model_runner = SimpleNamespace(
         model_memory_usage=0,
-        profile_run=lambda: events.append("profile_run"),
+        profile_run=lambda prepare: (prepare(), events.append("profile_run")),
         profile_glm_dcp_attention=lambda: events.append("profile_glm_dcp_attention"),
         profile_cudagraph_memory=profile_cudagraph_memory,
     )
@@ -253,7 +253,9 @@ def test_cudagraph_memory_profile_prepares_and_releases_b12x_state(
     available = gpu_worker.Worker.determine_available_memory(worker)
 
     assert events == [
+        "prepare_b12x_profile_state",
         "profile_run",
+        "release_b12x_profile_state",
         "profile_glm_dcp_attention",
         "prepare_b12x_profile_state",
         "profile_cudagraph_memory",

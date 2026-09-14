@@ -252,8 +252,7 @@ class NgramHashState(nn.Module):
                 run=lambda: state.run(binding, 1),
                 produce=lambda: self.history[0].fill_(DEAD_ID),
                 restore=lambda: self.history[0].copy_(history_before),
-                owners=(ids, mask, starts, self.history, slots, num_seqs,
-                        num_tokens, scratch, hashes),
+                owners=(self.history,),
             )
 
         requests = tuple(
@@ -522,15 +521,8 @@ class ParallelEngramEmbedding(nn.Module):
             return
         state = require_prepared(self.plan, "sequence.engram")
         table = native.DiskTable(state, resident_scales=self.resident_scales)
-        first = table.shard_start // table.shard_rows
-        last = (table.shard_end + table.shard_rows - 1) // table.shard_rows
         for path, offset, scale in self._disk_sources:
-            row_bytes = self.scale_shape[1] if scale else self.weight_shape[1]
-            for shard in range(first, last):
-                table.add_shard(
-                    shard, path, offset + shard * table.shard_rows * row_bytes,
-                    scale=scale,
-                )
+            table.add_shard(0, path, offset, scale=scale)
         table.require_complete()
         self.disk_table = table
 
@@ -687,15 +679,8 @@ class Engram(nn.Module):
             table = None
             if embed.table_memory == "disk":
                 table = native.DiskTable(state, resident_scales=embed.resident_scales)
-                first = table.shard_start // table.shard_rows
-                last = (table.shard_end + table.shard_rows - 1) // table.shard_rows
                 for path, offset, scale in embed._disk_sources:
-                    row_bytes = embed.scale_shape[1] if scale else embed.weight_shape[1]
-                    for shard in range(first, last):
-                        table.add_shard(
-                            shard, path, offset + shard * table.shard_rows * row_bytes,
-                            scale=scale,
-                        )
+                    table.add_shard(0, path, offset, scale=scale)
                 table.require_complete()
             binding = _bind_lookup_state(
                 state,
@@ -703,10 +688,18 @@ class Engram(nn.Module):
                 scales=embed.weight_scale_inv if table is None else None,
                 hash_ids=hash_ids, num_tokens=num_tokens, out=out, disk_table=table,
             )
+            def run():
+                if table is None:
+                    return state.run_lookup(binding, 1, clear_tail=True)
+                with table._cache.transaction():
+                    table._cache.read_rows(hash_ids, 24)
+                    return state.run_lookup(binding, 1, clear_tail=True)
+
             return PreparedCall(
-                run=lambda: state.run_lookup(binding, 1, clear_tail=True),
-                owners=(hash_ids, num_tokens, out, embed.weight, embed.weight_scale_inv),
-                close=table.close if table is not None else None,
+                run=run,
+                capture_safe=table is None,
+                owners=(embed.weight, embed.weight_scale_inv),
+                restore=table.close if table is not None else None,
             )
         request = self.embed_tokens.plan.request(
             name=f"{id(self)}/engram-lookup",

@@ -56,7 +56,7 @@ from vllm.utils.b12x import set_b12x_preparation_provider
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from ..b12x_layers import B12xLinearMethod, B12xMHC, collapse, stream_mean
+from ..b12x_layers import B12xLinearMethod, B12xMHC
 from ..b12x_layers import B12xRMSNorm as RMSNorm
 from ..ced import ced_decoder_start, gather_rows, scatter_rows
 from ..common.engram import Engram, EngramLayout, NgramHashState
@@ -601,7 +601,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_recon = layer._b12x_mhc.post(
                     hidden_states, residual, post_mix, res_mix
                 )
-                aux_hidden_state = stream_mean(aux_recon)
+                aux_hidden_state = layer._b12x_mhc.collapse(aux_recon)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 if decoder_compacted:
@@ -645,7 +645,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
-        hidden_states = collapse(hidden_states, pre_mix)
+        hidden_states = layer._b12x_mhc.collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.

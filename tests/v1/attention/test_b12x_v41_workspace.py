@@ -631,8 +631,12 @@ def test_model_post_load_packs_output_projections(native_workspace):
     assert calls == ["mhc", "wo"]
 
 
-def test_dspark_post_load_packs_output_projections(native_workspace, monkeypatch):
+def test_dspark_post_load_packs_output_projections(
+    native_workspace, monkeypatch, default_vllm_config, dist_init,
+):
     from vllm.models.deepseek_v4_1.nvidia import dspark
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
     _, _, _ = native_workspace
     calls = []
@@ -667,6 +671,9 @@ def test_dspark_post_load_packs_output_projections(native_workspace, monkeypatch
     )
     torch.nn.Module.__init__(root)
     root.model = Model()
+    root.model.markov_head = torch.nn.Module()
+    root.model.markov_head.markov_w2 = ParallelLMHead(128, 128)
+    root.logits_processor = LogitsProcessor(128)
     root.process_weights_after_loading()
 
     assert calls == ["wo", "wo"]

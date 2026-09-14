@@ -283,14 +283,41 @@ def test_blockscaled_holder_declares_provided_workspace_under_the_cap(monkeypatc
     assert eager.autotune is False and regimes[-1] == ()
 
 
-def test_prepare_locally_skips_collectives_and_releases_only_fresh_plans(monkeypatch) -> None:
-    released, prepared = [], []
-    plain, collective = _Request("plain"), _Request("collective", collective=object())
+@pytest.mark.parametrize("fail", [False, True])
+def test_profile_prepares_collectives_and_releases_only_fresh_plans(monkeypatch, fail) -> None:
+    from b12x.preparation import CollectiveRequirement
+    from vllm.distributed import parallel_state
+
+    released, prepared, authorized = [], [], []
+    requirement = CollectiveRequirement(key="profile-collective", ranks=(0,))
+    plain, collective = _Request("plain"), _Request("collective", collective=requirement)
     installed = _Request("installed", plan=SimpleNamespace(name="installed", prepared=object()))
+
+    class Job:
+        session = SimpleNamespace(_pool=None)
+        waiting = True
+
+        def advance(self, *, collective_key=None, tuning=None):
+            if self.waiting:
+                self.waiting = False
+                return SimpleNamespace(done=False, pending_compilation=False, ready_collectives=(requirement,))
+            authorized.append(collective_key)
+            assert collective_key == requirement.key
+            if fail:
+                raise RuntimeError("profiling collective failed")
+            return SimpleNamespace(done=True, pending_compilation=False, ready_collectives=())
+
+        def result(self):
+            return SimpleNamespace(close=lambda: None)
+
+        def close(self):
+            pass
+
     session = SimpleNamespace(
         state="OPEN",
-        prepare=lambda requests, *, autotune: prepared.append((requests, autotune)) or SimpleNamespace(close=lambda: None),
+        begin=lambda requests, *, autotune: prepared.append((requests, autotune)) or Job(),
         release=lambda plan: released.append(plan.name),
+        cancel_tuning=lambda: None,
     )
     monkeypatch.setattr(b12x_prepare, "b12x_native_supported", lambda worker: True)
     monkeypatch.setattr(b12x_prepare, "b12x_workload", lambda worker, *, stage, lane=0: _workload(stage))
@@ -302,12 +329,19 @@ def test_prepare_locally_skips_collectives_and_releases_only_fresh_plans(monkeyp
         ],
     )
     monkeypatch.setattr(b12x_prepare, "get_b12x_session", lambda worker: session)
-
-    batch = b12x_prepare.prepare_b12x_locally(object(), stage="state", autotune=False)
-    assert prepared == [((plain, installed), False)]
-    batch.release()
-    batch.release()
-    assert released == ["plain"]
+    world = SimpleNamespace(ranks=(0,), tcp_store_group=SimpleNamespace(all_gather_obj=lambda payload: [payload]))
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: world)
+    worker = SimpleNamespace(rank=0)
+    if fail:
+        with pytest.raises(RuntimeError, match="profiling collective failed"):
+            b12x_prepare.prepare_b12x_profile(worker, stage="state")
+    else:
+        batch = b12x_prepare.prepare_b12x_profile(worker, stage="state")
+        batch.release()
+        batch.release()
+    assert prepared == [((plain, collective, installed), False)]
+    assert authorized == [requirement.key]
+    assert released == ["collective", "plain"]
 
 
 def test_layer_registry_resolves_live_layers_by_name() -> None:
@@ -446,3 +480,74 @@ def test_collect_units_handles_target_and_draft_embedding_aliases(shared_module,
     assert len({request.name for request in requests}) == len(requests)
     assert len({id(request.plan) for request in requests}) == len(requests)
     assert {request.plan.query.id_dtype for request in requests} == {"int32", "int64"}
+
+
+@pytest.mark.parametrize("query_len", [7, 8])
+def test_parallel_draft_counts_reach_owners_and_collectives(monkeypatch, query_len):
+    target, draft = torch.nn.Module(), torch.nn.Module()
+    target.b12x_preparation_provider = _Provider()
+    draft.b12x_preparation_provider = _Provider()
+    collective = _Provider()
+    monkeypatch.setattr(b12x_prepare, "b12x_unit_providers", lambda: (collective,))
+    worker = _worker(target, draft=draft, draft_lane=1)
+    worker.model_runner.speculator = SimpleNamespace(
+        num_query_per_req=query_len, query_cudagraph_manager=None,
+    )
+    workload = _workload(
+        token_counts=(1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 4089, 4096),
+        fixed_token_counts=(1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64),
+        max_tokens=4096, max_seqs=8, max_model_len=1048576,
+    )
+    b12x_prepare.collect_b12x_units(worker, workload)
+    target_workload = target.b12x_preparation_provider.record[-1][1]
+    draft_workload = draft.b12x_preparation_provider.record[-1][1]
+    collective_workload = collective.record[-1][1]
+    assert target_workload.token_counts == workload.token_counts
+    for reqs in range(1, 9):
+        for rows in (reqs, reqs * query_len):
+            assert rows in draft_workload.token_counts
+            assert rows in draft_workload.fixed_token_counts
+            assert rows in collective_workload.token_counts
+    assert draft_workload.lane == 1 and collective_workload.lane == 0
+    worker.model_runner.speculator.query_cudagraph_manager = SimpleNamespace(
+        planned_token_counts=lambda: [query_len * reqs for reqs in range(1, 9)],
+    )
+    b12x_prepare.collect_b12x_units(worker, replace(workload, stage="state"))
+    assert draft.b12x_preparation_provider.record[-1][1].token_counts == draft_workload.token_counts
+
+
+def test_workload_prepares_every_adaptive_verification_profile_shape():
+    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import AdaptiveVerificationManager
+
+    capture_sizes = (1, 2, 4, 8, 16, 24, 32, 48, 64)
+    worker = _config_worker(capture_sizes=capture_sizes, max_seqs=8, speculative_tokens=7)
+    worker.scheduler_config.max_num_batched_tokens = 4096
+    worker.vllm_config.speculative_config.enable_adaptive_verification = True
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(max_num_batched_tokens=4096)
+    profiled = {batch["num_tokens"] for batch in manager.batches_to_profile(list(capture_sizes))}
+    tail = {96, 128, 256, 512, 1024, 2048, 4096}
+    assert profiled == {*capture_sizes, *tail}
+    for stage in ("weights", "state"):
+        workload = b12x_prepare.b12x_workload(worker, stage=stage)
+        assert profiled <= set(workload.token_counts)
+        assert not tail.intersection(workload.fixed_token_counts)
+
+
+def test_workload_covers_sampler_warmup_prefill_request_limits():
+    from vllm.v1.worker.gpu.warmup import warmup_prefill_shape
+
+    worker = _config_worker(
+        capture_sizes=(1, 2, 4, 8, 16, 24, 32, 48, 64),
+        max_seqs=8, speculative_tokens=7, decode_query_len=8,
+    )
+    worker.use_v2_model_runner = True
+    worker.scheduler_config.max_num_batched_tokens = 4096
+    prompt_len, max_reqs = warmup_prefill_shape(
+        max_num_seqs=8, max_num_batched_tokens=4096, decode_query_len=8,
+    )
+    assert (prompt_len, max_reqs) == (9, 8)
+    for stage in ("weights", "state"):
+        workload = b12x_prepare.b12x_workload(worker, stage=stage)
+        assert all(prompt_len * reqs in workload.token_counts for reqs in range(1, max_reqs + 1))
+        assert 72 not in workload.fixed_token_counts

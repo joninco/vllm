@@ -365,34 +365,3 @@ def test_lm_head(
         vllm_model.apply_model(check_model)
 
         print(vllm_model.generate_greedy(["Hello my name is"], max_tokens=4)[0][1])
-
-
-def test_b12x_vocab_projection_reuses_capacity_and_declares_overflow(monkeypatch):
-    import b12x.preparation as preparation
-
-    from vllm.model_executor.layers.logits_processor import LogitsProcessor
-
-    class _Plan:
-        def __init__(self):
-            self.request_kwargs = None
-
-        def request(self, **kwargs):
-            self.request_kwargs = kwargs
-            return ("request", kwargs["name"])
-
-    processor = LogitsProcessor.__new__(LogitsProcessor)
-    planned = _Plan()
-    processor._b12x_vocab_plans = {4: planned}
-    declared = _Plan()
-    prepared = []
-    monkeypatch.setattr(processor, "_declare_b12x_vocab_plan", lambda rows: declared)
-    monkeypatch.setattr(preparation, "prepare_default", lambda request: prepared.append(request))
-
-    assert processor._b12x_vocab_plan_for(4) is planned
-    assert processor._b12x_vocab_plan_for(3) is planned
-    assert processor._b12x_vocab_plans == {4: planned}
-    assert processor._b12x_vocab_plan_for(5) is declared
-    assert processor._b12x_vocab_plan_for(5) is declared
-    assert processor._b12x_vocab_plans[5] is declared
-    # Serving never prepares: the plan materializes its default on first use.
-    assert declared.request_kwargs is None and prepared == []

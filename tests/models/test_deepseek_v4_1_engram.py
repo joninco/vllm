@@ -862,3 +862,112 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
     assert hashes.shape == (13, 2, 24)
     assert hashes.dtype == torch.int64 and hashes.device == caps.device
     assert "prepared_engram_hashes" not in model.state_dict()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("tp_rank", [0, 3])
+@pytest.mark.parametrize("resident_scales", [False, True])
+@torch.inference_mode()
+def test_disk_lookup_preparation_and_serving_read_whole_table_sources(
+    tmp_path, dist_init, monkeypatch, tp_rank, resident_scales,
+):
+    import weakref
+
+    tables = []
+    initialize = native.DiskTable.__init__
+
+    def track_table(table, *args, **kwargs):
+        initialize(table, *args, **kwargs)
+        tables.append(weakref.ref(table))
+
+    monkeypatch.setattr(native.DiskTable, "__init__", track_table)
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity = 7
+    geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+    caps = native.Caps(
+        device=device, max_tokens=capacity, max_seqs=2, max_requests=2,
+        vocab_size=32, layer_id=1, tp_size=4, tp_rank=tp_rank,
+    )
+    lookup = native.plan(
+        caps, token_map=list(range(32)), geometry=geometry,
+        invocation={
+            "operation": "lookup", "compact_rows": True,
+            "resident_scales": resident_scales,
+        },
+    )
+    layout = SimpleNamespace(
+        caps=(caps,), lookup_plans=(lookup,), geometry=geometry,
+        table_memory="disk", disk_resident_scales=resident_scales,
+        projection_tp=False,
+    )
+    config = SimpleNamespace(hidden_size=64, hc_mult=4, rms_norm_eps=1e-3)
+    old_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device(device):
+            module = Engram(config, None, layout, 0, False, "engram_disk_test")
+    finally:
+        torch.set_default_dtype(old_dtype)
+    embed = module.embed_tokens
+    row_values = torch.arange(embed.table_rows).remainder(7).add(1)
+    weight = row_values[:, None].expand(-1, 256).to(torch.float8_e4m3fn).contiguous()
+    scales = torch.full((embed.table_rows, 8), 127, dtype=torch.uint8)
+    for name, tensor, offset, scale in (
+        ("weight.bin", weight, 4093, False),
+        ("scale.bin", scales, 123, True),
+    ):
+        path = tmp_path / name
+        with path.open("wb") as stream:
+            stream.write(bytes(offset))
+            stream.write(tensor.view(torch.uint8).numpy().tobytes())
+        embed._disk_sources.append((str(path), offset, scale))
+    workload = B12xWorkload(
+        stage="weights", token_counts=(1, capacity), fixed_token_counts=(1,),
+        output_dtype=torch.bfloat16, max_tokens=capacity, max_seqs=2,
+        max_model_len=8,
+    )
+    request = next(
+        request
+        for unit in module.get_b12x_preparation_units(module, workload)
+        for request in unit.requests
+        if request.plan is lookup
+    )
+    make_call = request.prepare_call
+    primed = []
+
+    def observe(state):
+        call = make_call(state)
+        assert not call.capture_safe
+
+        def run():
+            output = call.run()
+            primed.append(output)
+            return output
+
+        return replace(call, run=run)
+
+    request = replace(request, prepare_call=observe)
+    with PreparationSession(device=device, autotune=False) as session:
+        session.prepare((request,))
+        session.freeze()
+        assert len(primed) == 1
+        assert len(tables) == 1 and tables[0]() is None
+        prime_row = min(embed.shard_start + 1, embed.shard_end - 1)
+        expected = torch.zeros_like(primed[0])
+        expected[0, :256] = row_values[prime_row].item()
+        torch.testing.assert_close(primed[0], expected, rtol=0, atol=0)
+        ids = (torch.arange(24, device=device) + embed.shard_start + 1)
+        ids = ids.expand(capacity, -1).contiguous()
+        count = torch.tensor([capacity], device=device, dtype=torch.int32)
+        try:
+            module.prepare_disk(ids, count)
+            output = module.staged_rows
+            address = output.data_ptr()
+            for shift in (0, 1):
+                if shift:
+                    module.prepare_disk(ids + shift, count)
+                reference = weight.float()[ids.cpu() + shift].flatten(1).bfloat16()
+                torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
+                assert output.data_ptr() == address
+        finally:
+            embed.close()

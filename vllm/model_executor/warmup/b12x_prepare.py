@@ -119,6 +119,23 @@ def b12x_workload(worker: "Worker", *, stage: str, lane: int = 0) -> B12xWorkloa
         compile_range_endpoints=endpoints,
         speculative_tokens=speculative_tokens,
     )
+    if spec is not None and getattr(spec, "enable_adaptive_verification", False):
+        from vllm.v1.worker.gpu.spec_decode.adaptive_verification import preparation_tail_sizes
+
+        token_counts = tuple(sorted({
+            *token_counts, *preparation_tail_sizes(capture_sizes, max_tokens),
+        }))
+    if getattr(worker, "use_v2_model_runner", False):
+        from vllm.v1.worker.gpu.warmup import warmup_prefill_shape
+
+        prompt_len, max_reqs = warmup_prefill_shape(
+            max_num_seqs=int(worker.scheduler_config.max_num_seqs),
+            max_num_batched_tokens=max_tokens,
+            decode_query_len=int(worker.model_runner.decode_query_len),
+        )
+        token_counts = tuple(sorted({
+            *token_counts, *(prompt_len * reqs for reqs in range(1, max_reqs + 1)),
+        }))
     fixed = {int(count) for count in (*capture_sizes, *compile_sizes, *planned)}
     fixed_token_counts = tuple(
         count for count in token_counts if count in fixed and count < max_tokens
@@ -168,6 +185,12 @@ def _units_from_modules(
         if id(module) in seen:
             continue
         seen.add(id(module))
+        if workload.stage == "weights":
+            head = getattr(module, "lm_head", None)
+            processor = getattr(module, "logits_processor", None)
+            bind_head = getattr(processor, "prepare_b12x_vocab_projection", None)
+            if head is not None and callable(bind_head):
+                bind_head(head)
         provider = getattr(module, "b12x_preparation_provider", None)
         hook = getattr(provider, "get_b12x_preparation_units", None)
         if not callable(hook):
@@ -224,6 +247,29 @@ def mark_b12x_eager_shapes(worker: "Worker") -> None:
             module.b12x_eager_only = True
 
 
+def _draft_workload(worker: "Worker", workload: B12xWorkload, *, lane: int):
+    """Include the parallel draft's query and sequential sampling row counts."""
+    speculator = getattr(worker.model_runner, "speculator", None)
+    query_len = int(getattr(speculator, "num_query_per_req", 0) or 0)
+    if not query_len:
+        return replace(workload, lane=lane)
+    max_reqs = min(workload.max_seqs, workload.max_tokens // query_len)
+    counts = set(workload.token_counts)
+    draft_counts = set(range(1, max_reqs + 1))
+    draft_counts.update(reqs * query_len for reqs in range(1, max_reqs + 1))
+    manager = getattr(speculator, "query_cudagraph_manager", None)
+    planned = getattr(manager, "planned_token_counts", None)
+    if callable(planned):
+        draft_counts.update(int(count) for count in planned() if int(count) > 0)
+    counts.update(draft_counts)
+    fixed = set(workload.fixed_token_counts)
+    fixed.update(count for count in draft_counts if count < workload.max_tokens)
+    return replace(
+        workload, token_counts=tuple(sorted(counts)),
+        fixed_token_counts=tuple(sorted(fixed)), lane=lane,
+    )
+
+
 def collect_b12x_units(worker: "Worker", workload: B12xWorkload) -> list[B12xPreparationUnit]:
     """Collect every unit of one stage from the model, the draft, and comms."""
     mark_b12x_eager_shapes(worker)
@@ -234,7 +280,7 @@ def collect_b12x_units(worker: "Worker", workload: B12xWorkload) -> list[B12xPre
     draft = worker.get_draft_model()
     if draft is not None:
         lane = _draft_lane(worker)
-        draft_workload = replace(workload, lane=lane)
+        draft_workload = _draft_workload(worker, workload, lane=lane)
         from vllm.v1.worker.workspace import use_workspace_lane
 
         with use_workspace_lane(lane):
@@ -242,6 +288,10 @@ def collect_b12x_units(worker: "Worker", workload: B12xWorkload) -> list[B12xPre
         if lane:
             draft_units = [scope_b12x_unit_calls(unit, lane) for unit in draft_units]
         units.extend(draft_units)
+        workload = replace(
+            workload, token_counts=draft_workload.token_counts,
+            fixed_token_counts=draft_workload.fixed_token_counts,
+        )
     for provider in b12x_unit_providers():
         hook = getattr(provider, "get_b12x_preparation_units", None)
         if callable(hook):
@@ -409,24 +459,27 @@ class B12xPreparedBatch:
             self.session.release(plan)
 
 
-def prepare_b12x_locally(worker: "Worker", *, stage: str, autotune: bool) -> B12xPreparedBatch:
-    """Prepare one stage on this worker alone, without candidate timing.
+def prepare_b12x_profile(worker: "Worker", *, stage: str) -> B12xPreparedBatch:
+    """Prime profiling-pool plans with defaults in complete-world control rounds."""
+    from vllm.distributed.parallel_state import get_world_group
+    from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
 
-    Used for the throwaway profiling pool: collective and timed work is not
-    allowed here, so every unit is prepared with its default configuration.
-    """
-    if not b12x_native_supported(worker):
-        return B12xPreparedBatch(None, ())
-    workload = b12x_workload(worker, stage=stage)
-    units = collect_b12x_units(worker, workload)
-    requests = tuple(
-        request for unit in units for request in unit.requests
-        if request.collective is None
-    )
-    if not requests:
-        return B12xPreparedBatch(None, ())
-    session = get_b12x_session(worker)
+    requests = ()
+    if b12x_native_supported(worker):
+        workload = b12x_workload(worker, stage=stage)
+        units = collect_b12x_units(worker, workload)
+        requests = tuple(request for unit in units for request in unit.requests)
+    session = get_b12x_session(worker) if requests else None
     fresh = tuple(request.plan for request in requests if request.plan.prepared is None)
-    result = session.prepare(requests, autotune=autotune)
-    result.close()
-    return B12xPreparedBatch(session, fresh)
+    batch = B12xPreparedBatch(session, fresh)
+    coordinator = B12xPreparationCoordinator(
+        session, [(requests, False)] if requests else [],
+        global_rank=int(worker.rank), world_group=get_world_group(),
+    )
+    outcome = coordinator.status()
+    while not outcome["done"]:
+        outcome = coordinator.advance()
+    if outcome["error"] is not None:
+        batch.release()
+        raise RuntimeError(f"b12x profiling preparation failed: {outcome['error']}")
+    return batch

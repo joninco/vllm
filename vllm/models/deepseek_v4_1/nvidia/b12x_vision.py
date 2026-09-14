@@ -78,10 +78,11 @@ class _Linear(nn.Module):
         }))
 
         def make_call(state):
+            offset = int(not state.query.source_aligned)
             source = torch.empty(
-                (state.query.max_rows, self.weight.shape[1]),
+                (state.query.max_rows + offset, self.weight.shape[1]),
                 dtype=torch.bfloat16, device=self.weight.device,
-            )
+            )[offset:]
             out = torch.empty(
                 (state.query.max_rows, self.weight.shape[0]),
                 dtype=torch.bfloat16, device=self.weight.device,
@@ -89,7 +90,7 @@ class _Linear(nn.Module):
             return PreparedCall(
                 run=lambda: state.run(source, self.weight, out=out, bias=self.bias),
                 produce=lambda: source.normal_(std=0.25),
-                owners=(source, out),
+                owners=(self.weight, self.bias),
             )
 
         requests = []
@@ -99,7 +100,8 @@ class _Linear(nn.Module):
                     source_dtype="bfloat16", weight_dtype="bfloat16",
                     max_rows=capacity, in_features=self.weight.shape[1],
                     out_features=self.weight.shape[0], source_contiguous=True,
-                    source_aligned=True, weight_contiguous=self.weight.is_contiguous(),
+                    source_aligned=self.weight.shape[1] % 8 == 0,
+                    weight_contiguous=self.weight.is_contiguous(),
                     weight_aligned=self.weight.data_ptr() % 16 == 0,
                     bias_dtype=None if self.bias is None else "bfloat16",
                 ))
@@ -381,7 +383,7 @@ class DeepseekV4ViT(nn.Module):
                     source, self.norm.weight, eps=1e-6, zero_centered=False,
                     plan=state, out=out,
                 ),
-                produce=lambda: source.normal_(std=0.25), owners=(source, out),
+                produce=lambda: source.normal_(std=0.25), owners=(self.norm.weight,),
             )
 
         def pointwise_call(state):
@@ -406,7 +408,7 @@ class DeepseekV4ViT(nn.Module):
                 run=(lambda: run_swiglu_impl(
                     left, limit=float("inf"), round_silu=True, plan=state, out=out,
                 )) if swiglu else (lambda: run_add_impl(left, right, plan=state, out=out)),
-                produce=produce, owners=(left, right, out),
+                produce=produce,
             )
 
         def call(state):

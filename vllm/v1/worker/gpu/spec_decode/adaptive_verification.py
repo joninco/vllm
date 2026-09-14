@@ -113,6 +113,20 @@ def build_cost_tables_from_curves(
     return draft_table, verify_table
 
 
+def preparation_tail_sizes(capture_sizes: Iterable[int], max_num_tokens: int) -> tuple[int, ...]:
+    """Exact eager token counts used to initialize adaptive verification costs."""
+    capture_sizes = tuple(capture_sizes)
+    size = capture_sizes[-1] if capture_sizes else 0
+    tail_sizes = set()
+    if size:
+        tail_sizes.add(min(size + size // 2, max_num_tokens))
+        while size < max_num_tokens:
+            size = min(size * 2, max_num_tokens)
+            tail_sizes.add(size)
+        tail_sizes -= set(capture_sizes)
+    return tuple(sorted(tail_sizes))
+
+
 class AdaptiveVerificationManager:
     def __init__(
         self,
@@ -185,7 +199,7 @@ class AdaptiveVerificationManager:
         dense low-concurrency specializations.
         """
         max_num_tokens = self.req_states.max_num_batched_tokens
-        size = self._cudagraph_limit = capture_sizes[-1] if capture_sizes else 0
+        self._cudagraph_limit = capture_sizes[-1] if capture_sizes else 0
         profile_shapes: list[tuple[int, int | None]]
         if full_batch_shapes is None:
             profile_shapes = [(num_tokens, None) for num_tokens in capture_sizes]
@@ -195,14 +209,9 @@ class AdaptiveVerificationManager:
         # Also profile beyond the capture limit: real steps run there
         # (piecewise/eager) and linear extrapolation badly underestimates
         # them. These runs double as JIT warmup for the piecewise shapes.
-        tail_sizes: set[int] = set()
-        if size:
-            tail_sizes.add(min(size + size // 2, max_num_tokens))
-            while size < max_num_tokens:
-                size = min(size * 2, max_num_tokens)
-                tail_sizes.add(size)
-            tail_sizes -= set(capture_sizes)
-        profile_shapes.extend((num_tokens, None) for num_tokens in sorted(tail_sizes))
+        profile_shapes.extend(
+            (num_tokens, None) for num_tokens in preparation_tail_sizes(capture_sizes, max_num_tokens)
+        )
         for num_tokens, num_reqs in profile_shapes:
             for _ in range(_PROFILE_REPLAYS):
                 batch = {

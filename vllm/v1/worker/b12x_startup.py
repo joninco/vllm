@@ -12,6 +12,10 @@ identical declarations on different pipeline stages never collide.
 
 from __future__ import annotations
 
+import os
+import time
+from contextlib import nullcontext
+
 
 _CONTROL_GROUPS: dict[tuple[int, int], object] = {}
 
@@ -48,6 +52,12 @@ class B12xPreparationCoordinator:
         if global_rank not in self.world_ranks:
             raise ValueError("global rank is not in preparation control domain")
 
+        self._timing = None
+        if os.environ.get("B12X_PREPARATION_TRACE_DIR"):
+            from b12x.preparation._timing import PreparationTiming
+
+            self._timing = PreparationTiming("coordinator", rank=global_rank)
+        self._last_advance_end = None
         self._round = 0
         self._authorized_key: str | None = None
         self._authorized_tuning = None
@@ -80,12 +90,26 @@ class B12xPreparationCoordinator:
         return self._outcome()
 
     def advance(self, *, cancel_tuning: bool = False) -> dict[str, object]:
+        if self._timing is None:
+            return self._advance(cancel_tuning=cancel_tuning)
+        started = time.perf_counter()
+        if self._last_advance_end is not None:
+            self._timing.add("between_advances", started - self._last_advance_end)
+        try:
+            return self._advance(cancel_tuning=cancel_tuning)
+        finally:
+            self._timing.add("advance", time.perf_counter() - started)
+            self._timing.record("progress", periodic=not self._global_done, round=self._round)
+            self._last_advance_end = time.perf_counter()
+
+    def _advance(self, *, cancel_tuning: bool = False) -> dict[str, object]:
         """Perform one bounded local step and one complete-world exchange."""
         if self._closed:
             return self._outcome()
         self._stop |= bool(cancel_tuning)
         try:
-            self._advance_local()
+            with (self._timing.span("local") if self._timing else nullcontext()):
+                self._advance_local()
         except BaseException as error:
             self._record_error(error)
             self._stop = True
@@ -99,7 +123,8 @@ class B12xPreparationCoordinator:
             self._round += 1
             return self._outcome()
 
-        gathered = _all_gather(self.world_group, self._payload())
+        with (self._timing.span("control_exchange") if self._timing else nullcontext()):
+            gathered = _all_gather(self.world_group, self._payload())
         self._validate_domain(gathered)
         errors = [entry["error"] for entry in gathered if entry["error"]]
         if errors:
@@ -167,7 +192,8 @@ class B12xPreparationCoordinator:
         if progress.pending_compilation:
             pool = job.session._pool
             if pool is not None:
-                pool.wait_for_progress(timeout=0.05)
+                with (self._timing.span("compiler_wait") if self._timing else nullcontext()):
+                    pool.wait_for_progress(timeout=0.05)
         if not progress.done:
             return
 

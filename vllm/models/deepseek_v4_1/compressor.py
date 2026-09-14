@@ -160,6 +160,7 @@ class DeepseekCompressor(nn.Module):
             else None
         )
         self._plan = None
+        self._projection_plans = {}
         self._values = self._latent = self._emitted = self._slots = None
         self._gates = self._pending_values = self._pending_gates = None
         self._pending_tags = self._local_ids = self._row_ids = None
@@ -252,6 +253,62 @@ class DeepseekCompressor(nn.Module):
             pending_position=self._pending_tags,
         )
 
+    def _projection_unit(self, workload):
+        weight = self.fused_wkv_wgate.weight
+        capacities = tuple(sorted({workload.max_tokens, *workload.token_counts}))
+        self._projection_capacity = workload.max_tokens
+        dtype = torch.float32 if self.compress_ratio == 2 else torch.bfloat16
+
+        def prepare(state):
+            source = torch.empty(
+                (state.query.max_rows, weight.shape[1]), dtype=torch.bfloat16,
+                device=weight.device,
+            )
+            outputs = tuple(torch.empty(
+                (state.query.max_rows, 512), dtype=dtype, device=weight.device,
+            ) for _ in range(self.compress_ratio))
+
+            def run():
+                for index, output in enumerate(outputs):
+                    state.run(source, weight[index * 512:(index + 1) * 512], out=output)
+                return outputs
+
+            return PreparedCall(
+                run=run, output=outputs, produce=lambda: source.normal_(std=0.25),
+                owners=(weight,),
+            )
+
+        requests = []
+        for rows in capacities:
+            if rows not in self._projection_plans:
+                self._projection_plans[rows] = bf16_gemv.plan(bf16_gemv.GemvQuery(
+                    source_dtype="bfloat16", weight_dtype="bfloat16",
+                    output_dtype=str(dtype).removeprefix("torch."),
+                    max_rows=rows, in_features=weight.shape[1], out_features=512,
+                    source_contiguous=True, source_aligned=True,
+                    weight_contiguous=weight.is_contiguous(),
+                    weight_aligned=weight.data_ptr() % 16 == 0,
+                ))
+            requests.append(self._projection_plans[rows].request(
+                name=f"{self.prefix}/projection.m{rows}",
+                prepare_call=prepare, benchmark_call=prepare,
+            ))
+        return B12xPreparationUnit(
+            name="V41CompressorProjection", key=(self.prefix, capacities),
+            requests=tuple(requests), stage="weights", autotune=not workload.eager_only,
+        )
+
+    def _project(self, hidden_states):
+        rows = hidden_states.shape[0]
+        plan = self._projection_plans.get(rows)
+        if plan is None:
+            plan = self._projection_plans[self._projection_capacity]
+        for index, output in enumerate((self._values, self._gates)[:self.compress_ratio]):
+            bf16_gemv.mm(
+                hidden_states, self.fused_wkv_wgate.weight[index * 512:(index + 1) * 512],
+                out=output[:rows], output_dtype=output.dtype, plan=plan,
+            )
+
     def get_b12x_preparation_units(
         self, layer: object, workload: B12xWorkload
     ) -> tuple[B12xPreparationUnit, ...]:
@@ -291,7 +348,7 @@ class DeepseekCompressor(nn.Module):
             name=f"{self.prefix}/mla-compress",
             prepare_call=make_call, benchmark_call=make_call,
         )
-        return (B12xPreparationUnit(
+        return (self._projection_unit(workload), B12xPreparationUnit(
             name="DeepseekCompressor",
             key=(self.prefix, self.compress_ratio, self.capacity, self.requests),
             requests=(request,), stage="state", autotune=not workload.eager_only,
@@ -303,19 +360,8 @@ class DeepseekCompressor(nn.Module):
                 "compressor plan must be prepared before forwarding"
             )
         rows = hidden_states.shape[0]
-        bf16_gemv.mm(
-            hidden_states,
-            self.fused_wkv_wgate.weight[:512],
-            out=self._values[:rows],
-            output_dtype=self._values.dtype,
-        )
+        self._project(hidden_states)
         if self.compress_ratio == 2:
-            bf16_gemv.mm(
-                hidden_states,
-                self.fused_wkv_wgate.weight[512:],
-                out=self._gates[:rows],
-                output_dtype=torch.float32,
-            )
             if state_metadata is None:
                 raise RuntimeError("ratio2 compression requires request-state metadata")
             pool = self.state_cache.kv_cache

@@ -632,6 +632,7 @@ class B12xPcieAllReduce:
                 def prepare(state, invocation=invocation):
                     inp = self._request_input(invocation, registered=False)
                     assert inp is not None
+                    inp.fill_(1)
                     return _twoshot_preparation.prepared_call(
                         state, payload=inp, out=torch.empty_like(inp)
                     )
@@ -646,6 +647,7 @@ class B12xPcieAllReduce:
                 def prepare(state, invocation=invocation):
                     inp = self._request_input(invocation, registered=False)
                     assert inp is not None
+                    inp.fill_(1)
                     return _dma_preparation.prepared_call(
                         state, inp=inp, out=torch.empty_like(inp)
                     )

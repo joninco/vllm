@@ -1522,7 +1522,12 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
         SimpleNamespace(weight_block_size=[32, 32])
     )
     method.process_weights_after_loading(layer)
+    from b12x._lib import dense_gemm
+
+    dense_gemm._cached_alpha_one(device)
+    allocated_before = torch.cuda.memory_allocated(device)
     session, _ = _prepare(layer, device=device, counts=(1, 8, 17), fixed=(1, 8))
+    assert torch.cuda.memory_allocated(device) == allocated_before
     session.freeze()
     manager = workspace.current_workspace_manager()
     manager.reserve_all(*(
@@ -1613,7 +1618,9 @@ def _check_v41_vocab_embedding_and_tied_head(device):
     probe = torch.zeros((1, hidden), dtype=torch.bfloat16, device=device)
     probe[0, 0] = 1
     target.quant_method.process_weights_after_loading(target)
+    allocated_before = torch.cuda.memory_allocated(device)
     session, _ = _prepare(target, device=device, counts=(1, 3, ids.numel()))
+    assert torch.cuda.memory_allocated(device) == allocated_before
     session.freeze()
     processor = LogitsProcessor(vocab)
 
@@ -2090,10 +2097,12 @@ def test_v41_unquantized_prepares_dtypes_and_exact_rows_before_replay(output_dty
     layer.out_dtype = output_dtype
     method = B12xLinearMethod()
     method.process_weights_after_loading(layer)
+    allocated_before = torch.cuda.memory_allocated(device)
     session, _ = _prepare(
         layer, device=device, counts=(1, 8, 256), fixed=(1, 8),
         output_dtype=output_dtype,
     )
+    assert torch.cuda.memory_allocated(device) == allocated_before
     session.freeze()
     graph = torch.cuda.CUDAGraph()
     tolerance = 0.015 if output_dtype == torch.bfloat16 else 1e-4

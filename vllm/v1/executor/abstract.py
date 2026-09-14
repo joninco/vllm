@@ -72,9 +72,6 @@ def _aggregate_b12x_progress(outcomes):
         updates.update(
             candidate_count=sum(item.candidate_count for item in progress),
             candidates_prepared=sum(item.candidates_prepared for item in progress),
-            latest_round_us=tuple(
-                value for item in progress for value in item.latest_round_us
-            ),
         )
     return replace(primary, **updates)
 

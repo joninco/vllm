@@ -520,11 +520,9 @@ class Worker(WorkerBase):
 
     def _prepare_b12x_profile_state(self) -> None:
         """Prepare pool-dependent plans against the profiling pool, untimed."""
-        from vllm.model_executor.warmup.b12x_prepare import prepare_b12x_locally
+        from vllm.model_executor.warmup.b12x_prepare import prepare_b12x_profile
 
-        self._b12x_profile_batch = prepare_b12x_locally(
-            self, stage="state", autotune=False
-        )
+        self._b12x_profile_batch = prepare_b12x_profile(self, stage="state")
 
     def _release_b12x_profile_state(self) -> None:
         batch, self._b12x_profile_batch = self._b12x_profile_batch, None
@@ -566,7 +564,10 @@ class Worker(WorkerBase):
         maybe_apply_startup_plan(self)
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            self.model_runner.profile_run()
+            try:
+                self.model_runner.profile_run(self._prepare_b12x_profile_state)
+            finally:
+                self._release_b12x_profile_state()
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
                 f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
@@ -590,7 +591,10 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
+            try:
+                self.model_runner.profile_run(self._prepare_b12x_profile_state)
+            finally:
+                self._release_b12x_profile_state()
             self.model_runner.profile_glm_dcp_attention()
 
         # Profile CUDA graph memory if graphs will be captured.

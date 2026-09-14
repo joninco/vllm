@@ -11,13 +11,14 @@ from weakref import WeakValueDictionary
 import torch
 from b12x.gemm import bf16_gemv, block_fp8_linear
 from b12x.norm import hyperconnection, mhc
-from b12x.preparation import FrozenMapping, PreparedCall
+from b12x.preparation import FrozenMapping, PreparedCall, plan_from_handle
 from torch import nn
 
 from vllm.config import get_current_vllm_config
 from vllm.utils.b12x import (
     B12xPreparationUnit,
     B12xWorkload,
+    PreparationResourceUnavailableError,
     b12x_layer,
     b12x_layer_prefix,
     register_b12x_layer,
@@ -81,15 +82,6 @@ def _execution_capacities() -> tuple[int, ...]:
 
 
 _LINEARS: WeakValueDictionary[int, nn.Module] = WeakValueDictionary()
-
-
-@cache
-def _norm_plan(device, capacity, hidden):
-    return hyperconnection.plan(
-        hyperconnection.Caps(
-            device=device, max_tokens=capacity, hidden_size=hidden, streams=1, lowrank=1
-        )
-    )
 
 
 @cache
@@ -164,7 +156,7 @@ class B12xEmbeddingMethod(UnquantizedEmbeddingMethod):
                     torch.arange(ids.numel(), device=ids.device, dtype=ids.dtype)
                     .remainder_(weight.shape[0])
                 ),
-                owners=(ids, out),
+                owners=(weight,),
             )
 
         requests = []
@@ -233,7 +225,7 @@ class B12xLinearMethod(UnquantizedLinearMethod):
             return PreparedCall(
                 run=lambda: state.run(source, weight, out=out),
                 produce=lambda: source.normal_(std=0.25),
-                owners=(source, out),
+                owners=(weight,),
             )
 
         requests = []
@@ -366,7 +358,7 @@ class B12xFP8LinearMethod(LinearMethodBase):
             return PreparedCall(
                 run=lambda: state.run_binding(binding),
                 produce=lambda: source.normal_(std=0.25),
-                owners=(source, output, scratch, binding),
+                owners=(layer.b12x_weight,),
             )
 
         requests = tuple(
@@ -403,9 +395,9 @@ class B12xFP8LinearMethod(LinearMethodBase):
 
 @torch.library.custom_op("vllm::dsv41_rmsnorm", mutates_args=("out",))
 def _rmsnorm(
-    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, eps: float, capacity: int
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, eps: float, plan_handle: int
 ) -> None:
-    p = _norm_plan(x.device, capacity, x.shape[-1])
+    p = plan_from_handle(plan_handle)
     # These unused binding slots must remain disjoint from normalized storage.
     binding = hyperconnection.bind(
         p,
@@ -420,7 +412,7 @@ def _rmsnorm(
 
 
 @_rmsnorm.register_fake
-def _rmsnorm_fake(x, weight, out, eps, capacity):
+def _rmsnorm_fake(x, weight, out, eps, plan_handle):
     return None
 
 
@@ -432,8 +424,48 @@ class B12xRMSNorm(nn.Module):
         )
         self.variance_epsilon = eps
         self.capacity = _capacity()
+        self._plan = None
+        set_b12x_preparation_provider(self, self)
+
+    def get_b12x_preparation_units(self, layer, workload):
+        from b12x.norm.hyperconnection._impl import run_grouped_rmsnorm_impl
+
+        if self._plan is None:
+            self._plan = hyperconnection.plan(
+                hyperconnection.Caps(
+                    device=self.weight.device, max_tokens=self.capacity,
+                    hidden_size=self.weight.numel(), streams=1, lowrank=1,
+                ),
+                invocation={
+                    "operation": "grouped_rmsnorm", "zero_centered": False,
+                    "eps": self.variance_epsilon,
+                    "weight_dtype": str(self.weight.dtype).removeprefix("torch."),
+                },
+            )
+
+        def prepare(state):
+            source = torch.ones((1, self.weight.numel()), dtype=torch.bfloat16,
+                                device=self.weight.device)
+            out = torch.empty_like(source)
+            return PreparedCall(
+                run=lambda: run_grouped_rmsnorm_impl(
+                    source, self.weight, eps=self.variance_epsilon, plan=state,
+                    out=out, zero_centered=False,
+                ),
+                owners=(self.weight,),
+            )
+
+        return (B12xPreparationUnit(
+            name="V41RMSNorm", key=(id(self), self.capacity), stage="weights",
+            requests=(self._plan.request(
+                name=f"deepseek_v41.rmsnorm.{id(self):x}", prepare_call=prepare,
+            ),),
+            autotune=not workload.eager_only,
+        ),)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._plan is None:
+            raise PreparationResourceUnavailableError("V4.1 RMSNorm has no declared plan")
         shape = x.shape
         x = x.reshape(-1, shape[-1]).contiguous()
         out = torch.empty_like(x)
@@ -442,7 +474,7 @@ class B12xRMSNorm(nn.Module):
             self.weight,
             out,
             self.variance_epsilon,
-            self.capacity * (shape[-2] if len(shape) > 2 else 1),
+            self._plan.handle,
         )
         return out.view(shape)
 
@@ -535,6 +567,7 @@ class B12xMHC(nn.Module):
         self.iterations = config.hc_sinkhorn_iters
         self._plans: dict[tuple[str, int], object] = {}
         self._layer_name: LayerNameType | None = None
+        self._collapse_plans = {}
         if config.hc_mult != 4:
             raise ValueError("V4.1 mHC requires four streams")
 
@@ -602,9 +635,34 @@ class B12xMHC(nn.Module):
             for tokens in key
             for operation in ("pre", "post_pre", "post")
         )
+        collapse_requests = []
+        for weighted in (False, True):
+            if weighted not in self._collapse_plans:
+                self._collapse_plans[weighted] = mhc.plan(
+                    _mhc_caps(layer.hc_attn_fn.device, workload.max_tokens, self.hidden_size),
+                    invocation=FrozenMapping({
+                        "operation": "collapse", "output_mode": "provided",
+                        "collapse_weighted": weighted,
+                    }),
+                )
+
+            def prepare_collapse(state, weighted=weighted):
+                from b12x.norm.mhc._impl import _run_collapse_impl
+                device = layer.hc_attn_fn.device
+                source = torch.randn((1, 4, self.hidden_size), dtype=torch.bfloat16, device=device)
+                mix = torch.ones((1, 4), dtype=torch.float32, device=device) if weighted else None
+                output = torch.empty((1, self.hidden_size), dtype=torch.bfloat16, device=device)
+                return PreparedCall(run=lambda: _run_collapse_impl(
+                    source, mix, out=output, _state=state,
+                ))
+
+            collapse_requests.append(self._collapse_plans[weighted].request(
+                name=f"deepseek_v41.mhc.{id(layer):x}.collapse.weighted{int(weighted)}",
+                prepare_call=prepare_collapse,
+            ))
         return (B12xPreparationUnit(
             name="V41MHC", key=(id(layer), self.hidden_size, key),
-            requests=requests, stage="weights", autotune=not workload.eager_only,
+            requests=(*requests, *collapse_requests), stage="weights", autotune=not workload.eager_only,
         ),)
 
     def _prepare_call(self, layer, operation, tokens):
@@ -695,17 +753,10 @@ class B12xMHC(nn.Module):
         return out
 
 
-def collapse(state: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
-    out = torch.empty(
-        (state.shape[0], state.shape[-1]), dtype=state.dtype, device=state.device
-    )
-    mhc.run_collapse(state, pre, out=out)
-    return out
-
-
-def stream_mean(state: torch.Tensor) -> torch.Tensor:
-    out = torch.empty(
-        (state.shape[0], state.shape[-1]), dtype=state.dtype, device=state.device
-    )
-    mhc.run_collapse(state, None, out=out)
-    return out
+    def collapse(self, state: torch.Tensor, pre: torch.Tensor | None = None) -> torch.Tensor:
+        out = torch.empty(
+            (state.shape[0], state.shape[-1]), dtype=state.dtype, device=state.device,
+        )
+        return mhc.run_collapse(
+            state, pre, out=out, plan=self._collapse_plans[pre is not None],
+        )

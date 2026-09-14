@@ -913,7 +913,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         current_workspace_manager().reserve_all()
 
     @torch.inference_mode()
-    def profile_run(self) -> None:
+    def profile_run(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
         self._reserve_profile_scratch()
 
         if self.supports_mm_inputs and self.is_first_pp_rank:
@@ -949,13 +951,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # transient peak instead of an unreachable sum of both passes.
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
-        self._profile_deepseek_v4_attention()
+        self._profile_deepseek_v4_attention(prepare_profile_state)
         current_workspace_manager().reserve_all()
         self.reset_encoder_cache()
         gc.collect()
 
     @torch.inference_mode()
-    def _profile_deepseek_v4_attention(self) -> None:
+    def _profile_deepseek_v4_attention(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> None:
         """Include the maximum DeepSeek V4 prefill peak in KV admission.
 
         The generic profile omits attention and distributes its token budget
@@ -968,11 +972,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.model_config.architecture not in {
             "DeepseekV4ForCausalLM",
             "DeepseekV4ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
         }:
             return
 
         try:
             _init_minimal_kv_cache_for_profiling(self, num_blocks=1)
+            if prepare_profile_state is not None:
+                prepare_profile_state()
             self._dummy_run(
                 self.max_num_tokens,
                 skip_eplb=True,

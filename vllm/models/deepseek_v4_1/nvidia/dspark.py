@@ -24,7 +24,6 @@ from vllm.utils.b12x import (
     set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
-    PreparationResourceUnavailableError,
     b12x_layer_prefix,
     register_b12x_layer,
     register_b12x_unit_provider,
@@ -63,7 +62,6 @@ from vllm.v1.worker.workspace import (
 from ..b12x_layers import B12xRMSNorm as RMSNorm
 from ..b12x_layers import (
     _execution_capacities,
-    collapse,
 )
 from .model import (
     DeepseekV4DecoderLayer,
@@ -106,6 +104,7 @@ class _ContextKVProjection:
                     max_tokens=bound,
                     in_features=fused.weight.shape[1],
                     out_features=fused.weight.shape[0] - start,
+                    block_size=(32, 32),
                     output_mode="provided",
                 )
             )
@@ -125,7 +124,7 @@ class _ContextKVProjection:
             source = torch.zeros(
                 (bound, self.weight.in_features),
                 dtype=torch.bfloat16,
-                device=self.weight.weight.device,
+                device=state.device,
             )
             output = torch.empty(
                 (bound, self.weight.out_features, 1),
@@ -144,7 +143,8 @@ class _ContextKVProjection:
             )
             return PreparedCall(
                 run=lambda: state.run_binding(binding),
-                owners=(source, output, scratch, binding, self.weight),
+                produce=lambda: source.normal_(std=0.25),
+                owners=(self.weight,),
             )
 
         requests = tuple(
@@ -157,25 +157,17 @@ class _ContextKVProjection:
         )
         return (B12xPreparationUnit(
             name="DSparkContextKV", key=(id(self), self.capacities),
-            requests=requests, stage="state", autotune=not workload.eager_only,
+            requests=requests, stage="weights", autotune=not workload.eager_only,
         ),)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         index = bisect_left(self.capacities, x.shape[0])
         if index == len(self.capacities):
             raise ValueError("DSpark context rows exceed prepared capacity")
-        bound = self.capacities[index]
-        if x.shape[0] != bound:
-            raise ValueError(
-                "DSpark context projection must receive its admitted graph capacity"
-            )
+        rows = x.shape[0]
         plan = self.plans[index]
-        if plan.prepared is None:
-            raise PreparationResourceUnavailableError(
-                "DSpark context projection plan is not prepared"
-            )
         out = torch.empty(
-            (bound, self.weight.out_features),
+            (rows, self.weight.out_features),
             dtype=torch.bfloat16,
             device=x.device,
         )
@@ -187,7 +179,7 @@ class _ContextKVProjection:
             scratch=scratch,
             source=x,
             packed_weight=self.weight,
-            output=out.view(bound, self.weight.out_features, 1),
+            output=out.view(rows, self.weight.out_features, 1),
         )
         retain_cuda_graph_capture_resource(binding)
         block_fp8_linear.run(binding=binding)
@@ -473,7 +465,7 @@ class DSparkDeepseekV4Model(nn.Module):
         # last block's ffn pre-mix). Return the PRE-norm head hidden;
         # compute_logits applies self.norm.
         assert pre_mix is not None
-        hidden_states = collapse(hidden_states, pre_mix)
+        hidden_states = layer._b12x_mhc.collapse(hidden_states, pre_mix)
         return hidden_states
 
 
@@ -713,6 +705,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         return loaded_params
 
     def process_weights_after_loading(self) -> None:
+        self.logits_processor.prepare_b12x_vocab_projection(
+            self.model.markov_head.markov_w2
+        )
         for layer in self.model.layers:
             layer.attn.setup_wo_projection()
         self.model._context_kv_projections = [
