@@ -795,6 +795,8 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
         if view is None:
             view = _cache_page_view(cache, page_size, name)
             self._b12x_cache_page_views[key] = view
+        return view
+
     def _reserve_profile_workspace(self, q: torch.Tensor) -> None:
         from b12x.attention.compressed_sparse_mla._scratch import (
             plan_compressed_sparse_mla_scratch,
