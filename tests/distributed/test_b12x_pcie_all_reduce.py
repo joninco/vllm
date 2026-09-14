@@ -619,6 +619,19 @@ def test_twoshot_respects_runtime_acceptance() -> None:
     twoshot.all_reduce.assert_not_called()
 
 
+@pytest.mark.parametrize(("tokens", "expected"), [(12, None), (16, "twoshot")])
+def test_twoshot_metadata_requires_complete_rank_shards(tokens, expected):
+    communicator, _ = _make_communicator(allreduce_max_bytes=96 << 10)
+    communicator.world_size = 4
+    twoshot = _attach_twoshot(communicator, max_bytes=768 << 10)
+    twoshot.row_elems = 4096
+    invocation = b12x_pcie_all_reduce.B12xPcieInvocation(
+        name="embedding.all_reduce",
+        operation="all_reduce",
+        shape=(tokens, 5120),
+        dtype=torch.bfloat16,
+    )
+    assert communicator._route_invocation(invocation) == expected
 
 
 def test_graph_capture_supplies_caller_owned_twoshot_output(
