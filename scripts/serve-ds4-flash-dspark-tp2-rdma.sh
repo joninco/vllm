@@ -33,7 +33,6 @@ KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-10737418240}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
 DSPARK_DRAFT_ATTENTION_BACKEND="${DSPARK_DRAFT_ATTENTION_BACKEND:-auto}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.82}"
-B12X_POLICY_MODE="${B12X_POLICY_MODE:-auto}"
 # All-reduce transport between the two ranks: rocenante (b12x.comm.roce one-shot
 # RDMA, VLLM_ENABLE_ROCE_ALLREDUCE=1) or nccl.
 ALLREDUCE="${ALLREDUCE:-rocenante}"
@@ -66,7 +65,7 @@ Launcher options:
 
 Environment overrides include ALLREDUCE, HEAD_IP, WORKER_IP, MODEL_ID,
 MODEL_REVISION, HF_CACHE, MAX_MODEL_LEN, MAX_NUM_SEQS, NUM_SPECULATIVE_TOKENS,
-KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION, B12X_ROOT, B12X_POLICY_MODE,
+KV_CACHE_MEMORY_BYTES, GPU_MEMORY_UTILIZATION, B12X_ROOT,
 ROCE_ALLREDUCE_MAX_SIZE, ROCE_ALLGATHER_MAX_SIZE, IMAGE_NAME and
 CONTAINER_MEMORY_GB.
 EOF
@@ -101,13 +100,6 @@ case "${ALLREDUCE}" in
   rocenante|nccl) ;;
   *)
     echo "ALLREDUCE must be rocenante or nccl; got '${ALLREDUCE}'" >&2
-    exit 2
-    ;;
-esac
-case "${B12X_POLICY_MODE}" in
-  auto|heuristic-only|preplanned-only) ;;
-  *)
-    echo "Invalid B12X policy mode: ${B12X_POLICY_MODE}" >&2
     exit 2
     ;;
 esac
@@ -294,7 +286,6 @@ cluster_args=(
   --env "B12X_DENSE_SPLITK_TURBO=1"
   --env "B12X_W4A16_TC_DECODE=1"
   --env "B12X_MOE_FORCE_A8=1"
-  --env "B12X_POLICY_MODE=${B12X_POLICY_MODE}"
   --env "VLLM_ENABLE_PCIE_ALLREDUCE=0"
   --env "NCCL_NET_PLUGIN=none"
   --env "NCCL_IB_GID_INDEX=3"
@@ -398,7 +389,7 @@ Launching ${SERVED_MODEL_NAME} TP=2 on ${HEAD_IP} + ${WORKER_IP}
   speculation:     ${spec_summary}
   max seqs:        ${MAX_NUM_SEQS} (cudagraph capture up to ${max_cudagraph_capture_size})
   context / KV:    ${MAX_MODEL_LEN} tokens, ${KV_CACHE_MEMORY_BYTES} bytes
-  b12x policy:     ${B12X_POLICY_MODE} (B12X_ROOT=${B12X_ROOT})
+  b12x source:     ${B12X_ROOT}
 BANNER
 
 exec "${CLUSTER_LAUNCHER}" "${cluster_args[@]}" exec "${vllm_command[@]}"

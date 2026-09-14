@@ -237,7 +237,7 @@ from vllm.v1.worker.utils import (
     is_residual_scattered_for_sp,
     raise_if_nan_logits,
 )
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
 
 from .utils import (
     AttentionGroup,
@@ -6648,6 +6648,7 @@ class GPUModelRunner(
             reserve = getattr(module, "reserve_profile_scratch", None)
             if reserve is not None:
                 reserve()
+        current_workspace_manager().reserve_all()
 
     def profile_run(self) -> None:
         self._reserve_profile_scratch()
@@ -6726,6 +6727,7 @@ class GPUModelRunner(
         self._sync_device()
         del hidden_states, last_hidden_states, output
         self._profile_deepseek_v4_attention()
+        current_workspace_manager().reserve_all()
         self.encoder_cache.clear()
         gc.collect()
 
@@ -6941,11 +6943,15 @@ class GPUModelRunner(
                 logger.info("Initialized EncoderCudaGraphManager for vision encoder")
 
     @torch.inference_mode()
-    def profile_cudagraph_memory(self) -> int:
+    def profile_cudagraph_memory(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> int:
         profiling_state_initialized = False
         try:
             with set_current_vllm_config(self.vllm_config):
                 self._init_minimal_kv_cache_for_profiling()
+                if prepare_profile_state is not None:
+                    prepare_profile_state()
             profiling_state_initialized = True
         finally:
             if not profiling_state_initialized:

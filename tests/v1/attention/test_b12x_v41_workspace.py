@@ -353,6 +353,8 @@ def test_attention_shared_scratch_graph_replay(
     native_workspace, monkeypatch, is_decode, rows, live_rows, main_page, swa_page
 ):
     attention, manager, workspace = native_workspace
+    from b12x.preparation import PreparationSession
+    from vllm.utils.b12x import B12xWorkload
     # A TP4 rank must score all replicated heads without obtaining a TP group.
     monkeypatch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 4)
     device = torch.device("cuda", torch.accelerator.current_device_index())
@@ -365,7 +367,7 @@ def test_attention_shared_scratch_graph_replay(
         layer.config.compilation_config.max_cudagraph_capture_size = 32
     layer._prepare(device)
     if rows == 36:
-        assert layer._plans["decode"].caps.max_q_rows == 4 * (1 + 2 * 5)
+        assert layer._attention_declarations["decode"].query.query_rows == 4 * (1 + 2 * 5)
     length = 2048
     positions = torch.full((rows,), -1, dtype=torch.int64, device=device)
     positions[:live_rows] = torch.arange(
@@ -459,6 +461,15 @@ def test_attention_shared_scratch_graph_replay(
     packed = torch.empty((rows, 32, 64), dtype=torch.uint8, device=device)
     scales = torch.empty((rows, 32, 4), dtype=torch.uint8, device=device)
     out = torch.empty_like(q)
+    workload = B12xWorkload(
+        stage="state", token_counts=tuple(sorted({rows, 4 if is_decode else 64})),
+        fixed_token_counts=(), output_dtype=torch.bfloat16,
+        max_tokens=max(rows, 64), max_seqs=4, max_model_len=layer.max_model_len,
+    )
+    session = PreparationSession(device=device, autotune=False)
+    units = layer.get_b12x_preparation_units(layer, workload)
+    requests = tuple(request for unit in units for request in unit.requests)
+    session.prepare(requests, autotune=False)
 
     def run():
         attention.dsa_indexer.quantize_q_mxfp4(iq, q_mxfp4=packed, q_scales=scales)
@@ -484,6 +495,7 @@ def test_attention_shared_scratch_graph_replay(
     graph = torch.cuda.CUDAGraph()
     with (
         workspace.collect_cuda_graph_capture_resources() as resources,
+        session.capture(),
         torch.cuda.graph(graph, stream=stream),
     ):
         run()
@@ -503,9 +515,9 @@ def test_attention_shared_scratch_graph_replay(
             .clone()
         )
         expected_topk[live_rows:] = -1
-        for plan in (*layer._plans.values(), *layer._index_plans.values()):
-            for scratch in attention._scratch(plan):
-                scratch.fill_(0xA5)
+        for plan in layer._index_plans.values():
+            for scratch in attention.dsa_indexer.scratch_specs(plan, device=device):
+                torch.empty(scratch.shape, dtype=scratch.dtype, device=device).fill_(0xA5)
         out.fill_(float("nan"))
         layer.topk_indices_buffer[:rows].fill_(-1)
         graph.replay()
@@ -514,7 +526,9 @@ def test_attention_shared_scratch_graph_replay(
             layer.topk_indices_buffer[:rows], expected_topk, rtol=0, atol=0
         )
     # Keep the collector alive for all replays, as the production graph owner does.
-    del graph, resources
+    graph.reset()
+    session.close()
+    del resources
 
 
 def test_output_projection_uses_fused_block32_path(native_workspace, monkeypatch):
@@ -839,12 +853,14 @@ def test_ced_global_preparation_preserves_full_row_cache_bytes(
 @pytest.mark.parametrize("main_page,swa_page", [(64, 32), (128, 64), (256, 128)])
 @torch.inference_mode()
 def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
-    native_workspace, monkeypatch, main_page, swa_page
+    native_workspace, monkeypatch, request, main_page, swa_page
 ):
-    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from contextlib import ExitStack
     from b12x.attention._shared.mla.compressed_reference import (
         unpack_deepseek_v41_cache_reference,
     )
+    from b12x.preparation import PreparationSession
+    from vllm.utils.b12x import B12xWorkload
 
     attention, manager, workspace = native_workspace
     torch.manual_seed(713)
@@ -972,6 +988,20 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
         )
         return torch.einsum("rhk,kd->rhd", logits.softmax(-1)[..., :-1], values)
 
+    workload = B12xWorkload(
+        stage="state", token_counts=(17, 65, 128), fixed_token_counts=(),
+        output_dtype=torch.bfloat16, max_tokens=128, max_seqs=1,
+        max_model_len=layer.max_model_len,
+    )
+    session = PreparationSession(device=device, autotune=False)
+    owned = ExitStack()
+    request.addfinalizer(owned.close)
+    owned.callback(session.close)
+    units = layer.get_b12x_preparation_units(layer, workload)
+    prep_requests = tuple(pr for unit in units for pr in unit.requests)
+    result = session.prepare(prep_requests, autotune=False)
+    owned.callback(result.close)
+
     run()
     manager.lock()
     stream = torch.cuda.Stream()
@@ -980,40 +1010,44 @@ def test_ced_compact_attention_bounded_oracle_and_frozen_replay(
         run()
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
-    freeze_kernel_resolution("CED attention must replay using capacity-planned kernels")
-    try:
-        with (
-            workspace.collect_cuda_graph_capture_resources() as resources,
-            torch.cuda.graph(graph, stream=stream),
-        ):
-            run()
-        for live in (128, 65, 17):
-            positions.fill_(-1)
-            positions[:live] = torch.arange(boundary, boundary + live, device=device)
-            reqs.fill_(-1)
-            reqs[:live] = 0
-            visible.copy_((positions + 1).clamp_min(0).int())
-            starts[1] = live
-            q.normal_()
-            expected = oracle(live)
-            # Eager under freeze also catches live-count specialization leaks.
-            run()
-            torch.testing.assert_close(
-                out[:live].float(), expected, rtol=0.04, atol=0.025
-            )
-            out.fill_(float("nan"))
-            graph.replay()
-            torch.testing.assert_close(
-                out[:live].float(), expected, rtol=0.04, atol=0.025
-            )
-            torch.testing.assert_close(
-                out[live:], torch.zeros_like(out[live:]), rtol=0, atol=0
-            )
-            selected = layer.topk_indices_buffer[:live]
-            assert torch.all((selected < 0) | (selected <= positions[:live, None]))
-    finally:
-        unfreeze_kernel_resolution()
-    del graph, resources
+    owned.callback(graph.reset)
+    resources = None
+    with session.capture():
+        try:
+            with (
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.graph(graph, stream=stream),
+            ):
+                run()
+            for live in (128, 65, 17):
+                positions.fill_(-1)
+                positions[:live] = torch.arange(boundary, boundary + live, device=device)
+                reqs.fill_(-1)
+                reqs[:live] = 0
+                visible.copy_((positions + 1).clamp_min(0).int())
+                starts[1] = live
+                q.normal_()
+                expected = oracle(live)
+                # Eager under the scoped guard also catches live-count specialization leaks.
+                run()
+                torch.testing.assert_close(
+                    out[:live].float(), expected, rtol=0.04, atol=0.025
+                )
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.testing.assert_close(
+                    out[:live].float(), expected, rtol=0.04, atol=0.025
+                )
+                torch.testing.assert_close(
+                    out[live:], torch.zeros_like(out[live:]), rtol=0, atol=0
+                )
+                selected = layer.topk_indices_buffer[:live]
+                assert torch.all(
+                    (selected < 0) | (selected <= positions[:live, None])
+                )
+        finally:
+            graph.reset()
+            del resources
 
 
 @pytest.mark.parametrize("swa_page", [32, 64, 128])

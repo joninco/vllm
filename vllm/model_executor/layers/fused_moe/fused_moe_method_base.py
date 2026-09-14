@@ -150,10 +150,36 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     def prepare_workspace(
         self, hidden_states: torch.Tensor, shared_workspace_size: int
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
-        """Reserve disjoint routed/shared scratch before either branch runs."""
-        raise NotImplementedError(
-            "This MoE backend cannot coordinate arena-backed shared-expert scratch"
+        """Reserve disjoint routed/shared scratch before either branch runs.
+
+        Any modular kernel leases both from the workspace manager in one call,
+        so the shared experts never draw a view that overlaps the routed
+        experts' buffers while the two branches run on different streams.
+        """
+        kernel = self.moe_kernel
+        impl = getattr(kernel, "impl", None)
+        if not isinstance(impl, mk.FusedMoEKernelModularImpl):
+            raise NotImplementedError(
+                "This MoE backend cannot coordinate arena-backed shared-expert scratch"
+            )
+        rows = hidden_states.shape[0]
+        workspace, shared_workspace = impl._allocate_buffers(
+            hidden_states.dtype,
+            impl.fused_experts.output_dtype,
+            hidden_states.device,
+            rows,
+            rows,
+            self.moe.intermediate_size_per_partition,
+            self.moe.hidden_dim,
+            self.moe.experts_per_token,
+            self.moe.num_experts,
+            self.moe.num_local_experts,
+            None,
+            self.moe.activation,
+            shared_workspace_size,
         )
+        assert shared_workspace is not None
+        return workspace, shared_workspace
 
     def apply_with_workspace(
         self,
@@ -165,7 +191,15 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         shared_experts_input: torch.Tensor | None,
         workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        raise NotImplementedError("This MoE backend cannot consume reserved scratch")
+        return self.apply(
+            layer,
+            x,
+            topk_weights,
+            topk_ids,
+            shared_experts,
+            shared_experts_input,
+            workspace=workspace,
+        )
 
     def apply(
         self,

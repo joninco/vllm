@@ -19,7 +19,16 @@ import torch
 import torch.nn as nn
 from b12x.gemm import block_fp8_linear
 
-import vllm.envs as envs
+from vllm import envs
+from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    b12x_layer_prefix,
+    register_b12x_layer,
+    register_b12x_unit_provider,
+)
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
@@ -97,32 +106,88 @@ class _ContextKVProjection:
                     max_tokens=bound,
                     in_features=fused.weight.shape[1],
                     out_features=fused.weight.shape[0] - start,
-                    block_size=(32, 32),
+                    output_mode="provided",
                 )
             )
             for bound in self.capacities
         )
-        for bound in self.capacities:
-            block_fp8_linear.prewarm(self.weight, (1, bound), expected_m=bound)
+        register_b12x_unit_provider(self)
+
+    def get_b12x_preparation_units(
+        self, layer: object, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if self.weight.weight.values.is_meta:
+            return ()
+
+        def make_call(state, *, bound: int):
+            from b12x.preparation import PreparedCall
+
+            source = torch.zeros(
+                (bound, self.weight.in_features),
+                dtype=torch.bfloat16,
+                device=self.weight.weight.device,
+            )
+            output = torch.empty(
+                (bound, self.weight.out_features, 1),
+                dtype=torch.bfloat16,
+                device=source.device,
+            )
+            scratch = [
+                torch.empty(spec.shape, dtype=spec.dtype, device=source.device)
+                for spec in state.scratch.scratch_specs()
+            ]
+            binding = state.bind(
+                scratch=scratch,
+                source=source,
+                packed_weight=self.weight,
+                output=output,
+            )
+            return PreparedCall(
+                run=lambda: state.run_binding(binding),
+                owners=(source, output, scratch, binding, self.weight),
+            )
+
+        requests = tuple(
+            plan.request(
+                name=f"dspark.context_kv.{id(self):x}.m{bound}",
+                prepare_call=lambda state, bound=bound: make_call(state, bound=bound),
+                benchmark_call=lambda state, bound=bound: make_call(state, bound=bound),
+            )
+            for bound, plan in zip(self.capacities, self.plans)
+        )
+        return (B12xPreparationUnit(
+            name="DSparkContextKV", key=(id(self), self.capacities),
+            requests=requests, stage="state", autotune=not workload.eager_only,
+        ),)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         index = bisect_left(self.capacities, x.shape[0])
         if index == len(self.capacities):
-            raise ValueError("DSpark context rows exceed planned capacity")
+            raise ValueError("DSpark context rows exceed prepared capacity")
+        bound = self.capacities[index]
+        if x.shape[0] != bound:
+            raise ValueError(
+                "DSpark context projection must receive its admitted graph capacity"
+            )
         plan = self.plans[index]
+        if plan.prepared is None:
+            raise PreparationResourceUnavailableError(
+                "DSpark context projection plan is not prepared"
+            )
         out = torch.empty(
-            (x.shape[0], self.weight.out_features),
+            (bound, self.weight.out_features),
             dtype=torch.bfloat16,
             device=x.device,
         )
+        scratch = current_workspace_manager().get_simultaneous(
+            *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
+        )
         binding = block_fp8_linear.bind(
             plan,
-            scratch=current_workspace_manager().get_simultaneous(
-                *plan.shapes_and_dtypes()
-            ),
+            scratch=scratch,
             source=x,
             packed_weight=self.weight,
-            output=out.view(x.shape[0], self.weight.out_features, 1),
+            output=out.view(bound, self.weight.out_features, 1),
         )
         retain_cuda_graph_capture_resource(binding)
         block_fp8_linear.run(binding=binding)
@@ -162,6 +227,7 @@ class DSparkContextCudaGraphs:
         # Powers of two bound padding to less than 2x, independent of live rows.
         capacities = []
         capacity = 1
+
         while capacity < limit:
             capacities.append(capacity)
             capacity *= 2
@@ -240,6 +306,12 @@ class DSparkContextCudaGraphs:
         self.positions[num_tokens:capacity].zero_()
         self.slot_mappings[:, num_tokens:capacity].fill_(PAD_SLOT_ID)
         self.manager.run_fullgraph(desc)
+
+    def close(self) -> None:
+        """Destroy context graphs before their prepared executions are released."""
+        self.manager.reset_graphs()
+        self.manager.graphs.clear()
+        self.manager.graph_capture_resources.clear()
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -657,6 +729,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             first_layer.hc_attn_fn_broadcast = broadcast
         else:
             first_layer.hc_attn_fn_broadcast.copy_(broadcast)
+        for layer in self.model.layers:
+            mhc = getattr(layer, "_b12x_mhc", None)
+            if mhc is not None:
+                set_b12x_preparation_provider(layer, mhc)
+                name = b12x_layer_prefix(layer)
+                register_b12x_layer(name, layer)
+                mhc.bind_layer_name(name)
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.

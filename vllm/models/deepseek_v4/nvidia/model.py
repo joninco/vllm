@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.utils.b12x import set_b12x_preparation_provider
 from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
@@ -1244,7 +1245,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self._b12x_mhc is not None:
             assert self.hc_ffn_fn_bf16 is not None
             self.hc_ffn_fn_bf16.copy_(self.hc_ffn_fn.detach().to(torch.bfloat16))
-
+            # This hook runs only after model.finalize_mhc_broadcast_weights().
+            # It therefore captures the published first-layer broadcast tensor
+            # and the exact loaded attention/FFN operands for this decoder.
+            set_b12x_preparation_provider(self, self._b12x_mhc)
     @property
     def uses_b12x_mhc(self) -> bool:
         return self._b12x_mhc is not None

@@ -72,16 +72,12 @@ def _reference(vision, aligner, patches, height, width):
 def test_native_small_vision_block_aligner_and_image_isolation():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x vision requires SM12x")
-    from b12x._lib.runtime_control import (
-        freeze_kernel_resolution,
-        unfreeze_kernel_resolution,
-    )
-
+    from b12x.preparation import PreparationSession
     from vllm.models.deepseek_v4_1.nvidia.b12x_vision import (
         DeepseekV4Aligner,
         DeepseekV4ViT,
-        warmup_vision_tower,
     )
+    from vllm.utils.b12x import B12xWorkload
 
     config = SimpleNamespace(
         vision_patch_size=2,
@@ -96,40 +92,43 @@ def test_native_small_vision_block_aligner_and_image_isolation():
     )
     torch.manual_seed(411)
     vision, aligner = DeepseekV4ViT(config).cuda(), DeepseekV4Aligner(config).cuda()
+    workload = B12xWorkload(
+        stage="weights", token_counts=(1,), fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=config.vision_max_n_token * config.vision_downsample_ratio**2,
+        max_seqs=1, max_model_len=1,
+    )
+    session = PreparationSession(device=torch.device("cuda"))
+    units = [
+        unit
+        for provider in (vision, aligner)
+        for unit in provider.get_b12x_preparation_units(provider, workload)
+    ]
+    requests = tuple(request for unit in units for request in unit.requests)
+    result = session.prepare(requests)
+    assert result is not None
     with torch.no_grad():
-        for module in (vision, aligner):
-            for name, parameter in module.named_parameters():
-                parameter.normal_(0.0, 0.04)
-                if "norm" in name:
-                    parameter.add_(1.0)
-        # The post-load single-patch warmup must cover larger live images too.
-        warmup_vision_tower(vision, aligner)
         warm = torch.randn(7 * 11, 3, 2, 2, device="cuda", dtype=torch.bfloat16)
         patches = torch.randn(4 * 7, 3, 2, 2, device="cuda", dtype=torch.bfloat16)
-        freeze_kernel_resolution("small vision images share fixed capacity")
-        try:
-            aligner(vision(warm, 7, 11), 7, 11)
-            encoded = vision(patches, 4, 7)
-            actual = aligner(encoded, 4, 7)
-            # A different image contaminates every shared capacity buffer. The
-            # next call must still match this image's isolated bidirectional oracle.
-            vision(warm * 4, 7, 11)
-            repeated = vision(patches, 4, 7)
-            torch.testing.assert_close(repeated, encoded, atol=0, rtol=0)
-            graph = torch.cuda.CUDAGraph()
-            graph_encoded, graph_out = (
-                torch.empty_like(encoded),
-                torch.empty_like(actual),
-            )
-            with torch.cuda.graph(graph):
-                vision(patches, 4, 7, out=graph_encoded)
-                aligner(graph_encoded, 4, 7, out=graph_out)
-            patches.neg_()
-            graph.replay()
-        finally:
-            unfreeze_kernel_resolution()
+        session.freeze()
+        aligner(vision(warm, 7, 11), 7, 11)
+        encoded = vision(patches, 4, 7)
+        actual = aligner(encoded, 4, 7)
+        # A different image contaminates every shared capacity buffer. The
+        # next call must still match this image's isolated bidirectional oracle.
+        vision(warm * 4, 7, 11)
+        repeated = vision(patches, 4, 7)
+        torch.testing.assert_close(repeated, encoded, atol=0, rtol=0)
+        graph = torch.cuda.CUDAGraph()
+        graph_encoded, graph_out = torch.empty_like(encoded), torch.empty_like(actual)
+        with torch.cuda.graph(graph):
+            vision(patches, 4, 7, out=graph_encoded)
+            aligner(graph_encoded, 4, 7, out=graph_out)
+        patches.neg_()
+        graph.replay()
         expected_encoded, expected_aligned = _reference(vision, aligner, patches, 4, 7)
         torch.testing.assert_close(
             graph_encoded, expected_encoded, atol=0.025, rtol=0.025
         )
         torch.testing.assert_close(graph_out, expected_aligned, atol=0.02, rtol=0.025)
+    session.close()

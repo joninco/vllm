@@ -36,6 +36,31 @@ from vllm.platforms import current_platform
 DEFAULT_VOCAB_PADDING_SIZE = 64
 logger = init_logger(__name__)
 
+def _register_b12x_embedding_collective(owner, prefix: str, width: int,
+                                        tp_size: int) -> None:
+    if tp_size <= 1:
+        return
+    from vllm.distributed.parallel_state import register_b12x_collective_describer
+
+    def describe(requirements):
+        if not prefix:
+            raise ValueError(
+                "B12X embedding collective preparation requires a stable module prefix"
+            )
+        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+            B12xPcieInvocation,
+        )
+        return tuple(
+            B12xPcieInvocation(
+                name=f"{prefix}.embedding_all_reduce.m{rows}",
+                operation="all_reduce", shape=(rows, width),
+                dtype=requirements.output_dtype,
+            )
+            for rows in requirements.token_counts
+        )
+
+    register_b12x_collective_describer(owner, describe)
+
 
 def _supports_default_lm_head_quantization(
     recipe: Literal["mxfp8", "nvfp4"],
@@ -436,6 +461,9 @@ class VocabParallelEmbedding(PluggableLayer):
             weight_loader=self.weight_loader,
         )
         self.update_param_tp_status()
+        _register_b12x_embedding_collective(
+            self, prefix, self.embedding_dim, self.tp_size,
+        )
 
     def update_param_tp_status(self):
         for param in self.parameters():

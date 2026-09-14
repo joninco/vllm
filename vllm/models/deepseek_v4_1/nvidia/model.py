@@ -51,6 +51,8 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
 from vllm.sequence import IntermediateTensors
+from vllm.utils.b12x import b12x_layer_prefix, register_b12x_layer
+from vllm.utils.b12x import set_b12x_preparation_provider
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -643,7 +645,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
-        assert pre_mix is not None
         hidden_states = collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
@@ -1043,6 +1044,11 @@ class DeepseekV41LLMForCausalLM(
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
         for module in self.modules():
+            if isinstance(module, DeepseekV4DecoderLayer):
+                set_b12x_preparation_provider(module, module._b12x_mhc)
+                name = b12x_layer_prefix(module)
+                register_b12x_layer(name, module)
+                module._b12x_mhc.bind_layer_name(name)
             if isinstance(module, DeepseekV41B12xAttention):
                 module.setup_wo_projection()
             if isinstance(module, Engram):

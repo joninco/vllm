@@ -2,16 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """V4.1 Full/Reindex/Reuse topology with native b12x compute only."""
 
+from dataclasses import replace
+import math
 from typing import cast
 
 import regex as re
 import torch
 from b12x.attention import compressed_sparse_mla as mla
 from b12x.attention import dsa_indexer
-from b12x.attention.compressed_sparse_mla.preparation import rotate
-from b12x.attention.compressed_sparse_mla.weight_scale import (
-    scale_index_weights,
-)
+from b12x.attention.compressed_sparse_mla import rotary, weight_scale
 from b12x.gemm import wo_projection
 from torch import nn
 
@@ -43,6 +42,13 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
     _chunk,
 )
 from vllm.triton_utils import tl, triton
+from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    register_b12x_unit_provider,
+)
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.worker.workspace import (
@@ -74,8 +80,100 @@ def _scratch(plan):
 def _rotated(x, positions, cos_sin_cache, **kwargs):
     # This result can span nested GEMMs, which reuse the workspace arena.
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-    rotate(x, positions, cos_sin_cache, out=out, **kwargs)
+    rotary.rotate(x, positions, cos_sin_cache, out=out, **kwargs)
     return out
+
+
+class _AttentionHelpers:
+    """Loaded-resource owner, independent of unpublished attention caches."""
+
+    def __init__(self, attention):
+        self.attention = attention
+
+    def get_b12x_preparation_units(
+        self, layer: object, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        from b12x.preparation import FrozenMapping, MemoryRequirements, PreparedCall
+        attn = self.attention
+        table = attn.rotary_emb.cos_sin_cache
+        device = table.device
+        attn._declare_attention(device)
+        roles = [("kv", 1, 512, 1), ("q", attn.n_local_heads, 512, 1)]
+        if attn.indexer is not None:
+            roles.append(("index_query", attn.indexer.heads, 128, 1))
+        if attn.compressor is not None:
+            roles.extend((("index_key", 1, 128, attn.compress_ratio),
+                          ("latent", 1, 512, attn.compress_ratio)))
+        plans: dict[str, object] = {}
+        requests = []
+        for role, heads, dim, ratio in roles:
+            query = rotary.Query(
+                max_rows=attn.capacity, heads=heads, dim=dim, ratio=ratio,
+                cos_sin_dtype=str(table.dtype).removeprefix("torch."),
+            )
+            declaration = rotary.plan(query, device=device)
+            if role == "kv":
+                native_memory = declaration._memory_requirements
+                def memory(config, detected, native_memory=native_memory):
+                    return MemoryRequirements.sequential((
+                        native_memory(config, detected), attn._staging_memory(),
+                    ))
+                declaration = replace(
+                    declaration, _memory_requirements=memory,
+                    invocation=FrozenMapping({"vllm_staging": tuple(
+                        (name, shape, str(dtype)) for name, shape, dtype in attn._staging_specs
+                    )}),
+                )
+            plans[role] = declaration
+
+            def prepare(state, heads=heads, dim=dim):
+                attn._prepare(device)
+                source = torch.ones((1, heads, dim), dtype=torch.bfloat16, device=device)
+                output = torch.empty_like(source)
+                positions = torch.zeros(1, dtype=torch.int64, device=device)
+                return PreparedCall(run=lambda: state.run(source, positions, table, out=output))
+            requests.append(declaration.request(
+                name=f"{attn.prefix}.helper.{role}", prepare_call=prepare,
+            ))
+        if attn.indexer is not None:
+            declaration = weight_scale.plan(
+                weight_scale.Query(max_elements=attn.capacity * attn.indexer.heads),
+                device=device,
+            )
+            plans["index_weights"] = declaration
+            def prepare_weights(state):
+                source = torch.ones((1, attn.indexer.heads), dtype=torch.bfloat16, device=device)
+                output = torch.empty_like(source)
+                return PreparedCall(run=lambda: state.run(source, out=output))
+            requests.append(declaration.request(
+                name=f"{attn.prefix}.helper.index_weights", prepare_call=prepare_weights,
+            ))
+        cache_roles = [("swa_cache_write", attn.swa_cache_layer.block_size, "swa")]
+        if attn.compressor is not None:
+            cache_roles.append(("indexed_cache_write", attn._main_page, "indexed"))
+        for role, page_size, kind in cache_roles:
+            declaration = mla.plan_cache_writer(
+                mla.CacheWriterQuery(max_rows=attn.capacity, page_size=page_size,
+                                     cache_kind=kind, slot_dtype="int64"),
+                device=device,
+            )
+            plans[role] = declaration
+            def prepare_writer(state, page_size=page_size, kind=kind):
+                source = torch.ones((1, 512), dtype=torch.bfloat16, device=device)
+                cache = torch.empty(
+                    (1, mla.page_nbytes(page_size, cache_kind=kind, cache_format="deepseek_v41")),
+                    dtype=torch.uint8, device=device,
+                )
+                slots = torch.zeros(1, dtype=torch.int64, device=device)
+                return PreparedCall(run=lambda: state.run(source, cache, slots))
+            requests.append(declaration.request(
+                name=f"{attn.prefix}.helper.{role}", prepare_call=prepare_writer,
+            ))
+        attn._helper_plans = plans
+        return (B12xPreparationUnit(
+            name="V41AttentionHelpers", key=(attn.prefix, attn.capacity),
+            requests=tuple(requests), stage="state", autotune=not workload.eager_only,
+        ),)
 
 
 @triton.jit(do_not_specialize=["offset", "stride", "width"])
@@ -295,7 +393,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             from vllm.v1.attention.backends.mla.compressor_utils import (
                 get_dspark_swa_index_width,
             )
-
             self.swa_width = get_dspark_swa_index_width(
                 self.window_size, spec.num_speculative_tokens
             )
@@ -306,6 +403,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.layer_id < len(hf.compress_ratios)
             else 0
         )
+        self._main_page = vllm_config.cache_config.block_size // max(self.compress_ratio, 1)
+        self._main_width = (
+            self.max_model_len + vllm_config.cache_config.block_size - 1
+        ) // vllm_config.cache_config.block_size
+        self._index_page, self._index_width = self._main_page, self._main_width
         self.is_kv_source = self.layer_id in hf.kv_source_layer_ids
         self.is_index_source = self.layer_id in hf.index_source_layer_ids
         self.kv_source_layer_id = (
@@ -434,6 +536,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 ratio=self.compress_ratio,
             )
         self.topk_indices_buffer = topk_indices_buffer
+        self._index_plans: dict[tuple[str, int], object] = {}
+        self._attention_plans: dict[str, object] = {}
+        self._helper_plans: dict[str, object] = {}
+        self._helpers = _AttentionHelpers(self)
+        register_b12x_unit_provider(self._helpers)
+        set_b12x_preparation_provider(self, self)
         self._ready = False
 
     def get_attn_backend(self):
@@ -459,16 +567,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
     def _owner(self):
         return self._context[_source(self.prefix, self.kv_source_layer_id)]
 
-    def _prepare(self, device):
-        if self._ready:
-            return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("V4.1 attention must be warmed before graph capture")
+    def _declare_attention(self, device):
+        """Describe native code and simultaneous metadata without allocating."""
+        from b12x._lib.scratch import ScratchBufferSpec
+        from b12x.preparation import MemoryRequirements
 
-        def alloc(shape, dtype=torch.bfloat16):
-            return torch.empty(shape, dtype=dtype, device=device)
+        def descriptor(tensor, *, page_size, kind):
+            if tensor is None or tensor.numel() == 0:
+                width = mla.page_nbytes(
+                    page_size, cache_kind=kind, cache_format="deepseek_v41",
+                )
+                return {"shape": (1, width), "stride": (width, 1), "alignment": 16, "dtype": "uint8"}
+            return {
+                "shape": tuple(tensor.shape), "stride": tuple(tensor.stride()),
+                "alignment": min(16, tensor.data_ptr() & -tensor.data_ptr()),
+                "dtype": str(tensor.dtype).removeprefix("torch."),
+            }
 
-        c = self.INDEX_CHUNK
         self._main_page = self.config.cache_config.block_size // max(
             self.compress_ratio, 1
         )
@@ -491,13 +606,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self.config.compilation_config.max_cudagraph_capture_size or 0,
         )
         self._attention_workspace_specs = {}
-        self._plans = {}
+        self._attention_declarations = {}
         for mode, capacity in (
             ("decode", min(self.capacity, decode_rows)),
             ("extend", self.capacity),
         ):
-            plan = mla.plan(
-                mla.Caps(
+            caps = mla.Caps(
                     device=device,
                     num_q_heads=self.n_local_heads,
                     max_q_rows=capacity,
@@ -515,89 +629,352 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     decode_row_capacity=capacity if mode == "decode" else None,
                     cache_format="deepseek_v41",
                     use_cuda_graph=True,
-                )
             )
-            self._plans[mode] = plan
-            metadata_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
+            swa_cache = getattr(self.swa_cache_layer, "kv_cache", None)
+            indexed_cache = getattr(self._owner(), "kv_cache", None) if self.compress_ratio else None
+            declaration = mla.plan(
+                caps,
+                invocation=mla.invocation_from_descriptors(
+                    q={"shape": (capacity, self.n_local_heads, 512),
+                       "stride": (self.n_local_heads * 512, 512, 1), "alignment": 16,
+                       "dtype": "bfloat16"},
+                    swa_cache=descriptor(swa_cache, page_size=self.swa_cache_layer.block_size, kind="swa"),
+                    indexed_cache=(
+                        descriptor(indexed_cache, page_size=self._main_page, kind="indexed")
+                        if self.compress_ratio else None
+                    ),
+                    attn_sink_present=True, output_mode="provided",
+                ),
+            )
+            metadata_specs = (
                 ((capacity, self.swa_width), torch.int32),
                 ((capacity,), torch.int32),
                 ((capacity,), torch.int32),
-            ]
-            if self.compress_ratio:
-                metadata_specs.append(((capacity, self._main_width), torch.int32))
-            workspace_specs = tuple(metadata_specs) + tuple(plan.shapes_and_dtypes())
-            self._attention_workspace_specs[mode] = workspace_specs
-            current_workspace_manager().get_simultaneous(*workspace_specs)
-        if self.topk_indices_buffer is None and self.is_index_source:
-            self.topk_indices_buffer = alloc((self.capacity, 512), torch.int32)
-        self._short_index_plan = None
-        if self.indexer is not None:
-            self._index_pages = alloc((c, self._index_width), torch.int32)
-            self._active = torch.full(
-                (1,),
-                self._index_width * self._index_page,
-                dtype=torch.int32,
-                device=device,
             )
-            h = self.indexer.heads
-            self._index_plans = {}
-            for mode in ("decode", "prefill"):
-                plan_rows = self.DECODE_CHUNK if mode == "decode" else c
-                plan = dsa_indexer.plan(
-                    dsa_indexer.Caps(
-                        device=device,
-                        num_q_heads=h,
-                        max_q_rows=plan_rows,
-                        max_page_table_width=self._index_width,
-                        topk=512,
-                        mode=mode,
-                        cache_format="mxfp4",
-                        page_size=self._index_page,
-                        max_candidates=16384
-                        if self.layer_id > self.candidate_source_layer
-                        else 0,
-                        candidate_topk_blocks=2048
-                        if self.layer_id == self.candidate_source_layer
-                        else 0,
-                    )
+            if self.compress_ratio:
+                metadata_specs += (((capacity, self._main_width), torch.int32),)
+            self._attention_workspace_specs[mode] = metadata_specs
+            # These metadata views coexist with native scratch in one arena.
+            # Only integration-owned storage is added; launch policy stays native.
+            def memory(config, detected, native=declaration._memory_requirements,
+                       metadata_specs=metadata_specs, mode=mode):
+                requirement = native(config, detected)
+                metadata = tuple(
+                    ScratchBufferSpec(name=f"{mode}_metadata_{index}", shape=shape,
+                                      dtype=dtype, device=torch.device("cuda", detected.ordinal))
+                    for index, (shape, dtype) in enumerate(metadata_specs)
                 )
-                self._index_plans[mode] = plan
-                _scratch(plan)
-            if (
-                not self.is_ced_decoder
-                and self.capacity > c
-                and self.layer_id < self.candidate_source_layer
-            ):
-                # Short full scans need only the leading logical page columns.
-                # Bound score scratch independently of the model context limit.
-                short_rows = min(1024, self.capacity)
-                short_width = min(
-                    self._index_width, triton.cdiv(16384, self._index_page)
+                return MemoryRequirements(
+                    scratch=(*metadata, *requirement.scratch),
+                    persistent=requirement.persistent,
                 )
-                self._short_index_plan = dsa_indexer.plan(
-                    dsa_indexer.Caps(
-                        device=device,
-                        num_q_heads=h,
-                        max_q_rows=short_rows,
-                        max_page_table_width=short_width,
-                        topk=512,
-                        mode="prefill",
-                        cache_format="mxfp4",
-                        page_size=self._index_page,
-                    )
-                )
-                self._short_index_pages = alloc((short_rows, short_width), torch.int32)
-                _scratch(self._short_index_plan)
+            self._attention_declarations[mode] = replace(
+                declaration, _memory_requirements=memory,
+            )
+        if not hasattr(self, "_owns_topk_indices"):
+            self._owns_topk_indices = self.topk_indices_buffer is None and self.is_index_source
+        specs = []
+        if self._owns_topk_indices:
+            specs.append(("topk_indices_buffer", (self.capacity, 512), torch.int32))
+        if self.indexer is not None:
+            specs.extend((
+                ("_index_pages", (self.INDEX_CHUNK, self._index_width), torch.int32),
+                ("_active", (1,), torch.int32),
+            ))
             if self.layer_id == self.candidate_source_layer:
-                self._candidates = alloc((self.capacity, 16384), torch.int32)
-                self._candidate_lens = alloc((self.capacity,), torch.int32)
-        if self.compressor is not None:
-            self.compressor.prepare(device)
+                specs.extend((
+                    ("_candidates", (self.capacity, 16384), torch.int32),
+                    ("_candidate_lens", (self.capacity,), torch.int32),
+                ))
+        self._short_index_shape = None
+        if (
+            self.indexer is not None
+            and not self.is_ced_decoder
+            and self.capacity > self.INDEX_CHUNK
+            and self.layer_id < self.candidate_source_layer
+        ):
+            short_rows = min(1024, self.capacity)
+            short_width = min(self._index_width, triton.cdiv(16384, self._index_page))
+            self._short_index_shape = (short_rows, short_width)
+            specs.append(("_short_index_pages", self._short_index_shape, torch.int32))
+        self._staging_specs = tuple(specs)
+
+    def _staging_memory(self):
+        from b12x.preparation import MemoryRequirements, PersistentMemory
+        required = resident = 0
+        for name, shape, dtype in self._staging_specs:
+            nbytes = math.prod(shape) * dtype.itemsize
+            required += nbytes
+            tensor = getattr(self, name, None)
+            if tensor is not None and tuple(tensor.shape) == shape and tensor.dtype == dtype:
+                resident += nbytes
+        return MemoryRequirements(persistent=(
+            PersistentMemory(key=(self, "attention_metadata"),
+                             required_nbytes=required, resident_nbytes=resident),
+        ))
+
+    def _prepare(self, device):
+        """Materialize admitted integration-owned metadata, never launch choices."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("V4.1 metadata must be prepared before graph capture")
+        if not hasattr(self, "_staging_specs"):
+            self._declare_attention(device)
+        for name, shape, dtype in self._staging_specs:
+            tensor = getattr(self, name, None)
+            if tensor is None or tuple(tensor.shape) != shape or tensor.dtype != dtype:
+                setattr(self, name, torch.empty(shape, dtype=dtype, device=device))
+        if self.indexer is not None:
+            self._active.fill_(self._index_width * self._index_page)
         self._ready = True
 
+
+    def _index_request_name(self, mode: str, rows: int) -> str:
+        return f"{self.prefix}.mxfp4_index.{mode}.m{rows}"
+
+    def get_b12x_preparation_units(
+        self, layer: object, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        device = self.rotary_emb.cos_sin_cache.device
+        self._declare_attention(device)
+        index_declarations = {}
+        if self.indexer is not None:
+            regimes = [
+                ("decode", self.DECODE_CHUNK, self._index_width),
+                ("prefill", self.INDEX_CHUNK, self._index_width),
+            ]
+            if self._short_index_shape is not None:
+                regimes.append(("prefill_short", *self._short_index_shape))
+            for mode, chunk, width in regimes:
+                counts = set() if mode == "prefill_short" else set(workload.token_counts)
+                counts.update(min(rows, chunk) for rows in workload.token_counts)
+                counts.update(rows % chunk for rows in workload.token_counts if rows % chunk)
+                for rows in sorted(counts):
+                    caps = dsa_indexer.Caps(
+                        device=device, num_q_heads=self.indexer.heads, max_q_rows=rows,
+                        max_page_table_width=width, topk=512,
+                        mode="decode" if mode == "decode" else "prefill",
+                        cache_format="mxfp4", page_size=self._index_page,
+                        max_candidates=16384 if self.layer_id > self.candidate_source_layer else 0,
+                        candidate_topk_blocks=2048 if self.layer_id == self.candidate_source_layer else 0,
+                    )
+                    index_declarations[mode, rows] = dsa_indexer.plan(caps)
+
+        caches = [getattr(self.swa_cache_layer, "kv_cache", None)]
+        if self.compress_ratio:
+            caches.append(getattr(self._owner(), "kv_cache", None))
+        if self.indexer is not None:
+            caches.append(getattr(self.indexer.k_cache, "kv_cache", None))
+        if any(cache is None or cache.numel() == 0 for cache in caches):
+            return ()
+        self._index_plans = dict(index_declarations)
+        requests = [
+            declaration.request(
+                name=self._index_request_name(mode, rows),
+                prepare_call=self._index_call(mode, rows),
+                benchmark_call=self._index_call(mode, rows),
+                collective=self._index_collective(),
+            )
+            for (mode, rows), declaration in index_declarations.items()
+        ]
+        self._attention_plans = dict(self._attention_declarations)
+        for mode, declaration in self._attention_declarations.items():
+            capacity = declaration.query.query_rows
+            requests.append(
+                declaration.request(
+                    name=f"{self.prefix}.mla.{mode}.m{capacity}",
+                    prepare_call=self._attention_call(mode, capacity),
+                    benchmark_call=self._attention_call(mode, capacity),
+                )
+            )
+        return (B12xPreparationUnit(
+            name="V41Attention", key=(self.prefix, workload.token_counts),
+            requests=tuple(requests), stage="state", autotune=not workload.eager_only,
+        ),)
+
+    def _attention_call(self, mode: str, rows: int):
+        def prepare(state):
+            from b12x.preparation import PreparedCall
+
+            device = self.swa_cache_layer.kv_cache.device
+            source = torch.randn((rows, self.n_local_heads, 512),
+                                 dtype=torch.bfloat16, device=device)
+            q = torch.empty_like(source)
+            out = torch.empty_like(source)
+            # Trial scratch belongs to the trial; the serving workspace is
+            # never drawn from while candidates are timed.
+            scratch = [
+                torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                for spec in state.scratch_plan.scratch_specs()
+            ]
+            snapshots = []
+            initializers = []
+
+            def cache_inputs(cache, page_size, width, kind):
+                pages = min(cache.shape[0], self._main_width if kind == "indexed"
+                            else triton.cdiv(width, page_size))
+                if pages < 1:
+                    raise PreparationResourceUnavailableError("attention primer needs a live cache page")
+                live = cache[:pages]
+                snapshots.append((live, live.clone()))
+                records = live.view(pages, page_size, -1)
+                if kind == "swa":
+                    payload = torch.randn((pages, page_size, 512), device=device).mul_(0.25)
+                    initializers.append((records, payload.to(torch.float8_e4m3fn).view(torch.uint8), 512, 127))
+                else:
+                    payload = torch.randint(0, 256, (pages, page_size, 256),
+                                            dtype=torch.uint8, device=device)
+                    initializers.append((records, payload, 256, 56))
+                count = min(width, pages * page_size)
+                indices = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+                indices[:, :count] = torch.arange(count, dtype=torch.int32, device=device)
+                lengths = torch.full((rows,), count, dtype=torch.int32, device=device)
+                return indices, lengths, pages
+
+            swa_indices, swa_lengths, _ = cache_inputs(
+                self.swa_cache_layer.kv_cache, self.swa_cache_layer.block_size,
+                self.swa_width, "swa",
+            )
+            kwargs = {}
+            if self.compress_ratio:
+                indices, lengths, pages = cache_inputs(
+                    self._owner().kv_cache, self._main_page, 512, "indexed",
+                )
+                table = torch.full((rows, self._main_width), -1, dtype=torch.int32, device=device)
+                table[:, :pages] = torch.arange(pages, dtype=torch.int32, device=device)
+                kwargs = dict(indexed_indices=indices, indexed_lengths=lengths,
+                              indexed_page_table=table)
+            binding = state.bind_for_preparation(
+                scratch=scratch, q=q, swa_indices=swa_indices,
+                swa_lengths=swa_lengths, **kwargs,
+            )
+
+            def reset():
+                for target, payload, width, scale in initializers:
+                    target[..., :width].copy_(payload)
+                    target[..., width:].fill_(scale)
+                out.fill_(float("nan"))
+
+            def restore():
+                from b12x.preparation.types import _close_all
+                _close_all(
+                    (lambda target=target, saved=saved: target.copy_(saved))
+                    for target, saved in snapshots
+                )
+
+            return PreparedCall(
+                run=lambda: state.run(
+                    binding, swa_k_cache=self.swa_cache_layer.kv_cache,
+                    indexed_k_cache=self._owner().kv_cache if self.compress_ratio else None,
+                    swa_page_size=self.swa_cache_layer.block_size,
+                    indexed_page_size=self._main_page,
+                    sm_scale=512**-0.5, attn_sink=self.attn_sink, out=out,
+                    cache_format="deepseek_v41",
+                ),
+                output=out, produce=lambda: q.copy_(source),
+                reset=reset, restore=restore,
+            )
+        return prepare
+
+    def _index_collective(self):
+        if get_tensor_model_parallel_world_size() == 1:
+            return None
+        from b12x.preparation import CollectiveRequirement
+        return CollectiveRequirement(
+            key=f"{self.prefix}.mxfp4_index.tp",
+            ranks=tuple(sorted(int(rank) for rank in get_tp_group().ranks)),
+        )
+
+    def _index_call(self, mode: str, rows: int):
+        def prepare(state):
+            from b12x.attention.dsa_indexer.mxfp4 import score_mxfp4, select_mxfp4
+            from b12x.preparation import PreparedCall
+
+            cache = self.indexer.k_cache.kv_cache
+            device, heads = cache.device, self.indexer.heads
+            width = state.query.max_page_table_width
+            live_pages = min(cache.shape[0], width)
+            if live_pages < 1:
+                raise PreparationResourceUnavailableError("indexer primer needs a live cache page")
+            live_tokens = live_pages * self._index_page
+            saved_cache = cache[:live_pages].clone()
+            keys = torch.randn((live_tokens, 128), dtype=torch.bfloat16, device=device)
+            slots = torch.arange(live_tokens, dtype=torch.int64, device=device)
+            source = torch.randn((rows, heads, 128), dtype=torch.bfloat16, device=device)
+            q = torch.empty((rows, heads, 64), dtype=torch.uint8, device=device)
+            scales = torch.empty((rows, heads, 4), dtype=torch.uint8, device=device)
+            weights = torch.full((rows, heads), 1 / 64, dtype=torch.bfloat16, device=device)
+            pages = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+            pages[:, :live_pages] = torch.arange(live_pages, dtype=torch.int32, device=device)
+            lengths = torch.full((rows,), live_tokens, dtype=torch.int32, device=device)
+            active = torch.full((1,), live_tokens, dtype=torch.int32, device=device)
+            indices = torch.empty((rows, 512), dtype=torch.int32, device=device)
+            kwargs = {}
+            if self.layer_id == self.candidate_source_layer:
+                kwargs = dict(
+                    candidate_output=torch.empty((rows, 16384), dtype=torch.int32, device=device),
+                    candidate_output_lengths=torch.empty((rows,), dtype=torch.int32, device=device),
+                )
+            elif self.layer_id > self.candidate_source_layer:
+                count = min(16384, live_tokens)
+                candidates = torch.full((rows, 16384), -1, dtype=torch.int32, device=device)
+                candidates[:, :count] = torch.arange(count, dtype=torch.int32, device=device)
+                kwargs = dict(
+                    candidate_indices=candidates,
+                    candidate_lengths=torch.full((rows,), count, dtype=torch.int32, device=device),
+                )
+            scratch = [
+                torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                for spec in state.layout.scratch_specs()
+            ]
+            binding = state.bind(
+                scratch=scratch, q_mxfp4=q, q_scales=scales, query_weights=weights,
+                index_k_cache=cache, page_table=pages, cache_lengths=lengths,
+                active_width=active, output_indices=indices, **kwargs,
+            )
+
+            def run():
+                scores = score_mxfp4(binding, launchers=state._launchers)
+                if get_tensor_model_parallel_world_size() > 1:
+                    get_tp_group().all_reduce(scores)
+                return select_mxfp4(binding, launchers=state._launchers)
+
+            return PreparedCall(
+                run=run, output=indices,
+                produce=lambda: state.quantize_query(source, q_mxfp4=q, q_scales=scales),
+                reset=lambda: state.write_index_keys(keys, index_k_cache=cache, slot_mapping=slots),
+                restore=lambda: cache[:live_pages].copy_(saved_cache),
+            )
+        return prepare
+
+    def _helper_plan(self, role: str):
+        try:
+            return self._helper_plans[role]
+        except KeyError:
+            raise PreparationResourceUnavailableError(
+                f"{self.prefix} lacks a declared {role} attention helper plan"
+            ) from None
+
+    def _attention_plan(self, mode: str):
+        try:
+            return self._attention_plans[mode]
+        except KeyError:
+            raise PreparationResourceUnavailableError(
+                f"{self.prefix} lacks a declared {mode} MLA attention plan"
+            ) from None
+
+    def _index_plan(self, mode: str, rows: int):
+        try:
+            return self._index_plans[(mode, rows)]
+        except KeyError:
+            raise PreparationResourceUnavailableError(
+                f"{self.prefix} lacks a declared MXFP4 {mode} indexer plan for {rows} rows") from None
     def insert_context_kv(self, kv, positions, slot_mapping):
-        self._prepare(kv.device)
-        rotated = _rotated(kv, positions, self.rotary_emb.cos_sin_cache)
+        if not self._ready:
+            raise PreparationResourceUnavailableError("V4.1 attention metadata is not prepared")
+        rotated = _rotated(
+            kv, positions, self.rotary_emb.cos_sin_cache,
+            plan=self._helper_plan("kv"),
+        )
         mla.write_cache(
             rotated,
             self.swa_cache_layer.kv_cache,
@@ -605,6 +982,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             page_size=self.swa_cache_layer.block_size,
             cache_kind="swa",
             cache_format="deepseek_v41",
+            plan=self._helper_plan("swa_cache_write"),
         )
 
     def _query_metadata(self, metadata):
@@ -628,7 +1006,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
     @eager_break_during_capture
     def _prepare_global_kv(self, positions, hidden_states):
-        self._prepare(hidden_states.device)
+        if not self._ready:
+            raise PreparationResourceUnavailableError("V4.1 attention metadata is not prepared")
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or self.compressor is None:
             return
@@ -650,20 +1029,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             key,
             positions,
             self.rotary_emb.cos_sin_cache,
-            ratio=self.compress_ratio,
+            plan=self._helper_plan("index_key"),
         )
         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
         dsa_indexer.quantize_write_index_k_mxfp4(
+            self._index_plan("prefill", rows),
             key,
             index_k_cache=indexer.k_cache.kv_cache,
             slot_mapping=index_meta.slot_mapping[:rows],
-            page_size=self._index_page,
         )
         latent = _rotated(
             latent,
             positions,
             self.rotary_emb.cos_sin_cache,
-            ratio=self.compress_ratio,
+            plan=self._helper_plan("latent"),
         )
         mla.write_cache(
             latent,
@@ -672,6 +1051,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             page_size=self._main_page,
             cache_kind="indexed",
             cache_format="deepseek_v41",
+            plan=self._helper_plan("indexed_cache_write"),
         )
 
     def forward(
@@ -682,13 +1062,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         return _attention(hidden_states, positions, self.prefix, global_kv_ready)
 
     def _forward(self, positions, hidden_states):
-        self._prepare(hidden_states.device)
+        if not self._ready:
+            raise PreparationResourceUnavailableError("V4.1 attention metadata is not prepared")
         rows = hidden_states.shape[0]
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
         qr, kv = self.q_norm(qr), self.kv_norm(kv)
         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
-        q = _rotated(q, positions, self.rotary_emb.cos_sin_cache)
+        q = _rotated(
+            q, positions, self.rotary_emb.cos_sin_cache,
+            plan=self._helper_plan("q"),
+        )
         output = torch.empty_like(q)
         metadata = cast(
             dict[str, DeepseekV41B12xMetadata] | None,
@@ -709,13 +1093,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             if self.indexer is not None:
                 h = self.indexer.heads
                 iq = self.indexer.wq_b(qr).view(rows, h, 128)
-                iq = _rotated(iq, positions, self.rotary_emb.cos_sin_cache)
+                iq = _rotated(
+                    iq, positions, self.rotary_emb.cos_sin_cache,
+                    plan=self._helper_plan("index_query"),
+                )
                 iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=q.device)
                 iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=q.device)
-                dsa_indexer.quantize_q_mxfp4(iq, q_mxfp4=iq_data, q_scales=iq_scale)
+                dsa_indexer.quantize_q_mxfp4(
+                    self._index_plan("decode" if swa.is_decode else "prefill", rows),
+                    iq,
+                    q_mxfp4=iq_data,
+                    q_scales=iq_scale,
+                )
                 weights = self.indexer.weights_proj(hidden_states)
                 iw = torch.empty_like(weights)
-                scale_index_weights(weights, out=iw)
+                weight_scale.scale_index_weights(
+                    weights, out=iw, plan=self._helper_plan("index_weights"),
+                )
                 index_query = (iq_data, iq_scale, iw)
             self.forward_mqa(q, kv, positions, output, index_query=index_query)
         return self._o_proj(output, positions, is_prefill=is_prefill)
@@ -731,11 +1125,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         )
         mode = "decode" if swa.is_decode else "extend"
         rows = q.shape[0]
-        plan = self._plans[mode]
-        if rows > plan.caps.max_q_rows:
+        from b12x.preparation import require_prepared
+
+        plan = self._attention_plan(mode)
+        state = require_prepared(plan, "attention.compressed_sparse_mla")
+        if rows > state.query.query_rows:
             raise ValueError(
-                f"V4.1 {mode} rows {rows} exceed planned capacity "
-                f"{plan.caps.max_q_rows}"
+                f"V4.1 {mode} rows {rows} exceed prepared capacity "
+                f"{state.query.query_rows}"
             )
         owner = (
             self._context[_source(self.prefix, self.index_source_layer_id)]
@@ -749,7 +1146,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             index_mode = "decode" if mode == "decode" else "prefill"
             iq_data, iq_scale, iw = index_query
             im = self._query_metadata(metadata[self.indexer.k_cache.prefix])
-            index_plan = self._index_plans[index_mode]
             score_width = None
             if (
                 mode == "extend"
@@ -766,12 +1162,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 mode == "extend"
                 and score_width is not None
                 and score_width <= 16384
-                and self._short_index_plan is not None
+                and self._short_index_shape is not None
             ):
-                index_plan = self._short_index_plan
-                chunk_rows = index_plan.caps.max_q_rows
+                index_mode = "prefill_short"
+                chunk_rows = self._short_index_shape[0]
                 index_pages = self._short_index_pages
-            index_width = index_plan.caps.max_page_table_width
+            index_width = index_pages.shape[1]
             for offset in range(0, rows, chunk_rows):
                 end = min(offset + chunk_rows, rows)
                 count = end - offset
@@ -799,10 +1195,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                         candidate_indices=source._candidates[offset:end],
                         candidate_lengths=source._candidate_lens[offset:end],
                     )
-                # All replicated heads are ranked locally in one scratch borrow.
+                index_plan = self._index_plan(index_mode, count)
                 binding = dsa_indexer.bind(
                     index_plan,
-                    scratch=_scratch(index_plan),
+                    scratch=current_workspace_manager().get_simultaneous(
+                        *((spec.shape, spec.dtype)
+                          for spec in dsa_indexer.scratch_specs(
+                              index_plan, device=iq_data.device))),
                     q_mxfp4=iq_data[offset:end],
                     q_scales=iq_scale[offset:end],
                     query_weights=iw[offset:end],
@@ -815,13 +1214,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     **candidate_args,
                 )
                 retain_cuda_graph_capture_resource(binding)
-                dsa_indexer.score(binding)
+                scores = dsa_indexer.score(binding)
+                if get_tensor_model_parallel_world_size() > 1:
+                    get_tp_group().all_reduce(scores)
                 dsa_indexer.select(binding)
 
         # Reuse the shared arena only after indexing completes. Keep full-batch
         # metadata beside, not overlapping, the native attention scratch.
         buffers = current_workspace_manager().get_simultaneous(
-            *self._attention_workspace_specs[mode]
+            *self._attention_workspace_specs[mode],
+            *((spec.shape, spec.dtype) for spec in state.scratch_plan.scratch_specs()),
         )
         swa_indices, swa_lengths, top_lengths = buffers[:3]
         visible = main.cache_lengths if main is not None else swa.cache_lengths

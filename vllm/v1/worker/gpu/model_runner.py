@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -166,7 +167,11 @@ from vllm.v1.worker.utils import (
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
 )
-from vllm.v1.worker.workspace import use_workspace_lane
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    lock_workspace,
+    use_workspace_lane,
+)
 
 logger = init_logger(__name__)
 
@@ -905,6 +910,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             reserve = getattr(module, "reserve_profile_scratch", None)
             if reserve is not None:
                 reserve()
+        current_workspace_manager().reserve_all()
 
     @torch.inference_mode()
     def profile_run(self) -> None:
@@ -944,6 +950,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
         self._profile_deepseek_v4_attention()
+        current_workspace_manager().reserve_all()
         self.reset_encoder_cache()
         gc.collect()
 
@@ -1022,9 +1029,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pooling_runner.clear()
 
     @torch.inference_mode()
-    def profile_cudagraph_memory(self) -> int:
+    def profile_cudagraph_memory(
+        self, prepare_profile_state: Callable[[], None] | None = None
+    ) -> int:
         """Estimate the GPU memory required to capture CUDA graphs."""
-        return _profile_cudagraph_memory(self)
+        return _profile_cudagraph_memory(self, prepare_profile_state)
 
     @torch.inference_mode()
     def capture_model(self) -> int:
@@ -1077,6 +1086,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         ):
                             self._dummy_run(**batch)
                     self.adaptive_verification.set_initial_cost_curves(timings)
+
+        # Captured graphs replay fixed workspace addresses; growth after this
+        # point is an error rather than a silent pointer change.
+        lock_workspace()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]

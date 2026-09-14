@@ -10,11 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from b12x._lib.runtime_control import (
-    freeze_kernel_resolution,
-    kernel_resolution_frozen,
-    unfreeze_kernel_resolution,
-)
+from b12x._lib.runtime_control import kernel_resolution_guard
+from b12x.preparation import PreparationSession
 from b12x.sequence import engram as native
 from safetensors.torch import save_file
 from torch import nn
@@ -23,11 +20,8 @@ from vllm.config.engram import EngramConfig
 from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader import default_loader, weight_utils
 from vllm.model_executor.models.utils import WeightsMapper
-from vllm.models.deepseek_v4_1.common.engram import (
-    Engram,
-    NgramHashState,
-    ParallelEngramEmbedding,
-)
+from vllm.utils.b12x import B12xWorkload
+from vllm.models.deepseek_v4_1.common.engram import Engram, NgramHashState, ParallelEngramEmbedding
 from vllm.models.deepseek_v4_1.common.mm_preprocess import image_sentinel_mask
 from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4_1.nvidia.model import (
@@ -95,17 +89,30 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
         weights.update(layer_weights)
 
     def make_model(memory, *, tp_size=1, tp_rank=0, resident_scales=False):
-        local_plans = tuple(
-            native.plan(
-                replace(plan.caps, tp_size=tp_size, tp_rank=tp_rank),
-                token_map=list(range(32)),
-                geometry=geometry,
-            )
-            for plan in plans
+        session = PreparationSession(device=torch.device("cuda"), autotune=False)
+        local_caps = tuple(
+            replace(plan.caps, tp_size=tp_size, tp_rank=tp_rank) for plan in plans
         )
         layout = SimpleNamespace(
-            plans=local_plans,
+            caps=local_caps,
+            hash_plans=tuple(
+                native.plan(caps, token_map=list(range(32)), geometry=geometry)
+                for caps in local_caps
+            ),
+            lookup_plans=tuple(
+                native.plan(
+                    caps,
+                    token_map=list(range(32)),
+                    geometry=geometry,
+                    invocation={
+                        "operation": "lookup", "compact_rows": memory == "disk",
+                        "resident_scales": resident_scales,
+                    },
+                )
+                for caps in local_caps
+            ),
             layer_ids=geometry.layer_ids,
+            geometry=geometry,
             table_memory=memory,
             disk_resident_scales=resident_scales,
         )
@@ -149,10 +156,7 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
         root.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
             "fp4", "weight_scale_inv"
         )
-        return root, target
-
-    return make_model, weights, paths
-
+        return root, target, session
 
 def _engrams(target):
     return tuple(
@@ -172,6 +176,27 @@ def _load_checkpoint(root, directory, load_format="safetensors"):
         )
 
 
+def _prepare_engram(session, target):
+    workload = B12xWorkload(
+        stage="state",
+        token_counts=(8,),
+        fixed_token_counts=(),
+        output_dtype=torch.bfloat16,
+        max_tokens=8,
+        max_seqs=2,
+        max_model_len=8,
+    )
+    providers = (target.engram_hash, *_engrams(target))
+    units = [
+        unit
+        for provider in providers
+        for unit in provider.get_b12x_preparation_units(provider, workload)
+    ]
+    requests = tuple(request for unit in units for request in unit.requests)
+    result = session.prepare(requests, autotune=False)
+    assert result is not None
+    return result
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "load_format", ["safetensors", "fastsafetensors", "instanttensor"]
@@ -186,7 +211,7 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
 ):
     """Raw table entries never reach payload readers or placeholder parameters."""
     make_model, weights, _ = tiny_engram_checkpoint
-    root, target = make_model(table_memory)
+    root, target, session = make_model(table_memory)
     real_open = weight_utils.safe_open
 
     @contextmanager
@@ -209,6 +234,7 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
     monkeypatch.setattr(weight_utils, "safe_open", guarded_open)
     monkeypatch.setattr(default_loader, f"{load_format}_weights_iterator", forbid_bulk)
     _load_checkpoint(root, tmp_path, load_format)
+    _prepare_engram(session, target)
     for layer_id, engram in zip(target.engram_layout.layer_ids, _engrams(target)):
         for name in ("q_weight", "k_weight", "wkv.weight"):
             actual = engram.get_parameter(name)
@@ -232,6 +258,7 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
             atol=0,
         )
         assert torch.count_nonzero(engram.staged_rows[3:]) == 0
+    session.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -244,8 +271,9 @@ def test_ram_engram_checkpoint_tp4_graph_reads_live_host_aliases(
     from cuda.bindings import runtime as cudart
 
     make_model, weights, paths = tiny_engram_checkpoint
-    root, target = make_model("ram", tp_size=4, tp_rank=tp_rank)
+    root, target, session = make_model("ram", tp_size=4, tp_rank=tp_rank)
     _load_checkpoint(root, tmp_path)
+    _prepare_engram(session, target)
     embedding = _engrams(target)[0].embed_tokens
     plan = embedding.plan
     prefix = f"layers.{plan.caps.layer_id}.engram.embed."
@@ -320,52 +348,51 @@ def test_ram_engram_checkpoint_tp4_graph_reads_live_host_aliases(
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    was_frozen = kernel_resolution_frozen()
     graph = torch.cuda.CUDAGraph()
     resources = []
-    try:
-        with torch.cuda.stream(stream):
-            embedding.lookup_native(ids, out)
-            stream.synchronize()
-            torch.testing.assert_close(out.cpu(), expected_output(), rtol=0, atol=0)
-            freeze_kernel_resolution("RAM Engram graph replay")
-            with (
-                collect_cuda_graph_capture_resources() as resources,
-                torch.cuda.graph(graph, stream=stream),
-            ):
+    with kernel_resolution_guard("RAM Engram graph replay"):
+        try:
+            with torch.cuda.stream(stream):
                 embedding.lookup_native(ids, out)
-            # No checkpoint file or model reference is needed after capture.
-            # Only the graph resource collector may retain the mapped owners.
-            del embedding, target, root
-            for path in paths:
-                path.unlink()
-            gc.collect()
-            assert_mapped_pointers()
-            graph.replay()
-            stream.synchronize()
-            torch.testing.assert_close(out.cpu(), expected_output(), rtol=0, atol=0)
+                stream.synchronize()
+                torch.testing.assert_close(out.cpu(), expected_output(), rtol=0, atol=0)
+                with (
+                    collect_cuda_graph_capture_resources() as resources,
+                    session.capture(),
+                    torch.cuda.graph(graph, stream=stream),
+                ):
+                    embedding.lookup_native(ids, out)
+                # No checkpoint file or model reference is needed after capture.
+                # Only the graph resource collector may retain the mapped owners.
+                del embedding, target, root
+                for path in paths:
+                    path.unlink()
+                gc.collect()
+                assert_mapped_pointers()
+                graph.replay()
+                stream.synchronize()
+                torch.testing.assert_close(out.cpu(), expected_output(), rtol=0, atol=0)
 
-            # Finish every GPU read before mutating write-combined CPU aliases.
-            # Change both planes to detect a stale device copy of either one.
-            torch.cuda.synchronize(plan.caps.device)
-            host_weight[0].copy_(torch.full((256,), -4.0).to(torch.float8_e4m3fn))
-            host_scale[0].view(torch.uint8).fill_(129)
-            decoded[plan.shard_start].fill_(-16.0)
-            graph.replay()
-            stream.synchronize()
-            torch.testing.assert_close(out.cpu(), expected_output(), rtol=0, atol=0)
+                # Finish every GPU read before mutating write-combined CPU aliases.
+                # Change both planes to detect a stale device copy of either one.
+                torch.cuda.synchronize(plan.caps.device)
+                host_weight[0].copy_(torch.full((256,), -4.0).to(torch.float8_e4m3fn))
+                host_scale[0].view(torch.uint8).fill_(129)
+                decoded[plan.shard_start].fill_(-16.0)
+                graph.replay()
+                stream.synchronize()
+                torch.testing.assert_close(out.cpu(), expected_output(), rtol=0, atol=0)
 
-            ids_cpu.fill_(-1)
-            ids.copy_(ids_cpu)
-            graph.replay()
+                ids_cpu.fill_(-1)
+                ids.copy_(ids_cpu)
+                graph.replay()
+                stream.synchronize()
+                torch.testing.assert_close(out.cpu(), expected_output(), rtol=0, atol=0)
+        finally:
             stream.synchronize()
-            torch.testing.assert_close(out.cpu(), expected_output(), rtol=0, atol=0)
-    finally:
-        stream.synchronize()
-        graph.reset()
-        resources.clear()
-        if not was_frozen:
-            unfreeze_kernel_resolution()
+            graph.reset()
+            resources.clear()
+            session.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -378,16 +405,15 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
 ):
     """Accepted GPU history, images, padding and failures cross the eager boundary."""
     make_model, weights, paths = tiny_engram_checkpoint
-    root, target = make_model(
-        "disk",
-        resident_scales=resident_scales,
-    )
-    resident_root, resident = make_model("device")
+    root, target, session = make_model("disk", resident_scales=resident_scales)
+    resident_root, resident, resident_session = make_model("device")
     _load_checkpoint(root, tmp_path)
     with torch.no_grad():
         resident_root.load_weights(weights.items())
         for engram in (*_engrams(target), *_engrams(resident)):
             engram.process_weights_after_loading()
+    _prepare_engram(session, target)
+    _prepare_engram(resident_session, resident)
 
     state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
     state.ced_state = None
@@ -519,6 +545,8 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
         for output in actual:
             torch.testing.assert_close(output, hidden, rtol=0, atol=0)
     torch.cuda.current_stream().wait_stream(stream)
+    session.close()
+    resident_session.close()
 
 
 def test_dspark_checkpoint_filter_does_not_read_target_engram(tmp_path, monkeypatch):

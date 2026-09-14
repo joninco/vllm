@@ -11,10 +11,18 @@ from weakref import WeakValueDictionary
 import torch
 from b12x.gemm import bf16_gemv, block_fp8_linear
 from b12x.norm import hyperconnection, mhc
-from b12x.sequence import embedding
+from b12x.preparation import FrozenMapping, PreparedCall
 from torch import nn
 
 from vllm.config import get_current_vllm_config
+from vllm.utils.b12x import (
+    B12xPreparationUnit,
+    B12xWorkload,
+    b12x_layer,
+    b12x_layer_prefix,
+    register_b12x_layer,
+)
+from vllm.utils.torch_utils import LayerNameType, _encode_layer_name, _resolve_layer_name
 from vllm.model_executor.layers.linear import LinearMethodBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
@@ -84,9 +92,8 @@ def _norm_plan(device, capacity, hidden):
 
 
 @cache
-def _mhc_plan(device, capacity, hidden):
-    return mhc.plan(mhc.Caps(device=device, max_tokens=capacity, hidden_size=hidden))
-
+def _mhc_caps(device, capacity, hidden):
+    return mhc.Caps(device=device, max_tokens=capacity, hidden_size=hidden, split_k=hidden // 64)
 
 @torch.library.custom_op("vllm::dsv41_block32_linear", mutates_args=("out", "scratch"))
 def _block32_linear(
@@ -123,6 +130,8 @@ def _block32_linear_fake(x, out, key, scratch):
 
 @torch.library.custom_op("vllm::dsv41_embedding_out", mutates_args=("out",))
 def _embedding_out(weight: torch.Tensor, ids: torch.Tensor, out: torch.Tensor) -> None:
+    from b12x.sequence import embedding
+
     embedding.run(weight, ids, out=out)
 
 
@@ -135,6 +144,8 @@ class B12xEmbeddingMethod(UnquantizedEmbeddingMethod):
     """Retain sharded weight loading/ties; replace only token-row compute."""
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
+        from b12x.sequence import embedding
+
         for id_dtype in (torch.int32, torch.int64):
             embedding.precompile(layer.weight, id_dtype=id_dtype)
 
@@ -318,81 +329,44 @@ def _mhc_pre(
     rms_eps: float,
     hc_eps: float,
     iterations: int,
-    capacity: int,
+    layer_name: LayerNameType,
     previous_output: torch.Tensor | None = None,
     previous_post: torch.Tensor | None = None,
     previous_comb: torch.Tensor | None = None,
 ) -> None:
-    # Use fixed capacity buckets so B12X can plan decode and prefill separately.
-    # Live row counts never become compilation or plan-cache keys.
-    decode_capacity = min(capacity, 64)
-    if residual.shape[0] <= decode_capacity:
-        capacity = decode_capacity
-    plan = _mhc_plan(residual.device, capacity, y.shape[-1])
-    (scratch,) = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+    mhc_module = b12x_layer(_resolve_layer_name(layer_name))._b12x_mhc
+    operation = "pre" if previous_output is None else "post_pre"
+    plan = mhc_module._plan_for(operation, int(residual.shape[0]))
+    scratch = current_workspace_manager().get_simultaneous(
+        *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
+    )
     binding = mhc.bind(
-        plan,
-        scratch=scratch,
-        tokens=residual.shape[0],
-        y=y,
-        post=post,
-        comb=comb,
-        out=residual_out,
-        expected_m=capacity,
-        pre_out=pre_out,
+        plan, scratch=scratch, tokens=int(residual.shape[0]), out=residual_out,
+        y=y, post=post, comb=comb, pre_out=pre_out,
     )
-    # Outputs are caller-owned tensors with ordinary PyTorch lifetimes.
-    # Retain only the shared arena, not every layer's transient activations.
-    retain_cuda_graph_capture_resource(scratch)
+    retain_cuda_graph_capture_resource(binding)
     if previous_output is None:
-        operation = mhc.run_pre
-        inputs = (residual, fn, scale, base)
-    else:
-        operation = mhc.run_post_pre
-        inputs = (
-            previous_output,
-            residual,
-            previous_post,
-            previous_comb,
-            fn,
-            scale,
-            base,
+        mhc.run_pre(
+            residual, fn, scale, base, rms_eps=rms_eps, hc_eps=hc_eps,
+            sinkhorn_iters=iterations, norm_weight=norm, norm_eps=rms_eps,
+            pre_mix=pre, binding=binding,
         )
-    operation(
-        *inputs,
-        rms_eps=rms_eps,
-        hc_eps=hc_eps,
-        sinkhorn_iters=iterations,
-        norm_weight=norm,
-        norm_eps=rms_eps,
-        pre_mix=pre,
-        binding=binding,
-    )
-
+    else:
+        if previous_post is None or previous_comb is None:
+            raise ValueError("lagged mHC post-pre requires both previous mix tensors")
+        mhc.run_post_pre(
+            previous_output, residual, previous_post, previous_comb, fn, scale, base,
+            rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=iterations,
+            norm_weight=norm, norm_eps=rms_eps, pre_mix=pre, binding=binding,
+        )
 
 @_mhc_pre.register_fake
 def _mhc_pre_fake(
-    residual,
-    fn,
-    scale,
-    base,
-    norm,
-    pre,
-    residual_out,
-    y,
-    post,
-    comb,
-    pre_out,
-    rms_eps,
-    hc_eps,
-    iterations,
-    capacity,
-    previous_output=None,
-    previous_post=None,
-    previous_comb=None,
+    residual, fn, scale, base, norm, pre, residual_out, y, post, comb, pre_out,
+    rms_eps, hc_eps, iterations, layer_name, previous_output=None,
+    previous_post=None, previous_comb=None,
 ):
     return None
-
 
 @torch.library.custom_op("vllm::dsv41_mhc_post", mutates_args=("out",))
 def _mhc_post(
@@ -401,98 +375,187 @@ def _mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
     out: torch.Tensor,
+    layer_name: LayerNameType,
 ) -> None:
-    mhc.run_post(x, residual, post, comb, out=out)
+    mhc_module = b12x_layer(_resolve_layer_name(layer_name))._b12x_mhc
+    plan = mhc_module._plan_for("post", int(residual.shape[0]))
+    mhc.run_post(x, residual, post, comb, plan=plan, out=out)
 
 
 @_mhc_post.register_fake
-def _mhc_post_fake(x, residual, post, comb, out):
+def _mhc_post_fake(x, residual, post, comb, out, layer_name):
     return None
 
 
 class B12xMHC(nn.Module):
-    """Plan shared scratch; allocate only the outputs live at each invocation."""
+    """Prepared V4.1 lagged mHC plans owned by their loaded decoder."""
 
     def __init__(self, config):
         super().__init__()
-        self.capacity = _capacity()
         self.capacities = _execution_capacities()
         self.hidden_size = config.hidden_size
         self.rms_eps = config.rms_norm_eps
         self.hc_eps = config.hc_eps
         self.iterations = config.hc_sinkhorn_iters
+        self._plans: dict[tuple[str, int], object] = {}
+        self._layer_name: LayerNameType | None = None
         if config.hc_mult != 4:
             raise ValueError("V4.1 mHC requires four streams")
 
-    def pre(
-        self,
-        residual,
-        fn,
-        scale,
-        base,
-        norm,
-        pre,
-        *,
-        previous_output=None,
-        previous_post=None,
-        previous_comb=None,
-    ):
-        tokens = residual.shape[0]
-        index = bisect_left(self.capacities, tokens)
-        if index == len(self.capacities):
-            raise ValueError("V4.1 mHC rows exceed planned capacity")
+    def bind_layer_name(self, name: str) -> None:
+        """Record the encoded name of the decoder layer that owns this module."""
+        self._layer_name = _encode_layer_name(name)
+
+    def _plan_for(self, operation, tokens):
+        tokens = int(tokens)
+        exact = self._plans.get((operation, tokens))
+        if exact is not None:
+            return exact
+        capacity = max((rows for op, rows in self._plans if op == operation), default=0)
+        if 0 <= tokens <= capacity and capacity:
+            return self._plans[(operation, capacity)]
+        raise RuntimeError(
+            f"B12x mHC {operation} live M={tokens} exceeds prepared capacity {capacity}"
+        )
+
+    def get_b12x_preparation_units(
+        self, layer, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if any(t.is_meta for t in (
+            layer.hc_attn_fn, layer.hc_ffn_fn, layer.hc_attn_scale,
+            layer.hc_ffn_scale, layer.hc_attn_base, layer.hc_ffn_base,
+            layer.attn_norm.weight, layer.ffn_norm.weight,
+        )):
+            return ()
+        key = tuple(sorted({workload.max_tokens, *workload.fixed_token_counts}))
+        common = FrozenMapping({
+            "lagged_mix": True,
+            "has_norm_weight": True,
+            "rms_eps": self.rms_eps,
+            "hc_eps": self.hc_eps,
+            "sinkhorn_iters": self.iterations,
+            "norm_eps": self.rms_eps,
+        })
+        for tokens in key:
+            for operation in ("pre", "post_pre"):
+                if (operation, tokens) in self._plans:
+                    continue
+                invocation = FrozenMapping({
+                    **common.to_dict(), "operation": operation,
+                    "has_fn_bf16": False,
+                    "expanded_residual": operation == "pre" and int(
+                        (layer.hc_attn_fn_broadcast if layer.hc_attn_fn_broadcast is not None else layer.hc_attn_fn).shape[1]
+                    ) == 4 * self.hidden_size,
+                })
+                self._plans[(operation, tokens)] = mhc.plan(
+                    _mhc_caps(layer.hc_attn_fn.device, tokens, self.hidden_size),
+                    invocation=invocation,
+                )
+        for tokens in key:
+            if ("post", tokens) not in self._plans:
+                self._plans[("post", tokens)] = mhc.plan(
+                    _mhc_caps(layer.hc_attn_fn.device, tokens, self.hidden_size),
+                    invocation=FrozenMapping({"operation": "post", "output_mode": "provided"}),
+                )
+        requests = tuple(
+            self._plans[(operation, tokens)].request(
+                name=f"deepseek_v41.mhc.{id(layer):x}.{operation}.m{tokens}",
+                prepare_call=self._prepare_call(layer, operation, tokens),
+                benchmark_call=self._prepare_call(layer, operation, tokens),
+            )
+            for tokens in key
+            for operation in ("pre", "post_pre", "post")
+        )
+        return (B12xPreparationUnit(
+            name="V41MHC", key=(id(layer), self.hidden_size, key),
+            requests=requests, stage="weights", autotune=not workload.eager_only,
+        ),)
+
+    def _prepare_call(self, layer, operation, tokens):
+        def prepare(state):
+            from b12x.norm.mhc import _impl
+
+            device = layer.hc_attn_fn.device
+            shape = (tokens, 4, self.hidden_size) if operation != "pre" or state.query.expanded_residual else (tokens, self.hidden_size)
+            residual = torch.empty(shape, dtype=torch.bfloat16, device=device)
+            x = torch.empty((tokens, self.hidden_size), dtype=torch.bfloat16, device=device)
+            post = torch.empty((tokens, 4), dtype=torch.float32, device=device)
+            comb = torch.empty((tokens, 4, 4), dtype=torch.float32, device=device)
+            pre_mix = torch.empty((tokens, 4), dtype=torch.float32, device=device)
+            pre_out = torch.empty_like(pre_mix)
+            out = torch.empty((tokens, 4, self.hidden_size), dtype=torch.bfloat16, device=device)
+            y = torch.empty_like(x)
+            next_post, next_comb = torch.empty_like(post), torch.empty_like(comb)
+            scratch = [torch.empty(spec.shape, dtype=spec.dtype, device=device) for spec in state.scratch_specs()]
+            binding = None if operation == "post" else state.bind(
+                scratch=scratch, tokens=tokens, out=out, y=y,
+                post=next_post, comb=next_comb, pre_out=pre_out,
+            )
+
+            def produce():
+                residual.normal_()
+                x.normal_()
+                post.normal_()
+                comb.normal_()
+                pre_mix.zero_()
+                pre_mix[:, 0].fill_(1)
+
+            if operation == "pre":
+                fn = layer.hc_attn_fn_broadcast
+                if fn is None:
+                    fn = layer.hc_attn_fn
+                run = lambda: _impl._b12x_mhc_pre_impl(
+                    residual, fn, layer.hc_attn_scale, layer.hc_attn_base,
+                    rms_eps=self.rms_eps, hc_eps=self.hc_eps,
+                    sinkhorn_iters=self.iterations, norm_weight=layer.attn_norm.weight,
+                    norm_eps=self.rms_eps, pre_mix=pre_mix, binding=binding,
+                    _state=state,
+                )
+            elif operation == "post_pre":
+                run = lambda: _impl._b12x_mhc_post_pre_impl(
+                    x, residual, post, comb, layer.hc_ffn_fn, layer.hc_ffn_scale,
+                    layer.hc_ffn_base, rms_eps=self.rms_eps, hc_eps=self.hc_eps,
+                    sinkhorn_iters=self.iterations, norm_weight=layer.ffn_norm.weight,
+                    norm_eps=self.rms_eps, pre_mix=pre_mix, binding=binding,
+                    _state=state,
+                )
+            else:
+                run = lambda: _impl._b12x_mhc_post_impl(x, residual, post, comb, out=out, _state=state)
+            return PreparedCall(
+                run=run, produce=produce,
+                owners=(
+                    layer.hc_attn_fn, layer.hc_ffn_fn, layer.hc_attn_scale,
+                    layer.hc_ffn_scale, layer.hc_attn_base, layer.hc_ffn_base,
+                    layer.attn_norm.weight, layer.ffn_norm.weight,
+                ),
+            )
+        return prepare
+
+    def pre(self, residual, fn, scale, base, norm, pre, *,
+            previous_output=None, previous_post=None, previous_comb=None):
+        tokens = int(residual.shape[0])
         if pre is None:
-            # The read-only initial mix must not share storage with native
-            # scratch. Only the first sublayer needs this small live-row input.
             pre = torch.zeros((tokens, 4), dtype=torch.float32, device=residual.device)
             pre[:, 0].fill_(1)
-        residual_out = torch.empty(
-            (tokens, 4, self.hidden_size), dtype=residual.dtype, device=residual.device
-        )
-        y = torch.empty(
-            (tokens, self.hidden_size), dtype=residual.dtype, device=residual.device
-        )
+        residual_out = torch.empty((tokens, 4, self.hidden_size), dtype=residual.dtype, device=residual.device)
+        y = torch.empty((tokens, self.hidden_size), dtype=residual.dtype, device=residual.device)
         post = torch.empty((tokens, 4), dtype=torch.float32, device=residual.device)
         comb = torch.empty((tokens, 4, 4), dtype=torch.float32, device=residual.device)
         pre_out = torch.empty((tokens, 4), dtype=torch.float32, device=residual.device)
         _mhc_pre(
-            residual,
-            fn,
-            scale,
-            base,
-            norm,
-            pre,
-            residual_out,
-            y,
-            post,
-            comb,
-            pre_out,
-            self.rms_eps,
-            self.hc_eps,
-            self.iterations,
-            self.capacities[index],
-            previous_output,
-            previous_post,
-            previous_comb,
+            residual, fn, scale, base, norm, pre, residual_out, y, post, comb, pre_out,
+            self.rms_eps, self.hc_eps, self.iterations, self._layer_name,
+            previous_output, previous_post, previous_comb,
         )
         return residual_out, post, comb, y, pre_out
 
     def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
-        return self.pre(
-            residual,
-            fn,
-            scale,
-            base,
-            norm,
-            pre,
-            previous_output=x,
-            previous_post=post,
-            previous_comb=comb,
-        )
+        return self.pre(residual, fn, scale, base, norm, pre, previous_output=x,
+                        previous_post=post, previous_comb=comb)
 
     def post(self, x, residual, post, comb):
         out = torch.empty_like(residual)
-        _mhc_post(x, residual, post, comb, out)
+        _mhc_post(x, residual, post, comb, out, self._layer_name)
         return out
 
 

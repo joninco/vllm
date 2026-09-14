@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
+from dataclasses import replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Literal, TypeVar, overload
 
@@ -33,6 +36,47 @@ logger = init_logger(__name__)
 _R = TypeVar("_R")
 
 FailureCallback = Callable[[], None]
+
+
+def _aggregate_b12x_progress(outcomes):
+    ranked = sorted(
+        (
+            (int(outcome.get("global_rank", index)), outcome.get("progress"))
+            for index, outcome in enumerate(outcomes)
+            if outcome.get("progress") is not None
+        ),
+        key=lambda item: item[0],
+    )
+    if not ranked:
+        return None
+    progress = [item[1] for item in ranked]
+    primary = next((item for item in progress if not item.done), progress[0])
+    same_request = all(
+        item.request_name == primary.request_name
+        and item.component_id == primary.component_id
+        for item in progress
+    )
+    updates = {
+        "measured_candidates": sum(item.measured_candidates for item in progress),
+        "compilations": sum(item.compilations for item in progress),
+        "active_compilations": sum(item.active_compilations for item in progress),
+        "done": all(bool(outcome.get("done")) for outcome in outcomes),
+        "elapsed_seconds": max(item.elapsed_seconds for item in progress),
+    }
+    if (
+        same_request
+        and all(item.candidate_sharded for item in progress)
+        and primary.phase not in ("planning", "selecting")
+        and any(item.candidate_count for item in progress)
+    ):
+        updates.update(
+            candidate_count=sum(item.candidate_count for item in progress),
+            candidates_prepared=sum(item.candidates_prepared for item in progress),
+            latest_round_us=tuple(
+                value for item in progress for value in item.latest_round_us
+            ),
+        )
+    return replace(primary, **updates)
 
 
 class Executor(ABC):
@@ -107,6 +151,7 @@ class Executor(ABC):
         self.device_config = vllm_config.device_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self._b12x_autotuning_cancel = threading.Event()
         self._init_executor()
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
@@ -123,13 +168,10 @@ class Executor(ABC):
 
     def compile_or_warm_up_model(self) -> None:
         """Compile/warm up the model and capture cudagraphs on workers."""
+        self._run_b12x_preparation(stage="state")
         compilation_times: list[CompilationTimes] = self.collective_rpc(
             "compile_or_warm_up_model"
         )
-        # Propagate compilation time from workers back to the main process.
-        # With TP>1, compilation happens in worker processes, so the main
-        # process config is never updated. Use max across workers since they
-        # compile in parallel.
         if compilation_times:
             self.vllm_config.compilation_config.compilation_time = max(
                 t.language_model for t in compilation_times
@@ -137,6 +179,59 @@ class Executor(ABC):
             self.vllm_config.compilation_config.encoder_compilation_time = max(
                 t.encoder for t in compilation_times
             )
+
+    def cancel_b12x_autotuning(self) -> None:
+        """Request optional native tuning cancellation at the next bounded round."""
+        self._b12x_autotuning_cancel.set()
+
+    def _run_b12x_preparation(self, *, stage: str) -> None:
+        """Drive one b12x preparation stage through bounded worker rounds."""
+        display = None
+        begun = False
+        completed = False
+        try:
+            begun = True
+            outcomes = self.collective_rpc(
+                "begin_b12x_preparation",
+                kwargs={"stage": stage},
+            )
+            if any(item.get("native") for item in outcomes):
+                from b12x.preparation import PreparationDisplay
+                from vllm.utils.system_utils import undecorated_log_stream
+
+                display = PreparationDisplay(
+                    global_rank=0, stream=undecorated_log_stream(sys.stderr),
+                )
+                display.__enter__()
+            while not all(bool(item.get("done")) for item in outcomes):
+                outcomes = self.collective_rpc(
+                    "advance_b12x_preparation",
+                    kwargs={"cancel_tuning": self._b12x_autotuning_cancel.is_set()},
+                )
+                if display is not None:
+                    progress = _aggregate_b12x_progress(outcomes)
+                    if progress is not None:
+                        display.update(progress)
+                errors = [item["error"] for item in outcomes if item.get("error")]
+                if errors and all(item.get("cleanup_complete") for item in outcomes):
+                    primary = min(errors, key=lambda item: int(item["rank"]))
+                    raise RuntimeError(
+                        f"b12x preparation failed on rank {primary['rank']}: "
+                        f"{primary['type']}: {primary['message']}"
+                    )
+            completed = True
+        except BaseException as error:
+            if begun and not completed:
+                try:
+                    self.collective_rpc("abort_b12x_preparation")
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        f"b12x preparation abort failed: {cleanup_error!r}"
+                    )
+            raise
+        finally:
+            if display is not None:
+                display.close(failed=not completed)
 
     def register_failure_callback(self, callback: FailureCallback):  # noqa: B027
         """
@@ -146,6 +241,7 @@ class Executor(ABC):
         pass
 
     def determine_available_memory(self) -> list[int]:  # in bytes
+        self._run_b12x_preparation(stage="weights")
         return self.collective_rpc("determine_available_memory")
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:

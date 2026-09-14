@@ -1015,7 +1015,10 @@ def _profiling_cudagraph_managers(runner: "GPUModelRunner") -> list[CudaGraphMan
 
 
 @torch.inference_mode()
-def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
+def profile_cudagraph_memory(
+    runner: "GPUModelRunner",
+    prepare_profile_state: Callable[[], None] | None = None,
+) -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
 
     Called during memory profiling, *before* the real KV cache is allocated,
@@ -1041,6 +1044,8 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     try:
         with set_current_vllm_config(runner.vllm_config):
             _init_minimal_kv_cache_for_profiling(runner)
+            if prepare_profile_state is not None:
+                prepare_profile_state()
         profiling_state_initialized = True
     finally:
         if not profiling_state_initialized:

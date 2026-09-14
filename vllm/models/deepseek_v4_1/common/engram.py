@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native Engram with readonly accepted history and global ceil-row TP shards."""
-
 from functools import lru_cache
-from weakref import WeakValueDictionary
 
 import torch
+import torch.nn as nn
 from b12x.norm import hyperconnection
+from b12x.preparation import PreparedCall, require_prepared
 from b12x.sequence import engram as native
 from b12x.sequence._shared.disk_table import MappedHostAllocation
-from torch import nn
+from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+)
 
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
@@ -25,10 +30,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
 
 logger = init_logger(__name__)
-
 DEAD_ID = -1
-_STATES = WeakValueDictionary()
-_TABLES = WeakValueDictionary()
 
 
 @lru_cache(maxsize=2)
@@ -83,23 +85,34 @@ class EngramLayout:
         )
         if compressed_size != config.engram_compressed_vocab_size:
             raise ValueError("Engram tokenizer compressed vocabulary mismatch")
-        device = torch.empty(0).device
-        self.plans = tuple(
-            native.plan(
-                native.Caps(
-                    device=device,
-                    max_tokens=vc.scheduler_config.max_num_batched_tokens,
-                    max_seqs=vc.scheduler_config.max_num_seqs,
-                    max_requests=vc.scheduler_config.max_num_seqs,
-                    vocab_size=config.vocab_size,
-                    layer_id=layer,
-                    tp_size=get_tensor_model_parallel_world_size(),
-                    tp_rank=get_tensor_model_parallel_rank(),
-                ),
-                token_map=token_map,
-                geometry=self.geometry,
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        self.caps = tuple(
+            native.Caps(
+                device=device,
+                max_tokens=vc.scheduler_config.max_num_batched_tokens,
+                max_seqs=vc.scheduler_config.max_num_seqs,
+                max_requests=vc.scheduler_config.max_num_seqs,
+                vocab_size=config.vocab_size,
+                layer_id=layer,
+                tp_size=get_tensor_model_parallel_world_size(),
+                tp_rank=get_tensor_model_parallel_rank(),
             )
             for layer in self.layer_ids
+        )
+        self.hash_plans = tuple(
+            native.plan(caps, token_map=token_map, geometry=self.geometry)
+            for caps in self.caps
+        )
+        self.lookup_plans = tuple(
+            native.plan(
+                caps, token_map=token_map, geometry=self.geometry,
+                invocation={
+                    "operation": "lookup",
+                    "compact_rows": self.table_memory == "disk",
+                    "resident_scales": self.disk_resident_scales,
+                },
+            )
+            for caps in self.caps
         )
 
     @classmethod
@@ -149,21 +162,6 @@ def _prepare_metadata(
         tl.store(num_tokens_out, live_tokens)
 
 
-@torch.library.custom_op("vllm::dsv41_engram_hash", mutates_args=("out",))
-def _hash(
-    ids: torch.Tensor,
-    mask: torch.Tensor,
-    starts: torch.Tensor,
-    history: torch.Tensor,
-    out: torch.Tensor,
-    key: int,
-) -> None:
-    _STATES[key].run_native(ids, mask, starts, history, out)
-
-
-@_hash.register_fake
-def _hash_fake(ids, mask, starts, history, out, key):
-    return None
 
 
 class NgramHashState(nn.Module):
@@ -172,9 +170,17 @@ class NgramHashState(nn.Module):
         self.layout = layout
         self.lookback_depth = 3
         self.use_slot_cache = False
-        self.key = id(self)
-        _STATES[self.key] = self
-        c = layout.plans[0].caps
+        c = layout.caps[0]
+        self.bindings = []
+        self._scratch = []
+        self._hashes = []
+        self._token_map = None
+        for i in range(len(layout.hash_plans)):
+            self.register_buffer(
+                f"hashes_{i}",
+                torch.empty((0,), dtype=torch.int64, device=c.device),
+                persistent=False,
+            )
         for name, shape, dtype in (
             ("ids", (c.max_tokens,), torch.int64),
             ("mask", (c.max_tokens,), torch.bool),
@@ -187,34 +193,89 @@ class NgramHashState(nn.Module):
             self.register_buffer(
                 name, torch.empty(shape, dtype=dtype, device=c.device), persistent=False
             )
-        self.bindings = []
-        for i, plan in enumerate(layout.plans):
-            (spec,) = plan.scratch_specs()
-            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-            hashes = torch.empty((c.max_tokens, 24), dtype=torch.int64, device=c.device)
-            self.register_buffer(f"scratch_{i}", scratch, persistent=False)
-            self.register_buffer(f"hashes_{i}", hashes, persistent=False)
-            self.bindings.append(
-                native.bind(
-                    plan,
-                    scratch=scratch,
-                    token_ids=self.ids,
-                    token_mask=self.mask,
-                    query_start_loc=self.starts,
-                    request_slots=self.slots,
-                    committed_history=self.history,
-                    num_seqs=self.num_seqs,
-                    num_tokens=self.num_tokens,
-                    hash_ids=hashes,
-                )
+        set_b12x_preparation_provider(self, self)
+    def _ensure_bindings(self) -> None:
+        """Bind the runner-owned buffers to each prepared hash plan, once."""
+        if self.bindings:
+            return
+        bindings, scratch, hashes = [], [], []
+        token_map = None
+        for plan in self.layout.hash_plans:
+            state = require_prepared(plan, "sequence.engram")
+            if token_map is None:
+                token_map = state.token_map
+            spec, = state.scratch_specs()
+            buffer = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            hash_ids = torch.empty(
+                (state.caps.max_tokens, 24), dtype=torch.int64, device=state.caps.device
             )
+            scratch.append(buffer)
+            hashes.append(hash_ids)
+            bindings.append(native.bind(
+                plan, scratch=buffer, token_ids=self.ids, token_mask=self.mask,
+                query_start_loc=self.starts, request_slots=self.slots,
+                committed_history=self.history, num_seqs=self.num_seqs,
+                num_tokens=self.num_tokens, hash_ids=hash_ids,
+            ))
+        self.bindings, self._scratch, self._hashes = bindings, scratch, hashes
+        self._token_map = token_map
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if workload.max_tokens > self.layout.caps[0].max_tokens:
+            return ()
+        def make_call(state):
+            from b12x.sequence.engram._impl import _bind_state
+
+            spec, = state.scratch_specs()
+            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            hashes = torch.empty(
+                (state.caps.max_tokens, 24), dtype=torch.int64, device=state.caps.device
+            )
+            ids = torch.full((state.caps.max_tokens,), 2, dtype=torch.int64, device=state.caps.device)
+            mask = torch.ones((state.caps.max_tokens,), dtype=torch.bool, device=state.caps.device)
+            starts = torch.zeros((state.caps.max_seqs + 1,), dtype=torch.int32, device=state.caps.device)
+            starts[1] = 1
+            slots = torch.zeros((state.caps.max_seqs,), dtype=torch.int32, device=state.caps.device)
+            num_seqs = torch.ones((1,), dtype=torch.int32, device=state.caps.device)
+            num_tokens = torch.ones((1,), dtype=torch.int32, device=state.caps.device)
+            binding = _bind_state(
+                state, scratch=scratch, token_ids=ids, token_mask=mask,
+                query_start_loc=starts, request_slots=slots,
+                committed_history=self.history, num_seqs=num_seqs,
+                num_tokens=num_tokens, hash_ids=hashes,
+            )
+            history_before = self.history[0].clone()
+
+            return PreparedCall(
+                run=lambda: state.run(binding, 1),
+                produce=lambda: self.history[0].fill_(DEAD_ID),
+                restore=lambda: self.history[0].copy_(history_before),
+                owners=(ids, mask, starts, self.history, slots, num_seqs,
+                        num_tokens, scratch, hashes),
+            )
+
+        requests = tuple(
+            plan.request(
+                name=f"engram/hash/{index}",
+                prepare_call=make_call,
+                benchmark_call=make_call,
+            )
+            for index, plan in enumerate(self.layout.hash_plans)
+        )
+        return (B12xPreparationUnit(
+            name="EngramHash", key=(id(self.layout), workload.max_tokens),
+            requests=requests, stage="weights", autotune=not workload.eager_only,
+        ),)
 
     def ensure_cache(self):
         return True  # Hash history belongs to the runner, never the KV slot pool.
 
     def run_native(self, ids, mask, starts, history, out):
         retain_cuda_graph_capture_resource(self)
-        c = self.layout.plans[0].caps
+        self._ensure_bindings()
+        c = self.layout.caps[0]
         seqs = starts.numel() - 1
         if ids.numel() > c.max_tokens or seqs > c.max_seqs:
             raise ValueError("Engram live rows exceed preallocated capacity")
@@ -228,7 +289,7 @@ class NgramHashState(nn.Module):
             mask,
             starts,
             history,
-            self.layout.plans[0].token_map,
+            self._token_map,
             self.ids,
             self.mask,
             self.starts,
@@ -264,7 +325,7 @@ class NgramHashState(nn.Module):
             dtype=torch.int64,
             device=input_ids.device,
         )
-        _hash(input_ids, ~dead_mask, query_start_loc, lookback_token_ids, out, self.key)
+        self.run_native(input_ids, ~dead_mask, query_start_loc, lookback_token_ids, out)
         return out
 
 
@@ -316,61 +377,54 @@ def _load_table(param, loaded_weight):
             )
 
 
-@torch.library.custom_op("vllm::dsv41_engram_lookup", mutates_args=("out",))
-def _lookup(indices: torch.Tensor, out: torch.Tensor, key: int) -> None:
-    _TABLES[key].lookup_native(indices, out)
-
-
-@_lookup.register_fake
-def _lookup_fake(indices, out, key):
-    return None
 
 
 class ParallelEngramEmbedding(nn.Module):
-    def __init__(self, plan, table_memory="device", *, resident_scales=False):
+    def __init__(self, plan, caps, geometry, table_memory="device", *, resident_scales=False):
         super().__init__()
         self.plan = plan
-        self.key = id(self)
-        _TABLES[self.key] = self
-        self.tp_size = plan.caps.tp_size
+        self.caps = caps
+        self.table_rows = geometry.num_embeddings[geometry.layer_ids.index(caps.layer_id)]
+        self.shard_rows = (self.table_rows + caps.tp_size - 1) // caps.tp_size
+        self.shard_start = caps.tp_rank * self.shard_rows
+        self.shard_end = (caps.tp_rank + 1) * self.shard_rows
+        self.weight_shape = (self.shard_rows, 256)
+        self.scale_shape = (self.shard_rows, 8)
+        self.tp_size = caps.tp_size
         if table_memory not in ("device", "ram", "disk"):
             raise ValueError("Engram table_memory must be device, ram or disk")
+        self.table_memory = table_memory
         self.disk_table = None
-        if table_memory == "disk":
-            # Do not require the optional B12X API on unchanged/default boots.
-            options = {}
-            if resident_scales:
-                options = {"resident_scales": resident_scales}
-            self.disk_table = native.DiskTable(plan, **options)
+        self._disk_sources = []
+        self.resident_scales = resident_scales
         self._disk_binding = None
-        self._disk_prepared_rows = 0
         self.mapped_host_nbytes = 0
         if table_memory == "ram":
             nbytes = (
-                plan.weight_shape[0] * plan.weight_shape[1]
-                + plan.scale_shape[0] * plan.scale_shape[1]
+                self.weight_shape[0] * self.weight_shape[1]
+                + self.scale_shape[0] * self.scale_shape[1]
             )
             logger.info(
                 "Engram layer %d TP rank %d: allocating %.2f GiB mapped-host "
                 "RAM (packed E4M3 weights and E8M0 scales)",
-                plan.caps.layer_id,
-                plan.caps.tp_rank,
+                caps.layer_id,
+                caps.tp_rank,
                 nbytes / (1 << 30),
             )
             self._weight_allocation = None
             try:
                 self._weight_allocation = MappedHostAllocation(
-                    plan.weight_shape, torch.float8_e4m3fn, plan.caps.device
+                    self.weight_shape, torch.float8_e4m3fn, caps.device
                 )
                 self._scale_allocation = MappedHostAllocation(
-                    plan.scale_shape, torch.uint8, plan.caps.device
+                    self.scale_shape, torch.uint8, caps.device
                 )
             except Exception as exc:
                 if self._weight_allocation is not None:
                     self._weight_allocation.close()
                 raise RuntimeError(
                     f"Engram mapped-host RAM allocation failed for "
-                    f"{nbytes / (1 << 30):.2f} GiB on {plan.caps.device}; "
+                    f"{nbytes / (1 << 30):.2f} GiB on {caps.device}; "
                     "no disk or device fallback is permitted"
                 ) from exc
             self.mapped_host_nbytes = nbytes
@@ -386,78 +440,104 @@ class ParallelEngramEmbedding(nn.Module):
             set_weight_attrs(
                 self.weight_scale_inv, {"load_view": self.weight_scale_load_view}
             )
-        elif self.disk_table is None:
+        elif table_memory != "disk":
             self.weight = nn.Parameter(
                 torch.empty(
-                    plan.weight_shape,
+                    self.weight_shape,
                     dtype=torch.float8_e4m3fn,
-                    device=plan.caps.device,
+                    device=caps.device,
                 ),
                 requires_grad=False,
             )
             self.weight_scale_inv = nn.Parameter(
                 torch.empty(
-                    plan.scale_shape, dtype=torch.uint8, device=plan.caps.device
+                    self.scale_shape, dtype=torch.uint8, device=caps.device
                 ),
                 requires_grad=False,
             )
         else:
             self.register_parameter("weight", None)
             self.register_parameter("weight_scale_inv", None)
-        if self.disk_table is None:
+        if table_memory != "disk":
             for param in (self.weight, self.weight_scale_inv):
                 set_weight_attrs(
                     param,
                     {
                         "weight_loader": _load_table,
-                        "global_rows": plan.table_rows,
-                        "shard_start": plan.shard_start,
+                        "global_rows": self.table_rows,
+                        "shard_start": self.shard_start,
                     },
                 )
         self.register_buffer(
             "hashes",
             torch.empty(
-                (plan.caps.max_tokens, 24), dtype=torch.int64, device=plan.caps.device
+                (caps.max_tokens, 24), dtype=torch.int64, device=caps.device
             ),
             persistent=False,
         )
         self.register_buffer(
             "num_tokens",
-            torch.empty((1,), dtype=torch.int32, device=plan.caps.device),
+            torch.empty((1,), dtype=torch.int32, device=caps.device),
             persistent=False,
         )
+
+    def close(self):
+        """Release file-backed staging only after graph consumers are gone."""
+        if self.disk_table is not None:
+            self.disk_table.close()
+            self.disk_table = None
+            self._disk_binding = None
+        for allocation in (
+            getattr(self, "_scale_allocation", None),
+            getattr(self, "_weight_allocation", None),
+        ):
+            if allocation is not None:
+                allocation.close()
 
     def load_weights(self, weights):
         loaded = set()
         for name, value in weights:
             if name not in ("weight", "weight_scale_inv"):
                 raise ValueError(f"Unknown Engram table weight: {name}")
-            if self.disk_table is None:
+            if self.table_memory != "disk":
                 _load_table(getattr(self, name), value)
             else:
                 source = get_file_tensor_source(value)
                 if source is None:
-                    raise ValueError(
-                        "Disk Engram requires a file-backed checkpoint table"
-                    )
+                    raise ValueError("Disk Engram requires a file-backed checkpoint table")
                 scale = name == "weight_scale_inv"
-                width = self.plan.scale_shape[1] if scale else self.plan.weight_shape[1]
-                if source.shape != (self.plan.table_rows, width):
+                width = self.scale_shape[1] if scale else self.weight_shape[1]
+                if source.shape != (self.table_rows, width):
                     raise ValueError("Engram source must be the unpadded global table")
-                dtypes = (
-                    (torch.uint8, torch.float8_e8m0fnu)
-                    if scale
-                    else (torch.float8_e4m3fn,)
-                )
+                dtypes = (torch.uint8, torch.float8_e8m0fnu) if scale else (torch.float8_e4m3fn,)
                 if source.dtype not in dtypes:
                     raise TypeError(f"Invalid Engram {name} dtype: {source.dtype}")
-                self.disk_table.add_shard(0, source.path, source.offset, scale=scale)
+                self._disk_sources.append((source.path, source.offset, scale))
             loaded.add(name)
         return loaded
 
+    def _ensure_disk_table(self) -> None:
+        """Build the disk-backed lookup table from the prepared plan, once."""
+        if self.table_memory != "disk" or self.disk_table is not None:
+            return
+        state = require_prepared(self.plan, "sequence.engram")
+        table = native.DiskTable(state, resident_scales=self.resident_scales)
+        first = table.shard_start // table.shard_rows
+        last = (table.shard_end + table.shard_rows - 1) // table.shard_rows
+        for path, offset, scale in self._disk_sources:
+            row_bytes = self.scale_shape[1] if scale else self.weight_shape[1]
+            for shard in range(first, last):
+                table.add_shard(
+                    shard, path, offset + shard * table.shard_rows * row_bytes,
+                    scale=scale,
+                )
+        table.require_complete()
+        self.disk_table = table
+
     def prepare_disk(self, indices, out, num_tokens):
-        if self.disk_table is None:
+        if self.table_memory != "disk":
             raise RuntimeError("Engram table is not disk-backed")
+        self._ensure_disk_table()
         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Disk Engram preparation must run outside compile/capture"
@@ -484,6 +564,10 @@ class ParallelEngramEmbedding(nn.Module):
         self._disk_prepared_rows = indices.shape[0]
 
     def lookup_native(self, indices, out):
+        if self.plan.prepared is None:
+            raise PreparationResourceUnavailableError(
+                "Engram lookup plan must be prepared before forwarding"
+            )
         self.hashes[: indices.shape[0]].copy_(indices)
         self.num_tokens.fill_(indices.shape[0])
         binding = native.bind_lookup(
@@ -496,13 +580,11 @@ class ParallelEngramEmbedding(nn.Module):
         )
         retain_cuda_graph_capture_resource(binding)
         if self.mapped_host_nbytes:
-            # CUDA tensor aliases do not own cudaHostAlloc storage. Captured
-            # graphs must retain both mapped owners along with their binding.
             retain_cuda_graph_capture_resource(self)
         native.run_lookup(binding)
 
     def lookup(self, indices, out):
-        _lookup(indices, out, self.key)
+        self.lookup_native(indices, out)
 
 
 class Engram(nn.Module):
@@ -522,10 +604,10 @@ class Engram(nn.Module):
         self.dim = config.hidden_size
         self.hc_mult = config.hc_mult
         self.eps = config.rms_norm_eps
-        plan = layout.plans[layer_hash_index]
+        plan = layout.lookup_plans[layer_hash_index]
+        caps = layout.caps[layer_hash_index]
         self.embed_tokens = ParallelEngramEmbedding(
-            plan,
-            layout.table_memory,
+            plan, caps, layout.geometry, layout.table_memory,
             resident_scales=getattr(layout, "disk_resident_scales", False),
         )
         self._disk_prepared = False
@@ -556,21 +638,76 @@ class Engram(nn.Module):
         self.register_buffer(
             "staged_rows",
             torch.empty(
-                plan.caps.max_tokens,
+                caps.max_tokens,
                 6144,
                 dtype=torch.bfloat16,
-                device=plan.caps.device,
+                device=caps.device,
             ),
             persistent=False,
         )
         self.mix_plan = hyperconnection.plan(
             hyperconnection.Caps(
-                device=plan.caps.device,
-                max_tokens=plan.caps.max_tokens,
+                device=caps.device,
+                max_tokens=caps.max_tokens,
                 hidden_size=self.dim,
                 streams=self.hc_mult,
             )
         )
+        set_b12x_preparation_provider(self, self)
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        caps = self.embed_tokens.caps
+        if workload.max_tokens > caps.max_tokens:
+            return ()
+        def make_call(state):
+            from b12x.sequence.engram._impl import _bind_lookup_state
+
+            embed = self.embed_tokens
+            hash_ids = torch.full(
+                (embed.caps.max_tokens, 24), -1, dtype=torch.int64,
+                device=embed.caps.device,
+            )
+            prime_row = min(embed.shard_start + 1, embed.shard_end - 1)
+            if prime_row <= 0:
+                raise PreparationResourceUnavailableError("Engram shard has no nonzero local lookup row")
+            hash_ids[0, 0] = prime_row
+            num_tokens = torch.ones((1,), dtype=torch.int32, device=embed.caps.device)
+            out = torch.empty(
+                (embed.caps.max_tokens, 6144), dtype=torch.bfloat16, device=embed.caps.device
+            )
+            table = None
+            if embed.table_memory == "disk":
+                table = native.DiskTable(state, resident_scales=embed.resident_scales)
+                first = table.shard_start // table.shard_rows
+                last = (table.shard_end + table.shard_rows - 1) // table.shard_rows
+                for path, offset, scale in embed._disk_sources:
+                    row_bytes = embed.scale_shape[1] if scale else embed.weight_shape[1]
+                    for shard in range(first, last):
+                        table.add_shard(
+                            shard, path, offset + shard * table.shard_rows * row_bytes,
+                            scale=scale,
+                        )
+                table.require_complete()
+            binding = _bind_lookup_state(
+                state,
+                weight=embed.weight if table is None else None,
+                scales=embed.weight_scale_inv if table is None else None,
+                hash_ids=hash_ids, num_tokens=num_tokens, out=out, disk_table=table,
+            )
+            return PreparedCall(
+                run=lambda: state.run_lookup(binding, 1, clear_tail=True),
+                owners=(hash_ids, num_tokens, out, embed.weight, embed.weight_scale_inv),
+                close=table.close if table is not None else None,
+            )
+        request = self.embed_tokens.plan.request(
+            name=f"{id(self)}/engram-lookup",
+            prepare_call=make_call, benchmark_call=make_call,
+        )
+        return (B12xPreparationUnit(
+            name="EngramLookup", key=(id(self), workload.max_tokens),
+            requests=(request,), stage="weights", autotune=not workload.eager_only,
+        ),)
 
     def process_weights_after_loading(self):
         self.norm_weights.copy_(

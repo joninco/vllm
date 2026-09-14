@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
+    VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES: int = 2_000_000_000
     VLLM_MXFP8_LM_HEAD: bool = False
     VLLM_LM_HEAD_A16: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
@@ -1665,6 +1666,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MXFP8_ACTIVATION_MODE": env_with_choices(
         "VLLM_B12X_MXFP8_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
+    ),
+    # Maximum caller-owned scratch available to one block-scaled GEMM.
+    "VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES", "2000000000")
     ),
     # Quantize eligible unquantized LM heads on b12x only when explicitly enabled.
     "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "0"))),

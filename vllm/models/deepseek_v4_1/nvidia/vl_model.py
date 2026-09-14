@@ -51,7 +51,6 @@ from .b12x_vision import (
     DeepseekV4Aligner,
     DeepseekV4ViT,
     run_dp_sharded_vision_tower,
-    warmup_vision_tower,
 )
 from .model import (
     DeepseekV41LLMForCausalLM,
@@ -338,10 +337,6 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         )
 
     def process_weights_after_loading(self) -> None:
-        # The loader invokes this once after exhausting the complete weight
-        # stream and finalizing all per-layer quantization methods.
+        # Native vision and aligner declarations are collected from their loaded
+        # owners by the worker preparation registry.
         self.language_model.process_weights_after_loading()
-        if isinstance(self.vision, DeepseekV4ViT) and isinstance(
-            self.aligner, DeepseekV4Aligner
-        ):
-            warmup_vision_tower(self.vision, self.aligner)

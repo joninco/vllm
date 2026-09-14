@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Replicated V4.1 ViT and aligner using only native b12x compute.
+"""Replicated V4.1 ViT and aligner using prepared native b12x compute.
 
-One image is evaluated per call. Attention binds full planned-capacity tensors
-and a device [0, live_patches] prefix, so padded/stale rows cannot participate.
-Call ``prepare`` and warm up before capture; forward accepts caller-owned output.
-Workspace is shared across blocks, not images concurrently on different streams.
+One image is evaluated per call.  The preparation registry installs immutable
+rotary, merge, and GELU executions together with fixed owner workspaces before
+capture. Attention binds full planned-capacity tensors and a device
+[0, live_patches] prefix, so padded/stale rows cannot participate.
 """
 
 from __future__ import annotations
@@ -16,8 +16,17 @@ import torch
 from b12x.attention import varlen
 from b12x.gemm import bf16_gemv
 from b12x.norm import hyperconnection
-from b12x.norm.vision import run_gelu, run_rope_qkv, run_spatial_merge
+from b12x.norm import vision as vision_api
+from b12x.norm.vision import VisionQuery, run_gelu, run_rope_qkv, run_spatial_merge
+from b12x.preparation import PreparedCall
 from torch import nn
+
+from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+)
 
 
 def _capacity(config):
@@ -107,6 +116,7 @@ class _Attention(nn.Module):
             k=workspace.k,
             v=workspace.v,
             cu_seqlens=workspace.cu,
+            plan=workspace.rope_plan,
         )
         attended, _ = varlen.run(binding=workspace.attention_binding)
         return self.wo(attended[:rows].reshape(rows, -1), out=out)
@@ -225,22 +235,62 @@ class DeepseekV4ViT(nn.Module):
         )
         self.norm = _Norm(config.vision_dim)
         self._workspace = None
-
-    def prepare(self):
-        """Allocate planned storage and resolve projections/attention outside capture."""
+        self._rope_plan = None
+        set_b12x_preparation_provider(self, self)
+    def _provision_workspace(self):
+        """Create fixed serving buffers only while the session is priming us."""
         device = self.patch_embed.proj.weight.device
         if device.type != "cuda":
             raise ValueError("native vision requires CUDA weights")
-        if self._workspace is not None:
-            if self._workspace.state.device != device:
-                raise ValueError("vision moved devices after preparation")
-            return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("prepare and warm vision before CUDA graph capture")
-        self._workspace = _VisionWorkspace(self.config, self.capacity, device)
-        for module in self.modules():
-            if isinstance(module, _Linear):
-                module.prepare()
+        if self._workspace is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("vision preparation cannot allocate during CUDA graph capture")
+            self._workspace = _VisionWorkspace(self.config, self.capacity, device)
+            self._workspace.rope_plan = self._rope_plan
+            for module in self.modules():
+                if isinstance(module, _Linear):
+                    module.prepare()
+        elif self._workspace.state.device != device:
+            raise ValueError("vision moved devices after preparation")
+        return self._workspace
+
+    def get_b12x_preparation_units(
+        self, layer: nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if any(parameter.is_meta for parameter in self.parameters()):
+            return ()
+        if self._rope_plan is None:
+            rope = VisionQuery(
+                operation="rope",
+                channels=self.config.vision_dim,
+                heads=self.config.vision_n_heads,
+                ratio=1,
+            )
+            self._rope_plan = vision_api.plan(
+                rope, device=self.patch_embed.proj.weight.device
+            )
+
+        def call(state):
+            workspace = self._provision_workspace()
+            rows = min(self.capacity, 1)
+            return PreparedCall(
+                run=lambda: vision_api._run_state(
+                    state, workspace.qkv[:rows], workspace.q, rows, 1, rows,
+                    k=workspace.k, v=workspace.v, inv=workspace.inv_freq, cu=workspace.cu,
+                ),
+                reset=lambda: workspace.qkv[:rows].zero_(),
+                owners=(workspace.qkv, workspace.q, workspace.k, workspace.v, workspace.inv_freq, workspace.cu),
+            )
+
+        request = self._rope_plan.request(
+            name=f"deepseek_v41.vision.rope.{id(self):x}",
+            prepare_call=call, benchmark_call=call,
+        )
+        return (B12xPreparationUnit(
+            name="DeepseekV4ViT",
+            key=(id(self), self.config.vision_dim, self.config.vision_n_heads),
+            requests=(request,), stage="weights", autotune=not workload.eager_only,
+        ),)
 
     def forward(self, patches, n_vit_h: int, n_vit_w: int, *, out=None):
         rows = n_vit_h * n_vit_w
@@ -255,7 +305,12 @@ class DeepseekV4ViT(nn.Module):
             )
         if patches.dtype != torch.bfloat16 or not patches.is_contiguous():
             raise ValueError("vision patches must be contiguous BF16")
-        self.prepare()
+        if (
+            self._workspace is None
+            or self._rope_plan is None
+            or self._rope_plan.prepared is None
+        ):
+            raise RuntimeError("vision plan was not prepared")
         ws = self._workspace
         if out is None:
             out = torch.empty(
@@ -282,25 +337,75 @@ class DeepseekV4Aligner(nn.Module):
         self.w1 = _Linear(config.vision_dim * self.downsample_ratio**2, self.out_dim)
         self.w2 = _Linear(self.out_dim, self.out_dim)
         self._workspace = None
-
-    def prepare(self):
+        self._merge_plan = None
+        self._gelu_plan = None
+        set_b12x_preparation_provider(self, self)
+    def _provision_workspace(self):
         device = self.w1.weight.device
         if device.type != "cuda":
             raise ValueError("native aligner requires CUDA weights")
-        if self._workspace is not None:
-            if self._workspace[0].device != device:
-                raise ValueError("aligner moved devices after preparation")
-            return
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("prepare and warm aligner before CUDA graph capture")
-        r = self.downsample_ratio
-        capacity = (self.capacity + r - 1) // r
-        self._workspace = tuple(
-            torch.empty((capacity, width), device=device, dtype=torch.bfloat16)
-            for width in (self.hidden_size * r * r, self.out_dim, self.out_dim)
+        if self._workspace is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("aligner preparation cannot allocate during CUDA graph capture")
+            r = self.downsample_ratio
+            capacity = (self.capacity + r - 1) // r
+            self._workspace = (
+                torch.empty((self.capacity, self.hidden_size), device=device, dtype=torch.bfloat16),
+                *(torch.empty((capacity, width), device=device, dtype=torch.bfloat16)
+                  for width in (self.hidden_size * r * r, self.out_dim, self.out_dim)),
+            )
+            self.w1.prepare()
+            self.w2.prepare()
+        elif self._workspace[0].device != device:
+            raise ValueError("aligner moved devices after preparation")
+        return self._workspace
+
+    def get_b12x_preparation_units(
+        self, layer: nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if any(parameter.is_meta for parameter in self.parameters()):
+            return ()
+        device = self.w1.weight.device
+        if self._merge_plan is None:
+            merge = VisionQuery(
+                operation="merge", channels=self.hidden_size, heads=1,
+                ratio=self.downsample_ratio,
+            )
+            self._merge_plan = vision_api.plan(merge, device=device)
+        if self._gelu_plan is None:
+            gelu = VisionQuery(operation="gelu", channels=self.out_dim, heads=1, ratio=1)
+            self._gelu_plan = vision_api.plan(gelu, device=device)
+
+        def merge_call(state):
+            source, merged, _, _ = self._provision_workspace()
+            return PreparedCall(
+                run=lambda: vision_api._run_state(state, source[:1], merged[:1], 1, 1, 1),
+                reset=lambda: source[:1].zero_(),
+                owners=(source, merged),
+            )
+
+        def gelu_call(state):
+            _, _, hidden, activated = self._provision_workspace()
+            return PreparedCall(
+                run=lambda: vision_api._run_state(state, hidden[:1], activated[:1], 1),
+                reset=lambda: hidden[:1].zero_(),
+                owners=(hidden, activated),
+            )
+
+        base = f"deepseek_v41.aligner.{id(self):x}"
+        requests = (
+            self._merge_plan.request(
+                name=f"{base}.merge", prepare_call=merge_call, benchmark_call=merge_call,
+            ),
+            self._gelu_plan.request(
+                name=f"{base}.gelu", prepare_call=gelu_call, benchmark_call=gelu_call,
+            ),
         )
-        self.w1.prepare()
-        self.w2.prepare()
+        return (B12xPreparationUnit(
+            name="DeepseekV4Aligner",
+            key=(id(self), self.hidden_size, self.out_dim, self.downsample_ratio),
+            requests=requests, stage="weights", autotune=not workload.eager_only,
+        ),)
 
     def forward(self, x, n_vit_h: int, n_vit_w: int, *, out=None):
         if (
@@ -312,50 +417,32 @@ class DeepseekV4Aligner(nn.Module):
             raise ValueError(
                 "aligner image grid exceeds capacity or does not match input"
             )
-        self.prepare()
+        if (
+            self._workspace is None
+            or self._merge_plan is None
+            or self._gelu_plan is None
+            or self._merge_plan.prepared is None
+            or self._gelu_plan.prepared is None
+        ):
+            raise RuntimeError("aligner plan was not prepared")
         r = self.downsample_ratio
         rows = ((n_vit_h + r - 1) // r) * ((n_vit_w + r - 1) // r)
-        merged, hidden, activated = (t[:rows] for t in self._workspace)
-        run_spatial_merge(x, n_vit_h, n_vit_w, ratio=r, out=merged)
+        _, merged_buffer, hidden_buffer, activated_buffer = self._workspace
+        merged, hidden, activated = (
+            merged_buffer[:rows], hidden_buffer[:rows], activated_buffer[:rows]
+        )
+        run_spatial_merge(
+            x, n_vit_h, n_vit_w, ratio=r, out=merged,
+            plan=self._merge_plan,
+        )
         self.w1(merged, out=hidden)
-        run_gelu(hidden, out=activated)
+        run_gelu(hidden, out=activated, plan=self._gelu_plan)
         if out is None:
             out = torch.empty(
                 (rows, self.out_dim), dtype=torch.bfloat16, device=x.device
             )
         return self.w2(activated, out=out)
 
-
-def warmup_vision_tower(vision_model: DeepseekV4ViT, aligner: DeepseekV4Aligner):
-    """Resolve every native tower specialization in the root post-load hook.
-
-    A single patch is enough: row counts and the image grid are runtime scalars,
-    while attention always binds the complete planned-capacity workspace. Run
-    every block so distinct checkpoint dtypes and projection geometries are
-    covered, then the aligner to cover merge, biased GEMV, and erf-GELU.
-    """
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("vision warmup must run after loading and before capture")
-    vision_model.prepare()
-    aligner.prepare()
-    if getattr(vision_model, "_warmed_up", False) and getattr(
-        aligner, "_warmed_up", False
-    ):
-        return
-    patch_size = vision_model.config.vision_patch_size
-    device = vision_model.patch_embed.proj.weight.device
-    with torch.no_grad():
-        patches = torch.zeros(
-            (1, 3, patch_size, patch_size), dtype=torch.bfloat16, device=device
-        )
-        encoded = torch.empty(
-            (1, vision_model.config.vision_dim), dtype=torch.bfloat16, device=device
-        )
-        aligned = torch.empty((1, aligner.out_dim), dtype=torch.bfloat16, device=device)
-        vision_model(patches, 1, 1, out=encoded)
-        aligner(encoded, 1, 1, out=aligned)
-    vision_model._warmed_up = True
-    aligner._warmed_up = True
 
 
 def run_dp_sharded_vision_tower(vision_model, aligner, patches, vit_grid):

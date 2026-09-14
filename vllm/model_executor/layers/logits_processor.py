@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that compute logits from hidden_stats."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import cache
 
 import torch
@@ -21,7 +21,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
-from vllm.utils.b12x import get_b12x_bf16_vocab_projection
+from vllm.utils.b12x import (
+    set_b12x_preparation_provider,
+    B12xPreparationUnit,
+    B12xWorkload,
+    PreparationResourceUnavailableError,
+    get_b12x_bf16_vocab_projection,
+)
 from vllm.utils.flashinfer import has_flashinfer
 
 logger = init_logger(__name__)
@@ -99,7 +105,8 @@ class LogitsProcessor(PluggableLayer):
         self.head_dtype = model_config.head_dtype if model_config is not None else None
         kernel_config = get_current_vllm_config().kernel_config
         self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
-        self._b12x_vocab_projection_plan = None
+        self._b12x_vocab_plans: dict[int, object] = {}
+        self._b12x_vocab_lm_head: VocabParallelEmbedding | None = None
         self.use_b12x_vocab_projection = bool(
             kernel_config.linear_backend == "b12x"
             and self._b12x_vocab_projection is not None
@@ -112,7 +119,7 @@ class LogitsProcessor(PluggableLayer):
         self,
         lm_head: torch.nn.Module,
     ) -> None:
-        """Resolve the immutable b12x vocabulary plan before execution."""
+        """Register the loaded LM head; preparation happens in worker lifecycle."""
         if (
             not self.use_b12x_vocab_projection
             or not isinstance(lm_head, VocabParallelEmbedding)
@@ -126,16 +133,93 @@ class LogitsProcessor(PluggableLayer):
             or not lm_head.weight.is_contiguous()
         ):
             return
+        self._b12x_vocab_lm_head = lm_head
+        set_b12x_preparation_provider(self, self)
+    def _b12x_vocab_name(self, tokens: int) -> str:
+        return f"logits.vocab.{id(self):x}.m{tokens}"
+
+    def _declare_b12x_vocab_plan(self, rows: int):
+        head = self._b12x_vocab_lm_head
         projection = self._b12x_vocab_projection
-        assert projection is not None
-        out_features, in_features = lm_head.weight.shape
-        self._b12x_vocab_projection_plan = projection.plan(
-            projection.Caps(
-                device=lm_head.weight.device,
-                max_tokens=1,
-                in_features=in_features,
-                out_features=out_features,
+        assert head is not None and projection is not None
+        out_features, in_features = map(int, head.weight.shape)
+        return projection.plan(projection.Caps(
+            device=head.weight.device, max_tokens=rows,
+            in_features=in_features, out_features=out_features,
+        ))
+
+    def _b12x_vocab_call(self, rows: int):
+        head = self._b12x_vocab_lm_head
+        assert head is not None
+        in_features = int(head.weight.shape[1])
+
+        def call(state):
+            from b12x.preparation import PreparedCall
+
+            # This is deliberately an isolated representative hidden-state
+            # buffer.  The loaded vocabulary matrix remains borrowed.
+            source = torch.empty(
+                (rows, in_features), dtype=torch.bfloat16,
+                device=head.weight.device,
             )
+
+            def produce() -> None:
+                indices = torch.arange(
+                    source.numel(), device=source.device, dtype=torch.float32,
+                ).reshape_as(source)
+                source.copy_((indices.remainder(53).sub_(26)).mul_(1 / 32))
+
+            return PreparedCall(
+                run=lambda: state.run(source, head.weight),
+                produce=produce,
+                owners=(head.weight,),
+            )
+
+        return call
+
+    def _b12x_vocab_plan_for(self, rows: int):
+        """Reuse a prepared capacity for the unpadded sampled positions."""
+        plans = self._b12x_vocab_plans
+        capacity = rows if rows in plans else min(
+            (count for count in plans if count >= rows), default=rows,
+        )
+        plan = plans.get(capacity)
+        if plan is None:
+            plan = self._declare_b12x_vocab_plan(capacity)
+            plans[capacity] = plan
+        return plan
+
+    def get_b12x_preparation_units(
+        self, layer: torch.nn.Module, workload: B12xWorkload,
+    ) -> Sequence[B12xPreparationUnit]:
+        if layer is not self or self._b12x_vocab_lm_head is None:
+            return ()
+        head = self._b12x_vocab_lm_head
+        if head.weight.is_meta:
+            return ()
+        plans = self._b12x_vocab_plans
+        requests = []
+        for tokens in workload.token_counts:
+            plan = plans.get(tokens)
+            if plan is None:
+                plan = self._declare_b12x_vocab_plan(tokens)
+                plans[tokens] = plan
+            call = self._b12x_vocab_call(tokens)
+            requests.append(plan.request(
+                name=self._b12x_vocab_name(tokens),
+                prepare_call=call,
+                benchmark_call=call,
+            ))
+        if not requests:
+            return ()
+        return (
+            B12xPreparationUnit(
+                name="VOCAB_PROJECTION",
+                key=(id(self), tuple(sorted(plans))),
+                requests=tuple(requests),
+                stage="weights",
+                autotune=not workload.eager_only,
+            ),
         )
 
     def forward(
@@ -192,29 +276,17 @@ class LogitsProcessor(PluggableLayer):
                     (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
                 )
             ):
-                planned = self._b12x_vocab_projection_plan
+                # compute_logits runs outside the compiled model graph, so
+                # this capacity lookup is plain Python, not traced.
                 flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-                if (
-                    planned is not None
-                    and flat.shape[0] == 1
-                    and tuple(lm_head.weight.shape)
-                    == (
-                        planned.caps.out_features,
-                        planned.caps.in_features,
-                    )
-                ):
-                    logger.info_once(
-                        "Using the profile-backed b12x BF16 vocabulary projection."
-                    )
-                    projection = self._b12x_vocab_projection
-                    assert projection is not None
-                    binding = projection.bind(
-                        planned,
-                        source=flat,
-                        weight=lm_head.weight,
-                    )
-                    logits = projection.run(binding)
-                    return logits.reshape(*hidden_states.shape[:-1], -1)
+                plan = self._b12x_vocab_plan_for(int(flat.shape[0]))
+                projection = self._b12x_vocab_projection
+                assert projection is not None
+                binding = projection.bind(
+                    plan, source=flat, weight=lm_head.weight,
+                )
+                logits = projection.run(binding)
+                return logits.reshape(*hidden_states.shape[:-1], -1)
             return lm_head.quant_method.apply(
                 lm_head, hidden_states, bias=embedding_bias
             )

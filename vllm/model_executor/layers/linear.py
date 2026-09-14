@@ -73,6 +73,32 @@ def register_weight_loader_v2_supported_method(cls):
     return cls
 
 
+def _register_b12x_row_parallel_collective(owner, prefix: str, output_size: int,
+                                           enabled: bool) -> None:
+    """Describe the real row-parallel output; transport owns preparation."""
+    if not enabled:
+        return
+    from vllm.distributed.parallel_state import register_b12x_collective_describer
+
+    def describe(requirements):
+        if not prefix:
+            raise ValueError(
+                "B12X row-parallel collective preparation requires a stable module prefix"
+            )
+        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+            B12xPcieInvocation,
+        )
+        return tuple(
+            B12xPcieInvocation(
+                name=f"{prefix}.row_all_reduce.m{rows}",
+                operation="all_reduce", shape=(rows, output_size),
+                dtype=requirements.output_dtype,
+            )
+            for rows in requirements.token_counts
+        )
+
+    register_b12x_collective_describer(owner, describe)
+
 def adjust_marlin_shard(
     param: Parameter,
     shard_size: int,
@@ -163,6 +189,17 @@ class LinearMethodBase(QuantizeMethodBase):
         """Apply the weights in layer to the input tensor.
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
+
+    def get_workspace_size(self, layer: torch.nn.Module, rows: int) -> int:
+        """Scratch bytes one call at ``rows`` needs from a caller-reserved view.
+
+        The shared-experts runner reserves the maximum over its linears and
+        binds it while they run on a side stream. Methods that own a kernel
+        report the kernel's requirement; everything else needs none.
+        """
+        kernel = getattr(self, "kernel", None)
+        report = getattr(kernel, "get_workspace_size", None)
+        return 0 if report is None else int(report(layer, rows))
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
@@ -1604,6 +1641,10 @@ class RowParallelLinear(LinearBase):
             disable_tp=disable_tp,
         )
 
+        _register_b12x_row_parallel_collective(
+            self, prefix, self.output_size,
+            reduce_results and self.tp_size > 1,
+        )
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 

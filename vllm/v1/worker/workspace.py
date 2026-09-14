@@ -225,6 +225,10 @@ class WorkspaceManager:
             round_up(_compute_bytes(shape, dtype), 256)
             for shape, dtype in shapes_and_dtypes
         )
+        required_bytes = max(
+            required_bytes,
+            max(map(self._workspace_size_bytes, self._current_workspaces), default=0),
+        )
         undersized = [
             workspace_id
             for workspace_id, workspace in enumerate(self._current_workspaces)
@@ -303,11 +307,26 @@ class WorkspaceManager:
                     f"{current_size / _MB:.2f} MB. "
                     "Workspace growth is not allowed after locking."
                 )
+            if self._device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                # Growth frees and reallocates the slot; inside a capture that
+                # bakes a transient address into the graph and, across TP
+                # ranks, diverges the captured launch sequence.
+                raise RuntimeError(
+                    f"Workspace growth requested from '{get_caller_info()}' during "
+                    f"CUDA graph capture ({current_size / _MB:.2f} MB -> "
+                    f"{required_bytes / _MB:.2f} MB). Size the workspace before capture."
+                )
 
             # Only resize the requesting ubatch/lane workspace. Other slots
             # resize lazily on their next get_simultaneous call.
             # Resizing all ubatches here would orphan the other ubatch's
             # old tensor when it still holds views into it (DBO leak).
+            # Kernels already queued on any stream may still read the slot
+            # being replaced; releasing its segment to the driver below is not
+            # stream-ordered, so wait for the device first. Growth happens only
+            # before the workspace is locked, never in steady-state serving.
+            if self._device.type == "cuda" and current_workspace is not None:
+                torch.cuda.synchronize(self._device)
             self._current_workspaces[workspace_id] = None
             del current_workspace
             # Release the freed segment back to CUDA so the caching
