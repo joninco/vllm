@@ -430,19 +430,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 engram.prepare_disk(
                     hashes[:, engram.layer_hash_index], self.engram_hash.num_tokens
                 )
-            # Independent tables can issue concurrent NVMe reads, but all rows
-            # are ready before entering the existing target CUDA graph.
-            if getattr(self.engram_layout, "disk_prefetch_max_tokens", 0):
-                for engram in engrams:
-                    engram.finish_disk()
         except BaseException:
             for engram in engrams:
                 try:
                     engram.invalidate_disk_output(clear=True)
                 except BaseException:
-                    logger.exception(
-                        "Failed to drain an Engram prefetch during cleanup"
-                    )
+                    logger.exception("Failed to clear Engram rows during cleanup")
             raise
 
     def prepare_dummy_engram(self, num_tokens):

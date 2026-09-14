@@ -22,7 +22,6 @@ MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-64}"
 LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}"
 ENGRAM_TABLE_MEMORY="${ENGRAM_TABLE_MEMORY:-disk}"
 ENGRAM_DISK_RESIDENT_SCALES="${ENGRAM_DISK_RESIDENT_SCALES:-0}"
-ENGRAM_DISK_PREFETCH_MAX_TOKENS="${ENGRAM_DISK_PREFETCH_MAX_TOKENS:-0}"
 ENGRAM_PROJECTION_TP="${ENGRAM_PROJECTION_TP:-0}"
 PREFIX_CACHING="${PREFIX_CACHING:-1}"
 ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-1}"
@@ -62,14 +61,6 @@ require_positive_int() {
   local name=$1 value=$2
   if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${name} must be a positive integer; got '${value}'" >&2
-    exit 2
-  fi
-}
-
-require_nonnegative_int() {
-  local name=$1 value=$2
-  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
-    echo "${name} must be a non-negative integer; got '${value}'" >&2
     exit 2
   fi
 }
@@ -197,8 +188,6 @@ require_positive_int BLOCK_SIZE "${BLOCK_SIZE}"
 require_positive_int MAX_CUDAGRAPH_CAPTURE_SIZE \
   "${MAX_CUDAGRAPH_CAPTURE_SIZE}"
 require_positive_int NUM_SPECULATIVE_TOKENS "${NUM_SPECULATIVE_TOKENS}"
-require_nonnegative_int ENGRAM_DISK_PREFETCH_MAX_TOKENS \
-  "${ENGRAM_DISK_PREFETCH_MAX_TOKENS}"
 require_positive_number DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE \
   "${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE}"
 if [[ "${MAX_MODEL_LEN}" != "auto" && "${MAX_MODEL_LEN}" != "-1" ]]; then
@@ -419,9 +408,9 @@ speculative_config=$(printf \
   "${NUM_SPECULATIVE_TOKENS}" "${TP_SIZE}" "${adaptive_verification}" \
   "${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE}")
 engram_config=$(printf \
-  '{"cpu_offload":false,"table_memory":"%s","disk_resident_scales":%s,"disk_prefetch_max_tokens":%s,"projection_tp":%s}' \
+  '{"cpu_offload":false,"table_memory":"%s","disk_resident_scales":%s,"projection_tp":%s}' \
   "${ENGRAM_TABLE_MEMORY}" "${disk_resident_scales}" \
-  "${ENGRAM_DISK_PREFETCH_MAX_TOKENS}" "${projection_tp}")
+  "${projection_tp}")
 compilation_config='{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
 command=(
   "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL_PATH}"
@@ -466,9 +455,9 @@ cd "${SCRIPT_DIR}"
 printf 'Launching %s: TP%s, GPUs %s, %s Engram, DSpark (%s draft tokens)\n' \
   "${SERVED_MODEL_NAME}" "${TP_SIZE}" "${CUDA_VISIBLE_DEVICES}" \
   "${ENGRAM_TABLE_MEMORY}" "${NUM_SPECULATIVE_TOKENS}" >&2
-printf 'Engram offload: resident_scales=%s prefetch_max_tokens=%s projection_tp=%s\n' \
+printf 'Engram offload: resident_scales=%s projection_tp=%s\n' \
   "${ENGRAM_DISK_RESIDENT_SCALES}" \
-  "${ENGRAM_DISK_PREFETCH_MAX_TOKENS}" "${ENGRAM_PROJECTION_TP}" >&2
+  "${ENGRAM_PROJECTION_TP}" >&2
 printf 'DSpark adaptive verification cost scale: %s\n' \
   "${DSPARK_ADAPTIVE_VERIFICATION_COST_SCALE}" >&2
 printf 'Scheduling: chunked=%s async=%s reserve_full_isl=%s compute_share=%s parallel_prefills=%s policy=%s decode_refill=%s\n' \

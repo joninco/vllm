@@ -47,11 +47,6 @@ class EngramConfig:
     """Keep original E8M0 scale bytes in mapped host RAM for disk tables.
     Weights still use io_uring. Requires about 5.72 GiB total host RAM on V4.1."""
 
-    disk_prefetch_max_tokens: int = 0
-    """Opt-in concurrent reads across Engram tables before target execution.
-    Zero disables it. Larger preparation batches retain synchronous reads.
-    This does not overlap host I/O with captured decoder execution."""
-
     projection_tp: bool = False
     """Shard Engram WKV output columns over TP and gather the BF16 result.
     Opt-in pending matched whole-serving performance and precision checks."""
@@ -82,11 +77,7 @@ class EngramConfig:
                 f"implementation with non-empty {field or 'engram_layer_ids'} "
                 "is supported."
             )
-        if self.disk_prefetch_max_tokens < 0:
-            raise ValueError("disk_prefetch_max_tokens must be nonnegative")
-        if self.table_memory != "disk" and (
-            self.disk_resident_scales or self.disk_prefetch_max_tokens
-        ):
+        if self.table_memory != "disk" and self.disk_resident_scales:
             raise ValueError("disk Engram controls require table_memory='disk'")
         if self.table_memory == "ram":
             self._verify_ram_budget(model_config.hf_text_config, tp_size)

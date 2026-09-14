@@ -23,7 +23,11 @@ from vllm.config.engram import EngramConfig
 from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader import default_loader, weight_utils
 from vllm.model_executor.models.utils import WeightsMapper
-from vllm.models.deepseek_v4_1.common.engram import Engram, NgramHashState
+from vllm.models.deepseek_v4_1.common.engram import (
+    Engram,
+    NgramHashState,
+    ParallelEngramEmbedding,
+)
 from vllm.models.deepseek_v4_1.common.mm_preprocess import image_sentinel_mask
 from vllm.models.deepseek_v4_1.nvidia.dspark import DSparkDeepseekV4ForCausalLM
 from vllm.models.deepseek_v4_1.nvidia.model import (
@@ -90,9 +94,7 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
         paths.append(path)
         weights.update(layer_weights)
 
-    def make_model(
-        memory, *, tp_size=1, tp_rank=0, resident_scales=False, prefetch_max_tokens=0
-    ):
+    def make_model(memory, *, tp_size=1, tp_rank=0, resident_scales=False):
         local_plans = tuple(
             native.plan(
                 replace(plan.caps, tp_size=tp_size, tp_rank=tp_rank),
@@ -106,7 +108,6 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
             layer_ids=geometry.layer_ids,
             table_memory=memory,
             disk_resident_scales=resident_scales,
-            disk_prefetch_max_tokens=prefetch_max_tokens,
         )
         target = DeepseekV4Model.__new__(DeepseekV4Model)
         nn.Module.__init__(target)
@@ -369,20 +370,17 @@ def test_ram_engram_checkpoint_tp4_graph_reads_live_host_aliases(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("resident_scales", [False, True])
-@pytest.mark.parametrize("prefetch_max_tokens", [0, 2, 8])
 def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
     tiny_engram_checkpoint,
     tmp_path,
     monkeypatch,
     resident_scales,
-    prefetch_max_tokens,
 ):
     """Accepted GPU history, images, padding and failures cross the eager boundary."""
     make_model, weights, paths = tiny_engram_checkpoint
     root, target = make_model(
         "disk",
         resident_scales=resident_scales,
-        prefetch_max_tokens=prefetch_max_tokens,
     )
     resident_root, resident = make_model("device")
     _load_checkpoint(root, tmp_path)
@@ -566,6 +564,65 @@ def test_dspark_checkpoint_filter_does_not_read_target_engram(tmp_path, monkeypa
     torch.testing.assert_close(loaded[draft], torch.ones(2, 2))
 
 
+@pytest.mark.parametrize("resident_scales", [False, True])
+def test_disk_preparation_is_complete_on_return_and_clears_failed_rows(
+    resident_scales, monkeypatch
+):
+    """CPU lifecycle check with a reader that exposes no prefetch API."""
+
+    class DiskTable:
+        def __init__(self, plan, *, resident_scales=False):
+            self.resident_scales = resident_scales
+
+    fail_read = False
+
+    def lookup(binding, token_count, *, clear_tail):
+        assert not clear_tail
+        if fail_read:
+            raise OSError("injected read failure")
+        binding.out[:token_count].copy_(binding.hash_ids[:token_count, :1])
+
+    monkeypatch.setattr(native, "DiskTable", DiskTable)
+    monkeypatch.setattr(
+        native, "bind_lookup", lambda plan, **kwargs: SimpleNamespace(**kwargs)
+    )
+    monkeypatch.setattr(native, "run_lookup", lookup)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    plan = SimpleNamespace(caps=SimpleNamespace(device="cpu", max_tokens=3, tp_size=1))
+    layer = Engram.__new__(Engram)
+    nn.Module.__init__(layer)
+    layer.embed_tokens = ParallelEngramEmbedding(
+        plan, "disk", resident_scales=resident_scales
+    )
+    assert layer.embed_tokens.disk_table.resident_scales == resident_scales
+    layer.register_buffer("staged_rows", torch.zeros(3, 6144))
+    address = layer.staged_rows.data_ptr()
+    ids = torch.arange(72).reshape(3, 24)
+    count = torch.tensor([3], dtype=torch.int32)
+    layer.prepare_disk(ids, count)
+    assert layer._disk_prepared and layer._disk_prepared_tokens == 3
+    torch.testing.assert_close(layer.staged_rows[:, 0], torch.tensor([0.0, 24, 48]))
+
+    layer.prepare_disk(ids[:1] + 1, count.fill_(1))
+    assert layer._disk_prepared and layer._disk_prepared_tokens == 1
+    torch.testing.assert_close(layer.staged_rows[:, 0], torch.tensor([1.0, 0, 0]))
+    fail_read = True
+    with pytest.raises(OSError, match="injected"):
+        layer.prepare_disk(ids, count.fill_(3))
+    assert not layer._disk_prepared and layer._disk_prepared_tokens == 0
+    assert not layer.staged_rows.any()
+    fail_read = False
+    layer.prepare_disk(ids + 2, count)
+    torch.testing.assert_close(layer.staged_rows[:, 0], torch.tensor([2.0, 26, 50]))
+    assert layer._disk_prepared and layer.staged_rows.data_ptr() == address
+
+
+@pytest.mark.parametrize("value", [0, 32])
+def test_engram_rejects_removed_prefetch_option(value):
+    with pytest.raises(ValueError, match="disk_prefetch_max_tokens"):
+        EngramConfig(table_memory="disk", disk_prefetch_max_tokens=value)
+
+
 @pytest.mark.parametrize("cpu_offload", [False, True])
 def test_engram_storage_selection_changes_graph_configuration(cpu_offload):
     hashes = {
@@ -580,11 +637,10 @@ def test_engram_storage_selection_changes_graph_configuration(cpu_offload):
         for options in (
             {},
             {"disk_resident_scales": True},
-            {"disk_prefetch_max_tokens": 32},
             {"projection_tp": True},
         )
     }
-    assert len(disk_hashes) == 4
+    assert len(disk_hashes) == 3
 
 
 def test_disk_resident_scale_budget_charges_only_original_scale_bytes(monkeypatch):
@@ -608,11 +664,7 @@ def test_disk_resident_scale_budget_charges_only_original_scale_bytes(monkeypatc
         ).verify_model_config(model, tp_size=4)
     with pytest.raises(ValueError, match="table_memory"):
         EngramConfig(
-            table_memory="device", disk_prefetch_max_tokens=32
-        ).verify_model_config(model, tp_size=4)
-    with pytest.raises(ValueError, match="nonnegative"):
-        EngramConfig(
-            table_memory="disk", disk_prefetch_max_tokens=-1
+            table_memory="device", disk_resident_scales=True
         ).verify_model_config(model, tp_size=4)
 
 
