@@ -42,9 +42,7 @@ from vllm.v1.attention.backend import AttentionCGSupport
 DEVICE_TYPE = current_platform.device_type
 
 
-@pytest.mark.parametrize(
-    "swa_size,prefix_unit", [(None, 256), (32, 64), (64, 128), (128, 96)]
-)
+@pytest.mark.parametrize("swa_size,prefix_unit", [(None, 128), (32, 64), (128, 96)])
 def test_swa_page_size_rejects_incompatible_prefix_matching(swa_size, prefix_unit):
     config = SimpleNamespace(
         model_config=SimpleNamespace(architecture="DeepseekV41ForCausalLM"),
@@ -57,15 +55,6 @@ def test_swa_page_size_rejects_incompatible_prefix_matching(swa_size, prefix_uni
         VllmConfig.validate_swa_block_size(config)
     config.cache_config.prefix_match_unit = 32
     VllmConfig.validate_swa_block_size(config)
-
-
-def test_default_swa_page_accepts_128_token_prefix_matching():
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(architecture="DeepseekV41ForCausalLM"),
-        speculative_config=None,
-        cache_config=CacheConfig(prefix_match_unit=128),
-    )
-    assert VllmConfig.validate_swa_block_size(config) is config
 
 
 def test_swa_page_size_is_scoped_to_v41_target_and_draft():

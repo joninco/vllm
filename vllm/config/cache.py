@@ -85,7 +85,7 @@ class CacheConfig:
     Accepts None (meaning "use default"). After construction, always int."""
     swa_block_size: Literal[32, 64, 128] | None = None
     """Tokens per sliding-window cache page for native DeepSeek V4.1 B12X.
-    None uses 128 tokens. Independent of the logical attention window and
+    None uses 64 tokens. Independent of the logical attention window and
     the main/index cache's block_size. Requires a server restart; supported
     values are 32, 64 and 128. Other models do not support this override."""
     user_specified_block_size: bool = field(default=False, init=False)
