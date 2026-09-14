@@ -41,7 +41,7 @@ def _capacity(config):
 class _Linear(nn.Module):
     """Replicated checkpoint layout; bias is accumulated before BF16 rounding."""
 
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, bias=True, *, max_rows=None):
         super().__init__()
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, dtype=torch.bfloat16),
@@ -55,18 +55,62 @@ class _Linear(nn.Module):
             else None
         )
 
+        self._plans = {}
+        self._max_rows = max_rows
+        self._capacity = 0
+        set_b12x_preparation_provider(self, self)
+
     def forward(self, x, *, out):
+        plan = self._plans.get(x.shape[0], self._plans[self._capacity])
         return bf16_gemv.mm(
-            x, self.weight, bias=self.bias, out=out, output_dtype=torch.bfloat16
+            x, self.weight, plan=plan, bias=self.bias, out=out,
+            output_dtype=torch.bfloat16,
         )
 
-    def prepare(self):
-        bf16_gemv.precompile(
-            self.weight,
-            input_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
-            bias=self.bias,
-        )
+    def get_b12x_preparation_units(
+        self, layer: nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if workload.stage != "weights" or self.weight.is_meta:
+            return ()
+        self._capacity = workload.max_tokens if self._max_rows is None else self._max_rows
+        capacities = tuple(sorted({
+            self._capacity, *(rows for rows in workload.token_counts if rows <= self._capacity),
+        }))
+
+        def make_call(state):
+            source = torch.empty(
+                (state.query.max_rows, self.weight.shape[1]),
+                dtype=torch.bfloat16, device=self.weight.device,
+            )
+            out = torch.empty(
+                (state.query.max_rows, self.weight.shape[0]),
+                dtype=torch.bfloat16, device=self.weight.device,
+            )
+            return PreparedCall(
+                run=lambda: state.run(source, self.weight, out=out, bias=self.bias),
+                produce=lambda: source.normal_(std=0.25),
+                owners=(source, out),
+            )
+
+        requests = []
+        for capacity in capacities:
+            if capacity not in self._plans:
+                self._plans[capacity] = bf16_gemv.plan(bf16_gemv.GemvQuery(
+                    source_dtype="bfloat16", weight_dtype="bfloat16",
+                    max_rows=capacity, in_features=self.weight.shape[1],
+                    out_features=self.weight.shape[0], source_contiguous=True,
+                    source_aligned=True, weight_contiguous=self.weight.is_contiguous(),
+                    weight_aligned=self.weight.data_ptr() % 16 == 0,
+                    bias_dtype=None if self.bias is None else "bfloat16",
+                ))
+            requests.append(self._plans[capacity].request(
+                name=f"deepseek_v41.vision.linear.{id(self):x}.m{capacity}",
+                prepare_call=make_call, benchmark_call=make_call,
+            ))
+        return (B12xPreparationUnit(
+            name="V41VisionLinear", key=(id(self), capacities),
+            requests=tuple(requests), stage="weights", autotune=not workload.eager_only,
+        ),)
 
 
 class _Norm(nn.Module):
@@ -92,7 +136,9 @@ class _Norm(nn.Module):
 class _PatchEmbed(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.proj = _Linear(3 * config.vision_patch_size**2, config.vision_dim)
+        self.proj = _Linear(
+            3 * config.vision_patch_size**2, config.vision_dim, max_rows=_capacity(config),
+        )
 
     def forward(self, patches, *, out):
         return self.proj(patches.flatten(1), out=out)
@@ -101,8 +147,12 @@ class _PatchEmbed(nn.Module):
 class _Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.wqkv = _Linear(config.vision_dim, 3 * config.vision_dim)
-        self.wo = _Linear(config.vision_dim, config.vision_dim)
+        self.wqkv = _Linear(
+            config.vision_dim, 3 * config.vision_dim, max_rows=_capacity(config),
+        )
+        self.wo = _Linear(
+            config.vision_dim, config.vision_dim, max_rows=_capacity(config),
+        )
 
     def forward(self, x, height, width, workspace, *, out):
         rows = x.shape[0]
@@ -125,14 +175,19 @@ class _Attention(nn.Module):
 class _MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.w1 = _Linear(config.vision_dim, 2 * config.vision_inter_dim, False)
-        self.w2 = _Linear(config.vision_inter_dim, config.vision_dim, False)
+        self.w1 = _Linear(
+            config.vision_dim, 2 * config.vision_inter_dim, False, max_rows=_capacity(config),
+        )
+        self.w2 = _Linear(
+            config.vision_inter_dim, config.vision_dim, False, max_rows=_capacity(config),
+        )
 
     def forward(self, x, workspace, *, out):
         rows = x.shape[0]
         gate_up = self.w1(x, out=workspace.gate_up[:rows])
         activated = hyperconnection.run_swiglu(
-            gate_up, limit=float("inf"), round_silu=True, out=workspace.activated[:rows]
+            gate_up, limit=float("inf"), round_silu=True, out=workspace.activated[:rows],
+            plan=workspace.swiglu_plan,
         )
         return self.w2(activated, out=out)
 
@@ -148,10 +203,12 @@ class _Block(nn.Module):
         norm, branch = workspace.normalized[:rows], workspace.branch[:rows]
         self.norm1(x, out=norm, plan=workspace.norm_plan)
         self.attn(norm, height, width, workspace, out=branch)
-        residual = hyperconnection.run_add(x, branch, out=workspace.residual[:rows])
+        residual = hyperconnection.run_add(
+            x, branch, out=workspace.residual[:rows], plan=workspace.add_plan
+        )
         self.norm2(residual, out=norm, plan=workspace.norm_plan)
         self.mlp(norm, workspace, out=branch)
-        return hyperconnection.run_add(residual, branch, out=x)
+        return hyperconnection.run_add(residual, branch, out=x, plan=workspace.add_plan)
 
 
 class _VisionWorkspace:
@@ -183,37 +240,8 @@ class _VisionWorkspace:
         )
         self.inv_freq = inv.to(device=device)
         self.cu = torch.zeros(2, dtype=torch.int32, device=device)
-        kernel_plan = varlen.create_plan(
-            self.q,
-            self.k,
-            self.v,
-            self.cu,
-            max_seqlen_q=capacity,
-            max_seqlen_k=capacity,
-            causal=False,
-        )
-        scratch_plan = varlen.plan(kernel_plan)
-        (spec,) = scratch_plan.scratch_specs()
-        self.scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-        self.attention_binding = scratch_plan.bind(
-            scratch=self.scratch,
-            q=self.q,
-            k=self.k,
-            v=self.v,
-            cu_seqlens_q=self.cu,
-            max_seqlen_q=capacity,
-            max_seqlen_k=capacity,
-            causal=False,
-        )
-        self.norm_plan = hyperconnection.plan(
-            hyperconnection.Caps(
-                device=device,
-                max_tokens=capacity,
-                hidden_size=hidden,
-                streams=1,
-                lowrank=1,
-            )
-        )
+        self.scratch = None
+        self.attention_binding = None
 
 
 class DeepseekV4ViT(nn.Module):
@@ -236,6 +264,10 @@ class DeepseekV4ViT(nn.Module):
         self.norm = _Norm(config.vision_dim)
         self._workspace = None
         self._rope_plan = None
+        self._attention_plan = None
+        self._norm_plan = None
+        self._add_plan = None
+        self._swiglu_plan = None
         set_b12x_preparation_provider(self, self)
     def _provision_workspace(self):
         """Create fixed serving buffers only while the session is priming us."""
@@ -247,9 +279,9 @@ class DeepseekV4ViT(nn.Module):
                 raise RuntimeError("vision preparation cannot allocate during CUDA graph capture")
             self._workspace = _VisionWorkspace(self.config, self.capacity, device)
             self._workspace.rope_plan = self._rope_plan
-            for module in self.modules():
-                if isinstance(module, _Linear):
-                    module.prepare()
+            self._workspace.norm_plan = self._norm_plan
+            self._workspace.add_plan = self._add_plan
+            self._workspace.swiglu_plan = self._swiglu_plan
         elif self._workspace.state.device != device:
             raise ValueError("vision moved devices after preparation")
         return self._workspace
@@ -257,7 +289,7 @@ class DeepseekV4ViT(nn.Module):
     def get_b12x_preparation_units(
         self, layer: nn.Module, workload: B12xWorkload
     ) -> tuple[B12xPreparationUnit, ...]:
-        if any(parameter.is_meta for parameter in self.parameters()):
+        if workload.stage != "weights" or any(parameter.is_meta for parameter in self.parameters()):
             return ()
         if self._rope_plan is None:
             rope = VisionQuery(
@@ -268,6 +300,113 @@ class DeepseekV4ViT(nn.Module):
             )
             self._rope_plan = vision_api.plan(
                 rope, device=self.patch_embed.proj.weight.device
+            )
+
+        device = self.patch_embed.proj.weight.device
+        if self._attention_plan is None:
+            from torch._subclasses.fake_tensor import FakeTensorMode
+
+            heads = self.config.vision_n_heads
+            with FakeTensorMode():
+                q, k, v = (
+                    torch.empty(
+                        (self.capacity, heads, self.config.vision_dim // heads),
+                        dtype=torch.bfloat16, device=device,
+                    ) for _ in range(3)
+                )
+                cu = torch.empty(2, dtype=torch.int32, device=device)
+            self._attention_plan = varlen.plan(
+                q, k, v, cu, max_seqlen_q=self.capacity,
+                max_seqlen_k=self.capacity, causal=False,
+            )
+        for attribute, width, invocation in (
+            ("_norm_plan", self.config.vision_dim, {
+                "operation": "grouped_rmsnorm", "zero_centered": False,
+                "weight_dtype": "bfloat16", "eps": 1e-6,
+            }),
+            ("_add_plan", self.config.vision_dim, {"operation": "add"}),
+            ("_swiglu_plan", self.config.vision_inter_dim, {
+                "operation": "swiglu", "round_silu": True,
+            }),
+        ):
+            if getattr(self, attribute) is None:
+                setattr(self, attribute, hyperconnection.plan(
+                    hyperconnection.Caps(
+                        device=device, max_tokens=self.capacity, hidden_size=width,
+                        streams=1, lowrank=1,
+                    ),
+                    invocation=invocation,
+                ))
+
+        def attention_call(state, *, serving=False):
+            if serving:
+                workspace = self._provision_workspace()
+                q, k, v, cu = workspace.q, workspace.k, workspace.v, workspace.cu
+            else:
+                q, k, v = (
+                    torch.empty(state.plan.q_shape, dtype=torch.bfloat16, device=device)
+                    for _ in range(3)
+                )
+                cu = torch.empty(2, dtype=torch.int32, device=device)
+            (spec,) = self._attention_plan.scratch_specs()
+            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+            binding = state.bind(
+                plan=self._attention_plan, scratch=scratch, q=q, k=k, v=v,
+                cu_seqlens_q=cu, max_seqlen_q=self.capacity,
+                max_seqlen_k=self.capacity, causal=False,
+            )
+            if serving:
+                workspace.scratch, workspace.attention_binding = scratch, binding
+
+            def produce():
+                for tensor in (q, k, v):
+                    tensor.normal_(std=0.25)
+                cu[0].zero_()
+                cu[1].fill_(self.capacity)
+
+            return PreparedCall(
+                run=lambda: state.run(binding), produce=produce,
+                owners=(q, k, v, cu, scratch),
+            )
+
+        def norm_call(state):
+            from b12x.norm.hyperconnection._impl import run_grouped_rmsnorm_impl
+
+            source = torch.empty(
+                (self.capacity, self.config.vision_dim), dtype=torch.bfloat16, device=device,
+            )
+            out = torch.empty_like(source)
+            return PreparedCall(
+                run=lambda: run_grouped_rmsnorm_impl(
+                    source, self.norm.weight, eps=1e-6, zero_centered=False,
+                    plan=state, out=out,
+                ),
+                produce=lambda: source.normal_(std=0.25), owners=(source, out),
+            )
+
+        def pointwise_call(state):
+            from b12x.norm.hyperconnection._impl import run_add_impl, run_swiglu_impl
+
+            width = state.query.hidden_size
+            swiglu = state.query.operation == "swiglu"
+            left = torch.empty(
+                (self.capacity, width * (2 if swiglu else 1)),
+                dtype=torch.bfloat16, device=device,
+            )
+            right, out = (
+                torch.empty((self.capacity, width), dtype=torch.bfloat16, device=device)
+                for _ in range(2)
+            )
+
+            def produce():
+                left.normal_(std=0.25)
+                right.normal_(std=0.25)
+
+            return PreparedCall(
+                run=(lambda: run_swiglu_impl(
+                    left, limit=float("inf"), round_silu=True, plan=state, out=out,
+                )) if swiglu else (lambda: run_add_impl(left, right, plan=state, out=out)),
+                produce=produce, owners=(left, right, out),
             )
 
         def call(state):
@@ -282,14 +421,30 @@ class DeepseekV4ViT(nn.Module):
                 owners=(workspace.qkv, workspace.q, workspace.k, workspace.v, workspace.inv_freq, workspace.cu),
             )
 
-        request = self._rope_plan.request(
-            name=f"deepseek_v41.vision.rope.{id(self):x}",
-            prepare_call=call, benchmark_call=call,
+        base = f"deepseek_v41.vision.{id(self):x}"
+        requests = (
+            self._rope_plan.request(
+                name=f"{base}.rope", prepare_call=call, benchmark_call=call,
+            ),
+            self._attention_plan.request(
+                name=f"{base}.attention",
+                prepare_call=lambda state: attention_call(state, serving=True),
+                benchmark_call=attention_call,
+            ),
+            self._norm_plan.request(
+                name=f"{base}.norm", prepare_call=norm_call, benchmark_call=norm_call,
+            ),
+            self._add_plan.request(
+                name=f"{base}.add", prepare_call=pointwise_call, benchmark_call=pointwise_call,
+            ),
+            self._swiglu_plan.request(
+                name=f"{base}.swiglu", prepare_call=pointwise_call, benchmark_call=pointwise_call,
+            ),
         )
         return (B12xPreparationUnit(
             name="DeepseekV4ViT",
             key=(id(self), self.config.vision_dim, self.config.vision_n_heads),
-            requests=(request,), stage="weights", autotune=not workload.eager_only,
+            requests=requests, stage="weights", autotune=not workload.eager_only,
         ),)
 
     def forward(self, patches, n_vit_h: int, n_vit_w: int, *, out=None):
@@ -308,7 +463,10 @@ class DeepseekV4ViT(nn.Module):
         if (
             self._workspace is None
             or self._rope_plan is None
-            or self._rope_plan.prepared is None
+            or any(plan is None or plan.prepared is None for plan in (
+                self._rope_plan, self._attention_plan, self._norm_plan,
+                self._add_plan, self._swiglu_plan,
+            ))
         ):
             raise RuntimeError("vision plan was not prepared")
         ws = self._workspace
@@ -334,8 +492,11 @@ class DeepseekV4Aligner(nn.Module):
             raise ValueError("vision downsample ratio must be positive")
         self.out_dim = config.hidden_size
         self.hidden_size, self.capacity = config.vision_dim, _capacity(config)
-        self.w1 = _Linear(config.vision_dim * self.downsample_ratio**2, self.out_dim)
-        self.w2 = _Linear(self.out_dim, self.out_dim)
+        capacity = (self.capacity + self.downsample_ratio - 1) // self.downsample_ratio
+        self.w1 = _Linear(
+            config.vision_dim * self.downsample_ratio**2, self.out_dim, max_rows=capacity,
+        )
+        self.w2 = _Linear(self.out_dim, self.out_dim, max_rows=capacity)
         self._workspace = None
         self._merge_plan = None
         self._gelu_plan = None
@@ -354,8 +515,6 @@ class DeepseekV4Aligner(nn.Module):
                 *(torch.empty((capacity, width), device=device, dtype=torch.bfloat16)
                   for width in (self.hidden_size * r * r, self.out_dim, self.out_dim)),
             )
-            self.w1.prepare()
-            self.w2.prepare()
         elif self._workspace[0].device != device:
             raise ValueError("aligner moved devices after preparation")
         return self._workspace

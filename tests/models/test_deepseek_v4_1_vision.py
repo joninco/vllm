@@ -69,10 +69,12 @@ def _reference(vision, aligner, patches, height, width):
     return x, aligned
 
 
+@torch.no_grad()
 def test_native_small_vision_block_aligner_and_image_isolation():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("native b12x vision requires SM12x")
     from b12x.preparation import PreparationSession
+    from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
     from vllm.models.deepseek_v4_1.nvidia.b12x_vision import (
         DeepseekV4Aligner,
         DeepseekV4ViT,
@@ -92,17 +94,21 @@ def test_native_small_vision_block_aligner_and_image_isolation():
     )
     torch.manual_seed(411)
     vision, aligner = DeepseekV4ViT(config).cuda(), DeepseekV4Aligner(config).cuda()
+    for module in (vision, aligner):
+        for name, parameter in module.named_parameters():
+            if "norm" not in name:
+                parameter.normal_(std=0.04)
     workload = B12xWorkload(
         stage="weights", token_counts=(1,), fixed_token_counts=(),
         output_dtype=torch.bfloat16,
-        max_tokens=config.vision_max_n_token * config.vision_downsample_ratio**2,
+        max_tokens=32,
         max_seqs=1, max_model_len=1,
     )
-    session = PreparationSession(device=torch.device("cuda"))
+    session = PreparationSession(device=torch.device("cuda"), autotune=False, compile_workers=2)
     units = [
         unit
         for provider in (vision, aligner)
-        for unit in provider.get_b12x_preparation_units(provider, workload)
+        for unit in _units_from_modules(provider, workload)
     ]
     requests = tuple(request for unit in units for request in unit.requests)
     result = session.prepare(requests)
@@ -121,14 +127,79 @@ def test_native_small_vision_block_aligner_and_image_isolation():
         torch.testing.assert_close(repeated, encoded, atol=0, rtol=0)
         graph = torch.cuda.CUDAGraph()
         graph_encoded, graph_out = torch.empty_like(encoded), torch.empty_like(actual)
-        with torch.cuda.graph(graph):
+        with session.capture(), torch.cuda.graph(graph):
             vision(patches, 4, 7, out=graph_encoded)
             aligner(graph_encoded, 4, 7, out=graph_out)
         patches.neg_()
+        graph_encoded.fill_(float("nan"))
+        graph_out.fill_(float("nan"))
+        pointers = (graph_encoded.data_ptr(), graph_out.data_ptr())
+        allocated = torch.cuda.memory_allocated()
         graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        assert (graph_encoded.data_ptr(), graph_out.data_ptr()) == pointers
+        assert torch.isfinite(graph_out).all() and torch.count_nonzero(graph_out) > 0
         expected_encoded, expected_aligned = _reference(vision, aligner, patches, 4, 7)
         torch.testing.assert_close(
             graph_encoded, expected_encoded, atol=0.025, rtol=0.025
         )
         torch.testing.assert_close(graph_out, expected_aligned, atol=0.02, rtol=0.025)
+        graph.reset()
     session.close()
+
+
+@pytest.mark.parametrize("bias", [False, True])
+@torch.no_grad()
+def test_vision_linear_prepares_bias_and_replays_into_caller_output(bias):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x vision requires SM12x")
+    from b12x.preparation import PreparationSession
+    from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
+    from vllm.models.deepseek_v4_1.nvidia.b12x_vision import _Linear
+    from vllm.utils.b12x import B12xWorkload
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    layer = _Linear(128, 80, bias=bias).to(device)
+    layer.weight.normal_(std=0.125)
+    if layer.bias is not None:
+        layer.bias.normal_(std=0.125)
+    source = torch.randn(33, 128, device=device, dtype=torch.bfloat16).mul_(0.125)
+    output = torch.empty(33, 80, device=device, dtype=torch.bfloat16)
+    workload = B12xWorkload(
+        stage="weights", token_counts=(1, 8, 33), fixed_token_counts=(1, 8),
+        output_dtype=torch.bfloat16, max_tokens=33, max_seqs=1, max_model_len=33,
+    )
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare(tuple(
+            request for unit in _units_from_modules(layer, workload)
+            for request in unit.requests
+        ))
+        session.freeze()
+        launch = torch.compile(layer, fullgraph=True)
+        for rows in (1, 8, 17, 33):
+            output.fill_(float("nan"))
+            layer(source[:rows], out=output[:rows])
+            torch.testing.assert_close(
+                output[:rows], _linear(source[:rows], layer), rtol=0.01, atol=0.01,
+            )
+            assert torch.isnan(output[rows:]).all()
+        launch(source, out=output)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with session.capture(), torch.cuda.graph(graph):
+                launch(source, out=output)
+            pointer = output.data_ptr()
+            source.neg_()
+            if layer.bias is not None:
+                layer.bias.mul_(-0.5)
+            output.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated(device)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert output.data_ptr() == pointer
+            assert torch.cuda.memory_allocated(device) == allocated
+            assert torch.isfinite(output).all() and torch.count_nonzero(output) > 0
+            torch.testing.assert_close(output, _linear(source, layer), rtol=0.01, atol=0.01)
+        finally:
+            graph.reset()

@@ -376,13 +376,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and self.engram_layout.table_memory in ("ram", "disk")
         )
         if self.disk_engram:
-            plan = self.engram_layout.plans[0]
+            caps = self.engram_layout.caps[0]
             self.register_buffer(
                 "prepared_engram_hashes",
                 torch.empty(
-                    (plan.caps.max_tokens, len(self.engram_layout.layer_ids), 24),
+                    (caps.max_tokens, len(self.engram_layout.layer_ids), 24),
                     dtype=torch.int64,
-                    device=plan.caps.device,
+                    device=caps.device,
                 ),
                 persistent=False,
             )

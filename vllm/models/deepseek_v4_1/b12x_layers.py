@@ -21,6 +21,7 @@ from vllm.utils.b12x import (
     b12x_layer,
     b12x_layer_prefix,
     register_b12x_layer,
+    set_b12x_preparation_provider,
 )
 from vllm.utils.torch_utils import LayerNameType, _encode_layer_name, _resolve_layer_name
 from vllm.model_executor.layers.linear import LinearMethodBase, UnquantizedLinearMethod
@@ -105,10 +106,14 @@ def _block32_linear(
     if index == len(layer.b12x_capacities):
         raise ValueError("V4.1 linear rows exceed planned capacity")
     plan = layer.b12x_plans[index]
+    if scratch is None:
+        scratch = current_preallocated_workspace()
     buffers = (
         scratch
         if scratch is not None
-        else current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
+        else current_workspace_manager().get_simultaneous(
+            *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
+        )
     )
     binding = block_fp8_linear.bind(
         plan,
@@ -128,28 +133,65 @@ def _block32_linear_fake(x, out, key, scratch):
     return None
 
 
-@torch.library.custom_op("vllm::dsv41_embedding_out", mutates_args=("out",))
-def _embedding_out(weight: torch.Tensor, ids: torch.Tensor, out: torch.Tensor) -> None:
-    from b12x.sequence import embedding
-
-    embedding.run(weight, ids, out=out)
-
-
-@_embedding_out.register_fake
-def _embedding_out_fake(weight, ids, out):
-    return None
-
-
 class B12xEmbeddingMethod(UnquantizedEmbeddingMethod):
     """Retain sharded weight loading/ties; replace only token-row compute."""
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
+        layer.b12x_embedding_plans = {}
+        set_b12x_preparation_provider(layer, self)
+
+    def get_b12x_preparation_units(
+        self, layer: nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
         from b12x.sequence import embedding
 
+        if workload.stage != "weights" or layer.weight.is_meta:
+            return ()
+        weight = layer.weight
+
+        def make_call(state):
+            ids = torch.empty(
+                state.query.max_rows, device=weight.device,
+                dtype=getattr(torch, state.query.id_dtype),
+            )
+            out = torch.empty(
+                (state.query.max_rows, weight.shape[1]),
+                device=weight.device, dtype=weight.dtype,
+            )
+            return PreparedCall(
+                run=lambda: state.run(weight, ids, out=out),
+                produce=lambda: ids.copy_(
+                    torch.arange(ids.numel(), device=ids.device, dtype=ids.dtype)
+                    .remainder_(weight.shape[0])
+                ),
+                owners=(ids, out),
+            )
+
+        requests = []
         for id_dtype in (torch.int32, torch.int64):
-            embedding.precompile(layer.weight, id_dtype=id_dtype)
+            plan = layer.b12x_embedding_plans.get(id_dtype)
+            if plan is None:
+                query = embedding.EmbeddingQuery(
+                    max_rows=workload.max_tokens, table_rows=weight.shape[0],
+                    width=weight.shape[1], row_stride=weight.stride(0),
+                    weight_dtype=str(weight.dtype).removeprefix("torch."),
+                    id_dtype=str(id_dtype).removeprefix("torch."),
+                )
+                plan = embedding.plan(query, device=weight.device)
+                layer.b12x_embedding_plans[id_dtype] = plan
+            requests.append(plan.request(
+                name=f"deepseek_v41.embedding.{id(layer):x}.{id_dtype}",
+                prepare_call=make_call,
+            ))
+        return (B12xPreparationUnit(
+            name="V41Embedding", key=(id(layer), workload.max_tokens),
+            requests=tuple(requests), stage="weights",
+            autotune=not workload.eager_only,
+        ),)
 
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        from b12x.sequence import embedding
+
         # Each invocation owns its result: DSpark retains earlier Markov rows
         # for confidence evaluation. Graph capture owns these fixed allocations.
         out = torch.empty(
@@ -157,28 +199,82 @@ class B12xEmbeddingMethod(UnquantizedEmbeddingMethod):
             device=layer.weight.device,
             dtype=layer.weight.dtype,
         )
-        _embedding_out(layer.weight, input_, out)
+        embedding.run(
+            layer.weight, input_, out=out,
+            plan=layer.b12x_embedding_plans[input_.dtype],
+        )
         return out
 
 
 class B12xLinearMethod(UnquantizedLinearMethod):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        for input_dtype in (torch.bfloat16, torch.float32):
-            bf16_gemv.precompile(
-                layer.weight,
-                input_dtype=input_dtype,
-                output_dtype=getattr(layer, "out_dtype", torch.bfloat16),
+        layer.b12x_linear_plans = {}
+        set_b12x_preparation_provider(layer, self)
+
+    def get_b12x_preparation_units(
+        self, layer: nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if workload.stage != "weights" or layer.weight.is_meta:
+            return ()
+        weight = layer.weight
+        capacities = tuple(sorted({workload.max_tokens, *workload.token_counts}))
+        layer.b12x_linear_capacity = workload.max_tokens
+
+        def make_call(state):
+            query = state.query
+            source = torch.empty(
+                (query.max_rows, query.in_features), device=weight.device,
+                dtype=getattr(torch, query.source_dtype),
             )
+            out = torch.empty(
+                (query.max_rows, query.out_features), device=weight.device,
+                dtype=getattr(torch, query.output_dtype),
+            )
+            return PreparedCall(
+                run=lambda: state.run(source, weight, out=out),
+                produce=lambda: source.normal_(std=0.25),
+                owners=(source, out),
+            )
+
+        requests = []
+        for capacity in capacities:
+            for dtype in (torch.bfloat16, torch.float32):
+                key = (dtype, capacity)
+                plan = layer.b12x_linear_plans.get(key)
+                if plan is None:
+                    query = bf16_gemv.GemvQuery(
+                        source_dtype=str(dtype).removeprefix("torch."),
+                        weight_dtype=str(weight.dtype).removeprefix("torch."),
+                        output_dtype=str(getattr(layer, "out_dtype", torch.bfloat16))
+                        .removeprefix("torch."),
+                        max_rows=capacity, in_features=weight.shape[1],
+                        out_features=weight.shape[0], source_contiguous=True,
+                        source_aligned=True, weight_contiguous=weight.is_contiguous(),
+                        weight_aligned=weight.data_ptr() % 16 == 0,
+                    )
+                    plan = bf16_gemv.plan(query)
+                    layer.b12x_linear_plans[key] = plan
+                requests.append(plan.request(
+                    name=f"deepseek_v41.linear.{id(layer):x}.{dtype}.m{capacity}",
+                    prepare_call=make_call, benchmark_call=make_call,
+                ))
+        return (B12xPreparationUnit(
+            name="V41Linear", key=(id(layer), capacities), requests=tuple(requests),
+            stage="weights", autotune=not workload.eager_only,
+        ),)
 
     def apply(
         self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         if bias is not None:
             raise ValueError("V4.1 native projections require bias-free weights")
-        out = bf16_gemv.mm(
-            x, layer.weight, output_dtype=getattr(layer, "out_dtype", torch.bfloat16)
+        plan = layer.b12x_linear_plans.get((x.dtype, x.shape[0]))
+        if plan is None:
+            plan = layer.b12x_linear_plans[(x.dtype, layer.b12x_linear_capacity)]
+        return bf16_gemv.mm(
+            x, layer.weight, plan=plan,
+            output_dtype=getattr(layer, "out_dtype", torch.bfloat16),
         )
-        return out
 
 
 class B12xFP8LinearMethod(LinearMethodBase):
@@ -239,12 +335,51 @@ class B12xFP8LinearMethod(LinearMethodBase):
             )
             for capacity in layer.b12x_capacities
         )
-        for capacity in layer.b12x_capacities:
-            block_fp8_linear.prewarm(
-                layer.b12x_weight, (1, capacity), expected_m=capacity
-            )
         layer.b12x_key = id(layer)
         _LINEARS[layer.b12x_key] = layer
+        set_b12x_preparation_provider(layer, self)
+
+    def get_b12x_preparation_units(
+        self, layer: nn.Module, workload: B12xWorkload
+    ) -> tuple[B12xPreparationUnit, ...]:
+        if workload.stage != "weights" or layer.weight.is_meta:
+            return ()
+
+        def make_call(state):
+            query = state.query
+            source = torch.empty(
+                (query.max_tokens, query.in_features), device=state.device,
+                dtype=getattr(torch, query.source_dtype),
+            )
+            output = torch.empty(
+                (query.max_tokens, query.out_features, 1), device=state.device,
+                dtype=getattr(torch, query.output_dtype),
+            )
+            scratch = [
+                torch.empty(spec.shape, dtype=spec.dtype, device=state.device)
+                for spec in state.scratch.scratch_specs()
+            ]
+            binding = state.bind(
+                scratch=scratch, source=source,
+                packed_weight=layer.b12x_weight, output=output,
+            )
+            return PreparedCall(
+                run=lambda: state.run_binding(binding),
+                produce=lambda: source.normal_(std=0.25),
+                owners=(source, output, scratch, binding),
+            )
+
+        requests = tuple(
+            plan.request(
+                name=f"deepseek_v41.block32.{id(layer):x}.m{capacity}",
+                prepare_call=make_call, benchmark_call=make_call,
+            )
+            for capacity, plan in zip(layer.b12x_capacities, layer.b12x_plans)
+        )
+        return (B12xPreparationUnit(
+            name="V41Block32Linear", key=(id(layer), layer.b12x_capacities),
+            requests=requests, stage="weights", autotune=not workload.eager_only,
+        ),)
 
     def get_workspace_size(self, layer, num_tokens: int) -> int:
         index = bisect_left(layer.b12x_capacities, num_tokens)
@@ -261,7 +396,8 @@ class B12xFP8LinearMethod(LinearMethodBase):
             dtype=torch.bfloat16,
             device=x.device,
         )
-        _block32_linear(x, out, layer.b12x_key, current_preallocated_workspace())
+        scratch = None if torch.compiler.is_compiling() else current_preallocated_workspace()
+        _block32_linear(x, out, layer.b12x_key, scratch)
         return out
 
 

@@ -180,35 +180,39 @@ def test_prepare_memory_is_metadata_not_capacity_activations(native_workspace):
     assert allocated <= metadata_bytes + persistent_topk_bytes + 1024**2
 
 
-def test_block_linear_capture_retains_scratch_not_caller_activations(native_workspace):
+def test_block_linear_capture_retains_scratch_not_caller_activations(
+    native_workspace, monkeypatch,
+):
     from vllm.models.deepseek_v4_1 import b12x_layers
 
     _, manager, workspace = native_workspace
-    kernel = b12x_layers.block_fp8_linear
+    from b12x.preparation import PreparationSession
+    from vllm.utils.b12x import B12xWorkload
+
     torch.manual_seed(89)
     device = torch.device("cuda")
     layer = torch.nn.Module()
     layer.weight = torch.randn(256, 256, device=device).to(torch.float8_e4m3fn)
-    scales = torch.ones(8, 8, device=device).to(torch.float8_e8m0fnu)
-    layer.b12x_weight = kernel.pack_weight(layer.weight, scales, block_size=(32, 32))
-    layer.b12x_capacities = (16,)
-    plan = kernel.plan(
-        kernel.Caps(
-            device=device,
-            max_tokens=16,
-            in_features=256,
-            out_features=256,
-            block_size=(32, 32),
-        )
-    )
-    layer.b12x_plans = (plan,)
-    layer.b12x_key = id(layer)
-    b12x_layers._LINEARS[id(layer)] = layer
-    manager.reserve_all(*plan.shapes_and_dtypes())
-    kernel.prewarm(layer.b12x_weight, (8, 16), expected_m=16)
+    layer.weight_scale_inv = torch.ones(8, 8, device=device).to(torch.float8_e8m0fnu)
+    monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (16,))
     method = b12x_layers.B12xFP8LinearMethod(
         SimpleNamespace(weight_block_size=[32, 32])
     )
+    method.process_weights_after_loading(layer)
+    workload = B12xWorkload(
+        stage="weights", token_counts=(8, 16), fixed_token_counts=(8,),
+        output_dtype=torch.bfloat16, max_tokens=16, max_seqs=1, max_model_len=16,
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    session.prepare(tuple(
+        request for unit in method.get_b12x_preparation_units(layer, workload)
+        for request in unit.requests
+    ))
+    session.freeze()
+    manager.reserve_all(*(
+        (spec.shape, spec.dtype) for spec in layer.b12x_plans[0].scratch_specs()
+    ))
+    manager.lock()
     inputs = torch.randn(16, 256, dtype=torch.bfloat16, device=device)
     outputs = torch.empty_like(inputs)
     references: list[weakref.ReferenceType[torch.Tensor]] = []
@@ -222,28 +226,34 @@ def test_block_linear_capture_retains_scratch_not_caller_activations(native_work
     pool = torch.cuda.graph_pool_handle()
     graphs = {}
     owners = []
-    for rows in (16, 8):
-        run(rows)
-        torch.accelerator.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with (
-            workspace.collect_cuda_graph_capture_resources() as resources,
-            torch.cuda.graph(graph, pool=pool),
-        ):
+    try:
+        for rows in (16, 8):
             run(rows)
-        owners.append(resources)
-        graphs[rows] = graph
-        gc.collect()
-        assert all(reference() is None for reference in references)
-        assert resources
+            torch.accelerator.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with (
+                session.capture(),
+                workspace.collect_cuda_graph_capture_resources() as resources,
+                torch.cuda.graph(graph, pool=pool),
+            ):
+                run(rows)
+            owners.append(resources)
+            graphs[rows] = graph
+            gc.collect()
+            assert all(reference() is None for reference in references)
+            assert resources
 
-    for rows in (8, 16, 8, 16):
-        inputs.normal_()
-        run(rows)
-        expected = outputs[:rows].clone()
-        outputs.fill_(float("nan"))
-        graphs[rows].replay()
-        torch.testing.assert_close(outputs[:rows], expected, rtol=0, atol=0)
+        for rows in (8, 16, 8, 16):
+            inputs.normal_()
+            run(rows)
+            expected = outputs[:rows].clone()
+            outputs.fill_(float("nan"))
+            graphs[rows].replay()
+            torch.testing.assert_close(outputs[:rows], expected, rtol=0, atol=0)
+    finally:
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
 
 
 @pytest.mark.parametrize("draft_tokens", [5, 7])

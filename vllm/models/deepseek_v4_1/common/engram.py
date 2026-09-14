@@ -645,14 +645,22 @@ class Engram(nn.Module):
             ),
             persistent=False,
         )
-        self.mix_plan = hyperconnection.plan(
-            hyperconnection.Caps(
-                device=caps.device,
-                max_tokens=caps.max_tokens,
-                hidden_size=self.dim,
-                streams=self.hc_mult,
-            )
+        mix_caps = hyperconnection.Caps(
+            device=caps.device,
+            max_tokens=caps.max_tokens,
+            hidden_size=self.dim,
+            streams=self.hc_mult,
         )
+        self.mix_plans = {
+            masked: hyperconnection.plan(
+                mix_caps,
+                invocation={
+                    "operation": "engram_mix", "eps": self.eps,
+                    "token_mask": masked,
+                },
+            )
+            for masked in (False, True)
+        }
         set_b12x_preparation_provider(self, self)
     def get_b12x_preparation_units(
         self, layer: torch.nn.Module, workload: B12xWorkload
@@ -704,10 +712,54 @@ class Engram(nn.Module):
             name=f"{id(self)}/engram-lookup",
             prepare_call=make_call, benchmark_call=make_call,
         )
-        return (B12xPreparationUnit(
-            name="EngramLookup", key=(id(self), workload.max_tokens),
-            requests=(request,), stage="weights", autotune=not workload.eager_only,
-        ),)
+        def make_mix_call(state):
+            from b12x.norm.hyperconnection._impl import run_engram_mix_impl
+
+            rows = state.query.max_tokens
+            width = self.hc_mult * self.dim
+            residual = torch.empty(
+                (rows, width), dtype=torch.bfloat16, device=caps.device,
+            )
+            projected = torch.empty(
+                (rows, width + self.dim), dtype=torch.bfloat16, device=caps.device,
+            )
+            out = torch.empty_like(residual)
+            mask = (
+                torch.ones(rows, dtype=torch.bool, device=caps.device)
+                if state.query.token_mask else None
+            )
+            if mask is not None:
+                mask[::2] = False
+
+            def produce():
+                residual.fill_(0.125)
+                projected.fill_(0.25)
+
+            return PreparedCall(
+                run=lambda: run_engram_mix_impl(
+                    residual, projected, self.norm_weights, eps=self.eps,
+                    plan=state, out=out, token_mask=mask,
+                ),
+                produce=produce, output=out, owners=(self.norm_weights,),
+            )
+
+        mix_requests = tuple(
+            plan.request(
+                name=f"{id(self)}/engram-mix/{masked}",
+                prepare_call=make_mix_call, benchmark_call=make_mix_call,
+            )
+            for masked, plan in self.mix_plans.items()
+        )
+        return (
+            B12xPreparationUnit(
+                name="EngramLookup", key=(id(self), workload.max_tokens),
+                requests=(request,), stage="weights", autotune=not workload.eager_only,
+            ),
+            B12xPreparationUnit(
+                name="EngramMix", key=(id(self), workload.max_tokens),
+                requests=mix_requests, stage="weights", autotune=not workload.eager_only,
+            ),
+        )
 
     def process_weights_after_loading(self):
         self.norm_weights.copy_(
@@ -757,7 +809,7 @@ class Engram(nn.Module):
             kv,
             self.norm_weights,
             eps=self.eps,
-            plan=self.mix_plan,
+            plan=self.mix_plans[token_mask is not None],
             out=out,
             token_mask=token_mask,
         )

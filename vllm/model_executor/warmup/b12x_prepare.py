@@ -160,9 +160,14 @@ def _module_workload(module: torch.nn.Module, workload: B12xWorkload) -> B12xWor
 
 
 def _units_from_modules(
-    model: torch.nn.Module, workload: B12xWorkload
+    model: torch.nn.Module, workload: B12xWorkload, *, seen: set[int] | None = None,
 ) -> Iterable[B12xPreparationUnit]:
+    if seen is None:
+        seen = set()
     for module in model.modules():
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
         provider = getattr(module, "b12x_preparation_provider", None)
         hook = getattr(provider, "get_b12x_preparation_units", None)
         if not callable(hook):
@@ -223,7 +228,9 @@ def collect_b12x_units(worker: "Worker", workload: B12xWorkload) -> list[B12xPre
     """Collect every unit of one stage from the model, the draft, and comms."""
     mark_b12x_eager_shapes(worker)
     units: list[B12xPreparationUnit] = []
-    units.extend(_units_from_modules(worker.get_model(), workload))
+    # Target and draft can share the same embedding and output-head modules.
+    seen: set[int] = set()
+    units.extend(_units_from_modules(worker.get_model(), workload, seen=seen))
     draft = worker.get_draft_model()
     if draft is not None:
         lane = _draft_lane(worker)
@@ -231,7 +238,7 @@ def collect_b12x_units(worker: "Worker", workload: B12xWorkload) -> list[B12xPre
         from vllm.v1.worker.workspace import use_workspace_lane
 
         with use_workspace_lane(lane):
-            draft_units = list(_units_from_modules(draft, draft_workload))
+            draft_units = list(_units_from_modules(draft, draft_workload, seen=seen))
         if lane:
             draft_units = [scope_b12x_unit_calls(unit, lane) for unit in draft_units]
         units.extend(draft_units)

@@ -418,3 +418,31 @@ def test_b12x_batches_with_autotune_disabled_time_nothing():
     assert b12x_prepare.b12x_batches(units, autotune=False) == [
         ((timed_a, default, timed_b), False),
     ]
+
+
+@pytest.mark.parametrize("shared_module", [True, False])
+@pytest.mark.parametrize("draft_lane", [0, 1])
+def test_collect_units_handles_target_and_draft_embedding_aliases(shared_module, draft_lane):
+    from vllm.models.deepseek_v4_1.b12x_layers import B12xEmbeddingMethod
+
+    target = torch.nn.Module()
+    target.embed_tokens = torch.nn.Module()
+    target.embed_tokens.weight = torch.nn.Parameter(
+        torch.ones(32, 64, dtype=torch.bfloat16), requires_grad=False,
+    )
+    method = B12xEmbeddingMethod()
+    method.process_weights_after_loading(target.embed_tokens)
+    draft = torch.nn.Module()
+    if shared_module:
+        draft.embed_tokens = target.embed_tokens
+    else:
+        draft.embed_tokens = torch.nn.Module()
+        draft.embed_tokens.weight = target.embed_tokens.weight
+        method.process_weights_after_loading(draft.embed_tokens)
+    worker = _worker(target, draft=draft, draft_lane=draft_lane)
+    units = b12x_prepare.collect_b12x_units(worker, _workload())
+    requests = [request for unit in units for request in unit.requests]
+    assert len(requests) == (2 if shared_module else 4)
+    assert len({request.name for request in requests}) == len(requests)
+    assert len({id(request.plan) for request in requests}) == len(requests)
+    assert {request.plan.query.id_dtype for request in requests} == {"int32", "int64"}

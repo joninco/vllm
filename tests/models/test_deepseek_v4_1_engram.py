@@ -731,3 +731,134 @@ def test_ram_engram_budget_reserves_memory_and_survives_worker_serialization(
     # A different padded footprint is not covered by the original preflight.
     with pytest.raises(ValueError, match="Insufficient RAM"):
         worker_config.verify_model_config(model_config, tp_size=8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity, hidden, streams = 7, 64, 4
+    geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+    caps = native.Caps(
+        device=device, max_tokens=capacity, max_seqs=2, max_requests=2,
+        vocab_size=32, layer_id=1, tp_size=1, tp_rank=0,
+    )
+    lookup = native.plan(
+        caps, token_map=list(range(32)), geometry=geometry,
+        invocation={"operation": "lookup", "compact_rows": False},
+    )
+    layout = SimpleNamespace(
+        caps=(caps,), lookup_plans=(lookup,), geometry=geometry,
+        table_memory="device", projection_tp=False,
+    )
+    config = SimpleNamespace(hidden_size=hidden, hc_mult=streams, rms_norm_eps=1e-3)
+    old_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device(device):
+            module = Engram(config, None, layout, 0, False, "engram_graph_test")
+    finally:
+        torch.set_default_dtype(old_dtype)
+    module.q_weight.fill_(0.5)
+    module.k_weight.fill_(0.25)
+    module.wkv.weight.normal_(std=0.01)
+    module.embed_tokens.weight.fill_(2)
+    module.embed_tokens.weight_scale_inv.fill_(127)
+    module.process_weights_after_loading()
+    workload = B12xWorkload(
+        stage="weights", token_counts=(1, capacity), fixed_token_counts=(1,),
+        output_dtype=torch.bfloat16, max_tokens=capacity, max_seqs=2,
+        max_model_len=8,
+    )
+    requests = tuple(
+        request
+        for unit in module.get_b12x_preparation_units(module, workload)
+        for request in unit.requests
+    )
+    ids = torch.arange(24, device=device).expand(capacity, -1).contiguous()
+    residual = torch.randn(
+        (capacity, streams, hidden), device=device, dtype=torch.bfloat16,
+    ).mul_(0.1)
+    mask = torch.ones(capacity, dtype=torch.bool, device=device)
+    mask[::2] = False
+
+    def reference(rows, token_mask):
+        source = residual[:rows].float()
+        projected = module.wkv(module.staged_rows[:rows]).float()
+        key = projected[:, : streams * hidden].view(rows, streams, hidden)
+        value = projected[:, streams * hidden :]
+        score = (source * module.norm_weights.view(streams, hidden) * key).sum(-1)
+        score *= torch.rsqrt(source.square().mean(-1) + config.rms_norm_eps)
+        score *= torch.rsqrt(key.square().mean(-1) + config.rms_norm_eps)
+        score *= hidden**-0.5
+        gate = torch.sigmoid(torch.copysign(score.abs().clamp_min(1e-6).sqrt(), score))
+        if token_mask is not None:
+            gate.masked_fill_(~token_mask[:, None], 0)
+        return (source + gate[..., None] * value[:, None]).bfloat16()
+
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare(requests)
+        session.freeze()
+        module.prepare_embeddings(ids)
+        launch = torch.compile(module.forward, fullgraph=True)
+        for rows in (1, capacity):
+            for with_mask in (False, True):
+                token_mask = mask[:rows] if with_mask else None
+                launch(residual[:rows], ids[:rows], token_mask)
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with session.capture(), torch.cuda.graph(graph):
+                        actual = launch(residual[:rows], ids[:rows], token_mask)
+                    pointer = actual.data_ptr()
+                    allocated = torch.cuda.memory_allocated(device)
+                    residual.mul_(-0.5)
+                    module.staged_rows.mul_(0.75)
+                    mask.logical_not_()
+                    actual.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize(device)
+                    assert torch.cuda.memory_allocated(device) == allocated
+                    assert actual.data_ptr() == pointer
+                    assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+                    torch.testing.assert_close(
+                        actual, reference(rows, token_mask), rtol=1e-2, atol=1e-2,
+                    )
+                    if token_mask is not None:
+                        torch.testing.assert_close(
+                            actual[~token_mask], residual[:rows][~token_mask],
+                            rtol=0, atol=0,
+                        )
+                finally:
+                    graph.reset()
+
+
+def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch):
+    from vllm.models.deepseek_v4_1.nvidia import model as model_module
+
+    caps = SimpleNamespace(max_tokens=13, device=torch.device("cpu"))
+    layout = SimpleNamespace(caps=(caps,), layer_ids=(1, 14), table_memory="disk")
+    config = SimpleNamespace(
+        vocab_size=32, hidden_size=64, hc_mult=4, hc_eps=1e-6,
+        rms_norm_eps=1e-6, index_topk=8, num_hidden_layers=0,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=config, dtype=torch.bfloat16),
+        quant_config=SimpleNamespace(get_name=lambda: "deepseek_v41_fp8"),
+        parallel_config=SimpleNamespace(use_ubatching=False),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=13),
+        lora_config=None, speculative_config=None,
+    )
+    monkeypatch.setattr(model_module, "_use_sequence_parallel", lambda _: False)
+    monkeypatch.setattr(
+        model_module, "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=False, is_last_rank=False),
+    )
+    monkeypatch.setattr(model_module.EngramLayout, "from_config", lambda _: layout)
+    monkeypatch.setattr(
+        model_module, "make_layers", lambda *args, **kwargs: (0, 0, nn.ModuleList()),
+    )
+    model = model_module.DeepseekV4Model(vllm_config=vllm_config)
+    hashes = model.prepared_engram_hashes
+    assert hashes.shape == (13, 2, 24)
+    assert hashes.dtype == torch.int64 and hashes.device == caps.device
+    assert "prepared_engram_hashes" not in model.state_dict()

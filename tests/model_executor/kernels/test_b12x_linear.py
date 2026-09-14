@@ -1521,10 +1521,15 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
     method = b12x_layers.B12xFP8LinearMethod(
         SimpleNamespace(weight_block_size=[32, 32])
     )
-    # B12xFP8LinearMethod plans and prewarms its block32 regimes directly in
-    # process_weights_after_loading; it does not join the preparation-unit
-    # protocol, so no session is needed here.
     method.process_weights_after_loading(layer)
+    session, _ = _prepare(layer, device=device, counts=(1, 8, 17), fixed=(1, 8))
+    session.freeze()
+    manager = workspace.current_workspace_manager()
+    manager.reserve_all(*(
+        (spec.shape, spec.dtype)
+        for plan in layer.b12x_plans for spec in plan.scratch_specs()
+    ))
+    manager.lock()
     source = torch.randn((*leading_shape, 128), device=device, dtype=torch.bfloat16)
 
     def oracle():
@@ -1540,29 +1545,34 @@ def test_v41_block32_adapter_preserves_native_output_view_and_replay(
         weights = layer.weight.float() * 0.125
         return (values @ weights.T).bfloat16().view(*leading_shape, 96)
 
-    actual = method.apply(layer, source)
-    torch.testing.assert_close(actual, oracle(), rtol=0.01, atol=0.01)
+    apply = torch.compile(lambda x: method.apply(layer, x), fullgraph=True)
     graph = torch.cuda.CUDAGraph()
     try:
         with kernel_resolution_guard("V4.1 vLLM block32 output-view replay"):
+            torch.testing.assert_close(apply(source), oracle(), rtol=0.01, atol=0.01)
             for rows in (1, 3, 8, 9, 17):
                 live = source.reshape(-1, 128)[:rows]
                 torch.testing.assert_close(
-                    method.apply(layer, live),
-                    oracle().reshape(-1, 96)[:rows],
-                    rtol=0.01,
-                    atol=0.01,
+                    apply(live), oracle().reshape(-1, 96)[:rows],
+                    rtol=0.01, atol=0.01,
                 )
             with workspace.collect_cuda_graph_capture_resources() as retained:
-                with torch.cuda.graph(graph):
-                    captured = method.apply(layer, source)
+                with session.capture(), torch.cuda.graph(graph):
+                    captured = apply(source)
             source.mul_(0.5)
+            captured.fill_(float("nan"))
+            address = captured.data_ptr()
+            allocated = torch.cuda.memory_allocated(device)
             graph.replay()
             torch.cuda.synchronize()
+            assert captured.data_ptr() == address
+            assert torch.cuda.memory_allocated(device) == allocated
+            assert torch.isfinite(captured).all() and torch.count_nonzero(captured) > 0
             torch.testing.assert_close(captured, oracle(), rtol=0.01, atol=0.01)
             del retained
     finally:
         graph.reset()
+        session.close()
 
 
 def _check_v41_vocab_embedding_and_tied_head(device):
@@ -1602,10 +1612,9 @@ def _check_v41_vocab_embedding_and_tied_head(device):
     ids = torch.tensor([0, 1, 63, 64, 95, 96, 127, 130], device=device)
     probe = torch.zeros((1, hidden), dtype=torch.bfloat16, device=device)
     probe[0, 0] = 1
-    # B12xEmbeddingMethod precompiles its native path directly in
-    # process_weights_after_loading; it does not join the preparation-unit
-    # protocol, so no session is needed here.
     target.quant_method.process_weights_after_loading(target)
+    session, _ = _prepare(target, device=device, counts=(1, 3, ids.numel()))
+    session.freeze()
     processor = LogitsProcessor(vocab)
 
     def check_head():
@@ -1619,23 +1628,54 @@ def _check_v41_vocab_embedding_and_tied_head(device):
                 check_dtype=False,
             )
 
-    torch.testing.assert_close(target(ids), checkpoint[ids], rtol=0, atol=0)
-    check_head()
     graph = torch.cuda.CUDAGraph()
     try:
+        lookup = torch.compile(
+            lambda values: target.quant_method.embedding(target, values), fullgraph=True,
+        )
+        for dtype in (torch.int32, torch.int64):
+            local_ids = torch.arange(ids.numel(), device=device, dtype=dtype)
+            for rows in (1, 3, ids.numel()):
+                actual = lookup(local_ids[:rows])
+                torch.testing.assert_close(
+                    actual, target.weight[local_ids[:rows].long()], rtol=0, atol=0,
+                )
+            with session.capture(), torch.cuda.graph(graph):
+                local_out = lookup(local_ids)
+            address = local_out.data_ptr()
+            allocated = torch.cuda.memory_allocated(device)
+            local_ids.add_(7)
+            local_out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert local_out.data_ptr() == address
+            assert torch.cuda.memory_allocated(device) == allocated
+            torch.testing.assert_close(
+                local_out, target.weight[local_ids.long()], rtol=0, atol=0,
+            )
+            graph.reset()
+
+        torch.testing.assert_close(target(ids), checkpoint[ids], rtol=0, atol=0)
+        check_head()
         with (
+            session.capture(),
             kernel_resolution_guard("V4.1 sharded vocabulary embedding replay"),
             workspace.collect_cuda_graph_capture_resources() as retained,
             graph_capture(device=device) as capture_context,
             torch.cuda.graph(graph, stream=capture_context.stream),
         ):
             captured = target(ids)
+        address = captured.data_ptr()
         for offset in (3, 17):
             ids.add_(offset).remainder_(vocab)
             checkpoint.neg_()
             target.weight_loader(target.weight, checkpoint)
+            captured.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated(device)
             graph.replay()
             torch.cuda.synchronize()
+            assert captured.data_ptr() == address
+            assert torch.cuda.memory_allocated(device) == allocated
             torch.testing.assert_close(captured, checkpoint[ids], rtol=0, atol=0)
             # Reload the target after tying: the head must see current weights,
             # not a copied or prepacked snapshot from embedding finalization.
@@ -1643,6 +1683,7 @@ def _check_v41_vocab_embedding_and_tied_head(device):
         del retained
     finally:
         graph.reset()
+        session.close()
 
 
 def test_v41_vocab_embedding_global_ids_and_target_weight_tie(request, monkeypatch):
@@ -2031,3 +2072,54 @@ def test_b12x_fp8_eager_unplanned_rows_use_default_and_replay(recipe):
                 torch.testing.assert_close(captured, expected(4), rtol=0.02, atol=0.125)
             finally:
                 graph.reset()
+
+
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+@torch.no_grad()
+def test_v41_unquantized_prepares_dtypes_and_exact_rows_before_replay(output_dtype):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("native b12x projection requires SM12x")
+    from vllm.models.deepseek_v4_1.b12x_layers import B12xLinearMethod
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.randn(384, 5120, device=device).bfloat16().mul_(0.125),
+        requires_grad=False,
+    )
+    layer.out_dtype = output_dtype
+    method = B12xLinearMethod()
+    method.process_weights_after_loading(layer)
+    session, _ = _prepare(
+        layer, device=device, counts=(1, 8, 256), fixed=(1, 8),
+        output_dtype=output_dtype,
+    )
+    session.freeze()
+    graph = torch.cuda.CUDAGraph()
+    tolerance = 0.015 if output_dtype == torch.bfloat16 else 1e-4
+    try:
+        apply = torch.compile(lambda x: method.apply(layer, x), fullgraph=True)
+        for dtype in (torch.bfloat16, torch.float32):
+            source = torch.randn(256, 5120, device=device, dtype=dtype).mul_(0.125)
+            for rows in (1, 8, 17, 256):
+                actual = method.apply(layer, source[:rows])
+                expected = (source[:rows].float() @ layer.weight.float().T).to(output_dtype)
+                torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+            apply(source)
+            with session.capture(), torch.cuda.graph(graph):
+                captured = apply(source)
+            pointer = captured.data_ptr()
+            source.neg_()
+            captured.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated(device)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert captured.data_ptr() == pointer
+            assert torch.cuda.memory_allocated(device) == allocated
+            assert torch.isfinite(captured).all() and torch.count_nonzero(captured) > 0
+            expected = (source.float() @ layer.weight.float().T).to(output_dtype)
+            torch.testing.assert_close(captured, expected, rtol=tolerance, atol=tolerance)
+            graph.reset()
+    finally:
+        graph.reset()
+        session.close()

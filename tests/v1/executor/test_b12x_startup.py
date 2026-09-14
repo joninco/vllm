@@ -576,3 +576,41 @@ def test_executor_forwards_sticky_cancellation() -> None:
         "advance_b12x_preparation",
         {"cancel_tuning": True},
     )
+
+
+@pytest.mark.parametrize("variant", ("batched", "varlen"))
+def test_attention_tuning_rendezvous_ignores_rank_local_device_ordinal(variant):
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    from b12x.attention import varlen
+    from b12x.preparation.session import PreparationJob
+
+    mode = FakeTensorMode()
+    ranks = (0, 1, 2, 3)
+    gathered = []
+    for rank in ranks:
+        device = torch.device("cuda", rank)
+
+        def metadata(shape, dtype):
+            return FakeTensor(mode, torch.empty(shape, device="meta", dtype=dtype), device)
+
+        q, k, v = (metadata((9216, 16, 64), torch.bfloat16) for _ in range(3))
+        if variant == "varlen":
+            plan = varlen.plan(
+                q, k, v, metadata((2,), torch.int32),
+                max_seqlen_q=9216, max_seqlen_k=9216, causal=False,
+            )
+        else:
+            plan = varlen.plan_batched(q, k, v, causal=False)
+        request = SimpleNamespace(plan=plan, dependencies=())
+        configuration = plan.contract.configure(plan.query, device=None)
+        obligation = SimpleNamespace(request=request, configuration=configuration)
+        key = PreparationJob._choice_key(None, obligation, {})
+        gathered.append({
+            "global_rank": rank,
+            "tuning": ((key, ranks, {"tile_m": 128, "tile_n": 64}, 10.0 + rank, rank),),
+        })
+    authorized = _authorize_tuning(gathered, ranks)
+    assert authorized is not None
+    assert authorized[1:] == (ranks, {"tile_m": 128, "tile_n": 64}, 10.0, 0)
