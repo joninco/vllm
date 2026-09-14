@@ -856,8 +856,15 @@ class B12xPcieAllReduce:
         self._is_capturing = True
         try:
             with self._runtime.capture(stream=stream):
-                if self._twoshot is not None:
-                    with self._twoshot.capture():
+                twoshot_plan = next(
+                    (self._plans[name] for name, route in self._routes.items()
+                     if route == "twoshot"),
+                    None,
+                )
+                if twoshot_plan is not None:
+                    # The scope validates runtime ownership; each collective
+                    # still passes its shape-specific prepared plan at launch.
+                    with self._twoshot.capture(plan=twoshot_plan):
                         yield
                 else:
                     yield
