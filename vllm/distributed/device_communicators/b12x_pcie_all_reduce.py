@@ -577,6 +577,7 @@ class B12xPcieAllReduce:
         plans: dict[str, object] = {}
         routes: dict[str, str] = {}
         collective_ranks = tuple(sorted(self.global_ranks))
+        declarations = {}
         for invocation in invocations:
             route = self._route_invocation(invocation)
             if route is None:
@@ -596,7 +597,15 @@ class B12xPcieAllReduce:
                     dtype=invocation.dtype, strides=invocation.strides,
                     alignment=invocation.input_alignment,
                 )
-                plan = _oneshot_preparation.plan(query, runtime=target)
+                binding = (
+                    id(invocation.persistent_input)
+                    if query.setup["registered"] else None
+                )
+                key = (id(target), query, binding)
+                plan = declarations.get(key)
+                if plan is None:
+                    plan = _oneshot_preparation.plan(query, runtime=target)
+                    declarations[key] = plan
 
                 def prepare(state, invocation=invocation, query=query):
                     registered = bool(query.setup["registered"])
@@ -628,7 +637,11 @@ class B12xPcieAllReduce:
                     shape=invocation.shape, dtype=invocation.dtype,
                     strides=invocation.strides, alignment=invocation.input_alignment,
                 )
-                plan = _twoshot_preparation.plan(query, runtime=self._twoshot)
+                key = (id(self._twoshot), query, None)
+                plan = declarations.get(key)
+                if plan is None:
+                    plan = _twoshot_preparation.plan(query, runtime=self._twoshot)
+                    declarations[key] = plan
 
                 def prepare(state, invocation=invocation):
                     inp = self._request_input(invocation, registered=False)
@@ -643,7 +656,11 @@ class B12xPcieAllReduce:
                     self._dma, shape=invocation.shape, dtype=invocation.dtype,
                     strides=invocation.strides, alignment=invocation.input_alignment,
                 )
-                plan = _dma_preparation.plan(query, runtime=self._dma)
+                key = (id(self._dma), query, None)
+                plan = declarations.get(key)
+                if plan is None:
+                    plan = _dma_preparation.plan(query, runtime=self._dma)
+                    declarations[key] = plan
 
                 def prepare(state, invocation=invocation):
                     inp = self._request_input(invocation, registered=False)
@@ -855,15 +872,16 @@ class B12xPcieAllReduce:
         self._capture_stream = stream
         self._is_capturing = True
         try:
-            with self._runtime.capture(stream=stream):
+            twoshot_plan = None
+            if self._twoshot is not None:
                 twoshot_plan = next(
                     (self._plans[name] for name, route in self._routes.items()
                      if route == "twoshot"),
                     None,
                 )
+            with self._runtime.capture(stream=stream):
                 if twoshot_plan is not None:
-                    # The scope validates runtime ownership; each collective
-                    # still passes its shape-specific prepared plan at launch.
+                    assert self._twoshot is not None
                     with self._twoshot.capture(plan=twoshot_plan):
                         yield
                 else:

@@ -66,7 +66,7 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
     )
     units = attention._AttentionHelpers(module).get_b12x_preparation_units(module, workload)
     assert all(unit.stage == "weights" for unit in units)
-    assert tuple(module._wo_plans) == counts
+    assert tuple(key for key in module._wo_plans if key != "prefill") == counts
     source = torch.randn(capacity, module.n_local_heads, 512, device=device, dtype=torch.bfloat16) / 8
     positions = torch.arange(capacity, device=device, dtype=torch.int64).remainder_(table.shape[0])
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
@@ -87,8 +87,10 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
                 *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
             )
         session.freeze()
-        for rows in counts:
-            plan = module._wo_plans[rows]
+        cases = [(rows, False, module._wo_plans[rows]) for rows in counts]
+        remainders = (3575, 3582) if compacted else (13, 23)
+        cases.extend((rows, True, module._wo_plans["prefill"]) for rows in remainders)
+        for rows, is_prefill, plan in cases:
             scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device) for spec in plan.scratch_specs())
             binding = wo.bind_inv_rope(
                 plan, scratch=scratch, o=source[:rows], positions=positions[:rows],
@@ -96,7 +98,9 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
                 heads_per_group=heads_per_group, nope_dim=448, rope_dim=64,
             )
             expected = wo.run_inv_rope(binding=binding, plan=plan).clone()
-            actual = module._o_proj(source[:rows], positions[:rows])
+            actual = module._o_proj(source[:rows], positions[:rows], is_prefill=is_prefill)
+            if is_prefill:
+                assert rows not in module._wo_plans
             assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
             for tensor in current_workspace_manager().get_simultaneous(
@@ -107,7 +111,7 @@ def test_wo_preparation_exact_rows_owns_output_and_replays(
             graph = torch.cuda.CUDAGraph()
             try:
                 with session.capture(), torch.cuda.graph(graph):
-                    replayed = module._o_proj(source[:rows], positions[:rows])
+                    replayed = module._o_proj(source[:rows], positions[:rows], is_prefill=is_prefill)
                 pointer = replayed.data_ptr()
                 source[:rows].neg_()
                 positions[:rows].add_(1).remainder_(table.shape[0])
@@ -242,3 +246,31 @@ def test_indexer_primer_restores_live_cache(layer_id):
             finally:
                 call.restore()
             torch.testing.assert_close(cache, original, rtol=0, atol=0)
+
+
+def test_wo_prefill_remainders_reuse_declared_chunk_capacity():
+    from vllm.models.deepseek_v4_1 import attention
+    from vllm.utils.b12x import B12xWorkload
+
+    module = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
+    torch.nn.Module.__init__(module)
+    module.prefix, module.capacity, module.is_ced_decoder = "model.layers.0.attn", 4096, False
+    module.n_local_groups, module.n_local_heads = 2, 16
+    module.head_dim, module.rope_head_dim = 512, 64
+    module._wo_plans = {}
+    module._wo_projection_weights = SimpleNamespace(groups=2, group_width=4096, rank=1024, hidden=5120)
+    module.rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty(1, 64, dtype=torch.bfloat16))
+    workload = B12xWorkload(
+        stage="weights", token_counts=(1, 8, 4096), fixed_token_counts=(1, 8),
+        output_dtype=torch.bfloat16, max_tokens=4096, max_seqs=8, max_model_len=4096,
+    )
+    unit = module._wo_preparation_unit(workload)
+    declarations = dict(module._wo_plans)
+    prefill = module._wo_plan(4096, is_prefill=True)
+    assert any(request.plan is prefill for request in unit.requests)
+    assert prefill.query.max_tokens == 4096 and prefill.query.dynamic_tokens
+    for rows in (1, 127, 128, 129, 3575, 3582, 4096):
+        assert module._wo_plan(rows, is_prefill=True) is prefill
+    assert module._wo_plans == declarations
+    assert not module._wo_plan(1).query.dynamic_tokens
+    assert module._wo_plan(8).query.max_tokens == 8
