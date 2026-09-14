@@ -252,8 +252,8 @@ def test_profiled_batches_seed_cost_curves_via_consumer():
     manager.num_speculative_steps = 7
     manager.num_bonus_tokens = 1
     curves: dict[str, object] = {}
-    manager.set_cost_curves = (
-        lambda draft, verify, *, verify_curves_by_num_reqs=None: curves.update(
+    manager.set_cost_curves = lambda draft, verify, *, verify_curves_by_num_reqs=None: (
+        curves.update(
             draft=draft,
             verify=verify,
             verify_by_reqs=verify_curves_by_num_reqs,
@@ -298,6 +298,47 @@ def test_budget_uses_request_specific_full_graph_costs():
     assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 3
     assert manager._batch_budget is not None
     assert manager._batch_budget[2] == 2
+
+
+def test_sparse_full_graph_costs_follow_request_padding(monkeypatch):
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(max_num_reqs=32, max_num_batched_tokens=512)
+    manager._cudagraph_limit = 256
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(broadcast_object=lambda value, src: value),
+    )
+    full_curves = {
+        1: [(1, 1.0), (2, 1.1), (4, 1.2), (8, 1.3)],
+        2: [(2, 2.0), (4, 2.1), (8, 2.2), (16, 2.3)],
+        4: [(4, 4.0)],
+        8: [(8, 8.0)],
+        16: [(16, 16.0)],
+        24: [(24, 24.0)],
+        32: [(32, 32.0), (64, 64.0), (128, 128.0), (256, 256.0)],
+    }
+    manager.set_cost_curves(
+        [(1, 1.0), (32, 1.0)],
+        [(8, 1.0), (256, 256.0), (384, 768.0), (512, 1024.0)],
+        verify_curves_by_num_reqs=full_curves,
+    )
+    tables = manager.verify_cost_tables_by_num_reqs
+    # A four-request graph cannot serve 32 verification rows. Its single
+    # profiled point must not make every larger padded graph cost 4 ms.
+    assert tables[4][4] == 4.0
+    assert tables[4][5] == 8.0
+    assert tables[4][32] == 32.0
+    assert tables[16][17] == 24.0
+    assert tables[24][192] == 256.0
+    # There is no exact twelve-request graph: use compatible padded shapes.
+    assert tables[12][12] == 16.0
+    assert tables[12][25] == 32.0
+    # Keep the exact C1/C2 specializations and the measured eager tail.
+    assert tables[1][8] == 1.3
+    assert tables[2][16] == 2.3
+    for table in tables.values():
+        np.testing.assert_array_equal(table[257:], manager.cost_tables[1][257:])
 
 
 def test_compact_batch_preserves_totals_and_bounds():
