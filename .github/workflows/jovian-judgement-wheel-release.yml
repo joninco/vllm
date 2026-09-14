@@ -57,6 +57,19 @@ jobs:
           set -euo pipefail
           output=dist/jovian-wheel-release
           tag="vllm-jovian-cu134-beta-${GITHUB_SHA}"
+          mkdir built-release
+          cp "${output}"/bundle/wheels/*.whl \
+            "${output}"/bundle/manifest.json \
+            "${output}"/bundle/SHA256SUMS \
+            "${output}"/bundle/requirements-github.txt \
+            "${output}"/bundle/install.sh \
+            "${output}"/bundle/runtime.lock \
+            "${output}"/vllm-jovian-cu134-*.tar.zst \
+            "${output}"/vllm-jovian-cu134-*.tar.zst.sha256 built-release/
+          uv run --isolated --python 3.12 \
+            tools/jovian_wheel_release/verify_release_assets.py \
+            --directory built-release \
+            --source-commit "${GITHUB_SHA}" --beta-tag "${tag}"
           if gh release view "${tag}" >/dev/null 2>&1; then
             mkdir existing-release
             gh release download "${tag}" --dir existing-release
@@ -64,7 +77,8 @@ jobs:
               tools/jovian_wheel_release/verify_release_assets.py \
               --directory existing-release \
               --source-commit "${GITHUB_SHA}" \
-              --beta-tag "${tag}"
+              --beta-tag "${tag}" \
+              --reference-directory built-release
             exit 0
           fi
           gh release create "${tag}" \
@@ -119,21 +133,28 @@ jobs:
               --directory existing-stable-release \
               --source-commit "${GITHUB_SHA}" \
               --beta-tag "${beta_tag}" \
+              --reference-directory assets \
               --promotion
             exit 0
           fi
+          mkdir source-beta
+          cp assets/* source-beta/
           jq -n \
-            --arg status qualified \
+            --arg status byte-identical-promotion \
             --arg source_release "${beta_tag}" \
             --arg source_commit "${GITHUB_SHA}" \
             --arg source_manifest_sha256 "$(sha256sum assets/manifest.json | awk '{print $1}')" \
             '{schema: "local-inference-vllm-promotion/v1", status: $status,
               source_release: $source_release, source_commit: $source_commit,
               source_manifest_sha256: $source_manifest_sha256,
-              invariant: "Wheel bytes are unchanged from the qualified beta release."}' \
+              invariant: "Wheel bytes are unchanged from the source beta; GPU qualification belongs to the assembled runtime."}' \
             > assets/stable-promotion.json
+          uv run --isolated --python 3.12 \
+            tools/jovian_wheel_release/verify_release_assets.py \
+            --directory assets --source-commit "${GITHUB_SHA}" \
+            --beta-tag "${beta_tag}" --promotion --reference-directory source-beta
           gh release create "${stable_tag}" \
             --target "${GITHUB_SHA}" \
             --title "Jovian Judgement CUDA 13.4 vLLM stable ${GITHUB_SHA:0:12}" \
-            --notes "Qualified promotion of ${beta_tag}; wheel bytes were not rebuilt." \
+            --notes "Byte-identical promotion of ${beta_tag}; model-serving qualification belongs to the assembled runtime." \
             assets/*

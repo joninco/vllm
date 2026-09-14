@@ -27,6 +27,12 @@ Each branch commit publishes a prerelease named
 it never rebuilds or replaces wheel bytes. The verifier checks exact asset
 membership, source identity, manifest contents, and archive checksums before
 accepting either release.
+Reusing a published beta compares every asset with a fresh build. Reusing or
+creating a stable release compares every beta asset with the source beta and
+validates the promotion record's source identity and manifest checksum.
+Stable promotion records byte identity, not model-serving qualification.
+Verification consumes the flat asset directory produced by GitHub Downloads;
+the installable archive retains its separate nested wheel layout.
 
 ## Installation role
 
