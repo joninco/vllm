@@ -476,7 +476,8 @@ class B12xPcieAllReduce:
                 and nbytes <= self.twoshot_max_bytes
                 and nbytes > self.allreduce_max_bytes
                 and contiguous
-                and (nbytes // invocation.dtype.itemsize) % self._twoshot.row_elems == 0
+                and (nbytes // invocation.dtype.itemsize)
+                % (self.world_size * self._twoshot.row_elems) == 0
             ):
                 return "twoshot"
             if (

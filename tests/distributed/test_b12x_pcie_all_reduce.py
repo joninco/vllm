@@ -57,6 +57,7 @@ def _make_communicator(
     communicator.twoshot_max_bytes = 0
     plan = object()
     communicator._plans = {"prepared": plan}
+    communicator._routes = {}
     communicator._invocations = {}
     communicator._plan_for = MagicMock(return_value=plan)
     return communicator, runtime
@@ -320,6 +321,52 @@ def test_capture_forwards_the_vllm_stream() -> None:
         assert communicator._is_capturing
     assert communicator._capture_stream is None
     assert not communicator._is_capturing
+
+
+@pytest.mark.parametrize("raise_inside", [False, True])
+def test_capture_passes_a_declared_twoshot_plan_and_restores_state(raise_inside):
+    communicator, runtime = _make_communicator()
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    selected = object()
+    communicator._plans.update({"two": selected, "two_other": object()})
+    communicator._routes = {
+        "prepared": "oneshot", "two": "twoshot", "two_other": "twoshot",
+    }
+    entered = []
+
+    @contextmanager
+    def capture(*, plan):
+        assert plan is selected
+        entered.append("enter")
+        try:
+            yield
+        finally:
+            entered.append("exit")
+
+    twoshot.capture = capture
+    stream = object()
+    try:
+        with communicator.capture(stream=stream):
+            assert entered == ["enter"]
+            assert communicator._capture_stream is stream
+            assert communicator._is_capturing
+            if raise_inside:
+                raise ValueError("capture body failed")
+    except ValueError as error:
+        assert raise_inside and str(error) == "capture body failed"
+    assert entered == ["enter", "exit"]
+    assert communicator._capture_stream is None
+    assert not communicator._is_capturing
+    runtime.capture.assert_called_once_with(stream=stream)
+
+
+def test_capture_does_not_enter_twoshot_without_a_declared_route():
+    communicator, _ = _make_communicator()
+    twoshot = _attach_twoshot(communicator, max_bytes=1 << 20)
+    communicator._routes = {"prepared": "oneshot"}
+    with communicator.capture():
+        assert communicator._is_capturing
+    twoshot.capture.assert_not_called()
 
 
 def test_fused_custom_op_falls_back_atomically(
@@ -665,6 +712,19 @@ def test_twoshot_respects_runtime_acceptance() -> None:
     twoshot.all_reduce.assert_not_called()
 
 
+@pytest.mark.parametrize(("tokens", "expected"), [(12, None), (16, "twoshot")])
+def test_twoshot_metadata_requires_complete_rank_shards(tokens, expected):
+    communicator, _ = _make_communicator(allreduce_max_bytes=96 << 10)
+    communicator.world_size = 4
+    twoshot = _attach_twoshot(communicator, max_bytes=768 << 10)
+    twoshot.row_elems = 4096
+    invocation = b12x_pcie_all_reduce.B12xPcieInvocation(
+        name="embedding.all_reduce",
+        operation="all_reduce",
+        shape=(tokens, 5120),
+        dtype=torch.bfloat16,
+    )
+    assert communicator._route_invocation(invocation) == expected
 
 
 def test_graph_capture_supplies_caller_owned_twoshot_output(
