@@ -271,7 +271,7 @@ class DeepseekV41B12xBackend(AttentionBackend):
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size):
-        return 128
+        return 256
 
     @classmethod
     def get_supported_head_sizes(cls):

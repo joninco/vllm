@@ -15,6 +15,27 @@ from torch import nn
 from vllm.models.deepseek_v4_1.nvidia import model as native
 
 
+@pytest.mark.parametrize(
+    "configured,expected", [(None, 128), (32, 32), (64, 64), (128, 128)]
+)
+def test_swa_page_default_and_overrides_preserve_index_geometry(configured, expected):
+    from vllm.config import CacheConfig
+    from vllm.models.deepseek_v4_1.attention import _Cache
+    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
+
+    main_page = DeepseekV41B12xBackend.get_preferred_block_size(16)
+    assert main_page == 256
+    config = SimpleNamespace(
+        cache_config=CacheConfig(block_size=main_page, swa_block_size=configured),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    swa = _Cache(config, "model.layers.0.swa_cache", kind="swa", window=128)
+    index = _Cache(config, "model.layers.0.index_cache", kind="index")
+    assert swa.block_size == expected
+    assert swa.window == 128
+    assert index.block_size == 256
+
+
 def test_compacted_prefill_graph_excludes_prompt_logprobs_and_other_batch_shapes():
     from vllm.models.deepseek_v4_1.nvidia.model_state import DeepseekV41ModelState
 

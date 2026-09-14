@@ -98,7 +98,7 @@ class _Cache(nn.Module, AttentionLayerBase):
         self.prefix, self.kind, self.ratio, self.window = prefix, kind, ratio, window
         self.draft = draft
         self.block_size = (
-            config.cache_config.swa_block_size or 64
+            config.cache_config.swa_block_size or 128
             if kind == "swa"
             else config.cache_config.block_size
         )

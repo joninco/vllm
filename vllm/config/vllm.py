@@ -2816,7 +2816,7 @@ class VllmConfig:
                     "--swa-block-size is only supported by native DeepSeek V4.1 B12X"
                 )
             return self
-        swa_block_size = cache_config.swa_block_size or 64
+        swa_block_size = cache_config.swa_block_size or 128
         prefix_unit = cache_config.prefix_match_unit
         if (
             cache_config.enable_prefix_caching
