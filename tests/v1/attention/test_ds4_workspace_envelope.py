@@ -16,6 +16,9 @@ from vllm.models.deepseek_v4.nvidia import b12x as adapter
 def test_profile_covers_shorter_compressed_prefixes(monkeypatch, max_length, drafts):
     """Shorter prefixes can select more split chunks than the longest prefix."""
     from b12x.attention import compressed_sparse_mla as mla
+    from b12x.attention.compressed_sparse_mla._scratch import (
+        plan_compressed_sparse_mla_scratch,
+    )
 
     spec = SimpleNamespace(use_dspark=lambda: True, num_speculative_tokens=drafts)
     layer = SimpleNamespace(
@@ -49,7 +52,7 @@ def test_profile_covers_shorter_compressed_prefixes(monkeypatch, max_length, dra
         for index_width in (128, 256, 512, 1024, 2048, 4096):
             width = 128 + index_width
             capacity = 8 * (1 + drafts) if drafts else None
-            plan = mla.plan(
+            plan = plan_compressed_sparse_mla_scratch(
                 mla.Caps(
                     device=torch.device("cuda"),
                     num_q_heads=32,

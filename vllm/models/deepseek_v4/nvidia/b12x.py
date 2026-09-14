@@ -796,6 +796,10 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             view = _cache_page_view(cache, page_size, name)
             self._b12x_cache_page_views[key] = view
     def _reserve_profile_workspace(self, q: torch.Tensor) -> None:
+        from b12x.attention.compressed_sparse_mla._scratch import (
+            plan_compressed_sparse_mla_scratch,
+        )
+
         module = _require_b12x_compressed_sparse_mla()
         indexed_width = 0
         if self.compress_ratio == 4:
@@ -848,7 +852,9 @@ class DeepseekV4B12xAttention(DeepseekV4Attention):
             for swa in swa_widths
             for indexed in indexed_widths
         )
-        plan = module.plan(
+        # Allocation profiling needs geometry, not an executable declaration
+        # tied to live cache storage or an autotuning preparation session.
+        plan = plan_compressed_sparse_mla_scratch(
             module.Caps(
                 device=q.device,
                 num_q_heads=int(q.shape[1]),
