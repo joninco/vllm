@@ -4,6 +4,7 @@ import gc
 import os
 from collections import defaultdict
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import groupby, product
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
@@ -40,7 +41,11 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup, unbind_kv_cache
-from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
+from vllm.v1.worker.workspace import (
+    collect_cuda_graph_capture_resources,
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -301,12 +306,6 @@ class CudaGraphManager:
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
-
-        # Profiling hooks, set only by profile_cudagraph_memory() below: cap
-        # FULL-mode capture at the N largest descriptors and record each
-        # captured FULL graph's memory delta for extrapolation.
-        self._max_full_descs_to_capture: int | None = None
-        self._capture_mem_samples: list[int] | None = None
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
@@ -570,6 +569,27 @@ class CudaGraphManager:
             }
         )
 
+    def uniform_full_decode_token_counts(self) -> tuple[int, ...]:
+        """Return the token counts of the uniform FULL decode graphs to capture.
+
+        These graphs pad every request to the same query length and run without
+        active LoRA adapters; each exchanges one attention row per token. The
+        result is ascending and unique.
+
+        Returns:
+            Token counts of FULL-mode descriptors with a uniform token count.
+        """
+        return tuple(
+            sorted(
+                {
+                    desc.num_tokens
+                    for desc in self._capture_descs.get(CUDAGraphMode.FULL, [])
+                    if desc.uniform_token_count is not None
+                    and not desc.num_active_loras
+                }
+            )
+        )
+
     def reset_graphs(self) -> None:
         """Destroy FULL graph executables while retaining captured resources."""
         for graph in self.graphs.values():
@@ -599,80 +619,71 @@ class CudaGraphManager:
                     continue
 
                 descs = self._capture_descs[mode]
-                if (
-                    mode == CUDAGraphMode.FULL
-                    and self._max_full_descs_to_capture is not None
-                ):
-                    # Profiling only: capture a sample of the largest FULL
-                    # graphs; the total cost is extrapolated from their
-                    # per-graph memory deltas.
-                    descs = descs[: self._max_full_descs_to_capture]
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
-                    # Prepare inputs and get forward function
-                    forward_fn = create_forward_fn(desc, warmup=True)
+                    scope = getattr(self, "b12x_dcp_capture_scope", None)
+                    with scope(desc) if scope is not None else nullcontext():
+                        # Prepare inputs and get forward function
+                        forward_fn = create_forward_fn(desc, warmup=True)
 
-                    # Warmup
-                    forward_fn(CUDAGraphMode.NONE)
-                    # A model forward may fork work onto auxiliary streams and
-                    # join them with events queued on the compute stream.  CUDA
-                    # graph capture must not begin while those warmup kernels
-                    # are still executing, even though the queued event waits
-                    # preserve normal stream ordering.
-                    torch.accelerator.synchronize()
+                        # Warmup
+                        forward_fn(CUDAGraphMode.NONE)
+                        # A model forward may fork work onto auxiliary streams and
+                        # join them with events queued on the compute stream.  CUDA
+                        # graph capture must not begin while those warmup kernels
+                        # are still executing, even though the queued event waits
+                        # preserve normal stream ordering.
+                        torch.accelerator.synchronize()
 
-                    # Capture
-                    logger.debug(
-                        "CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc
-                    )
-                    pool_before = (
-                        _graph_pool_snapshot_totals()
-                        if _DEBUG_GRAPH_MEMORY_ACCOUNTING and is_global_first_rank()
-                        else None
-                    )
-                    if (
-                        desc.cg_mode == CUDAGraphMode.PIECEWISE
-                        and not self.use_breakable_cg
-                    ):
-                        forward_fn(CUDAGraphMode.PIECEWISE)
-                    else:
-                        # Capture with fresh attention state.
-                        forward_fn = create_forward_fn(desc, warmup=False)
-                        if desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                            forward_fn(CUDAGraphMode.PIECEWISE)
-                            _log_graph_pool_growth(progress_bar_desc, desc, pool_before)
-                            continue
-                        assert desc not in self.graphs, (
-                            f"Graph already captured for {desc}"
+                        # Capture
+                        logger.debug(
+                            "CG Capture: mode=%s, batch_desc=%s",
+                            desc.cg_mode.name,
+                            desc,
                         )
-                        graph = torch.cuda.CUDAGraph()
-                        # Sync offloader's copy stream before capture.
-                        # Ensure any pre-capture prefetches from offloader are complete.
-                        get_offloader().sync_prev_onload()
-                        if self.pool is not None:
-                            set_graph_pool_id(self.pool)
-                        else:
-                            set_graph_pool_id(current_platform.graph_pool_handle())
-                        if self._capture_mem_samples is not None:
-                            torch.accelerator.synchronize()
-                            free_before = torch.accelerator.get_memory_info()[0]
-                        with (
-                            collect_cuda_graph_capture_resources() as resources,
-                            torch.cuda.graph(graph, self.pool),
+                        pool_before = (
+                            _graph_pool_snapshot_totals()
+                            if _DEBUG_GRAPH_MEMORY_ACCOUNTING and is_global_first_rank()
+                            else None
+                        )
+                        if (
+                            desc.cg_mode == CUDAGraphMode.PIECEWISE
+                            and not self.use_breakable_cg
                         ):
-                            forward_fn(CUDAGraphMode.NONE)
-                            # Join the offloader copy stream because the last layer
-                            # can leave a prefetch pending at capture end.
-                            get_offloader().join_after_forward()
-                        if self._capture_mem_samples is not None:
-                            torch.accelerator.synchronize()
-                            free_after = torch.accelerator.get_memory_info()[0]
-                            self._capture_mem_samples.append(free_before - free_after)
-                        self.graphs[desc] = graph
-                        self.graph_capture_resources[desc] = resources
-                        compilation_counter.num_cudagraph_captured += 1
-                    _log_graph_pool_growth(progress_bar_desc, desc, pool_before)
+                            forward_fn(CUDAGraphMode.PIECEWISE)
+                        else:
+                            # Capture with fresh attention state.
+                            forward_fn = create_forward_fn(desc, warmup=False)
+                            if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                                forward_fn(CUDAGraphMode.PIECEWISE)
+                                _log_graph_pool_growth(
+                                    progress_bar_desc, desc, pool_before
+                                )
+                                continue
+                            assert desc not in self.graphs, (
+                                f"Graph already captured for {desc}"
+                            )
+                            graph = torch.cuda.CUDAGraph()
+                            # Sync offloader's copy stream before capture.
+                            # Complete offloader prefetches before capture.
+                            get_offloader().sync_prev_onload()
+                            if self.pool is not None:
+                                set_graph_pool_id(self.pool)
+                            else:
+                                set_graph_pool_id(current_platform.graph_pool_handle())
+                            with (
+                                collect_cuda_graph_capture_resources() as resources,
+                                torch.cuda.graph(graph, self.pool),
+                            ):
+                                forward_fn(CUDAGraphMode.NONE)
+                                # Join the offloader copy stream because the last layer
+                                # can leave a prefetch pending at capture end.
+                                get_offloader().join_after_forward()
+                            self.graphs[desc] = graph
+                            self.graph_capture_resources[desc] = resources
+                            compilation_counter.num_cudagraph_captured += 1
+                        _log_graph_pool_growth(progress_bar_desc, desc, pool_before)
         self._graphs_captured = True
 
     def captured_token_counts(self) -> list[int]:
@@ -987,12 +998,6 @@ def prepare_inputs_to_capture(
 # CUDA graph memory profiling
 # ---------------------------------------------------------------------------
 
-# Number of FULL graphs captured during profiling; the total FULL capture
-# cost is extrapolated from this sample to avoid a second full capture.
-_FULL_GRAPH_PROFILING_SAMPLES = 2
-# Floor for the extrapolated per-graph cost (driver overhead per graph).
-_MIN_PER_GRAPH_BYTES = 1 << 20
-
 
 def _profiling_cudagraph_managers(runner: "GPUModelRunner") -> list[CudaGraphManager]:
     managers: list[CudaGraphManager] = []
@@ -1026,13 +1031,24 @@ def profile_cudagraph_memory(
     graph capture. Bootstraps a minimal KV cache, runs ``capture_model()``
     once, then releases everything so the real init/capture path starts clean.
 
-    FULL graphs bake in KV cache pointers, so only the largest few are
-    captured (into a throwaway pool) and their total cost is extrapolated.
-    PIECEWISE, encoder and speculator graphs are measured in full. All
-    profiling captures are discarded afterwards: replaying graphs recorded
-    against the throwaway profiling state is unsafe (e.g. inductor graph
-    partition reclaims the storages of earlier cudagraph recordings once the
-    real capture records new ones, leading to use-after-free crashes).
+    FULL graphs bake in KV cache pointers, so every configured descriptor is
+    captured into a throwaway pool. Measuring the complete graph set avoids
+    assigning KV storage from an extrapolation that can miss per-executable
+    driver and allocator costs. PIECEWISE, encoder, and speculator graphs are
+    measured in the same pass. All profiling captures are discarded afterwards:
+    replaying graphs recorded against the throwaway profiling state is unsafe
+    (e.g. inductor graph partition reclaims the storages of earlier cudagraph
+    recordings once the real capture records new ones, leading to use-after-free
+    crashes).
+
+    Args:
+        runner: Model runner whose configured graphs are captured for
+            measurement.
+
+    Returns:
+        Device memory in bytes consumed while capturing the complete graph set
+        (the free-memory drop across the capture); zero when CUDA graphs are
+        off or nothing needs capture.
     """
     if runner.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
         return 0
@@ -1095,12 +1111,6 @@ def profile_cudagraph_memory(
         for wrapper in all_wrappers:
             original_pools[id(wrapper)] = wrapper.graph_pool
             wrapper.graph_pool = manager.pool
-        manager._max_full_descs_to_capture = (
-            None if _DEBUG_GRAPH_MEMORY_ACCOUNTING else _FULL_GRAPH_PROFILING_SAMPLES
-        )
-        mem_samples: list[int] = []
-        manager._capture_mem_samples = mem_samples
-
         if _DEBUG_GRAPH_MEMORY_ACCOUNTING and is_global_first_rank():
             torch.cuda.memory._record_memory_history(
                 enabled="all",
@@ -1122,14 +1132,7 @@ def profile_cudagraph_memory(
             _log_graph_pool_snapshot()
             torch.cuda.memory._record_memory_history(enabled=None)
 
-        # The measured delta covers PIECEWISE, encoder and speculator graphs
-        # plus the sampled FULL graphs; swap the sampled FULL cost for the
-        # extrapolated total. FULL and PIECEWISE share one pool here just as
-        # they share the global pool at runtime, so the overlap is not
-        # double-counted.
-        full_graph_descs = manager._capture_descs.get(CUDAGraphMode.FULL, [])
-        full_estimate = _extrapolate_full_graph_memory(mem_samples, full_graph_descs)
-        return max(measured - sum(mem_samples) + full_estimate, 0)
+        return measured
     finally:
         compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
         compilation_counter.num_gpu_runner_capture_triggers = saved_capture_triggers
@@ -1159,32 +1162,6 @@ def profile_cudagraph_memory(
             wrapper.graph_pool = original_pools.get(id(wrapper), persistent_global_pool)
         platform_cls._global_graph_pool = persistent_global_pool
         _teardown_profiling_state(runner)
-
-
-def _extrapolate_full_graph_memory(
-    mem_samples: list[int],
-    graph_descs: list[BatchExecutionDescriptor],
-) -> int:
-    """Project unsampled FULL graph costs from their descriptor token counts."""
-    if not mem_samples or not graph_descs:
-        return 0
-    assert len(mem_samples) <= len(graph_descs)
-
-    estimate = mem_samples[0] + sum(
-        max(sample, _MIN_PER_GRAPH_BYTES) for sample in mem_samples[1:]
-    )
-    if len(mem_samples) == len(graph_descs) or len(mem_samples) < 2:
-        return estimate
-
-    reference_desc = graph_descs[len(mem_samples) - 1]
-    reference_cost = max(mem_samples[-1], _MIN_PER_GRAPH_BYTES)
-    reference_tokens = reference_desc.num_tokens
-    for desc in graph_descs[len(mem_samples) :]:
-        scaled_cost = (
-            reference_cost * desc.num_tokens + reference_tokens - 1
-        ) // reference_tokens
-        estimate += max(scaled_cost, _MIN_PER_GRAPH_BYTES)
-    return estimate
 
 
 def _init_minimal_kv_cache_for_profiling(
@@ -1257,6 +1234,10 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         speculator.reset_attn()
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
+    # The profiling capture locked the workspace for graphs that no longer
+    # exist; the warmups before the real capture may still grow it.
+    if is_workspace_manager_initialized() and current_workspace_manager().is_locked():
+        current_workspace_manager().unlock()
     gc.collect()
     torch.accelerator.synchronize()
     torch.accelerator.empty_cache()

@@ -35,6 +35,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.ops.dcp_prefill_policy import DCPPrefillBatch
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
@@ -164,6 +165,8 @@ class DeepseekV32Indexer(nn.Module):
 
 
 class DeepseekV32Attention(MLAAttention):
+    _fused_norm_rope = staticmethod(fused_norm_rope)
+
     indexer: "DeepseekV32Indexer | None"
     indexer_cls: "type[DeepseekV32Indexer]" = DeepseekV32Indexer
 
@@ -264,6 +267,17 @@ class DeepseekV32Attention(MLAAttention):
             attn_backend=attn_backend,
         )
 
+        self._is_mtp_layer = is_mtp_layer
+        self._dcp_prefill_policy = (
+            self.dcp_manager.configure_prefill(
+                vllm_config,
+                backend=self.impl,
+                latent_dim=self.kv_lora_rank,
+                value_dim=self.v_head_dim,
+            )
+            if self.dcp_manager is not None and not self.use_pcp
+            else None
+        )
         self.num_local_heads = num_local_heads
         self.qk_head_dim = qk_head_dim
         self.indexer = indexer
@@ -331,6 +345,12 @@ class DeepseekV32Attention(MLAAttention):
             is_neox_style=not getattr(config, "indexer_rope_interleave", False),
         )
 
+        from vllm.models.deepseek_v32.prefill_diagnostics import (
+            install_glm_prefill_diagnostics,
+        )
+
+        install_glm_prefill_diagnostics(self)
+
     def forward(  # type: ignore[override]
         self,
         positions: torch.Tensor,
@@ -391,10 +411,25 @@ class DeepseekV32Attention(MLAAttention):
             indexer_softmax_scale = 0.0
             indexer_n_head_scale = 0.0
 
+        # Local-context indexer route: the step-local key copy and its slots
+        # come from the indexer metadata (None outside eligible prefills).
+        indexer_context_cache = None
+        indexer_context_slots = None
+        if has_indexer and isinstance(attn_metadata_raw, dict) and self.indexer:
+            indexer_prefill = getattr(
+                attn_metadata_raw.get(self.indexer.k_cache.prefix), "prefill", None
+            )
+            context_slots = getattr(indexer_prefill, "context_slot_mapping", None)
+            if context_slots is not None:
+                indexer_context_cache = getattr(indexer_prefill, "context_cache", None)
+                indexer_context_slots = context_slots
+
         if attn_metadata is None or self.use_pcp:
             mla_kv_cache = None
             mla_k_scale = None
             indexer_k_cache = None
+            indexer_context_cache = None
+            indexer_context_slots = None
             mla_slot = None
         elif self._native_packed_kv_update:
             # Keep the fused indexer-cache write, but let the sparse backend
@@ -405,10 +440,14 @@ class DeepseekV32Attention(MLAAttention):
             mla_kv_cache = self.kv_cache
             mla_k_scale = self._k_scale
 
-        separate_kv_update = self.use_pcp or self._native_packed_kv_update
-        kv_c_out = torch.empty_like(kv_c) if separate_kv_update else None
-        k_pe_out = torch.empty_like(k_pe) if separate_kv_update else None
-        q_c = fused_norm_rope(
+        materialize_mla_inputs = (
+            self.use_pcp
+            or self._native_packed_kv_update
+            or self.impl.dcp_world_size > 1
+        )
+        kv_c_out = torch.empty_like(kv_c) if materialize_mla_inputs else None
+        k_pe_out = torch.empty_like(k_pe) if materialize_mla_inputs else None
+        q_c = self._fused_norm_rope(
             positions,
             q_c,
             self.q_a_layernorm.weight,
@@ -425,6 +464,11 @@ class DeepseekV32Attention(MLAAttention):
             indexer_k_rope_cos_sin_cache,
             self.topk_indices_buffer,
             slot_mapping=mla_slot,
+            indexer_slot_mapping=(
+                slot_mapping.get(self.indexer.k_cache.prefix)
+                if indexer_k_cache is not None and self.indexer is not None
+                else None
+            ),
             indexer_k_cache=indexer_k_cache,
             mla_kv_cache=mla_kv_cache,
             mla_kv_cache_dtype=self.kv_cache_dtype,
@@ -434,11 +478,25 @@ class DeepseekV32Attention(MLAAttention):
             kv_c_out=kv_c_out,
             k_pe_out=k_pe_out,
             index_k_out=index_k_out,
+            materialize_nonlocal_mla_inputs=self.impl.dcp_world_size > 1,
+            indexer_local_cache=indexer_context_cache,
+            indexer_local_slot_mapping=indexer_context_slots,
         )
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+        if self._fp8_query:
+            # The fp8 query packs [ql_nope; q_pe] inside fused_q, so the latent
+            # query projection precedes it.
+            ql_nope: torch.Tensor | None = self._latent_query(q_nope)
+        else:
+            # The bf16 query keeps ql_nope separate and fused_q does not read
+            # it. The projection runs after the indexer launch instead
+            # (_sparse_indexer_and_attn): the indexer's selection sort runs on
+            # a side stream from the indexer to the attention kernels, and the
+            # projection and the query concatenation are the main-stream work
+            # that hides it.
+            ql_nope = None
 
         if self.indexer is not None and not self.skip_topk:
             index_q = self.indexer.wq_b(q_c)[0]
@@ -470,10 +528,18 @@ class DeepseekV32Attention(MLAAttention):
             kv_c_out,
             k_pe_out,
             ql_nope,
+            q_nope,
             mqa_q,
             output,
         )
         return self.o_proj(output)[0]
+
+    def _latent_query(self, q_nope: torch.Tensor) -> torch.Tensor:
+        """Project the query's NoPE part into the KV latent space (W_UK)."""
+        projected = self._try_prefill_query_bmm(q_nope)
+        if projected is not None:
+            return projected
+        return torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
 
     @eager_break_during_capture
     def _sparse_indexer_and_attn(
@@ -484,7 +550,8 @@ class DeepseekV32Attention(MLAAttention):
         index_weights_out: torch.Tensor | None,
         kv_c: torch.Tensor | None,
         k_pe: torch.Tensor | None,
-        ql_nope: torch.Tensor,
+        ql_nope: torch.Tensor | None,
+        q_nope: torch.Tensor,
         mqa_q: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
@@ -512,6 +579,11 @@ class DeepseekV32Attention(MLAAttention):
                     self._vllm_config.parallel_config.cp_kv_cache_interleave_size
                 ),
             )
+
+        if ql_nope is None:
+            # bf16 query path: issued after the indexer so the selection sort
+            # on the side stream overlaps this projection.
+            ql_nope = self._latent_query(q_nope)
 
         attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(
             self.layer_name
@@ -552,6 +624,7 @@ class DeepseekV32Attention(MLAAttention):
             output.zero_()
             return
 
+        original_kv_cache = kv_cache
         if self._fp8_kv_needs_view:
             kv_cache = kv_cache.view(torch.float8_e4m3fn)
         if self._fp8_query:
@@ -562,37 +635,153 @@ class DeepseekV32Attention(MLAAttention):
         else:
             mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
 
-        if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
-            if isinstance(mqa_q_arg, tuple):
-                mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
-            mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
+        # Decode context parallel: each rank holds a shard of the KV cache and
+        # attends over it for the query heads of the whole DCP group, and the
+        # per-rank partials are combined by log-sum-exp afterwards (the same
+        # exchange as the generic MLA layer's decode path). With prefill
+        # context parallel the query is gathered across the tensor-parallel
+        # group instead; a full-CKV prefill gathers the cache and needs
+        # neither the gather nor the combine.
+        dcp_world_size = self.impl.dcp_world_size
+        full_ckv_dcp = False
+        direct_dcp = None
+        prefill_route = "configured"
+        prefill_buffers = None
+        if dcp_world_size > 1:
+            assert self.dcp_manager is not None
+            if self.use_pcp:
+                if dcp_world_size > self.impl.pcp_world_size:
+                    if isinstance(mqa_q_arg, tuple):
+                        mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
+                    mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
+            else:
+                full_ckv_dcp = self.impl.uses_full_ckv_dcp(  # type: ignore[attr-defined]
+                    attn_metadata, num_actual
+                )
+                if not full_ckv_dcp:
+                    policy = getattr(self, "_dcp_prefill_policy", None)
+                    if policy is not None:
+                        decision = policy.select(
+                            DCPPrefillBatch(
+                                num_tokens=num_actual,
+                                num_prefills=attn_metadata.num_prefills,
+                                num_decodes=attn_metadata.num_decodes,
+                                is_capturing=(
+                                    attn_metadata.num_prefills > 0
+                                    and torch.cuda.is_current_stream_capturing()
+                                ),
+                                is_mtp=(
+                                    self._is_mtp_layer
+                                    or getattr(attn_metadata, "is_spec_decode", False)
+                                ),
+                            )
+                        )
+                        prefill_route = decision.route
+                        if prefill_route == "projected_ag_rs":
+                            workspace_specs = getattr(
+                                self.impl, "get_dcp_prefill_workspace_specs", None
+                            )
+                            assert callable(workspace_specs)
+                            prefill_buffers = self.dcp_manager.prefill_workspaces[
+                                decision.borrow_workspace
+                            ].borrow(
+                                num_actual,
+                                backend_specs=workspace_specs(),
+                            )
+                    if isinstance(mqa_q_arg, tuple) and prefill_buffers is None:
+                        mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
+                    from vllm.v1.attention.ops.b12x_dcp import active_dcp_transport
+
+                    binding = (
+                        active_dcp_transport()
+                        if prefill_route == "configured"
+                        else None
+                    )
+                    if prefill_buffers is not None:
+                        mqa_q_arg = prefill_buffers.gather_query(
+                            mqa_q_arg, self.dcp_manager.group
+                        )
+                    elif binding is not None and binding.accepts(
+                        mqa_q_arg, getattr(attn_metadata, "dcp_combine_seq_lens", None)
+                    ):
+                        direct_dcp = binding
+                        mqa_q_arg = binding.query(mqa_q_arg)
+                    else:
+                        assert self.dcp_manager.query_gather is not None
+                        mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
+        if full_ckv_dcp:
+            self.impl.set_ckv_current_cache(  # type: ignore[attr-defined]
+                original_kv_cache
+            )
         attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
             mqa_q_arg, kv_cache, attn_metadata, self
         )
 
-        if self.use_pcp and self.impl.dcp_world_size > 1:
+        if dcp_world_size > 1 and not full_ckv_dcp:
             assert lse is not None and self.dcp_manager is not None
-            seq_lens = (
-                attn_metadata.decode.seq_lens
-                if attn_metadata.decode is not None
-                else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
-                    : attn_metadata.num_decodes
+            if self.use_pcp:
+                seq_lens = (
+                    attn_metadata.decode.seq_lens
+                    if attn_metadata.decode is not None
+                    else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
+                        : attn_metadata.num_decodes
+                    ]
+                )
+                query_start_loc = attn_metadata.query_start_loc[
+                    : attn_metadata.num_decodes + 1
                 ]
-            )
-            query_start_loc = attn_metadata.query_start_loc[
-                : attn_metadata.num_decodes + 1
-            ]
-            attn_out = self.dcp_manager.combine(
-                attn_out,
-                lse,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-            )
-            attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+            else:
+                # B12X supplies local causal lengths per query row. Request
+                # lengths cannot mask an empty shard of an earlier draft row.
+                seq_lens = attn_metadata.dcp_combine_seq_lens  # type: ignore[attr-defined]
+                query_start_loc = attn_metadata.dcp_combine_query_start_loc  # type: ignore[attr-defined]
+                assert seq_lens is not None and query_start_loc is not None
+            if prefill_buffers is not None:
+                from b12x.comm.prefill import prepare_prefill_lse
+
+                from vllm.v1.attention.ops.dcp import correct_attn_out
+
+                attn_out = prefill_buffers.project(
+                    attn_out,
+                    lse,
+                    seq_lens,
+                    self.W_UV,
+                    self.dcp_manager.group,
+                    prepare_prefill_lse,
+                )
+                attn_out = prefill_buffers.combine(
+                    attn_out,
+                    self.dcp_manager.group,
+                    correct_attn_out,
+                    is_lse_base_on_e=self.dcp_manager.is_lse_base_on_e,
+                )
+            elif direct_dcp is not None:
+                attn_out = direct_dcp.combine(attn_out, lse, seq_lens)
+            elif prefill_route == "ag_rs":
+                attn_out = self.dcp_manager.prefill_ag_rs_combine(
+                    attn_out,
+                    lse,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                )
+            else:
+                attn_out = self.dcp_manager.combine(
+                    attn_out,
+                    lse,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                )
+            if self.use_pcp:
+                attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
         # NOTE(woosuk): While the below does not need to be in the eager region,
         # we put it here to avoid copying the attention output. Move this back to the
         # captured region once forward_mqa supports `out` argument.
+        if prefill_buffers is not None:
+            output[:num_actual].view(
+                num_actual, self.num_local_heads, self.v_head_dim
+            ).copy_(attn_out)
+            return
         x = attn_out.view(
             num_actual, self.num_local_heads, self.kv_lora_rank
         ).transpose(0, 1)

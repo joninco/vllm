@@ -39,6 +39,11 @@ _cuda_graph_capture_resources: ContextVar[list[Any] | None] = ContextVar(
 )
 
 
+def current_workspace_lane() -> int:
+    """Return the target or drafter workspace owner for this execution context."""
+    return _workspace_lane.get()
+
+
 @contextmanager
 def use_workspace_lane(lane: int) -> Iterator[None]:
     """Select an independent workspace owner for this execution context."""
@@ -115,6 +120,10 @@ class WorkspaceManager:
     Manages one workspace buffer per active ``(ubatch, lane)`` slot.
     Can be locked to prevent further growth during execution.
     """
+
+    def execution_lane_shape(self) -> tuple[int, int]:
+        """Return reserved ubatch and model-lane counts for persistent helpers."""
+        return self._num_ubatches, self._num_lanes
 
     def __init__(
         self,
@@ -314,7 +323,8 @@ class WorkspaceManager:
                 raise RuntimeError(
                     f"Workspace growth requested from '{get_caller_info()}' during "
                     f"CUDA graph capture ({current_size / _MB:.2f} MB -> "
-                    f"{required_bytes / _MB:.2f} MB). Size the workspace before capture."
+                    f"{required_bytes / _MB:.2f} MB). "
+                    "Size the workspace before capture."
                 )
 
             # Only resize the requesting ubatch/lane workspace. Other slots
@@ -326,7 +336,7 @@ class WorkspaceManager:
             # stream-ordered, so wait for the device first. Growth happens only
             # before the workspace is locked, never in steady-state serving.
             if self._device.type == "cuda" and current_workspace is not None:
-                torch.cuda.synchronize(self._device)
+                torch.accelerator.synchronize(self._device)
             self._current_workspaces[workspace_id] = None
             del current_workspace
             # Release the freed segment back to CUDA so the caching

@@ -220,6 +220,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
     CacheConfig,
+    CUDAGraphMode,
     ModelConfig,
     VllmConfig,
     get_current_vllm_config,
@@ -264,11 +265,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
     B12xPreparationUnit,
     B12xWorkload,
     get_b12x_mla_query_projection,
     register_b12x_layer,
+    set_b12x_preparation_provider,
 )
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down, round_up
@@ -728,6 +729,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
+        self._prefill_query_bmm_module = None
+        if (
+            envs.VLLM_B12X_MLA_PREFILL_QUERY_BMM
+            and self.attn_backend.get_name() == "B12X"
+            and self.impl.is_sparse
+            and parallel_config.decode_context_parallel_size > 1
+            and getattr(vllm_config.model_config.hf_text_config, "model_type", None)
+            == "glm_moe_dsa"
+        ):
+            from b12x.gemm import mla_query_bmm
+
+            self._prefill_query_bmm_module = mla_query_bmm
+            logger.info_once(
+                "B12X BF16 query BMM enabled for eager GLM DCP target prefill; "
+                "decode, MTP and batches of at most 32 rows retain their query path."
+            )
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -922,6 +939,49 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 q_dcp_replicated=q_dcp_replicated,
             )
             return output
+
+    def _try_prefill_query_bmm(self, q_nope: torch.Tensor) -> torch.Tensor | None:
+        """Project large eager GLM target-prefill queries without packing copies."""
+        module = getattr(self, "_prefill_query_bmm_module", None)
+        if (
+            module is None
+            or getattr(self, "_is_mtp_layer", True)
+            or self.impl.dcp_world_size <= 1
+            or self.use_pcp
+            or q_nope.shape[0] <= 32
+            or q_nope.dtype != torch.bfloat16
+        ):
+            return None
+        context = get_forward_context()
+        if context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
+            return None
+        if q_nope.is_cuda and torch.cuda.is_current_stream_capturing():
+            return None
+        metadata, _, _, _ = get_attention_context(self.layer_name)
+        if (
+            metadata is None
+            or getattr(metadata, "is_spec_decode", True)
+            or getattr(metadata, "num_decode_tokens", None) != 0
+            or getattr(metadata, "num_prefills", 0) <= 0
+            or getattr(metadata, "num_actual_tokens", None) != q_nope.shape[0]
+        ):
+            return None
+        weight = self.W_UK_T
+        if weight.dtype != torch.bfloat16 or not module.can_implement(
+            num_heads=q_nope.shape[1],
+            max_m=q_nope.shape[0],
+            k=q_nope.shape[2],
+            n=weight.shape[2],
+            device=q_nope.device,
+        ):
+            return None
+        output = torch.empty(
+            (q_nope.shape[1], q_nope.shape[0], weight.shape[2]),
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+        module.run(q_nope.transpose(0, 1), weight, output)
+        return output.transpose(0, 1)
 
     def _try_fused_mla_query(
         self,
@@ -1473,14 +1533,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         module = get_b12x_mla_query_projection()
         assert module is not None
-        return module.plan(ProjectionQuery(
-            heads=int(self.W_UK_T.shape[0]),
-            max_rows=tokens,
-            weight_format="bf16",
-            output_dtype="bfloat16",
-            b_major="n",
-            sf_axis="n",
-        ))
+        return module.plan(
+            ProjectionQuery(
+                heads=int(self.W_UK_T.shape[0]),
+                max_rows=tokens,
+                weight_format="bf16",
+                output_dtype="bfloat16",
+                b_major="n",
+                sf_axis="n",
+            )
+        )
 
     def _b12x_query_call(self, tokens: int):
         weight = self.W_UK_T
@@ -1490,21 +1552,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             from b12x.preparation import PreparedCall
 
             q_nope = torch.zeros(
-                (heads, tokens, nope_dim), dtype=torch.bfloat16, device=weight.device,
+                (heads, tokens, nope_dim),
+                dtype=torch.bfloat16,
+                device=weight.device,
             )
             q_pe = torch.zeros(
-                (tokens, heads, 64), dtype=torch.bfloat16, device=weight.device,
+                (tokens, heads, 64),
+                dtype=torch.bfloat16,
+                device=weight.device,
             )
             output = torch.empty(
                 (tokens, heads, latent_dim + 64),
-                dtype=torch.bfloat16, device=weight.device,
+                dtype=torch.bfloat16,
+                device=weight.device,
             )
             return PreparedCall(run=lambda: state.run(q_nope, weight, q_pe, output))
 
         return prepare
 
     def b12x_query_plan(self, tokens: int):
-        """The exact-M plan for tokens, declared on first use with its default configuration.
+        """Declare the exact-row-count query plan with its default configuration.
 
         Called from the fused-query custom op body only.
         """
@@ -1539,10 +1606,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if plan is None:
                 plan = self._declare_b12x_query_plan(tokens)
                 plans[tokens] = plan
-            requests.append(plan.request(
-                name=self._b12x_query_name(tokens),
-                prepare_call=self._b12x_query_call(tokens),
-            ))
+            requests.append(
+                plan.request(
+                    name=self._b12x_query_name(tokens),
+                    prepare_call=self._b12x_query_call(tokens),
+                )
+            )
         if not requests:
             return ()
         return (
@@ -1553,6 +1622,63 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 stage="weights",
                 autotune=not workload.eager_only,
             ),
+        )
+
+    def prepare_dcp_prefill(self, token_counts: tuple[int, ...]) -> bool:
+        """Initialize optional prefill projections and exchange workspaces."""
+        weight = getattr(self, "W_UK_T", None)
+        prefill_bmm = getattr(self, "_prefill_query_bmm_module", None)
+        prefill_rows = tuple(
+            rows
+            for rows in token_counts
+            if rows > 32
+            and prefill_bmm is not None
+            and not getattr(self, "_is_mtp_layer", True)
+            and isinstance(weight, torch.Tensor)
+            and weight.dtype == torch.bfloat16
+            and prefill_bmm.can_implement(
+                num_heads=int(weight.shape[0]),
+                max_m=rows,
+                k=int(weight.shape[1]),
+                n=int(weight.shape[2]),
+                device=weight.device,
+            )
+        )
+        if prefill_rows:
+            assert prefill_bmm is not None and isinstance(weight, torch.Tensor)
+            heads, k, n = weight.shape
+            rows = max(prefill_rows)
+            query = torch.zeros(
+                (rows, heads, k + self.qk_rope_head_dim),
+                dtype=weight.dtype,
+                device=weight.device,
+            )
+            output = torch.empty(
+                (heads, rows, n), dtype=weight.dtype, device=weight.device
+            )
+            prefill_bmm.prewarm(query[..., :k].transpose(0, 1), weight, output)
+            del query, output
+
+        prepare_collectives = getattr(self.impl, "prepare_profile_collectives", None)
+        if callable(prepare_collectives):
+            prepare_collectives()
+        manager = getattr(self, "dcp_manager", None)
+        workspace_key = getattr(manager, "prefill_warmup_key", None)
+        if workspace_key is not None:
+            assert manager is not None
+            backend_specs = getattr(self.impl, "get_dcp_prefill_workspace_specs", None)
+            if not callable(backend_specs):
+                raise RuntimeError(
+                    "Projected DCP prefill requires backend workspace declarations."
+                )
+            manager.prewarm_prefill(
+                self.W_UV,
+                backend_specs=backend_specs(),
+            )
+        return bool(
+            prefill_rows
+            or workspace_key is not None
+            or getattr(self.impl, "_ckv_gather_enabled", False)
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:

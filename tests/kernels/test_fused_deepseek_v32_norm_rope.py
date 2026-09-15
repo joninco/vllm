@@ -24,6 +24,8 @@ outputs are checked within 1 representable-step (ULP); bf16 norm/RoPE outputs us
 rtol/atol=1e-2 (the tolerance the sibling deepseek_v4 fused-kernel test uses).
 """
 
+from functools import partial
+
 import pytest
 import torch
 
@@ -453,11 +455,25 @@ def test_fused_norm_rope_no_indexer(num_tokens: int):
 
 
 @pytest.mark.parametrize("has_indexer", [False, True])
-def test_fused_norm_rope_materializes_pcp_cache_inputs(has_indexer: bool):
-    """PCP gets local normalized/rotated K rows without direct cache writes."""
+@pytest.mark.parametrize(
+    ("dcp_rank", "mla_cache_dtype"),
+    [(None, None)]
+    + [
+        (rank, cache_dtype)
+        for rank in range(4)
+        for cache_dtype in (None, "fp8", "fp8_ds_mla")
+    ],
+)
+@pytest.mark.parametrize("num_tokens", [1, 17])
+def test_fused_norm_rope_materializes_cache_inputs(
+    has_indexer: bool,
+    dcp_rank: int | None,
+    mla_cache_dtype: str | None,
+    num_tokens: int,
+):
+    """Every query is materialized even when its cache slot belongs to a peer."""
     torch.manual_seed(6)
     dev = "cuda"
-    num_tokens = 17
     max_pos = 8192
     pos = torch.arange(num_tokens, device=dev, dtype=torch.int64)
     q_c = torch.randn(num_tokens, Q_LORA, device=dev, dtype=torch.bfloat16)
@@ -482,13 +498,27 @@ def test_fused_norm_rope_materializes_pcp_cache_inputs(has_indexer: bool):
     )
     mla_cos_sin = make_cos_sin(max_pos, ROPE_DIM, dev)
     idx_cos_sin = make_cos_sin(max_pos, ROPE_DIM, dev) if has_indexer else None
-    q_out = torch.empty_like(q_c)
-    kv_out = torch.empty_like(kv_c)
-    kpe_out = torch.empty_like(k_pe)
-    ik_out = torch.empty_like(ik) if ik is not None else None
+    q_out = torch.full_like(q_c, float("nan"))
+    kv_out = torch.full_like(kv_c, float("nan"))
+    kpe_out = torch.full_like(k_pe, float("nan"))
+    ik_out = torch.empty_like(ik) if ik is not None and dcp_rank is None else None
     topk = torch.full((num_tokens, 2048), 7, device=dev, dtype=torch.int32)
+    slot_mapping = None
+    index_cache = None
+    mla_cache = None
+    mla_scale = torch.ones(1, device=dev)
+    if dcp_rank is not None:
+        slot_mapping = torch.where(pos % 4 == dcp_rank, pos // 4, -1)
+        if has_indexer:
+            index_cache = torch.zeros((1, 64, 132), dtype=torch.uint8, device=dev)
+        if mla_cache_dtype is not None:
+            record_bytes = 656 if mla_cache_dtype == "fp8_ds_mla" else 576
+            mla_cache = torch.zeros(
+                (1, 64, record_bytes), dtype=torch.uint8, device=dev
+            )
 
-    actual_q = K.fused_norm_rope(
+    run = partial(
+        K.fused_norm_rope,
         pos,
         q_c,
         qw,
@@ -506,25 +536,85 @@ def test_fused_norm_rope_materializes_pcp_cache_inputs(has_indexer: bool):
         topk,
         has_indexer=has_indexer,
         index_rope_interleave=True,
+    )
+    arguments = dict(
+        slot_mapping=slot_mapping,
+        indexer_k_cache=index_cache,
+        mla_kv_cache=mla_cache,
+        mla_kv_cache_dtype=mla_cache_dtype or "auto",
+        mla_k_scale=mla_scale,
         q_c_out=q_out,
         kv_c_out=kv_out,
         k_pe_out=kpe_out,
         index_k_out=ik_out,
+        materialize_nonlocal_mla_inputs=dcp_rank is not None,
     )
+    actual_q = run(**arguments)
 
     assert actual_q.data_ptr() == q_out.data_ptr()
-    assert_bf16(actual_q, rms_norm(q_c, qw), "PCP q norm")
-    assert_bf16(kv_out, rms_norm(kv_c, kvw), "PCP kv norm")
+    assert_bf16(actual_q, rms_norm(q_c, qw), "materialized q norm")
+    assert_bf16(kv_out, rms_norm(kv_c, kvw), "materialized kv norm")
     assert_bf16(
         kpe_out,
         rope(k_pe.float(), pos, mla_cos_sin, interleave=True),
-        "PCP k_pe RoPE",
+        "materialized k_pe RoPE",
     )
     if has_indexer:
         assert ik is not None and ikw is not None and ikb is not None
-        assert ik_out is not None and idx_cos_sin is not None
+        assert idx_cos_sin is not None
         ik_ref = rope(layer_norm(ik, ikw, ikb), pos, idx_cos_sin, interleave=True)
-        assert_bf16(ik_out, ik_ref, "PCP indexer-K")
+        if dcp_rank is None:
+            assert ik_out is not None
+            assert_bf16(ik_out, ik_ref, "PCP indexer-K")
+        else:
+            assert index_cache is not None
+            flat = index_cache[0].reshape(-1)
+            values = flat[: 64 * INDEX_HEAD_DIM].view(FP8).reshape(64, INDEX_HEAD_DIM)
+            scales = flat[64 * INDEX_HEAD_DIM :].view(torch.float32)
+            local_rows = pos % 4 == dcp_rank
+            count = len(range(dcp_rank, num_tokens, 4))
+            expected_values, expected_scales = ue8m0_quant(ik_ref)
+            if count:
+                assert_fp8(
+                    values[:count], expected_values[local_rows], "local indexer K"
+                )
+                torch.testing.assert_close(
+                    scales[:count], expected_scales[local_rows], rtol=0, atol=0
+                )
+            assert torch.count_nonzero(values[count:].float()) == 0
+            assert torch.count_nonzero(scales[count:]) == 0
+    if dcp_rank is not None:
+        if mla_cache is not None:
+            reference_cache = torch.zeros_like(mla_cache)
+            run(
+                slot_mapping=pos,
+                mla_kv_cache=reference_cache,
+                mla_kv_cache_dtype=mla_cache_dtype,
+                mla_k_scale=mla_scale,
+            )
+            local_rows = pos % 4 == dcp_rank
+            count = len(range(dcp_rank, num_tokens, 4))
+            torch.testing.assert_close(
+                mla_cache[0, :count],
+                reference_cache[0, :num_tokens][local_rows],
+                rtol=0,
+                atol=0,
+            )
+            assert torch.count_nonzero(mla_cache[0, count:]) == 0
+        expected_q, expected_kv, expected_rope = [
+            torch.empty_like(value) for value in (q_c, kv_c, k_pe)
+        ]
+        run(q_c_out=expected_q, kv_c_out=expected_kv, k_pe_out=expected_rope)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(**arguments)
+        for _ in range(3):
+            graph.replay()
+        torch.accelerator.synchronize()
+        for actual, expected in zip(
+            (q_out, kv_out, kpe_out), (expected_q, expected_kv, expected_rope)
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 512])
@@ -756,9 +846,11 @@ def test_fused_q_no_indexer(num_tokens: int):
 
 @pytest.mark.parametrize("num_tokens", [1, 17, 512])
 @pytest.mark.parametrize("has_indexer", [True, False])
-def test_fused_q_bf16_query(num_tokens: int, has_indexer: bool):
+@pytest.mark.parametrize("pass_ql_nope", [True, False])
+def test_fused_q_bf16_query(num_tokens: int, has_indexer: bool, pass_ql_nope: bool):
     """bf16-query path (FlashMLA sparse, SM90/SM100): only the RoPE'd q_pe is
-    produced (bf16, unquantized); ql_nope is consumed directly by the caller."""
+    produced (bf16, unquantized); ql_nope is consumed directly by the caller
+    and may be omitted (``None``) because the kernel never reads it."""
     torch.manual_seed(6)
     dev = "cuda"
     max_pos = 8192
@@ -787,7 +879,7 @@ def test_fused_q_bf16_query(num_tokens: int, has_indexer: bool):
         q_cos_sin,
         index_q,
         idx_cos_sin,
-        ql_nope,
+        ql_nope if pass_ql_nope else None,
         q_scale,
         index_w,
         INDEX_HEAD_DIM**-0.5,
@@ -876,3 +968,63 @@ def test_fused_eh_norm(num_tokens: int):
     ref = torch.cat([rms_norm(embeds, ew), rms_norm(prev, hw)], dim=-1)
     assert out.shape == (num_tokens, 2 * HIDDEN)
     assert_bf16(out, ref, "eh_norm")
+
+
+@pytest.mark.parametrize("indexer_shards", [1, 2, 4])
+def test_fused_norm_rope_independent_indexer_and_attention_slots(indexer_shards):
+    """Replicated indexer writes include tokens outside this rank's MLA shard."""
+    device = torch.device("cuda")
+    rows = 9
+    positions = torch.arange(rows, dtype=torch.int64, device=device)
+    mla_slots = torch.where(positions % 4 == 1, positions // 4 + 64, -1)
+    index_slots = torch.where(
+        positions % indexer_shards == 1 % indexer_shards,
+        positions // indexer_shards + 3,
+        -1,
+    )
+    mla = torch.empty((2, 64, 656), dtype=torch.uint8, device=device)
+    index = torch.empty((2, 64, 132), dtype=torch.uint8, device=device)
+    mla_reference = torch.empty_like(mla)
+    index_reference = torch.empty_like(index)
+    torch.manual_seed(733)
+    for generation in range(2):
+        arguments = dict(
+            positions=positions,
+            q_c=torch.randn((rows, 512), dtype=torch.bfloat16, device=device),
+            q_rms_norm_w=torch.ones(512, dtype=torch.bfloat16, device=device),
+            q_rms_eps=EPS,
+            kv_c=torch.randn((rows, 512), dtype=torch.bfloat16, device=device),
+            kv_rms_norm_w=torch.ones(512, dtype=torch.bfloat16, device=device),
+            kv_rms_eps=EPS,
+            k_pe=torch.randn((rows, 64), dtype=torch.bfloat16, device=device),
+            k_rope_cos_sin_cache=make_cos_sin(32, 64, device),
+            index_k=torch.randn((rows, 128), dtype=torch.bfloat16, device=device),
+            index_k_layer_norm_w=torch.ones(128, dtype=torch.float32, device=device),
+            index_k_layer_norm_bias=torch.zeros(
+                128, dtype=torch.float32, device=device
+            ),
+            index_k_layer_norm_eps=EPS,
+            index_k_rope_cos_sin_cache=make_cos_sin(32, 64, device),
+            topk_indices_buffer=torch.empty(
+                (rows, 2048), dtype=torch.int32, device=device
+            ),
+            mla_kv_cache_dtype="fp8_ds_mla",
+        )
+        for cache in (mla, index, mla_reference, index_reference):
+            cache.fill_(91 + generation)
+        K.fused_norm_rope(
+            **arguments,
+            slot_mapping=mla_slots,
+            indexer_slot_mapping=index_slots,
+            mla_kv_cache=mla,
+            indexer_k_cache=index,
+        )
+        K.fused_norm_rope(
+            **arguments, slot_mapping=mla_slots, mla_kv_cache=mla_reference
+        )
+        K.fused_norm_rope(
+            **arguments, slot_mapping=index_slots, indexer_k_cache=index_reference
+        )
+        torch.testing.assert_close(mla, mla_reference, rtol=0, atol=0)
+        torch.testing.assert_close(index, index_reference, rtol=0, atol=0)
+        assert not torch.all(index == 91 + generation)

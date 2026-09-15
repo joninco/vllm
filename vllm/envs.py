@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_USE_B12X_SPARSE_INDEXER: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -202,9 +203,24 @@ if TYPE_CHECKING:
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
-    VLLM_B12X_MLA_CKV_GATHER: bool = False
+    VLLM_B12X_MLA_CKV_GATHER: bool = True
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_DCP_PREFILL_TRACE: bool = False
+    VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 0
+    VLLM_B12X_MLA_PREFILL_QUERY_BMM: bool = False
+    VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB: int = 1024
+    VLLM_DCP_QUERY_SPLIT: bool = True
+    VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS: int = 0
+    VLLM_DCP_TOPK_OWNER_MERGE: bool = False
+    VLLM_DCP_INDEXER_LOCAL_CONTEXT: bool = True
+    VLLM_DCP_INDEXER_SHARDS: int = 0
+    VLLM_DCP_REPLICATE_INDEXER_CACHE: bool = False
+    VLLM_DCP_A2A_MAX_TOKENS: int = 16
+    VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
+    VLLM_DCP_PROJECT_BEFORE_MERGE: bool = False
+    VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS: int = 1024
+    VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE: bool = False
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk"] | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
@@ -319,6 +335,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_SHARED_EXPERTS_RETAIN_OUTPUT: bool = True
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
@@ -1657,6 +1674,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
     ),
+    # Use the bounded B12X DSA indexer independently of the sparse-MLA backend.
+    "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
+    ),
     # Dense activation precision; recipe overrides take precedence.
     "VLLM_B12X_DENSE_ACTIVATION_MODE": env_with_choices(
         "VLLM_B12X_DENSE_ACTIVATION_MODE", "auto", ["auto", "a16", "quantized"]
@@ -1689,17 +1710,72 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
     ),
-    # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
-    # query replication plus the per-rank LSE combine and is opt-in while the
-    # path is being qualified on GLM5Next.
+    # Gather native DCP KV records for local-head sparse-MLA prefill.
+    # Pure prefill batches within the reserved capacity then attend locally
+    # without query gathering or partial-output merging; mixed, decode,
+    # capture and MTP batches keep the configured transport.
     "VLLM_B12X_MLA_CKV_GATHER": lambda: (
-        os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
+        os.getenv("VLLM_B12X_MLA_CKV_GATHER", "1").lower() in ("1", "true", "yes", "on")
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS", "16")
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+    ),
+    # Optional caller-owned BF16 query projection for eligible DCP prefill.
+    "VLLM_B12X_MLA_PREFILL_QUERY_BMM": lambda: bool(
+        int(os.getenv("VLLM_B12X_MLA_PREFILL_QUERY_BMM", "0"))
+    ),
+    "VLLM_DCP_PREFILL_TRACE": lambda: os.getenv("VLLM_DCP_PREFILL_TRACE", "0") == "1",
+    # Persistent gathered history uses depth+1 slots per execution lane, so
+    # each lookahead step costs one more gathered copy of the rank capacity
+    # plus a dedicated communicator; depth 0 gathers synchronously.
+    # A zero byte budget is uncapped; every reservation is still accounted.
+    "VLLM_B12X_MLA_CKV_PREFETCH_DEPTH": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", "0")
+    ),
+    "VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB", "1024")
+    ),
+    # Partition prefill rows across replicas and restore selected indices only.
+    "VLLM_DCP_QUERY_SPLIT": lambda: bool(int(os.getenv("VLLM_DCP_QUERY_SPLIT", "1"))),
+    "VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", "0")
+    ),
+    "VLLM_DCP_TOPK_OWNER_MERGE": lambda: bool(
+        int(os.getenv("VLLM_DCP_TOPK_OWNER_MERGE", "0"))
+    ),
+    # Score prefill chunks whose whole context is among the step's tokens
+    # against a step-local key copy instead of merging sharded candidates.
+    "VLLM_DCP_INDEXER_LOCAL_CONTEXT": lambda: bool(
+        int(os.getenv("VLLM_DCP_INDEXER_LOCAL_CONTEXT", "1"))
+    ),
+    # Zero retains attention DCP sharding; replication changes cache geometry.
+    "VLLM_DCP_INDEXER_SHARDS": lambda: int(os.getenv("VLLM_DCP_INDEXER_SHARDS", "0")),
+    "VLLM_DCP_REPLICATE_INDEXER_CACHE": lambda: bool(
+        int(os.getenv("VLLM_DCP_REPLICATE_INDEXER_CACHE", "0"))
+    ),
+    # Eligible unprojected prefill batches above this many tokens use the
+    # large backend; a nonpositive cap keeps A2A for all of them.
+    "VLLM_DCP_A2A_MAX_TOKENS": lambda: int(os.getenv("VLLM_DCP_A2A_MAX_TOKENS", "16")),
+    "VLLM_DCP_A2A_LARGE_BACKEND": env_with_choices(
+        "VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs", ["ag_rs", "a2a"]
+    ),
+    "VLLM_DCP_PROJECT_BEFORE_MERGE": lambda: bool(
+        int(os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE", "0"))
+    ),
+    "VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_PROJECT_BEFORE_MERGE_MIN_PREFILL_TOKENS", "1024")
+    ),
+    # The VLLM-prefixed setting takes precedence over the compatibility alias.
+    "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_B12X_MLA_DCP_GATHER_IN_WORKSPACE",
+                os.getenv("B12X_MLA_DCP_GATHER_IN_WORKSPACE", "0"),
+            )
+        )
     ),
     # Qwen3.8-Flash-Next PLE offload policy, resolved by vLLM for b12x.
     "VLLM_PLE_TABLE_MEMORY": env_with_choices(
@@ -2128,6 +2204,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
+    ),
+    # Records the shared-expert output, computed on the auxiliary stream, on
+    # the caller stream so the allocator cannot hand its storage to a later
+    # auxiliary-stream allocation while the caller's read is still queued.
+    # Inside a CUDA graph capture the allocator defers such a release until the
+    # capture ends, so every captured graph retains one shared-expert output
+    # per MoE layer. A model whose only auxiliary-stream user is the shared
+    # expert path, joined to the caller stream at the start of every MoE block,
+    # may set this to 0: the join already orders the reuse.
+    "VLLM_SHARED_EXPERTS_RETAIN_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_SHARED_EXPERTS_RETAIN_OUTPUT", "1"))
     ),
     # Emergency rollback for the DeepSeek-V4 NVIDIA MegaMoE path. By default,
     # DeepGEMM computes replicated FP8 shared experts in the same persistent

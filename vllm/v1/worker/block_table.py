@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed.dcp_prefill import resolve_indexer_shards
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup import (
     VllmJitKernel,
@@ -66,6 +67,7 @@ class BlockTable:
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
         slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
+        dcp_kv_shard_count: int | None = None,
     ):
         """
         Args:
@@ -141,6 +143,10 @@ class BlockTable:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+        self.dcp_world_size = resolve_indexer_shards(
+            self.dcp_world_size, dcp_kv_shard_count or 0
+        )
+        self.dcp_rank %= self.dcp_world_size
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
         self.slot_mapping_mode = slot_mapping_mode
         if self.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT:
@@ -299,6 +305,7 @@ class MultiGroupBlockTable:
         max_num_blocks: list[int],
         cp_kv_cache_interleave_size: int = 1,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
+        dcp_kv_shard_counts: list[int] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -330,6 +337,10 @@ class MultiGroupBlockTable:
             )
         ]
 
+        if dcp_kv_shard_counts is None:
+            dcp_kv_shard_counts = [0] * len(block_sizes)
+        if len(dcp_kv_shard_counts) != len(block_sizes):
+            raise ValueError("KV shard counts must match cache groups")
         self.block_tables = [
             BlockTable(
                 block_size,
@@ -341,14 +352,20 @@ class MultiGroupBlockTable:
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
                 slot_mapping_mode=slot_mapping_mode,
+                dcp_kv_shard_count=dcp_kv_shard_count,
             )
             for (
                 block_size,
                 kernel_block_size,
                 max_num_blocks_per_req,
                 slot_mapping_mode,
+                dcp_kv_shard_count,
             ) in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks, slot_mapping_modes
+                block_sizes,
+                kernel_block_sizes,
+                max_num_blocks,
+                slot_mapping_modes,
+                dcp_kv_shard_counts,
             )
         ]
 

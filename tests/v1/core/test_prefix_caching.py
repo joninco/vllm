@@ -5396,3 +5396,44 @@ def test_full_replay_reports_retained_blocks(kind, events_enabled):
     assert event.kv_cache_spec_kind == kind.replace("full", "full_attention").replace(
         "swa", "sliding_window"
     )
+
+
+@pytest.mark.parametrize("shards", [1, 2, 4])
+def test_indexer_replication_admission_and_prefix_reuse(shards):
+    """A shared prefix reuses different block counts in attention and indexer groups."""
+    specs = [
+        MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=656 if index == 0 else 132,
+            dtype=torch.uint8,
+            dcp_kv_shard_count=count,
+        )
+        for index, count in enumerate((4, shards))
+    ]
+    config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec([name], spec)
+            for name, spec in zip(("attention", "indexer"), specs)
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=4096,
+        scheduler_block_size=256,
+        hash_block_size=64,
+        dcp_world_size=4,
+    )
+    first = make_request("populate", list(range(513)), 64, sha256)
+    allocated = manager.allocate_slots(first, 512)
+    assert allocated is not None
+    assert [len(group) for group in allocated.blocks] == [2, 8 // shards]
+    manager.cache_blocks(first, 512)
+    manager.free(first)
+    second = make_request("reuse", list(range(512)) + [999], 64, sha256)
+    cached, tokens, _ = manager.get_computed_blocks(second)
+    assert tokens == 512
+    assert [len(group) for group in cached.blocks] == [2, 8 // shards]
+    assert set(cached.get_block_ids()[0]).isdisjoint(cached.get_block_ids()[1])

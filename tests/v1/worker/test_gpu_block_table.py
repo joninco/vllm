@@ -342,3 +342,43 @@ def test_get_dummy_block_tables_returns_zeroed_rows():
     assert (dummy[0] == 0).all()
     # CUDA graph invariant: same persistent tensor, not a fresh allocation.
     assert dummy[0].data_ptr() == block_tables.input_block_tables[0].data_ptr()
+
+
+@pytest.mark.parametrize("shards", [1, 2, 4])
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+@pytest.mark.parametrize("interleave", [1, 4])
+def test_indexer_replication_slot_mapping_preserves_attention_ownership(
+    shards, rank, interleave
+):
+    """Each table writes its own token subset, including changed request pages."""
+    device = torch.device("cuda")
+    tables = BlockTables(
+        block_sizes=[64, 64],
+        max_num_reqs=1,
+        max_num_batched_tokens=259,
+        max_num_blocks_per_group=[5, 5],
+        device=device,
+        kernel_block_sizes=[64, 64],
+        cp_size=4,
+        cp_rank=rank,
+        cp_interleave=interleave,
+        group_cp_sizes=[4, shards],
+    )
+    positions = torch.arange(259, dtype=torch.int64, device=device)
+    mapping = torch.tensor([0], dtype=torch.int32, device=device)
+    starts = torch.tensor([0, 259], dtype=torch.int32, device=device)
+    for base in (5, 17):
+        tables.append_block_ids(
+            0,
+            (list(range(base, base + 5)), list(range(base + 10, base + 15))),
+            overwrite=True,
+        )
+        tables.apply_staged_writes()
+        actual = tables.compute_slot_mappings(mapping, starts, positions, 259)
+        for group, count in enumerate((4, shards)):
+            local = (
+                positions // (interleave * count) * interleave + positions % interleave
+            )
+            owned = positions // interleave % count == rank % count
+            expected = torch.where(owned, (base + group * 10) * 64 + local, -1)
+            torch.testing.assert_close(actual[group], expected)

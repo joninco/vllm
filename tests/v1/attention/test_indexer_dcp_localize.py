@@ -8,6 +8,7 @@ import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 import vllm.v1.attention.backends.mla.indexer as indexer_backend
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
+from vllm.v1.attention.backends.mla.b12x_indexer import B12xIndexerMetadataBuilder
 from vllm.v1.attention.backends.mla.indexer import (
     DeepSeekV32IndexerDecodeMetadata,
     DeepseekV32IndexerMetadata,
@@ -294,6 +295,98 @@ def test_get_dcp_local_seq_lens_can_localize_per_token_bounds():
             dtype=torch.int32,
         )
         torch.testing.assert_close(actual, expected)
+
+
+def test_get_dcp_local_seq_lens_does_not_upload_rank(monkeypatch):
+    """A scalar rank must not introduce a synchronizing host-to-device copy."""
+    seq_lens = torch.tensor([[0, 1, 3, 64], [257, 4096, 122880, 524288]])
+    expected = get_dcp_local_seq_lens(seq_lens, 4, None, 64)
+
+    def reject_tensor_upload(*args, **kwargs):
+        raise AssertionError("DCP localization must keep the rank as a scalar")
+
+    monkeypatch.setattr(torch, "tensor", reject_tensor_upload)
+    for rank in range(4):
+        actual = get_dcp_local_seq_lens(seq_lens, 4, rank, 64)
+        torch.testing.assert_close(actual, expected[..., rank])
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("interleave", [1, 64])
+@pytest.mark.parametrize("layout", ["request", "flat_mtp", "matrix_mtp"])
+def test_indexer_local_lengths_preserve_buffers_and_graph_replay(
+    device: str, rank: int, interleave: int, layout: str
+):
+    """Localize every causal bound without replacing shared metadata buffers."""
+    if device == "cuda" and not current_platform.is_cuda():
+        pytest.skip("CUDA replay requires a CUDA platform")
+    values = [
+        0,
+        1,
+        3,
+        63,
+        64,
+        65,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        4096,
+        8192,
+        122880,
+        524288,
+    ]
+    shape = (4, 4) if layout == "matrix_mtp" else (16,)
+    owned = layout != "request"
+    source = torch.tensor(values, dtype=torch.int32, device=device).view(shape)
+    global_lengths = source.clone()
+    builder = object.__new__(B12xIndexerMetadataBuilder)
+    builder.dcp_world_size = 4
+    builder.dcp_rank = rank
+    builder.cp_kv_cache_interleave_size = interleave
+    builder.decode_seq_lens_buffer = torch.full(
+        (32,), -77, dtype=torch.int32, device=device
+    )
+    if owned:
+        source = builder.decode_seq_lens_buffer[:16].view(shape)
+    expected_pointer = (
+        source.data_ptr() if owned else builder.decode_seq_lens_buffer.data_ptr()
+    )
+
+    def run():
+        source.copy_(global_lengths)
+        return builder._dcp_localize_decode_seq_lens(source, shape[0], owned)
+
+    def expected(lengths):
+        return torch.tensor(
+            [_local_count(length, rank, 4, interleave) for length in lengths],
+            dtype=torch.int32,
+        ).view(shape)
+
+    result = run()
+    assert result.data_ptr() == expected_pointer
+    torch.testing.assert_close(result.cpu(), expected(values), rtol=0, atol=0)
+    if not owned:
+        torch.testing.assert_close(source, global_lengths, rtol=0, atol=0)
+    assert (builder.decode_seq_lens_buffer[16:] == -77).all()
+
+    if device == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+        changed = [max(value - 1, 0) for value in values]
+        global_lengths.copy_(
+            torch.tensor(changed, dtype=torch.int32, device=device).view(shape)
+        )
+        for _ in range(3):
+            graph.replay()
+            assert captured.data_ptr() == expected_pointer
+            torch.testing.assert_close(
+                captured.cpu(), expected(changed), rtol=0, atol=0
+            )
 
 
 def test_get_dcp_local_seq_lens_preserves_mtp_bounds_shape():

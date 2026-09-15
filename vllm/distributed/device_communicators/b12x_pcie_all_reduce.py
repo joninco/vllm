@@ -15,7 +15,6 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm.distributed.parallel_state import in_the_same_node_as
-from vllm.distributed.utils import is_weak_contiguous
 from vllm.logger import init_logger
 from vllm.utils.b12x import B12xPreparationUnit, B12xWorkload
 
@@ -42,9 +41,15 @@ class B12xPcieInvocation:
             "all_reduce",
             "all_reduce_fused_add_rms_norm",
         ):
-            raise ValueError(f"unsupported PCIe collective operation {self.operation!r}")
-        if not self.name or any(type(value) is not int or value <= 0 for value in self.shape):
-            raise ValueError("PCIe invocation requires a nonempty name and positive shape")
+            raise ValueError(
+                f"unsupported PCIe collective operation {self.operation!r}"
+            )
+        if not self.name or any(
+            type(value) is not int or value <= 0 for value in self.shape
+        ):
+            raise ValueError(
+                "PCIe invocation requires a nonempty name and positive shape"
+            )
         if self.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError("PCIe invocation dtype is unsupported")
         if self.strides is not None and (
@@ -52,7 +57,9 @@ class B12xPcieInvocation:
             or any(type(value) is not int or value <= 0 for value in self.strides)
         ):
             raise ValueError("PCIe invocation strides must match its shape")
-        if self.input_alignment < 16 or self.input_alignment & (self.input_alignment - 1):
+        if self.input_alignment < 16 or self.input_alignment & (
+            self.input_alignment - 1
+        ):
             raise ValueError("PCIe invocation alignment must be a power of two >= 16")
         fused = self.operation == "all_reduce_fused_add_rms_norm"
         if fused != (self.norm_weight is not None):
@@ -62,6 +69,29 @@ class B12xPcieInvocation:
         if not fused and (self.epsilon is not None or self.norm_weight is not None):
             raise ValueError("plain PCIe invocation cannot carry RMSNorm controls")
 
+
+def _fused_residual_row_stride(tensor: torch.Tensor) -> int | None:
+    """Return a regular pack-aligned row stride accepted by B12X."""
+
+    if tensor.ndim == 0 or int(tensor.shape[-1]) <= 0 or int(tensor.stride(-1)) != 1:
+        return None
+    hidden_size = int(tensor.shape[-1])
+    if tensor.is_contiguous() or tensor.ndim == 1:
+        row_stride = hidden_size
+    else:
+        row_stride = int(tensor.stride(-2))
+        expected_stride = row_stride
+        for axis in range(tensor.ndim - 3, -1, -1):
+            expected_stride *= int(tensor.shape[axis + 1])
+            if int(tensor.stride(axis)) != expected_stride:
+                return None
+    if (
+        row_stride < hidden_size
+        or row_stride * tensor.element_size() % 16 != 0
+        or tensor.data_ptr() % 16 != 0
+    ):
+        return None
+    return row_stride
 
 
 def _parse_byte_size(value: str) -> int:
@@ -163,8 +193,23 @@ def _dma_min_bytes() -> int | None:
     return value
 
 
+def _dma_wire_is_lossless() -> bool:
+    """True when the DMA ring carries values verbatim (no wire codec)."""
+    configured = (envs.VLLM_PCIE_DMA_FP8 or "").strip().lower()
+    return configured in ("", "0", "false", "off", "no")
+
+
 def _dma_capacity_plan() -> dict[torch.dtype, int] | None:
-    """Plan static per-dtype element bounds, including FP32 reductions."""
+    """Plan static per-dtype element bounds.
+
+    The ring carries the model dtype (and the draft model's). FP32 reductions
+    are planned only on the lossless wire: a quantized wire codec cannot carry
+    them faithfully, and the ring slab and codec staging are sized by the
+    widest planned dtype, so an unused FP32 plan would double them before the
+    startup memory check (about 217 MiB more per GPU at 8,192 batched tokens
+    and a 6,144-wide hidden state), which a launch at 0.975 GPU memory
+    utilization cannot spare.
+    """
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
@@ -182,12 +227,14 @@ def _dma_capacity_plan() -> dict[torch.dtype, int] | None:
         model_configs.append(draft_config)
 
     max_tokens = config.scheduler_config.max_num_batched_tokens
+    plan_fp32 = _dma_wire_is_lossless()
     capacities: dict[torch.dtype, int] = {}
     for model_config in model_configs:
         elements = max_tokens * model_config.get_hidden_size()
         dtype = model_config.dtype
         capacities[dtype] = max(capacities.get(dtype, 0), elements)
-        capacities[torch.float32] = max(capacities.get(torch.float32, 0), elements)
+        if plan_fp32:
+            capacities[torch.float32] = max(capacities.get(torch.float32, 0), elements)
     return capacities
 
 
@@ -241,6 +288,7 @@ class B12xPcieAllReduce:
         self._routes: dict[str, str] = {}
         if len(self.global_ranks) != self.world_size:
             raise ValueError("PCIe global ranks must match the process group")
+        self.fused_max_rows = 0
 
         if device_group is None:
             logger.warning("B12X PCIe all-reduce requires a CUDA process group.")
@@ -294,6 +342,11 @@ class B12xPcieAllReduce:
 
         assert runtime is not None
         self._runtime = runtime
+        # Row capacity of the fused all-reduce + RMSNorm kernel (one CTA per
+        # row); zero when the runtime does not publish one.
+        max_rows = getattr(runtime, "fused_max_rows", None)
+        if isinstance(max_rows, int) and max_rows > 0:
+            self.fused_max_rows = max_rows
         self._initialize_dma(dma_cls)
         self._twoshot: Any | None = None
         self.twoshot_max_bytes = 0
@@ -425,7 +478,6 @@ class B12xPcieAllReduce:
             return None
         return stream
 
-
     def _oneshot_accepts(self, inp: torch.Tensor) -> bool:
         runtime = self._runtime
         return bool(
@@ -477,7 +529,8 @@ class B12xPcieAllReduce:
                 and nbytes > self.allreduce_max_bytes
                 and contiguous
                 and (nbytes // invocation.dtype.itemsize)
-                % (self.world_size * self._twoshot.row_elems) == 0
+                % (self.world_size * self._twoshot.row_elems)
+                == 0
             ):
                 return "twoshot"
             if (
@@ -489,6 +542,11 @@ class B12xPcieAllReduce:
             ):
                 return "dma"
         elif invocation.operation == "all_reduce_fused_add_rms_norm":
+            if not invocation.shape:
+                return None
+            rows = nbytes // invocation.dtype.itemsize // invocation.shape[-1]
+            if self.fused_max_rows and rows > self.fused_max_rows:
+                return None
             if nbytes <= self.fused_max_bytes:
                 return "oneshot_fused"
         # The enclosing CUDA communicator retains its existing backend dispatch
@@ -553,12 +611,12 @@ class B12xPcieAllReduce:
             raise ValueError("PCIe preparation owner mismatch")
         if workload.stage != "weights":
             return ()
-        from b12x.preparation import CollectiveRequirement
         from b12x.comm.pcie import (
             _dma_preparation,
             _oneshot_preparation,
             _twoshot_preparation,
         )
+        from b12x.preparation import CollectiveRequirement
 
         invocations = [
             invocation
@@ -568,7 +626,10 @@ class B12xPcieAllReduce:
         names = [invocation.name for invocation in invocations]
         if len(names) != len(set(names)):
             from collections import Counter
-            duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
+
+            duplicates = sorted(
+                name for name, count in Counter(names).items() if count > 1
+            )
             raise ValueError(
                 "PCIe collective describers produced duplicate names: "
                 + ", ".join(duplicates)
@@ -577,12 +638,14 @@ class B12xPcieAllReduce:
         plans: dict[str, object] = {}
         routes: dict[str, str] = {}
         collective_ranks = tuple(sorted(self.global_ranks))
-        declarations = {}
+        declarations: dict[tuple[Any, ...], Any] = {}
+        prepare: Callable[..., Any]
         for invocation in invocations:
             route = self._route_invocation(invocation)
             if route is None:
                 continue
             routes[invocation.name] = route
+            assert self._runtime is not None
             target = self._runtime._prepared_channel_for_stream(
                 None, invocation.channel_id
             )
@@ -593,13 +656,17 @@ class B12xPcieAllReduce:
                     else "OneshotAllReduce.all_reduce"
                 )
                 query = _oneshot_preparation.query_from_metadata(
-                    target, surface=surface, shape=invocation.shape,
-                    dtype=invocation.dtype, strides=invocation.strides,
+                    target,
+                    surface=surface,
+                    shape=invocation.shape,
+                    dtype=invocation.dtype,
+                    strides=invocation.strides,
                     alignment=invocation.input_alignment,
                 )
                 binding = (
                     id(invocation.persistent_input)
-                    if query.setup["registered"] else None
+                    if query.setup["registered"]
+                    else None
                 )
                 key = (id(target), query, binding)
                 plan = declarations.get(key)
@@ -607,7 +674,7 @@ class B12xPcieAllReduce:
                     plan = _oneshot_preparation.plan(query, runtime=target)
                     declarations[key] = plan
 
-                def prepare(state, invocation=invocation, query=query):
+                def prepare_oneshot(state, invocation=invocation, query=query):
                     registered = bool(query.setup["registered"])
                     inp = self._request_input(invocation, registered=registered)
                     reset, produce, restore, owners = self._oneshot_prime_input(
@@ -615,8 +682,13 @@ class B12xPcieAllReduce:
                     )
                     if invocation.operation == "all_reduce":
                         return _oneshot_preparation._prepare_plain_call(
-                            state, inp=inp, out=torch.empty_like(inp), produce=produce,
-                            reset=reset, restore=restore, owners=owners,
+                            state,
+                            inp=inp,
+                            out=torch.empty_like(inp),
+                            produce=produce,
+                            reset=reset,
+                            restore=restore,
+                            owners=owners,
                         )
                     residual = torch.empty_like(inp)
 
@@ -625,17 +697,29 @@ class B12xPcieAllReduce:
                         residual.fill_(1)
 
                     return _oneshot_preparation._prepare_fused_call(
-                        state, inp=inp, residual=residual,
-                        weight=invocation.norm_weight, out=torch.empty_like(inp),
-                        residual_out=residual, epsilon=invocation.epsilon,
-                        produce=produce_fused, reset=reset, restore=restore, owners=owners,
+                        state,
+                        inp=inp,
+                        residual=residual,
+                        weight=invocation.norm_weight,
+                        out=torch.empty_like(inp),
+                        residual_out=residual,
+                        epsilon=invocation.epsilon,
+                        produce=produce_fused,
+                        reset=reset,
+                        restore=restore,
+                        owners=owners,
                     )
+
+                prepare = prepare_oneshot
             elif route == "twoshot":
                 assert self._twoshot is not None
                 query = _twoshot_preparation.query_from_metadata(
-                    self._twoshot, surface="PCIeTwoShotBF16.all_reduce",
-                    shape=invocation.shape, dtype=invocation.dtype,
-                    strides=invocation.strides, alignment=invocation.input_alignment,
+                    self._twoshot,
+                    surface="PCIeTwoShotBF16.all_reduce",
+                    shape=invocation.shape,
+                    dtype=invocation.dtype,
+                    strides=invocation.strides,
+                    alignment=invocation.input_alignment,
                 )
                 key = (id(self._twoshot), query, None)
                 plan = declarations.get(key)
@@ -643,18 +727,23 @@ class B12xPcieAllReduce:
                     plan = _twoshot_preparation.plan(query, runtime=self._twoshot)
                     declarations[key] = plan
 
-                def prepare(state, invocation=invocation):
+                def prepare_twoshot(state, invocation=invocation):
                     inp = self._request_input(invocation, registered=False)
                     assert inp is not None
                     inp.fill_(1)
                     return _twoshot_preparation.prepared_call(
                         state, payload=inp, out=torch.empty_like(inp)
                     )
+
+                prepare = prepare_twoshot
             else:
                 assert self._dma is not None
                 query = _dma_preparation.query_from_metadata(
-                    self._dma, shape=invocation.shape, dtype=invocation.dtype,
-                    strides=invocation.strides, alignment=invocation.input_alignment,
+                    self._dma,
+                    shape=invocation.shape,
+                    dtype=invocation.dtype,
+                    strides=invocation.strides,
+                    alignment=invocation.input_alignment,
                 )
                 key = (id(self._dma), query, None)
                 plan = declarations.get(key)
@@ -662,13 +751,16 @@ class B12xPcieAllReduce:
                     plan = _dma_preparation.plan(query, runtime=self._dma)
                     declarations[key] = plan
 
-                def prepare(state, invocation=invocation):
+                def prepare_dma(state, invocation=invocation):
                     inp = self._request_input(invocation, registered=False)
                     assert inp is not None
                     inp.fill_(1)
                     return _dma_preparation.prepared_call(
                         state, inp=inp, out=torch.empty_like(inp)
                     )
+
+                prepare = prepare_dma
+
             plans[invocation.name] = plan
             requests.append(
                 plan.request(
@@ -684,7 +776,8 @@ class B12xPcieAllReduce:
                 )
             )
         self._invocations = {
-            invocation.name: invocation for invocation in invocations
+            invocation.name: invocation
+            for invocation in invocations
             if invocation.name in routes
         }
         self._plans = plans
@@ -702,8 +795,12 @@ class B12xPcieAllReduce:
         )
 
     def _plan_for(
-        self, inp: torch.Tensor, *, operation: str = "all_reduce",
-        weight: torch.Tensor | None = None, epsilon: float | None = None,
+        self,
+        inp: torch.Tensor,
+        *,
+        operation: str = "all_reduce",
+        weight: torch.Tensor | None = None,
+        epsilon: float | None = None,
     ):
         strides = tuple(inp.stride())
         for name, invocation in self._invocations.items():
@@ -752,7 +849,8 @@ class B12xPcieAllReduce:
         except PreparationResourceUnavailableError:
             logger.debug(
                 "b12x PCIe all-reduce declines undeclared shape %s %s",
-                tuple(inp.shape), inp.dtype,
+                tuple(inp.shape),
+                inp.dtype,
             )
             return False
         return True
@@ -777,9 +875,7 @@ class B12xPcieAllReduce:
             twoshot = self._twoshot
             assert twoshot is not None
             out = torch.empty_like(inp)
-            return twoshot.all_reduce(
-                inp, out=out, plan=self._plan_for(inp)
-            )
+            return twoshot.all_reduce(inp, out=out, plan=self._plan_for(inp))
         return self._all_reduce(inp, use_oneshot=use_oneshot)
 
     def _all_reduce(self, inp: torch.Tensor, *, use_oneshot: bool) -> torch.Tensor:
@@ -804,6 +900,70 @@ class B12xPcieAllReduce:
             and hasattr(self._runtime, "all_reduce_fused_add_rms_norm")
         )
 
+    def fused_add_rms_norm_dispatch_reason(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> str:
+        """Return the fused dispatch decision for the supplied operands."""
+
+        if not self.supports_fused_add_rms_norm():
+            return "runtime-unavailable"
+        if inp.nbytes > self.fused_max_bytes:
+            return "size-limit"
+        if inp.ndim == 0:
+            return "scalar-input"
+        if self.fused_max_rows and inp.numel() // inp.shape[-1] > self.fused_max_rows:
+            return "row-limit"
+        if residual.shape != inp.shape:
+            return "residual-shape"
+        if residual.dtype != inp.dtype:
+            return "residual-dtype"
+        if residual.device != inp.device:
+            return "residual-device"
+        if _fused_residual_row_stride(residual) is None:
+            return "residual-layout"
+        if weight.shape != (inp.shape[-1],):
+            return "weight-shape"
+        if weight.dtype != inp.dtype:
+            return "weight-dtype"
+        if weight.device != inp.device:
+            return "weight-device"
+        if not weight.is_contiguous():
+            return "weight-layout"
+        if inp.shape[-1] * inp.element_size() % 16 != 0:
+            return "row-alignment"
+        if inp.data_ptr() == residual.data_ptr():
+            return "input-residual-alias"
+        if epsilon < 0:
+            return "negative-epsilon"
+
+        runtime = self._runtime
+        assert runtime is not None
+        if not runtime.for_stream(self._runtime_stream()).should_allreduce(inp):
+            return "input-runtime-rejected"
+        return "fused"
+
+    def _record_fused_add_rms_norm_dispatch(
+        self,
+        reason: str,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> None:
+        if getattr(self, "rank", 0) != 0:
+            return
+        logger.info_once(
+            "B12X PCIe fused all-reduce + RMSNorm dispatch: reason=%s "
+            "shape=%s input_stride=%s residual_stride=%s.",
+            reason,
+            tuple(inp.shape),
+            tuple(inp.stride()),
+            tuple(residual.stride()),
+            scope="process",
+        )
+
     def try_fused_add_rms_norm(
         self,
         inp: torch.Tensor,
@@ -811,26 +971,16 @@ class B12xPcieAllReduce:
         weight: torch.Tensor,
         epsilon: float,
     ) -> bool:
-        if (
-            not self.supports_fused_add_rms_norm()
-            or inp.nbytes > self.fused_max_bytes
-            or inp.ndim == 0
-            or residual.shape != inp.shape
-            or residual.dtype != inp.dtype
-            or residual.device != inp.device
-            or not is_weak_contiguous(residual)
-            or weight.shape != (inp.shape[-1],)
-            or weight.dtype != inp.dtype
-            or weight.device != inp.device
-            or not weight.is_contiguous()
-            or inp.shape[-1] * inp.element_size() % 16 != 0
-            or inp.data_ptr() == residual.data_ptr()
-            or epsilon < 0
-        ):
+        reason = self.fused_add_rms_norm_dispatch_reason(inp, residual, weight, epsilon)
+        self._record_fused_add_rms_norm_dispatch(reason, inp, residual)
+        if reason != "fused":
             return False
 
         if not self._has_plan_for(
-            inp, operation="all_reduce_fused_add_rms_norm", weight=weight, epsilon=epsilon,
+            inp,
+            operation="all_reduce_fused_add_rms_norm",
+            weight=weight,
+            epsilon=epsilon,
         ):
             return False
         runtime = self._runtime
@@ -875,8 +1025,11 @@ class B12xPcieAllReduce:
             twoshot_plan = None
             if self._twoshot is not None:
                 twoshot_plan = next(
-                    (self._plans[name] for name, route in self._routes.items()
-                     if route == "twoshot"),
+                    (
+                        self._plans[name]
+                        for name, route in self._routes.items()
+                        if route == "twoshot"
+                    ),
                     None,
                 )
             with self._runtime.capture(stream=stream):

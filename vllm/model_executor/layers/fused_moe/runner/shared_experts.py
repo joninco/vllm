@@ -37,6 +37,42 @@ class SharedExpertsOrder(IntEnum):
     MULTI_STREAM_OVERLAPPED = (3,)
 
 
+class SharedExpertsFromGateUp(torch.nn.Module):
+    """Shared-expert MLP whose gate_up projection may be supplied by the MoE
+    runner.
+
+    The runner's weight-first projection (b12x ``gemm.weight_first_gemv``)
+    computes the router logits and the shared expert's gate_up activation in
+    one kernel at decode row counts. When the runner has stored that
+    activation in ``gate_up``, ``forward`` applies the activation function and
+    the down projection to it and clears it; otherwise it runs the wrapped MLP
+    on its input. Attributes the wrapper does not define resolve on the
+    wrapped MLP (``shard_sequence_parallel`` and the like).
+    """
+
+    def __init__(self, mlp: torch.nn.Module):
+        super().__init__()
+        self.mlp = mlp
+        self.gate_up: torch.Tensor | None = None
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if name in ("mlp", "gate_up"):
+                raise
+            return getattr(super().__getattr__("mlp"), name)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up
+        if gate_up is None:
+            return self.mlp(x)
+        self.gate_up = None
+        hidden = self.mlp.act_fn(gate_up)
+        out, _ = self.mlp.down_proj(hidden)
+        return out
+
+
 class SharedExperts(torch.nn.Module):
     def __init__(
         self,
@@ -169,7 +205,12 @@ class SharedExperts(torch.nn.Module):
         current_stream().wait_stream(self._stream)
         # The wait orders execution, but does not prevent producer-side reuse
         # after the caller releases this tensor with consumer work still queued.
-        output.record_stream(current_stream())
+        # The record costs one output per MoE layer in every captured graph
+        # (the allocator defers the release until the capture ends); a model
+        # that joins every auxiliary-stream launch behind the caller stream
+        # may switch it off.
+        if envs.VLLM_SHARED_EXPERTS_RETAIN_OUTPUT:
+            output.record_stream(current_stream())
 
         return output
 

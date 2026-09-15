@@ -18,8 +18,10 @@ from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.b12x import get_b12x_paged_attention
-from vllm.utils.b12x import PreparationResourceUnavailableError
+from vllm.utils.b12x import (
+    PreparationResourceUnavailableError,
+    get_b12x_paged_attention,
+)
 from vllm.v1.attention.backends import b12x
 from vllm.v1.attention.backends.b12x import (
     B12xPagedAttentionBackend,
@@ -152,7 +154,7 @@ def test_mla_query_plan_declares_an_unplanned_row_count_without_preparing(
     runs = []
     state = SimpleNamespace(run=lambda *args: runs.append(args))
     layer._b12x_query_call(11)(state).run()
-    (q_nope, weight, q_pe, output), = runs
+    ((q_nope, weight, q_pe, output),) = runs
     assert weight is layer.W_UK_T
     assert q_nope.shape == (8, 11, 192)
     assert q_pe.shape == (11, 8, 64)
@@ -324,7 +326,9 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
         Caps=lambda **kwargs: SimpleNamespace(**kwargs),
         plan=lambda caps, *, invocation: _Plan(caps, invocation),
         invocation_from_descriptors=lambda caps, *, operands: (
-            "invocation", caps.max_q_rows, tuple(operands),
+            "invocation",
+            caps.max_q_rows,
+            tuple(operands),
         ),
     )
     monkeypatch.setattr(b12x_indexer, "_require_b12x_indexer", lambda: module)
@@ -370,7 +374,11 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
 
     plan = indexer._plan("prefill", 11)
     assert isinstance(plan, _Plan)
-    assert (plan.caps.mode, plan.caps.max_q_rows, plan.caps.max_batch) == ("prefill", 11, 8)
+    assert (plan.caps.mode, plan.caps.max_q_rows, plan.caps.max_batch) == (
+        "prefill",
+        11,
+        8,
+    )
     assert plan.caps.max_page_table_width == indexer._max_page_table_width == 64
     assert plan.caps.num_q_heads == 16 and plan.caps.topk == 4
     assert plan.caps.output_index_space == "physical"
@@ -382,7 +390,11 @@ def test_b12x_dsa_indexer_reuses_capacity_and_declares_overflow(
     assert ("prefill", 7) not in indexer._prepared_plans
 
     decode = indexer._plan("decode", 11)
-    assert (decode.caps.mode, decode.caps.max_q_rows, decode.caps.max_batch) == ("decode", 11, 11)
+    assert (decode.caps.mode, decode.caps.max_q_rows, decode.caps.max_batch) == (
+        "decode",
+        11,
+        11,
+    )
     assert indexer._plan("decode", 11) is decode
     # Serving never prepares: the plans materialize their defaults on first use.
     assert prepared == []
@@ -411,6 +423,7 @@ def test_b12x_sparse_mla_prefill_binds_request_sequence_lengths(
     impl._q_head_dim = 576
     impl._topk_tokens = 4
     impl._ckv_local_capacity = 0
+    impl._cache_record_bytes = 656
     impl.topk_indices_buffer = torch.zeros((8, 4), dtype=torch.int32)
     impl.dcp_world_size = 1
     impl.kv_lora_rank = 512
@@ -767,19 +780,23 @@ def test_b12x_speculative_verification_uses_cuda_graph_plan(
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
 @pytest.mark.parametrize("compressed", [False, True])
 @torch.inference_mode()
-def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(mode, compressed, monkeypatch):
+def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(
+    mode, compressed, monkeypatch
+):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.attention import dsa_indexer
     from b12x.attention.dsa_indexer.reference import (
-        pack_index_k_cache_reference, unpack_index_k_cache_reference,
+        pack_index_k_cache_reference,
+        unpack_index_k_cache_reference,
     )
     from b12x.preparation import PreparationSession
-    from vllm.utils.b12x import B12xWorkload
+
     import vllm.v1.worker.workspace as workspace
+    from vllm.utils.b12x import B12xWorkload
 
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("requires SM12x")
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     torch.manual_seed(71)
     heads, topk, max_rows, width = 16, 512, 128, 16
     packed = pack_index_k_cache_reference(torch.randn(1024, 128, device=device))
@@ -792,27 +809,51 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(mode, comp
     monkeypatch.setattr(workspace, "_manager", manager)
     monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
     config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=max_rows, max_num_seqs=4),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=max_rows, max_num_seqs=4
+        ),
         parallel_config=SimpleNamespace(
-            decode_context_parallel_size=1, cp_kv_cache_interleave_size=1,
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
         ),
     )
     from vllm.models.deepseek_v4.nvidia import b12x_indexer as c4_indexer
+
     with set_current_vllm_config(config):
-        cls = c4_indexer.B12xC4SparseIndexer if compressed else b12x_indexer.B12xSparseIndexer
-        options = {"compress_ratio": 4} if compressed else {"num_q_heads": heads, "output_physical_slots": True}
+        cls = (
+            c4_indexer.B12xC4SparseIndexer
+            if compressed
+            else b12x_indexer.B12xSparseIndexer
+        )
+        options = (
+            {"compress_ratio": 4}
+            if compressed
+            else {"num_q_heads": heads, "output_physical_slots": True}
+        )
         indexer = cls(
             k_cache=SimpleNamespace(prefix="indexer", kv_cache=cache),
-            quant_block_size=128, scale_fmt="ue8m0", topk_tokens=topk, head_dim=128,
-            max_model_len=1024, max_total_seq_len=1024,
-            topk_indices_buffer=torch.empty((max_rows, topk), dtype=torch.int32, device=device),
-            skip_k_cache_insert=True, **options,
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+            topk_tokens=topk,
+            head_dim=128,
+            max_model_len=1024,
+            max_total_seq_len=1024,
+            topk_indices_buffer=torch.empty(
+                (max_rows, topk), dtype=torch.int32, device=device
+            ),
+            skip_k_cache_insert=True,
+            **options,
         )
         if compressed:
             indexer.set_b12x_index_cache(cache, num_q_heads=heads)
     workload = B12xWorkload(
-        stage="state", token_counts=(4, 125, max_rows), fixed_token_counts=(4,),
-        output_dtype=torch.bfloat16, max_tokens=max_rows, max_seqs=4, max_model_len=1024,
+        stage="state",
+        token_counts=(4, 125, max_rows),
+        fixed_token_counts=(4,),
+        output_dtype=torch.bfloat16,
+        max_tokens=max_rows,
+        max_seqs=4,
+        max_model_len=1024,
     )
     units = indexer.get_b12x_preparation_units(indexer, workload)
     plans = indexer._plans if compressed else indexer._prepared_plans
@@ -822,7 +863,9 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(mode, comp
     q = torch.randn((capacity, heads, 128), device=device).to(torch.float8_e4m3fn)
     weights = torch.rand((capacity, heads), device=device)
     lengths = torch.full((capacity,), 1024, dtype=torch.int32, device=device)
-    pages = torch.arange(high_page, high_page + width, dtype=torch.int32, device=device)[None]
+    pages = torch.arange(
+        high_page, high_page + width, dtype=torch.int32, device=device
+    )[None]
     pages = pages.expand(capacity, width)
     if mode == "decode":
         pages = pages.contiguous()
@@ -833,20 +876,37 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(mode, comp
         assert lookup(mode, rows) is plan
         if compressed:
             return indexer.run_paged_topk(
-                q=q[:rows], weights=weights[:rows], kv_cache=cache,
-                seq_lens=lengths[:rows], block_table=pages[:rows], output=output[:rows],
+                q=q[:rows],
+                weights=weights[:rows],
+                kv_cache=cache,
+                seq_lens=lengths[:rows],
+                block_table=pages[:rows],
+                output=output[:rows],
                 shared_page_table=mode == "prefill",
             )
         b12x_indexer._run_paged_topk(
-            module=dsa_indexer, plan=plan, q=q[:rows], weights=weights[:rows],
-            kv_cache=cache, seq_lens=lengths[:rows], block_table=pages[:rows],
-            active_width=indexer.active_width_cap, output=output[:rows], scores=None,
+            module=dsa_indexer,
+            plan=plan,
+            q=q[:rows],
+            weights=weights[:rows],
+            kv_cache=cache,
+            seq_lens=lengths[:rows],
+            block_table=pages[:rows],
+            active_width=indexer.active_width_cap,
+            output=output[:rows],
+            scores=None,
         )
 
     def expected(rows):
         logits = torch.einsum("rhd,kd->rhk", q[:rows].float(), decoded.float())
         scores = (logits.relu_() * weights[:rows, :, None]).sum(dim=1)
-        return scores.topk(topk, dim=1).indices.add(0 if compressed else high_page * 64).to(torch.int32).sort(dim=1).values
+        return (
+            scores.topk(topk, dim=1)
+            .indices.add(0 if compressed else high_page * 64)
+            .to(torch.int32)
+            .sort(dim=1)
+            .values
+        )
 
     with PreparationSession(device=device, autotune=False) as session:
         session.prepare(tuple(request for unit in units for request in unit.requests))
@@ -857,14 +917,21 @@ def test_b12x_dsa_indexer_live_rows_reuse_capacity_with_high_page_ids(mode, comp
         with kernel_resolution_guard("DSA live rows within prepared capacity"):
             for rows in (1, live_rows, capacity):
                 run(rows)
-                torch.testing.assert_close(output[:rows].sort(dim=1).values, expected(rows), rtol=0, atol=0)
+                torch.testing.assert_close(
+                    output[:rows].sort(dim=1).values, expected(rows), rtol=0, atol=0
+                )
             graph = torch.cuda.CUDAGraph()
             try:
                 with session.capture(), torch.cuda.graph(graph):
                     run(live_rows)
                 q.copy_((-q.float()).to(q.dtype))
                 graph.replay()
-                torch.cuda.synchronize()
-                torch.testing.assert_close(output[:live_rows].sort(dim=1).values, expected(live_rows), rtol=0, atol=0)
+                torch.accelerator.synchronize()
+                torch.testing.assert_close(
+                    output[:live_rows].sort(dim=1).values,
+                    expected(live_rows),
+                    rtol=0,
+                    atol=0,
+                )
             finally:
                 graph.reset()

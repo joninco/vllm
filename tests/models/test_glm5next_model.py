@@ -1566,9 +1566,16 @@ def test_glm5next_b12x_kda_plan_reserves_null_state_zero(monkeypatch) -> None:
     layer.b12x_kda_null_state_index = 0
     empty = torch.empty(0)
     for name in (
-        "_b12x_kda_mixed_qkv", "_b12x_kda_raw_g", "_b12x_kda_raw_beta", "_b12x_kda_z",
-        "_b12x_kda_query_start_loc", "_b12x_kda_num_accepted_tokens", "_b12x_kda_state_indices",
-        "_b12x_kda_num_seqs", "_b12x_kda_num_tokens", "_b12x_kda_output",
+        "_b12x_kda_mixed_qkv",
+        "_b12x_kda_raw_g",
+        "_b12x_kda_raw_beta",
+        "_b12x_kda_z",
+        "_b12x_kda_query_start_loc",
+        "_b12x_kda_num_accepted_tokens",
+        "_b12x_kda_state_indices",
+        "_b12x_kda_num_seqs",
+        "_b12x_kda_num_tokens",
+        "_b12x_kda_output",
     ):
         setattr(layer, name, empty)
     layer.A_log = empty
@@ -1668,14 +1675,28 @@ def test_glm_adaptive_kda_graph_matches_independent_request_states(monkeypatch, 
         lambda self: (torch.bfloat16, torch.float32),
     )
     width = heads * dim
-    layer._b12x_kda_mixed_qkv = torch.zeros((tokens, 3 * width), dtype=torch.bfloat16, device=device)
+    layer._b12x_kda_mixed_qkv = torch.zeros(
+        (tokens, 3 * width), dtype=torch.bfloat16, device=device
+    )
     layer.use_full_rank_gate = True
-    layer._b12x_kda_raw_g = torch.zeros((tokens, heads, dim), dtype=torch.bfloat16, device=device)
-    layer._b12x_kda_raw_beta = torch.zeros((tokens, heads), dtype=torch.bfloat16, device=device)
-    layer._b12x_kda_z = torch.zeros((tokens, heads, dim), dtype=torch.bfloat16, device=device)
-    layer._b12x_kda_output = torch.zeros((tokens, heads, dim), dtype=torch.bfloat16, device=device)
-    layer._b12x_kda_query_start_loc = torch.zeros(requests + 1, dtype=torch.int32, device=device)
-    layer._b12x_kda_state_indices = torch.zeros((requests, columns), dtype=torch.int32, device=device)
+    layer._b12x_kda_raw_g = torch.zeros(
+        (tokens, heads, dim), dtype=torch.bfloat16, device=device
+    )
+    layer._b12x_kda_raw_beta = torch.zeros(
+        (tokens, heads), dtype=torch.bfloat16, device=device
+    )
+    layer._b12x_kda_z = torch.zeros(
+        (tokens, heads, dim), dtype=torch.bfloat16, device=device
+    )
+    layer._b12x_kda_output = torch.zeros(
+        (tokens, heads, dim), dtype=torch.bfloat16, device=device
+    )
+    layer._b12x_kda_query_start_loc = torch.zeros(
+        requests + 1, dtype=torch.int32, device=device
+    )
+    layer._b12x_kda_state_indices = torch.zeros(
+        (requests, columns), dtype=torch.int32, device=device
+    )
     plan = layer._b12x_kda_decode_declaration(33)
     layer._b12x_kda_plan = plan
     (layer._b12x_kda_scratch,) = get_b12x_scratch_buffers(plan)
@@ -1720,11 +1741,12 @@ def test_glm_adaptive_kda_graph_matches_independent_request_states(monkeypatch, 
         context.attn_metadata[layer.prefix] = metadata
         layer.kv_cache[0].copy_(initial_conv)
         layer.kv_cache[1].copy_(initial_state)
-        allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        allocations = torch.accelerator.memory_stats(device)["allocation.all.allocated"]
         graph.replay()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         assert (
-            torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+            torch.accelerator.memory_stats(device)["allocation.all.allocated"]
+            == allocations
         )
         graph_output = output.clone()
         graph_states = tuple(state.clone() for state in layer.kv_cache)
@@ -1788,7 +1810,9 @@ def test_b12x_kda_shares_counts_but_preserves_each_layers_state_indices(
         lambda: forward_context,
     )
 
-    scratch_spec = SimpleNamespace(shape=(1,), dtype=torch.float32, device=torch.device("cpu"))
+    scratch_spec = SimpleNamespace(
+        shape=(1,), dtype=torch.float32, device=torch.device("cpu")
+    )
     plan = SimpleNamespace(
         caps=SimpleNamespace(max_state_slots=32), scratch_specs=lambda: (scratch_spec,)
     )
@@ -2115,7 +2139,9 @@ def test_glm5next_loads_separate_conv1d_shards() -> None:
     )
 
 
-def test_glm5next_mtp_uses_draft_kernel_overrides() -> None:
+def test_glm5next_mtp_uses_draft_model_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     @dataclass
     class KernelConfig:
         moe_backend: str
@@ -2134,6 +2160,13 @@ def test_glm5next_mtp_uses_draft_kernel_overrides() -> None:
         attention_config: AttentionConfig
         cache_config: CacheConfig
         speculative_config: SimpleNamespace
+        quant_config: object
+
+    draft_quant_config = object()
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.eagle.utils.get_draft_quant_config",
+        lambda _config: draft_quant_config,
+    )
 
     target_config = VllmConfig(
         kernel_config=KernelConfig(moe_backend="b12x"),
@@ -2144,14 +2177,17 @@ def test_glm5next_mtp_uses_draft_kernel_overrides() -> None:
             attention_backend=AttentionBackendEnum.B12X,
             kv_cache_dtype=None,
         ),
+        quant_config=object(),
     )
 
     draft_config = _make_eagle_draft_vllm_config(target_config)  # type: ignore[arg-type]
 
     assert draft_config.kernel_config.moe_backend == "humming"
     assert draft_config.attention_config.backend == AttentionBackendEnum.B12X
+    assert draft_config.quant_config is draft_quant_config
     assert target_config.kernel_config.moe_backend == "b12x"
     assert target_config.attention_config.backend == AttentionBackendEnum.FLASH_ATTN
+    assert target_config.quant_config is not draft_quant_config
 
 
 def test_glm5next_mtp_maps_multimodal_quantization_prefix() -> None:

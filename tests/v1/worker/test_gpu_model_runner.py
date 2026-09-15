@@ -1757,14 +1757,18 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
 
 @pytest.mark.parametrize("dummy_run_fails", [False, True])
+@pytest.mark.parametrize(
+    "architecture",
+    ["Glm5NextForConditionalGeneration", "GlmMoeDsaForCausalLM"],
+)
 def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
     dummy_run_fails: bool,
+    architecture: str,
 ):
     runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.model_config = SimpleNamespace(
-        architecture="Glm5NextForConditionalGeneration"
-    )
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.model_config = SimpleNamespace(architecture=architecture)
     runner.dcp_world_size = 4
     runner.vllm_config = object()
     runner.max_num_tokens = 4096
@@ -1810,7 +1814,11 @@ def test_glm_dcp_attention_profile_uses_single_request_and_cleans_up(
         assert events[-2] == "sync"
 
 
-def test_glm_dcp_attention_profile_skips_non_glm_and_dcp1():
+@pytest.mark.parametrize(
+    "architecture",
+    ["Glm5NextForConditionalGeneration", "GlmMoeDsaForCausalLM"],
+)
+def test_glm_dcp_attention_profile_skips_non_glm_and_dcp1(architecture):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.model_config = SimpleNamespace(architecture="OtherArchitecture")
     runner.dcp_world_size = 4
@@ -1818,7 +1826,7 @@ def test_glm_dcp_attention_profile_skips_non_glm_and_dcp1():
     runner.profile_glm_dcp_attention()
     runner._init_minimal_kv_cache_for_profiling.assert_not_called()
 
-    runner.model_config.architecture = "Glm5NextForConditionalGeneration"
+    runner.model_config.architecture = architecture
     runner.dcp_world_size = 1
     runner.profile_glm_dcp_attention()
     runner._init_minimal_kv_cache_for_profiling.assert_not_called()
@@ -1826,7 +1834,11 @@ def test_glm_dcp_attention_profile_skips_non_glm_and_dcp1():
 
 @pytest.mark.parametrize(
     "architecture",
-    ["DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration", "DeepseekV41ForCausalLM"],
+    [
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForConditionalGeneration",
+        "DeepseekV41ForCausalLM",
+    ],
 )
 @pytest.mark.parametrize(
     ("init_fails", "dummy_run_fails"),
@@ -1910,7 +1922,9 @@ def test_deepseek_v4_attention_profile_skips_other_architectures():
     runner._init_minimal_kv_cache_for_profiling.assert_not_called()
 
 
-def test_profile_run_releases_generic_outputs_before_deepseek_profile(monkeypatch, workspace_init):
+def test_profile_run_releases_generic_outputs_before_deepseek_profile(
+    monkeypatch, workspace_init
+):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.supports_mm_inputs = False
     runner.max_num_tokens = 4096

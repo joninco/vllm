@@ -45,6 +45,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.distributed.indexer_kv_geometry import indexer_layer_shards
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import (
@@ -286,6 +287,8 @@ class DeepseekV2MLP(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
+    _OUTPUT_REUSE_MIN_TOKENS = 1024
+
     def __init__(
         self,
         config: DeepseekV2Config | DeepseekV3Config,
@@ -410,18 +413,47 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
+        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if output_buffer is not None:
+            if not self.can_reuse_input_as_output(hidden_states):
+                raise ValueError(
+                    "DeepSeek MoE input storage is not eligible for output reuse"
+                )
+            if (
+                output_buffer.shape != hidden_states.shape
+                or output_buffer.stride() != hidden_states.stride()
+                or output_buffer.untyped_storage().data_ptr()
+                != hidden_states.untyped_storage().data_ptr()
+            ):
+                raise ValueError(
+                    "DeepSeek MoE output storage must be the consumed input tensor"
+                )
+            logger.info_once(
+                "DeepSeek MoE is writing large prefill expert sums into "
+                "consumed input storage (shape=%s).",
+                tuple(hidden_states.shape),
+            )
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
         if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=hidden_states
-        )
+        if output_buffer is None:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                output_buffer=output_buffer,
+            )
 
         if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -430,6 +462,30 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states[:num_tokens]
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+    def can_reuse_input_as_output(self, hidden_states: torch.Tensor) -> bool:
+        """Return whether a large consumed MoE input can hold its output.
+
+        Args:
+            hidden_states: MoE input whose storage the caller no longer needs
+                after the routed and shared experts have consumed it.
+
+        Returns:
+            True when the layer runs in inference mode without sequence
+            parallelism, has shared experts, skips the final all-reduce, has
+            no routed-output transform, and ``hidden_states`` is a contiguous
+            2-D tensor of at least ``_OUTPUT_REUSE_MIN_TOKENS`` rows.
+        """
+        return bool(
+            not torch.is_grad_enabled()
+            and not self.is_sequence_parallel
+            and self.shared_experts is not None
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] >= self._OUTPUT_REUSE_MIN_TOKENS
+            and hidden_states.is_contiguous()
+            and self.experts.moe_config.skip_final_all_reduce
+            and self.experts.routed_output_transform is None
+        )
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -643,7 +699,37 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
-        compilation_config = get_current_vllm_config().compilation_config
+        vllm_config = get_current_vllm_config()
+        parallel_config = vllm_config.parallel_config
+        try:
+            layer_index = extract_layer_index(prefix)
+        except (AssertionError, IndexError, ValueError):
+            layer_index = None
+        self.dcp_shard_count = indexer_layer_shards(
+            dcp_size=parallel_config.decode_context_parallel_size,
+            pcp_size=parallel_config.prefill_context_parallel_size,
+            requested_shards=envs.VLLM_DCP_INDEXER_SHARDS,
+            replicate_cache=envs.VLLM_DCP_REPLICATE_INDEXER_CACHE,
+            layer_index=layer_index,
+            target_layers=getattr(
+                vllm_config.model_config.hf_config, "num_hidden_layers", None
+            ),
+            b12x_enabled=self.get_attn_backend().get_name() == "B12X_INDEXER",
+        )
+        configured_shards = (
+            parallel_config.decode_context_parallel_size
+            * parallel_config.prefill_context_parallel_size
+        )
+        self.dcp_kv_shard_count = (
+            self.dcp_shard_count if self.dcp_shard_count != configured_shards else None
+        )
+        logger.info_once(
+            "Indexer KV geometry: shards=%d attention_shards=%d layer=%s",
+            self.dcp_shard_count,
+            configured_shards,
+            prefix,
+        )
+        compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
@@ -659,6 +745,7 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            dcp_kv_shard_count=self.dcp_kv_shard_count,
         )  # Only has one vector instead of K + V
 
     def forward(self): ...

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 
 from vllm.compilation.counter import compilation_counter
 from vllm.config.compilation import CUDAGraphMode
@@ -49,9 +50,6 @@ class _FakeCudaGraphManager(cgu.CudaGraphManager):
             self._capture_descs = {CUDAGraphMode.PIECEWISE: descs}
         else:
             self._capture_descs = {CUDAGraphMode.FULL: descs} if needs_capture else {}
-        # Profiling hooks set by profile_cudagraph_memory.
-        self._max_full_descs_to_capture: int | None = None
-        self._capture_mem_samples: list[int] | None = None
         self.use_breakable_cg = False
         self.graphs: dict[Any, Any] = {}
         self.graph_capture_resources: dict[Any, list[Any]] = {}
@@ -88,7 +86,6 @@ def _make_profiling_runner(
     num_full_descs: int = 3,
     piecewise_only: bool = False,
     captured_bytes: int = 7 << 30,
-    mem_samples: list[int] | None = None,
 ) -> Any:
     runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
     runner.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
@@ -105,10 +102,6 @@ def _make_profiling_runner(
     def _capture_model() -> int:
         events.append("capture")
         runner.pool_during_capture = runner.cudagraph_manager.pool
-        # Simulate the manager's per-FULL-graph memory sampling.
-        samples = runner.cudagraph_manager._capture_mem_samples
-        if samples is not None:
-            samples.extend(mem_samples or [])
         return captured_bytes
 
     runner.capture_model = _capture_model
@@ -149,6 +142,55 @@ def test_profile_cudagraph_memory_disabled_returns_zero(monkeypatch):
     assert runner.events == []
 
 
+def test_transport_scope_covers_warmup_and_full_capture(monkeypatch):
+    manager = _FakeCudaGraphManager(True, 1)
+    manager.device = "cpu"
+    desc = cgu.BatchExecutionDescriptor(CUDAGraphMode.FULL, 4, 1, 4)
+    manager._capture_descs = {CUDAGraphMode.FULL: [desc]}
+    events = []
+    active = False
+
+    @contextlib.contextmanager
+    def scope(descriptor):
+        nonlocal active
+        assert descriptor == desc
+        active = True
+        events.append("enter")
+        try:
+            yield
+        finally:
+            active = False
+            events.append("exit")
+
+    def create_forward(descriptor, warmup):
+        def forward(mode):
+            assert active
+            events.append("warmup" if warmup else "capture")
+
+        return forward
+
+    manager.b12x_dcp_capture_scope = scope
+    monkeypatch.setattr(cgu, "graph_capture", lambda **kw: contextlib.nullcontext())
+    monkeypatch.setattr(cgu, "is_global_first_rank", lambda: False)
+    monkeypatch.setattr(cgu, "set_graph_pool_id", lambda pool: None)
+    monkeypatch.setattr(cgu.torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(cgu.torch.cuda, "CUDAGraph", object)
+    monkeypatch.setattr(cgu.torch.cuda, "graph", lambda *a: contextlib.nullcontext())
+    monkeypatch.setattr(
+        cgu,
+        "get_offloader",
+        lambda: SimpleNamespace(
+            sync_prev_onload=lambda: None,
+            join_after_forward=lambda: None,
+        ),
+    )
+    with compilation_counter.expect(num_cudagraph_captured=1):
+        manager.capture(create_forward)
+    assert events == ["enter", "warmup", "capture", "exit"]
+    assert not active
+    assert desc in manager.graphs
+
+
 def test_profile_cudagraph_memory_no_graphs_tears_down(monkeypatch):
     _patch_module(monkeypatch)
     runner = _make_profiling_runner(CUDAGraphMode.FULL, needs_capture=False)
@@ -161,34 +203,25 @@ def test_profile_cudagraph_memory_no_graphs_tears_down(monkeypatch):
     assert runner.cudagraph_manager.pool == GLOBAL_POOL
 
 
-def test_profile_cudagraph_memory_samples_and_extrapolates(monkeypatch):
+def test_profile_cudagraph_memory_measures_complete_graph_set(monkeypatch):
     _patch_module(monkeypatch)
     gib = 1 << 30
-    # Measured delta 1000 MiB includes the sampled FULL graphs (100 + 20 MiB).
-    # The sampled graphs have sizes 3 and 2. Scale the second sample by the
-    # remaining graph's 1/2 token ratio: 100 + 20 + 10 = 130 MiB.
     runner = _make_profiling_runner(
         CUDAGraphMode.FULL,
         num_full_descs=3,
         captured_bytes=1000 * gib,
-        mem_samples=[100 * gib, 20 * gib],
     )
 
     result = cgu.profile_cudagraph_memory(
         runner, lambda: runner.events.append("prepare")
     )
 
-    assert result == (1000 - (100 + 20) + (100 + 20 + 10)) * gib
+    assert result == 1000 * gib
     # Bootstrap, capture, and teardown run in order.
     assert runner.events == ["init", "prepare", "capture", "teardown"]
     # Capture must use a throwaway pool, not the persistent global pool.
     assert runner.pool_during_capture == THROWAWAY_POOL
     assert runner.cudagraph_manager.pool == GLOBAL_POOL
-    # FULL capture must be limited to the largest few graphs.
-    assert (
-        runner.cudagraph_manager._max_full_descs_to_capture
-        == cgu._FULL_GRAPH_PROFILING_SAMPLES
-    )
 
 
 def test_profile_cudagraph_memory_piecewise_only_returns_measured(monkeypatch):
@@ -202,7 +235,7 @@ def test_profile_cudagraph_memory_piecewise_only_returns_measured(monkeypatch):
 
     result = cgu.profile_cudagraph_memory(runner)
 
-    # No FULL graphs to sample or extrapolate: the measured delta is exact.
+    # The complete configured graph set contributes to the measured delta.
     assert result == captured_bytes
 
 
@@ -294,27 +327,6 @@ def test_model_runner_delegates_to_cudagraph_utils(monkeypatch):
         lambda r, callback: (r, callback),
     )
     assert runner.profile_cudagraph_memory(prepare) == (runner, prepare)
-
-
-def test_extrapolate_full_graph_memory():
-    mib = 1 << 20
-    descs = [
-        cgu.BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens, None)
-        for num_tokens in (40, 32, 16, 8)
-    ]
-    # No samples (e.g. no FULL graphs): nothing to add.
-    assert cgu._extrapolate_full_graph_memory([], []) == 0
-    # A single graph costs exactly its sample.
-    assert cgu._extrapolate_full_graph_memory([100 * mib], descs[:1]) == 100 * mib
-    # Preserve sampled costs and scale the rest by their token counts.
-    assert (
-        cgu._extrapolate_full_graph_memory([100 * mib, 20 * mib], descs)
-        == (100 + 20 + 10 + 5) * mib
-    )
-    # Per-graph cost is floored to account for driver overhead.
-    assert (
-        cgu._extrapolate_full_graph_memory([100 * mib, 0], descs) == (100 + 3 * 1) * mib
-    )
 
 
 def test_profile_cudagraph_memory_clears_captured_graphs(monkeypatch):
@@ -687,3 +699,76 @@ def test_legacy_profile_tears_down_after_partial_init_error(monkeypatch):
     assert not hasattr(runner, "kv_cache_config")
     assert runner.cache_config.num_gpu_blocks is None
     assert runner._mamba_bufs is None
+
+
+@pytest.fixture
+def cpu_workspace_manager():
+    from vllm.v1.worker import workspace
+
+    workspace.reset_workspace_manager()
+    workspace.init_workspace_manager(torch.device("cpu"))
+    try:
+        yield workspace.current_workspace_manager()
+    finally:
+        workspace.reset_workspace_manager()
+
+
+def _make_capture_runner(monkeypatch) -> Any:
+    """A runner whose real ``capture_model`` drives a no-op graph manager."""
+    _patch_module(monkeypatch)
+    monkeypatch.setattr(mrv2.torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        mrv2.torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
+    )
+    runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL)
+    manager = _FakeCudaGraphManager(needs_capture=True, num_full_descs=2)
+    manager.capture = lambda *args, **kwargs: None
+    runner.cudagraph_manager = manager
+    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
+    runner.lora_config = None
+    runner.speculator = None
+    runner.adaptive_verification = None
+    runner.model = None
+    runner.input_buffers = None
+    runner.intermediate_tensors = None
+    runner.block_tables = None
+    runner.attn_groups = None
+    runner.kv_cache_config = None
+    runner.use_aux_hidden_state_outputs = False
+    return runner
+
+
+def test_capture_model_locks_workspace_growth(monkeypatch, cpu_workspace_manager):
+    """Captured graphs bake in workspace addresses: growth must raise, not
+    reallocate the storage the graphs replay into."""
+    runner = _make_capture_runner(monkeypatch)
+    cpu_workspace_manager.get_simultaneous(((1024,), torch.uint8))
+    assert not cpu_workspace_manager.is_locked()
+
+    runner.capture_model()
+
+    assert cpu_workspace_manager.is_locked()
+    before = cpu_workspace_manager.get_simultaneous(((512,), torch.uint8))[0]
+    with pytest.raises(AssertionError, match="locked"):
+        cpu_workspace_manager.get_simultaneous(((1 << 20,), torch.uint8))
+    after = cpu_workspace_manager.get_simultaneous(((512,), torch.uint8))[0]
+    assert after.data_ptr() == before.data_ptr()
+
+
+def test_profiling_teardown_unlocks_workspace(monkeypatch, cpu_workspace_manager):
+    """The memory-profiling capture discards its graphs, so the warmups that
+    follow may still grow the workspace before the real capture locks it."""
+    teardown = cgu._teardown_profiling_state
+    runner = _make_capture_runner(monkeypatch)
+    runner.compilation_config.static_forward_context = {}
+    runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
+    runner.attn_groups = []
+    monkeypatch.setattr(cgu.torch.accelerator, "synchronize", lambda: None)
+    runner.capture_model()
+    assert cpu_workspace_manager.is_locked()
+
+    teardown(runner)
+
+    assert not cpu_workspace_manager.is_locked()
+    cpu_workspace_manager.get_simultaneous(((1 << 20,), torch.uint8))
