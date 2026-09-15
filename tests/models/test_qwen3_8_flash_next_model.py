@@ -421,6 +421,125 @@ def test_attention_projection_overlap_replays_with_changed_inputs(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_tokens", [1, 4])
+@pytest.mark.parametrize("kind", ["gdn", "qsa"])
+@torch.inference_mode()
+def test_b12x_projection_overlap_preserves_scratch(monkeypatch, num_tokens, kind):
+    """Concurrent projections must not overwrite activation or split-K scratch."""
+    pytest.importorskip("b12x")
+    from b12x.gemm import blockscaled
+    from b12x.preparation import PreparationSession
+    from vllm.model_executor.kernels.linear.b12x_blockscaled import (
+        B12xBlockscaledLinear,
+    )
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    torch.manual_seed(43)
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not blockscaled.is_supported(device):
+        pytest.skip("requires b12x block-scaled kernels on SM120/SM121")
+    init_workspace_manager(device)
+    module = gdn_module if kind == "gdn" else qsa_module
+    op = (
+        torch.ops.vllm.qwen_gdn_input_projections
+        if kind == "gdn"
+        else torch.ops.vllm.qwen3_8_flash_next_qsa_input_projections
+    )
+    widths = (4096, 24) if kind == "gdn" else (3584, 640)
+    x = torch.randn(num_tokens, 2560, device=device, dtype=torch.bfloat16)
+    linears = []
+    configs = (
+        blockscaled.BlockscaledConfig(mode="quantized")
+        if num_tokens == 1
+        else blockscaled.BlockscaledConfig(
+            mode="a16", tile_n=64, tile_k=64, split_k=2
+        ),
+        blockscaled.BlockscaledConfig(
+            mode="a16", tile_n=64, tile_k=128, split_k=4
+        ),
+    )
+    try:
+        with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+            for n, config in zip(widths, configs):
+                weight = (torch.randn(n, 2560, device=device) * 0.05).to(
+                    torch.float8_e4m3fn
+                )
+                scales = torch.full((n, 80), 127, device=device, dtype=torch.uint8)
+                packed = blockscaled.pack_weight(weight, scales)
+                holder = B12xBlockscaledLinear(
+                    packed, recipe="mxfp8", activation_mode="auto",
+                    layer_name=f"projection.{n}",
+                )
+                query = blockscaled.BlockscaledQuery(
+                    recipe="mxfp8", num_tokens=num_tokens,
+                    in_features=2560, padded_in_features=2560,
+                    out_features=n, expected_m=num_tokens,
+                    workspace_form="provided",
+                )
+                holder.plan = blockscaled.plan(query, override=config)
+                session.prepare((holder.plan.request(
+                    name=str(n), prepare_call=holder._call_factory(num_tokens),
+                ),))
+                linears.append(holder)
+            session.freeze()
+
+            class Projection:
+                def __init__(self, holder):
+                    self.b12x_linear = holder
+
+                def __call__(self, value):
+                    return self.b12x_linear.run(value, None), None
+
+            first, second = map(Projection, linears)
+            layer = SimpleNamespace(
+                in_proj_qkvz=first, in_proj_ba=second, qkv_proj=first,
+                indexer=SimpleNamespace(index_qk_proj=second),
+            )
+            monkeypatch.setattr(
+                module, "get_forward_context",
+                lambda: SimpleNamespace(no_compile_layers={"test.projection": layer}),
+            )
+            monkeypatch.setattr(module, "aux_stream", lambda: side_stream)
+            side_stream = torch.cuda.Stream()
+            main_stream = torch.cuda.Stream()
+            main_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(main_stream):
+                expected = op(x, *widths, "test.projection")
+                assert all(value.isfinite().all() for value in expected)
+                assert all(value.count_nonzero() for value in expected)
+                manager = current_workspace_manager()
+                manager.lock()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=main_stream):
+                    actual = op(x, *widths, "test.projection")
+                try:
+                    for _ in range(3):
+                        x.normal_()
+                        reference = tuple(
+                            value.clone() for value in op(x, *widths, "test.projection")
+                        )
+                        allocations = torch.cuda.memory_stats(device)[
+                            "allocation.all.allocated"
+                        ]
+                        graph.replay()
+                        torch.cuda.synchronize(device)
+                        assert torch.cuda.memory_stats(device)[
+                            "allocation.all.allocated"
+                        ] == allocations
+                        for value, ref in zip(actual, reference):
+                            torch.testing.assert_close(value, ref, rtol=0, atol=0)
+                finally:
+                    del graph
+    finally:
+        torch.cuda.synchronize(device)
+        reset_workspace_manager()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_tokens", [4, 32])
 def test_ple_prefetch_joins_before_embedding_consumers(monkeypatch, num_tokens) -> None:
     embedding = ple_layer_module.Qwen3_8FlashNextNGramEmbedding.__new__(

@@ -69,6 +69,7 @@ from vllm.utils.b12x import (
     PreparationResourceUnavailableError,
     get_b12x_gdn_decode,
     get_b12x_gdn_prefill,
+    get_b12x_projection_workspaces,
     get_b12x_scratch_buffers,
 )
 from vllm.utils.torch_utils import (
@@ -80,7 +81,10 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+from vllm.v1.worker.workspace import (
+    retain_cuda_graph_capture_resource,
+    use_preallocated_workspace,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.mamba.ops.b12x_gdn_prefill import B12xGdnPrefill
@@ -2988,9 +2992,14 @@ def qwen_gdn_input_projections(
     layer_name: LayerNameType,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    qkvz_scratch, ba_scratch = get_b12x_projection_workspaces(
+        hidden_states.shape[0], layer.in_proj_qkvz, layer.in_proj_ba
+    )
     if hidden_states.shape[0] > 16 or not torch.cuda.is_current_stream_capturing():
-        qkvz, _ = layer.in_proj_qkvz(hidden_states)
-        ba, _ = layer.in_proj_ba(hidden_states)
+        with use_preallocated_workspace(qkvz_scratch):
+            qkvz, _ = layer.in_proj_qkvz(hidden_states)
+        with use_preallocated_workspace(ba_scratch):
+            ba, _ = layer.in_proj_ba(hidden_states)
         return qkvz, ba
 
     stream = aux_stream()
@@ -2998,9 +3007,10 @@ def qwen_gdn_input_projections(
     main_stream = current_stream()
     stream.wait_stream(main_stream)
     hidden_states.record_stream(stream)
-    with torch.cuda.stream(stream):
+    with torch.cuda.stream(stream), use_preallocated_workspace(ba_scratch):
         ba, _ = layer.in_proj_ba(hidden_states)
-    qkvz, _ = layer.in_proj_qkvz(hidden_states)
+    with use_preallocated_workspace(qkvz_scratch):
+        qkvz, _ = layer.in_proj_qkvz(hidden_states)
     main_stream.wait_stream(stream)
     ba.record_stream(main_stream)
     return qkvz, ba

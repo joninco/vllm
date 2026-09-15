@@ -33,6 +33,7 @@ from vllm.utils.b12x import (
     B12xWorkload,
     PreparationResourceUnavailableError,
     get_b12x_qsa,
+    get_b12x_projection_workspaces,
     get_b12x_scratch_buffers,
 )
 from vllm.utils.torch_utils import (
@@ -66,7 +67,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     get_kv_quant_mode,
 )
-from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+from vllm.v1.worker.workspace import (
+    retain_cuda_graph_capture_resource,
+    use_preallocated_workspace,
+)
 
 from ..common.qsa_cache import (
     canonical_qsa_rope_positions,
@@ -2196,9 +2200,14 @@ def _qsa_input_projections(
     layer_name: LayerNameType,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    qkv_scratch, index_scratch = get_b12x_projection_workspaces(
+        hidden_states.shape[0], layer.qkv_proj, layer.indexer.index_qk_proj
+    )
     if hidden_states.shape[0] > 16 or not torch.cuda.is_current_stream_capturing():
-        qkv, _ = layer.qkv_proj(hidden_states)
-        index_qk, _ = layer.indexer.index_qk_proj(hidden_states)
+        with use_preallocated_workspace(qkv_scratch):
+            qkv, _ = layer.qkv_proj(hidden_states)
+        with use_preallocated_workspace(index_scratch):
+            index_qk, _ = layer.indexer.index_qk_proj(hidden_states)
         return qkv, index_qk
 
     stream = aux_stream()
@@ -2206,9 +2215,10 @@ def _qsa_input_projections(
     main_stream = current_stream()
     stream.wait_stream(main_stream)
     hidden_states.record_stream(stream)
-    with torch.cuda.stream(stream):
+    with torch.cuda.stream(stream), use_preallocated_workspace(index_scratch):
         index_qk, _ = layer.indexer.index_qk_proj(hidden_states)
-    qkv, _ = layer.qkv_proj(hidden_states)
+    with use_preallocated_workspace(qkv_scratch):
+        qkv, _ = layer.qkv_proj(hidden_states)
     main_stream.wait_stream(stream)
     index_qk.record_stream(main_stream)
     return qkv, index_qk

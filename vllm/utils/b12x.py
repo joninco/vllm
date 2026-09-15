@@ -401,6 +401,27 @@ def run_b12x_blockscaled_linear(
     return torch.ops.vllm.b12x_blockscaled_linear(source, bias, out_features, layer_name)
 
 
+def get_b12x_projection_workspaces(
+    rows: int, *layers: torch.nn.Module
+) -> tuple[torch.Tensor | None, ...]:
+    """Reserve disjoint scratch for projections that can run concurrently."""
+    sizes = tuple(
+        holder.get_workspace_size(rows)
+        if (holder := getattr(layer, "b12x_linear", None)) is not None
+        else 0
+        for layer in layers
+    )
+    if not any(sizes):
+        return (None,) * len(layers)
+
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    buffers = current_workspace_manager().get_simultaneous(
+        *(((size,), torch.uint8) for size in sizes)
+    )
+    return tuple(buffer if size else None for buffer, size in zip(buffers, sizes))
+
+
 def get_b12x_scratch_buffers(plan: Any) -> list[torch.Tensor]:
     """Return caller-owned scratch buffers for a planned b12x operation."""
     specs = tuple(plan.scratch_specs())
