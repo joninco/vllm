@@ -38,10 +38,13 @@ class B12xPreparationCoordinator:
         global_rank: int,
         world_group,
         process_local_only: bool = False,
+        workspace=None,
     ) -> None:
         if type(global_rank) is not int or global_rank < 0:
             raise ValueError("global_rank must be a nonnegative integer")
         self.session = session
+        self._workspace = workspace
+        self._active_requests = ()
         self.global_rank = global_rank
         self.world_group = world_group
         self.process_local_only = process_local_only
@@ -90,6 +93,7 @@ class B12xPreparationCoordinator:
 
     def _begin_next_batch(self) -> None:
         requests, autotune = self._batches.pop(0)
+        self._active_requests = requests
         self._job = self.session.begin(requests, autotune=autotune)
 
     def status(self) -> dict[str, object]:
@@ -255,6 +259,15 @@ class B12xPreparationCoordinator:
             return
 
         job.result().close()
+        if self._workspace is not None:
+            for request in self._active_requests:
+                specs = tuple(request.plan.scratch_specs())
+                if specs:
+                    self._workspace.get_simultaneous(
+                        *((spec.shape, spec.dtype) for spec in specs)
+                    )
+            self._workspace.reserve_all()
+        self._active_requests = ()
         self._job = None
         if self._batches:
             self._begin_next_batch()
@@ -333,6 +346,7 @@ class B12xPreparationCoordinator:
             except BaseException as error:
                 primary = error
             self._job = None
+        self._active_requests = ()
         self._batches.clear()
         self._cleanup_complete = True
         self._local_done = True

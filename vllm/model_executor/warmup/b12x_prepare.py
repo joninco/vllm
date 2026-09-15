@@ -429,6 +429,7 @@ def begin_b12x_preparation(worker: "Worker", *, stage: str):
     """Start the world-coordinated preparation of one stage."""
     from vllm.distributed.parallel_state import get_world_group
     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+    from vllm.v1.worker.workspace import current_workspace_manager
 
     batches = []
     if b12x_native_supported(worker):
@@ -441,6 +442,7 @@ def begin_b12x_preparation(worker: "Worker", *, stage: str):
     session = get_b12x_session(worker) if batches else None
     return B12xPreparationCoordinator(
         session, batches, global_rank=int(worker.rank), world_group=get_world_group(),
+        workspace=current_workspace_manager() if batches else None,
     )
 
 
@@ -465,6 +467,7 @@ def prepare_b12x_profile(worker: "Worker", *, stage: str) -> B12xPreparedBatch:
     """Prime profiling-pool plans with defaults in complete-world control rounds."""
     from vllm.distributed.parallel_state import get_world_group
     from vllm.v1.worker.b12x_startup import B12xPreparationCoordinator
+    from vllm.v1.worker.workspace import current_workspace_manager
 
     requests = ()
     if b12x_native_supported(worker):
@@ -477,6 +480,7 @@ def prepare_b12x_profile(worker: "Worker", *, stage: str) -> B12xPreparedBatch:
     coordinator = B12xPreparationCoordinator(
         session, [(requests, False)] if requests else [],
         global_rank=int(worker.rank), world_group=get_world_group(),
+        workspace=current_workspace_manager() if requests else None,
     )
     outcome = coordinator.status()
     while not outcome["done"]:
