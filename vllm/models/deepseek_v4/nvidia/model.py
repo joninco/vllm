@@ -874,7 +874,9 @@ class DeepseekV4MoE(nn.Module):
             # instead of e_score_correction_bias / the hash table. Created on
             # every MoE layer, hash layers included.
             self.gate.bias_vl = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                allocate_weights(
+                    torch.empty, config.n_routed_experts, dtype=torch.float32
+                ),
                 requires_grad=False,
             )
 

@@ -47,6 +47,7 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.weight_transfer import copy_weight
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -687,7 +688,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             else:
                 if "attn_sink" in name:
                     narrow = loaded_weight[head_start:head_end]
-                    params_dict[name][: narrow.shape[0]].copy_(narrow)
+                    copy_weight(params_dict[name][: narrow.shape[0]], narrow)
                     loaded_params.add(name)
                     continue
                 if name.endswith(".ffn.gate.bias"):

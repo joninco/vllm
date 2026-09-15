@@ -25,7 +25,11 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.weight_transfer import get_file_tensor_source
+from vllm.model_executor.weight_transfer import (
+    allocate_weights,
+    copy_weight,
+    get_file_tensor_source,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
 
@@ -371,8 +375,9 @@ def _load_table(param, loaded_weight):
         if source is not None:
             _read_table_rows(destination[:count], source, start)
         else:
-            destination[:count].view(torch.uint8).copy_(
-                loaded_weight[start : start + count].view(torch.uint8)
+            copy_weight(
+                destination[:count].view(torch.uint8),
+                loaded_weight[start : start + count].view(torch.uint8),
             )
 
 
@@ -441,7 +446,8 @@ class ParallelEngramEmbedding(nn.Module):
             )
         elif table_memory != "disk":
             self.weight = nn.Parameter(
-                torch.empty(
+                allocate_weights(
+                    torch.empty,
                     self.weight_shape,
                     dtype=torch.float8_e4m3fn,
                     device=caps.device,
@@ -449,7 +455,8 @@ class ParallelEngramEmbedding(nn.Module):
                 requires_grad=False,
             )
             self.weight_scale_inv = nn.Parameter(
-                torch.empty(
+                allocate_weights(
+                    torch.empty,
                     self.scale_shape, dtype=torch.uint8, device=caps.device
                 ),
                 requires_grad=False,
@@ -616,11 +623,13 @@ class Engram(nn.Module):
             **({"gather_output": True} if projection_tp else {}),
         )
         self.q_weight = nn.Parameter(
-            torch.empty(self.hc_mult, self.dim, dtype=torch.bfloat16),
+            allocate_weights(
+                torch.empty, self.hc_mult, self.dim, dtype=torch.bfloat16
+            ),
             requires_grad=False,
         )
         self.k_weight = nn.Parameter(
-            torch.empty_like(self.q_weight), requires_grad=False
+            allocate_weights(torch.empty_like, self.q_weight), requires_grad=False
         )
         self.register_buffer(
             "norm_weights",

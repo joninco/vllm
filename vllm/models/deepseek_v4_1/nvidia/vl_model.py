@@ -34,6 +34,7 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     maybe_prefix,
 )
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
@@ -149,13 +150,13 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
             self.vision = DeepseekV4ViT(config)
             self.aligner = DeepseekV4Aligner(config)
             self.image_start = nn.Parameter(
-                torch.empty(config.hidden_size, dtype=torch.float32)
+                allocate_weights(torch.empty, config.hidden_size, dtype=torch.float32)
             )
             self.image_end = nn.Parameter(
-                torch.empty(config.hidden_size, dtype=torch.float32)
+                allocate_weights(torch.empty, config.hidden_size, dtype=torch.float32)
             )
             self.image_newline = nn.Parameter(
-                torch.empty(config.hidden_size, dtype=torch.float32)
+                allocate_weights(torch.empty, config.hidden_size, dtype=torch.float32)
             )
 
         with self._mark_language_model(vllm_config):

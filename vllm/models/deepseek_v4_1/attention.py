@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4_1.b12x_layers import (
     B12xFP8LinearMethod,
     B12xLinearMethod,
@@ -440,7 +441,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         self._context[prefix] = self
         self.kv_cache = torch.tensor([])
         self.attn_sink = nn.Parameter(
-            torch.full((self.n_local_heads,), -float("inf"), dtype=torch.float32),
+            allocate_weights(
+                torch.full, (self.n_local_heads,), -float("inf"), dtype=torch.float32
+            ),
             requires_grad=False,
         )
         self.fused_wqa_wkv = MergedColumnParallelLinear(

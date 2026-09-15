@@ -44,6 +44,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -163,7 +164,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
         self.hc_attn_fn = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
@@ -171,35 +173,40 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self.hc_attn_fn_broadcast: torch.Tensor | None = None
         self.hc_ffn_fn = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 (mix_hc, hc_dim),
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_attn_base = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 mix_hc,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_ffn_base = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 mix_hc,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_attn_scale = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 3,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
         self.hc_ffn_scale = nn.Parameter(
-            torch.empty(
+            allocate_weights(
+                torch.empty,
                 3,
                 dtype=torch.float32,
             ),
@@ -758,7 +765,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
+                    copy_weight(params_dict[name][:n], narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:

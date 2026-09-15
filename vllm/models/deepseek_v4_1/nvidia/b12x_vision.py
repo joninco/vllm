@@ -21,6 +21,7 @@ from b12x.norm.vision import VisionQuery, run_gelu, run_rope_qkv, run_spatial_me
 from b12x.preparation import PreparedCall
 from torch import nn
 
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.utils.b12x import (
     set_b12x_preparation_provider,
     B12xPreparationUnit,
@@ -44,12 +45,15 @@ class _Linear(nn.Module):
     def __init__(self, in_features, out_features, bias=True, *, max_rows=None):
         super().__init__()
         self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, dtype=torch.bfloat16),
+            allocate_weights(
+                torch.empty, out_features, in_features, dtype=torch.bfloat16
+            ),
             requires_grad=False,
         )
         self.bias = (
             nn.Parameter(
-                torch.empty(out_features, dtype=torch.bfloat16), requires_grad=False
+                allocate_weights(torch.empty, out_features, dtype=torch.bfloat16),
+                requires_grad=False,
             )
             if bias
             else None
@@ -119,7 +123,7 @@ class _Norm(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.weight = nn.Parameter(
-            torch.ones(dim, dtype=torch.bfloat16), requires_grad=False
+            allocate_weights(torch.ones, dim, dtype=torch.bfloat16), requires_grad=False
         )
 
     def forward(self, x, *, out, plan):
