@@ -239,7 +239,7 @@ class Executor(ABC):
                 phase_number = {"weights": 1, "state": 2}[stage]
                 display = PreparationDisplay(
                     global_rank=0, stream=stream,
-                    title=f"b12x / one-time kernel autotuning (phase {phase_number}/2)",
+                    title=f"b12x / kernel autotuning (phase {phase_number}/2)",
                     cancel_available=bool(
                         getattr(self, "_b12x_keyboard", None)
                         and self._b12x_keyboard.active

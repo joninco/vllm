@@ -181,7 +181,7 @@ def test_executor_serializes_bound_handlers_native_writes_and_child_output(colum
             output.extend(os.read(master, 65536))
         assert process.returncode == 0, output.decode(errors='replace')
         screen = _terminal_text(bytes(output), rows, columns)
-        assert screen.count('b12x / one-time kernel autotuning') == 1, screen
+        assert screen.count('b12x / kernel autotuning') == 1, screen
         for message in (
             'engine-bound-handler', 'engine-native-write', 'worker-bound-handler',
             'worker-native-write', 'compiler-child-output', 'worker-final-fragment',
@@ -200,5 +200,94 @@ def test_executor_serializes_bound_handlers_native_writes_and_child_output(colum
         os.close(master)
 
 
-if __name__ == '__main__' and '--startup-replay' in sys.argv:
-    _startup_with_native_output()
+def _loading_with_native_output():
+    import logging
+    import time
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from b12x.integration.vllm.loader import B12xModelLoader
+    from vllm.config.load import LoadConfig
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+    from vllm.utils.system_utils import decorate_logs
+
+    decorate_logs('Worker_TP0')
+    handler = logging.StreamHandler(sys.stderr)
+    summary = dict(ranks=4, payload_bytes=305_750_000_000,
+                   shared_physical_bytes=299_595_000_000,
+                   physical_bytes=299_640_000_000, shared_transfer_seconds=0.1)
+    group = SimpleNamespace(epoch=1, progress=None, summary=summary,
+                            start=lambda session: None, _gather=lambda value: None)
+    session = SimpleNamespace(shared_read_group=group, progress=None,
+                              flush=lambda: None, stats=lambda **_: {})
+    loader = B12xModelLoader(LoadConfig(load_format='b12x'))
+    loader._session = session
+
+    def route(self, model, config):
+        self.counter_before_loading_weights = time.perf_counter()
+        self._progress.source(48)
+        for index in range(48):
+            self._progress.advance((index + 1) * 1_592_447_916)
+        for phase in ('prepare', 'plan', 'execute', 'unmap'):
+            group.progress(phase)
+            self._progress._live.refresh()
+            time.sleep(0.04)
+        handler.emit(logging.LogRecord('loader', logging.INFO, '', 0, 'loading-bound-handler', (), None))
+        os.write(2, b'loading-native-write\n')
+        subprocess.run([sys.executable, '-c', 'import os; os.write(1, b"loading-child-output\\n")'], check=True)
+        self.counter_after_loading_weights = time.perf_counter()
+        self._log_loading_time()
+
+    with patch.object(DefaultModelLoader, 'load_weights', route):
+        loader.load_weights(None, None)
+    print('loading-returned')
+
+
+@pytest.mark.parametrize('columns', [84, 133])
+def test_weight_loading_keeps_one_complete_panel_with_native_logs(columns, tmp_path):
+    master, slave = os.openpty()
+    rows = 36
+    termios.tcsetwinsize(slave, (rows, columns))
+    os.set_blocking(master, False)
+    env = dict(os.environ, TERM='xterm-256color', PYTHONDONTWRITEBYTECODE='1')
+    for key in ('COLUMNS', 'LINES'):
+        env.pop(key, None)
+    output = bytearray()
+    try:
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), '--loading-replay'],
+            stdin=slave, stdout=slave, stderr=slave, env=env,
+        )
+        while process.poll() is None:
+            if select.select([master], [], [], 0.1)[0]:
+                output.extend(os.read(master, 65536))
+        while select.select([master], [], [], 0)[0]:
+            output.extend(os.read(master, 65536))
+        (tmp_path / 'terminal.ansi').write_bytes(output)
+        assert process.returncode == 0, output.decode(errors='replace')
+        screen = _terminal_text(bytes(output), rows, columns)
+        (tmp_path / 'screen.txt').write_text(screen)
+        assert screen.count('b12x / weight loading') == 1, screen
+        assert screen.index('Loading weights') > screen.index('└'), screen
+        assert '0 / 0 shards' not in output.decode(errors='replace')
+        for message in ('loading-bound-handler', 'loading-native-write',
+                        'loading-child-output', 'loading-returned'):
+            assert screen.count(message) == 1, screen
+        top = next(i for i, line in enumerate(screen.splitlines()) if line.startswith('┌'))
+        bottom = next(i for i, line in enumerate(screen.splitlines()) if line.startswith('└'))
+        panel = screen.splitlines()[top:bottom + 1]
+        assert len(panel) >= 8, screen
+        assert all(line.startswith('│') and line.endswith('│') for line in panel[1:-1]), screen
+    finally:
+        if 'process' in locals() and process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        os.close(slave)
+        os.close(master)
+
+
+if __name__ == '__main__':
+    if '--startup-replay' in sys.argv:
+        _startup_with_native_output()
+    elif '--loading-replay' in sys.argv:
+        _loading_with_native_output()
