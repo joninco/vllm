@@ -19,15 +19,7 @@ import torch
 import torch.nn as nn
 from b12x.gemm import block_fp8_linear
 
-from vllm import envs
-from vllm.utils.b12x import (
-    set_b12x_preparation_provider,
-    B12xPreparationUnit,
-    B12xWorkload,
-    b12x_layer_prefix,
-    register_b12x_layer,
-    register_b12x_unit_provider,
-)
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
@@ -47,7 +39,6 @@ from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
-from vllm.model_executor.weight_transfer import copy_weight
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -63,11 +54,13 @@ from vllm.v1.worker.workspace import (
 from ..b12x_layers import B12xRMSNorm as RMSNorm
 from ..b12x_layers import (
     _execution_capacities,
+    collapse,
 )
 from .model import (
     DeepseekV4DecoderLayer,
     _linear_scale_param_name,
     _use_sequence_parallel,
+    make_deepseek_v4_expert_params_mapping,
 )
 
 logger = init_logger(__name__)
@@ -106,81 +99,31 @@ class _ContextKVProjection:
                     in_features=fused.weight.shape[1],
                     out_features=fused.weight.shape[0] - start,
                     block_size=(32, 32),
-                    output_mode="provided",
                 )
             )
             for bound in self.capacities
         )
-        register_b12x_unit_provider(self)
-
-    def get_b12x_preparation_units(
-        self, layer: object, workload: B12xWorkload
-    ) -> tuple[B12xPreparationUnit, ...]:
-        if self.weight.weight.values.is_meta:
-            return ()
-
-        def make_call(state, *, bound: int):
-            from b12x.preparation import PreparedCall
-
-            source = torch.zeros(
-                (bound, self.weight.in_features),
-                dtype=torch.bfloat16,
-                device=state.device,
-            )
-            output = torch.empty(
-                (bound, self.weight.out_features, 1),
-                dtype=torch.bfloat16,
-                device=source.device,
-            )
-            scratch = [
-                torch.empty(spec.shape, dtype=spec.dtype, device=source.device)
-                for spec in state.scratch.scratch_specs()
-            ]
-            binding = state.bind(
-                scratch=scratch,
-                source=source,
-                packed_weight=self.weight,
-                output=output,
-            )
-            return PreparedCall(
-                run=lambda: state.run_binding(binding),
-                produce=lambda: source.normal_(std=0.25),
-                owners=(self.weight,),
-            )
-
-        requests = tuple(
-            plan.request(
-                name=f"dspark.context_kv.{id(self):x}.m{bound}",
-                prepare_call=lambda state, bound=bound: make_call(state, bound=bound),
-                benchmark_call=lambda state, bound=bound: make_call(state, bound=bound),
-            )
-            for bound, plan in zip(self.capacities, self.plans)
-        )
-        return (B12xPreparationUnit(
-            name="DSparkContextKV", key=(id(self), self.capacities),
-            requests=requests, stage="weights", autotune=not workload.eager_only,
-        ),)
+        for bound in self.capacities:
+            block_fp8_linear.prewarm(self.weight, (1, bound), expected_m=bound)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         index = bisect_left(self.capacities, x.shape[0])
         if index == len(self.capacities):
-            raise ValueError("DSpark context rows exceed prepared capacity")
-        rows = x.shape[0]
+            raise ValueError("DSpark context rows exceed planned capacity")
         plan = self.plans[index]
         out = torch.empty(
-            (rows, self.weight.out_features),
+            (x.shape[0], self.weight.out_features),
             dtype=torch.bfloat16,
             device=x.device,
         )
-        scratch = current_workspace_manager().get_simultaneous(
-            *((spec.shape, spec.dtype) for spec in plan.scratch_specs())
-        )
         binding = block_fp8_linear.bind(
             plan,
-            scratch=scratch,
+            scratch=current_workspace_manager().get_simultaneous(
+                *plan.shapes_and_dtypes()
+            ),
             source=x,
             packed_weight=self.weight,
-            output=out.view(rows, self.weight.out_features, 1),
+            output=out.view(x.shape[0], self.weight.out_features, 1),
         )
         retain_cuda_graph_capture_resource(binding)
         block_fp8_linear.run(binding=binding)
@@ -220,7 +163,6 @@ class DSparkContextCudaGraphs:
         # Powers of two bound padding to less than 2x, independent of live rows.
         capacities = []
         capacity = 1
-
         while capacity < limit:
             capacities.append(capacity)
             capacity *= 2
@@ -299,12 +241,6 @@ class DSparkContextCudaGraphs:
         self.positions[num_tokens:capacity].zero_()
         self.slot_mappings[:, num_tokens:capacity].fill_(PAD_SLOT_ID)
         self.manager.run_fullgraph(desc)
-
-    def close(self) -> None:
-        """Destroy context graphs before their prepared executions are released."""
-        self.manager.reset_graphs()
-        self.manager.graphs.clear()
-        self.manager.graph_capture_resources.clear()
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -466,7 +402,7 @@ class DSparkDeepseekV4Model(nn.Module):
         # last block's ffn pre-mix). Return the PRE-norm head hidden;
         # compute_logits applies self.norm.
         assert pre_mix is not None
-        hidden_states = layer._b12x_mhc.collapse(hidden_states, pre_mix)
+        hidden_states = collapse(hidden_states, pre_mix)
         return hidden_states
 
 
@@ -591,6 +527,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         Non-mtp weights (embed/head/main layers) belong to the target model and
         are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
         """
+        first_layer = self.model.layers[0]
+        use_mega_moe = first_layer.ffn.use_mega_moe
         # Draft MoE layers use the dspark_* expert counts, not the
         # backbone's (see DeepseekV4MoE and the reference
         # ModelArgs.get_moe_config).
@@ -598,13 +536,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             getattr(self.config, "dspark_n_routed_experts", 0)
             or self.config.n_routed_experts
         )
-        expert_mapping = fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=n_draft_experts,
-        )
+        if use_mega_moe:
+            expert_mapping = make_deepseek_v4_expert_params_mapping(n_draft_experts)
+        else:
+            expert_mapping = fused_moe_make_expert_params_mapping(
+                self,
+                ckpt_gate_proj_name="w1",
+                ckpt_down_proj_name="w2",
+                ckpt_up_proj_name="w3",
+                num_experts=n_draft_experts,
+            )
         expert_scale_suffix = (
             ".weight_scale"
             if getattr(self.config, "expert_dtype", "fp4") == "fp4"
@@ -688,7 +629,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             else:
                 if "attn_sink" in name:
                     narrow = loaded_weight[head_start:head_end]
-                    copy_weight(params_dict[name][: narrow.shape[0]], narrow)
+                    params_dict[name][: narrow.shape[0]].copy_(narrow)
                     loaded_params.add(name)
                     continue
                 if name.endswith(".ffn.gate.bias"):
@@ -705,12 +646,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
-    def process_weights_after_loading(self) -> None:
-        self.logits_processor.prepare_b12x_vocab_projection(
-            self.model.markov_head.markov_w2
-        )
+    def _finalize_moe(self) -> None:
         for layer in self.model.layers:
-            layer.attn.setup_wo_projection()
+            layer.ffn.finalize_mega_moe_weights()
+
+    def process_weights_after_loading(self) -> None:
+        self._finalize_moe()
         self.model._context_kv_projections = [
             _ContextKVProjection(layer.attn, self.model.context_capacity)
             for layer in self.model.layers
@@ -725,13 +666,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             first_layer.hc_attn_fn_broadcast = broadcast
         else:
             first_layer.hc_attn_fn_broadcast.copy_(broadcast)
-        for layer in self.model.layers:
-            mhc = getattr(layer, "_b12x_mhc", None)
-            if mhc is not None:
-                set_b12x_preparation_provider(layer, mhc)
-                name = b12x_layer_prefix(layer)
-                register_b12x_layer(name, layer)
-                mhc.bind_layer_name(name)
 
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.

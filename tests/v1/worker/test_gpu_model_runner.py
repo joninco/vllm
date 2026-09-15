@@ -1834,11 +1834,7 @@ def test_glm_dcp_attention_profile_skips_non_glm_and_dcp1(architecture):
 
 @pytest.mark.parametrize(
     "architecture",
-    [
-        "DeepseekV4ForCausalLM",
-        "DeepseekV4ForConditionalGeneration",
-        "DeepseekV41ForCausalLM",
-    ],
+    ["DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration"],
 )
 @pytest.mark.parametrize(
     ("init_fails", "dummy_run_fails"),
@@ -1879,25 +1875,22 @@ def test_deepseek_v4_attention_profile_uses_reachable_prefill_and_cleans_up(
         lambda _: nullcontext(),
     )
 
-    prepare = lambda: events.append("prepare")
-
     if init_fails:
         with pytest.raises(
             RuntimeError, match="expected DeepSeek V4 KV initialization failure"
         ):
-            runner._profile_deepseek_v4_attention(prepare)
+            runner._profile_deepseek_v4_attention()
     elif dummy_run_fails:
         with pytest.raises(RuntimeError, match="expected DeepSeek V4 profile failure"):
-            runner._profile_deepseek_v4_attention(prepare)
+            runner._profile_deepseek_v4_attention()
     else:
-        runner._profile_deepseek_v4_attention(prepare)
+        runner._profile_deepseek_v4_attention()
 
     assert events[0] == ("init-kv", 1)
     if init_fails:
         assert events == [("init-kv", 1), "cleanup"]
     else:
-        assert events[1] == "prepare"
-        assert events[2] == (
+        assert events[1] == (
             "dummy-run",
             (4096,),
             {
@@ -1922,9 +1915,7 @@ def test_deepseek_v4_attention_profile_skips_other_architectures():
     runner._init_minimal_kv_cache_for_profiling.assert_not_called()
 
 
-def test_profile_run_releases_generic_outputs_before_deepseek_profile(
-    monkeypatch, workspace_init
-):
+def test_profile_run_releases_generic_outputs_before_deepseek_profile(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.supports_mm_inputs = False
     runner.max_num_tokens = 4096
@@ -1942,7 +1933,7 @@ def test_profile_run_releases_generic_outputs_before_deepseek_profile(
         output_refs.extend(ref(output) for output in outputs)
         return outputs
 
-    def profile_attention(prepare_profile_state=None):
+    def profile_attention():
         assert all(output_ref() is None for output_ref in output_refs)
         events.append("profile-attention")
 

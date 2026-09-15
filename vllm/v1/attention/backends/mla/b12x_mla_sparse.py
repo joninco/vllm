@@ -3,7 +3,7 @@
 """B12x sparse MLA attention backend."""
 
 from dataclasses import dataclass, field, replace
-from math import gcd
+from math import gcd, prod
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 from weakref import WeakKeyDictionary
 
@@ -24,13 +24,7 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
-from vllm.utils.b12x import (
-    B12xPreparationUnit,
-    B12xWorkload,
-    PreparationResourceUnavailableError,
-    get_b12x_sparse_mla,
-    set_b12x_preparation_provider,
-)
+from vllm.utils.b12x import get_b12x_sparse_mla
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -1433,14 +1427,8 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._module = module
         self._kernel_page_size = 0
         self._kernel_page_size_finalized = not self._is_glm_next
-        self._plans: dict[tuple[str, int], Any] = {}
-        self._plan_caps: dict[tuple[str, int], Any] = {}
-        self._cache_writer_plan: object | None = None
-        self._bound_kv_cache: torch.Tensor | None = None
         self._set_kernel_page_size(kernel_page_size)
         self.supports_quant_query_input = False
-        if not getattr(self, "b12x_preparation_suppressed", False):
-            set_b12x_preparation_provider(self, self)
         if self.dcp_world_size > 1:
             from .prefill_diagnostics import get_prefill_trace, install_backend_trace
 
@@ -1456,23 +1444,44 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
         if kernel_page_size == self._kernel_page_size:
             return
-        # Plan declarations read the page size.
-        self._kernel_page_size = kernel_page_size
-        keys = [("decode", self._decode_max_rows), ("extend", self._max_tokens)]
-        if self._ckv_gather_enabled:
-            keys.append(("ckv_extend", self._max_tokens))
-        self._plans = {}
-        self._plan_caps = {}
-        for key in keys:
-            self._plan_caps[key], self._plans[key] = self._declare_plan(*key)
-        self._cache_record_bytes = int(self._plan_caps[keys[0]].cache_record_bytes)
-        # This family's scratch layout is a deterministic function of Caps
-        # alone (see plan_sparse_mla_scratch) and grows with the row capacity,
-        # so the largest plan declared here also covers every decode plan
-        # declared later for fewer rows.
-        self._scratch_nbytes = max(
-            int(plan.scratch_specs()[0].nbytes) for plan in self._plans.values()
+
+        def make_plan(mode: str, num_q_heads: int = self._input_num_heads):
+            max_rows = self._decode_max_rows if mode == "decode" else self._max_tokens
+            caps_kwargs = dict(
+                device=torch.device("cuda", torch.accelerator.current_device_index()),
+                num_q_heads=num_q_heads,
+                max_q_rows=max_rows,
+                max_width=self._topk_tokens,
+                softmax_scale=self.scale,
+                dtype=torch.bfloat16,
+                kv_dtype=self._kv_dtype,
+                head_dim=self._q_head_dim,
+                v_head_dim=self.kv_lora_rank,
+                mode=mode,
+                max_batch=max_rows,
+                max_chunks_per_row=max(1, (self._topk_tokens + 63) // 64),
+                page_size=kernel_page_size,
+                return_lse=self.need_to_return_lse_for_decode,
+                lse_scale="natural",
+            )
+            if self._model_type is not None:
+                caps_kwargs["model_type"] = self._model_type
+            if self._uses_nvfp4_cache:
+                caps_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
+            return self._module.plan(self._module.Caps(**caps_kwargs))
+
+        decode_plan = make_plan("decode")
+        extend_plan = make_plan("extend")
+        self._cache_record_bytes = int(decode_plan.caps.cache_record_bytes)
+        self._decode_plan = decode_plan
+        self._extend_plan = extend_plan
+        self._ckv_extend_plan = (
+            make_plan("extend", self.num_heads) if self._ckv_gather_enabled else None
         )
+        plans = [decode_plan, extend_plan]
+        if self._ckv_extend_plan is not None:
+            plans.append(self._ckv_extend_plan)
+        self._scratch_nbytes = max(int(plan.layout.nbytes) for plan in plans)
         self._ckv_local_capacity = _round_up_ckv_rank_tokens(
             self._ckv_capacity_tokens,
             page_size=kernel_page_size,
@@ -1487,122 +1496,43 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         self._kernel_page_size = kernel_page_size
         self._reserve_planned_workspaces()
 
-    def _declare_plan(self, mode: str, rows: int):
-        """Declare the plan for mode at rows query rows; returns (caps, plan).
-
-        The decode launch is exact in its row count, so decode plans are
-        declared per row count. The extend modes accept any row count up to
-        their declared capacity.
-        """
-        caps_kwargs = dict(
-            device=torch.device("cuda", torch.accelerator.current_device_index()),
-            num_q_heads=(
-                self.num_heads if mode == "ckv_extend" else self._input_num_heads
-            ),
-            max_q_rows=rows,
-            max_width=self._topk_tokens,
-            softmax_scale=self.scale,
-            dtype=torch.bfloat16,
-            kv_dtype=self._kv_dtype,
-            head_dim=self._q_head_dim,
-            v_head_dim=self.kv_lora_rank,
-            mode="extend" if mode == "ckv_extend" else mode,
-            max_batch=rows,
-            max_chunks_per_row=max(1, (self._topk_tokens + 63) // 64),
-            page_size=self._kernel_page_size,
-            return_lse=self.need_to_return_lse_for_decode,
-            lse_scale="natural",
+    def _base_workspace_specs(
+        self, plan
+    ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        del plan
+        q_spec = (
+            (self._max_tokens, self._input_num_heads, self._q_head_dim),
+            torch.bfloat16,
         )
-        if self._model_type is not None:
-            caps_kwargs["model_type"] = self._model_type
-        if self._uses_nvfp4_cache:
-            caps_kwargs.update(_nvfp4_run_options(is_glm_next=self._is_glm_next))
-        caps = self._module.Caps(**caps_kwargs)
-        return caps, self._module.plan(caps)
+        scratch_spec = ((self._scratch_nbytes,), torch.uint8)
+        return (q_spec, scratch_spec)
 
-    def _preparation_prefix(self) -> str:
-        return f"attention.sparse_mla.{id(self):x}"
-
-    def _request_name(self, key: tuple[str, int]) -> str:
-        mode, rows = key
-        return f"{self._preparation_prefix()}.{mode}.m{rows}"
-
-    def _plan(self, key: tuple[str, int]):
-        """The plan for key, declared on first use with its default configuration."""
-        plan = self._plans.get(key)
-        if plan is None:
-            caps, plan = self._declare_plan(*key)
-            self._plans[key] = plan
-            self._plan_caps[key] = caps
-        return plan
-
-    def _make_prepare_call(self, state, caps):
-        from b12x.preparation import PreparedCall
-
-        if self._bound_kv_cache is None or self._bound_kv_cache.numel() == 0:
-            raise PreparationResourceUnavailableError(
-                "sparse MLA benchmark requires the published KV cache"
-            )
-        rows = int(caps.max_q_rows)
-        q = torch.empty(
-            (rows, int(caps.num_q_heads), int(caps.head_dim)),
-            dtype=caps.dtype,
-            device=caps.device,
-        )
-        # Selection reads the real cache.  Page zero is a legal physical page
-        # and avoids a synthetic cache or a pool-sized checkpoint.
-        kv_cache = self._bound_kv_cache
-        selected = torch.zeros(
-            (rows, int(caps.max_width)), dtype=torch.int32, device=caps.device
-        )
-        cache_lengths = torch.full(
-            (int(caps.max_batch),),
-            int(caps.page_size),
-            dtype=torch.int32,
-            device=caps.device,
-        )
-        selected_lengths = torch.ones(rows, dtype=torch.int32, device=caps.device)
-        scratch = torch.empty(
-            (int(state.layout.nbytes),), dtype=torch.uint8, device=caps.device
-        )
-        binding = state.bind(
-            scratch=scratch,
-            q=q,
-            selected_indices=selected,
-            cache_seqlens_int32=cache_lengths,
-            nsa_cache_seqlens_int32=selected_lengths,
-            kv_cache=kv_cache,
-        )
-        # Launcher construction belongs to the declaration's preparation
-        # callback: runtime only consumes these retained launchers.
-        state.prime(binding, kv_cache=kv_cache)
-
-        def produce():
-            q.fill_(1)
-
-        return PreparedCall(
-            run=lambda: state.run(binding, kv_cache=kv_cache),
-            produce=produce,
-            owners=(q, selected, cache_lengths, selected_lengths, scratch, binding),
+    @staticmethod
+    def _workspace_nbytes(
+        specs: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+    ) -> int:
+        return sum(
+            ((prod(shape) * dtype.itemsize + 255) // 256) * 256
+            for shape, dtype in specs
         )
 
     def _reserve_planned_workspaces(self) -> None:
         if not is_workspace_manager_initialized():
             return
-        current_workspace_manager().reserve_all(
-            *self._workspace_specs(
-                input_num_heads=self._input_num_heads, include_ckv=False
-            )
+        plan_specs = (
+            self._base_workspace_specs(self._decode_plan),
+            self._base_workspace_specs(self._extend_plan),
         )
+        largest_specs = max(plan_specs, key=self._workspace_nbytes)
+        current_workspace_manager().get_simultaneous(*largest_specs)
         if self._ckv_gather_enabled and self._kernel_page_size_finalized:
             self._reserve_ckv_prefetch()
-            self._reserve_attention_workspaces()
 
-    def get_dcp_prefill_workspace_specs(self):
+    def get_dcp_prefill_workspace_specs(
+        self,
+    ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
         """Return the sequential prefill scratch prefix, excluding persistent KV."""
-        return self._workspace_specs(
-            input_num_heads=self._input_num_heads, include_ckv=False
-        )
+        return self._base_workspace_specs(self._extend_plan)
 
     def _reserve_ckv_prefetch(self) -> None:
         manager = current_workspace_manager()
@@ -1662,7 +1592,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 )
 
                 ensure_dcp_ckv_prefetch_group()
-            device = self._plan_caps[("decode", self._decode_max_rows)].device
+            device = self._decode_plan.caps.device
             pool = CKVWorkspacePool(plan, device)
             current_local = torch.empty(
                 (
@@ -1905,93 +1835,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             raise
         return gathered, state, layer_idx
 
-    def get_b12x_preparation_units(
-        self, layer: torch.nn.Module, workload: B12xWorkload
-    ) -> tuple[B12xPreparationUnit, ...]:
-        if layer is not self:
-            raise ValueError("sparse MLA preparation owner mismatch")
-        if self._bound_kv_cache is None or self._bound_kv_cache.numel() == 0:
-            return ()
-        requests = []
-        # Decode launches are exact in their row count, so every planned token
-        # count that can route to decode gets its own plan.
-        for rows in workload.token_counts:
-            key = ("decode", rows)
-            if rows <= self._decode_max_rows and key not in self._plans:
-                self._plan_caps[key], self._plans[key] = self._declare_plan(*key)
-        for key, declaration in self._plans.items():
-            caps = self._plan_caps[key]
-            requests.append(
-                declaration.request(
-                    name=self._request_name(key),
-                    prepare_call=lambda state, caps=caps: self._make_prepare_call(
-                        state, caps
-                    ),
-                    benchmark_call=lambda state, caps=caps: self._make_prepare_call(
-                        state, caps
-                    ),
-                )
-            )
-        if self._is_glm_next:
-            from b12x.preparation import PreparedCall
-
-            kv_probe = torch.empty(
-                (self._max_tokens, self.kv_lora_rank),
-                dtype=torch.bfloat16,
-                device=self._bound_kv_cache.device,
-            )
-            ignored_slots = torch.full(
-                (self._max_tokens,),
-                -1,
-                dtype=torch.int64,
-                device=self._bound_kv_cache.device,
-            )
-            writer_plan = self._module.plan_cache_writer(
-                kv_probe, self._bound_kv_cache, ignored_slots
-            )
-            self._cache_writer_plan = writer_plan
-
-            def prepare_writer(state):
-                probe = torch.empty_like(kv_probe)
-                # The writer touches only slot zero; retain that single page
-                # for restoration instead of cloning the serving KV pool.
-                slots = torch.zeros_like(ignored_slots)
-                saved_page = state.kv_cache[0].clone()
-
-                def produce():
-                    probe.fill_(1)
-
-                def restore():
-                    state.kv_cache[0].copy_(saved_page)
-
-                return PreparedCall(
-                    run=lambda: state.run(probe, state.kv_cache, slots),
-                    produce=produce,
-                    restore=restore,
-                    owners=(probe, slots, saved_page),
-                )
-
-            requests.append(
-                writer_plan.request(
-                    name=f"{self._preparation_prefix()}.cache_writer",
-                    prepare_call=prepare_writer,
-                    benchmark_call=prepare_writer,
-                    dependencies=tuple(request.name for request in requests),
-                )
-            )
-        if not requests:
-            return ()
-        return (
-            B12xPreparationUnit(
-                name="sparse MLA",
-                key=self._preparation_prefix(),
-                requests=tuple(requests),
-                stage="state",
-                autotune=not workload.eager_only,
-            ),
-        )
-
-    def _use_decode_execution(
+    def _use_decode_plan(
         self,
         attn_metadata: B12xMLASparseMetadata,
         num_tokens: int,
@@ -2008,10 +1852,12 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
 
     def _workspace_specs(
         self,
+        plan: Any,
         *,
         input_num_heads: int,
         include_ckv: bool,
     ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        del plan
         q_spec = (
             (self._max_tokens, input_num_heads, self._q_head_dim),
             torch.bfloat16,
@@ -2039,10 +1885,19 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
     def _reserve_attention_workspaces(self) -> None:
         if not self._ckv_gather_enabled:
             return
+        assert self._ckv_extend_plan is not None
         manager = current_workspace_manager()
-        for heads in {self._input_num_heads, self.num_heads}:
+        for plan, input_num_heads, include_ckv in (
+            (self._decode_plan, self._input_num_heads, False),
+            (self._extend_plan, self._input_num_heads, False),
+            (self._ckv_extend_plan, self.num_heads, False),
+        ):
             manager.reserve_all(
-                *self._workspace_specs(input_num_heads=heads, include_ckv=False)
+                *self._workspace_specs(
+                    plan,
+                    input_num_heads=input_num_heads,
+                    include_ckv=include_ckv,
+                )
             )
 
     def _borrow_workspaces(
@@ -2055,6 +1910,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             self._input_num_heads if input_num_heads is None else input_num_heads
         )
         specs = self._workspace_specs(
+            self._decode_plan,
             input_num_heads=input_num_heads,
             include_ckv=include_ckv,
         )
@@ -2090,15 +1946,20 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             raise RuntimeError("B12X fused MLA query output must be contiguous.")
         return output
 
-    def _plan_key(
-        self, attn_metadata: B12xMLASparseMetadata, num_tokens: int
-    ) -> tuple[str, int]:
-        """The route and declared row count serving one batch."""
-        if self.uses_full_ckv_dcp(attn_metadata, num_tokens):
-            return ("ckv_extend", self._max_tokens)
-        if self._use_decode_execution(attn_metadata, num_tokens):
-            return ("decode", num_tokens)
-        return ("extend", self._max_tokens)
+    def b12x_warmup_key(self) -> tuple[object, ...]:
+        return (
+            type(self),
+            self._decode_plan.caps.device,
+            self._input_num_heads,
+            self._q_head_dim,
+            self._topk_tokens,
+            self._max_tokens,
+            self._decode_plan.caps.max_q_rows,
+            self.need_to_return_lse_for_decode,
+            self._model_type,
+            self._kernel_page_size,
+            self._ckv_gather_enabled,
+        )
 
     def prepare_profile_collectives(self) -> None:
         """Prepare native-cache collectives before the attention memory profile."""
@@ -2216,7 +2077,6 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     else:
                         main.wait_event(completion)
                     completions.append(completion)
-        self._warmup_ckv_copy_kernels()
         main.synchronize()
         reservation.collectives_warmed = True
         logger.info(
@@ -2229,8 +2089,60 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             reservation.current_local.shape[-2],
         )
 
-    def _warmup_ckv_copy_kernels(self) -> None:
-        """Compile native history and current-chunk copies using empty spans."""
+    def warmup(self, token_counts: tuple[int, ...]) -> None:
+        decode_capacity = int(self._decode_plan.caps.max_q_rows)
+        decode_rows = {
+            int(rows) for rows in token_counts if 0 < int(rows) <= decode_capacity
+        }
+        decode_rows.add(1)
+        extend_rows = {1, 2, 4, self._max_tokens}
+        kv_cache = torch.zeros(
+            (1, self._kernel_page_size, self._cache_record_bytes),
+            dtype=torch.uint8,
+            device=self._decode_plan.caps.device,
+        )
+
+        plans: list[tuple[Any, list[int], int]] = [
+            (self._decode_plan, sorted(decode_rows), self._input_num_heads),
+            (self._extend_plan, sorted(extend_rows), self._input_num_heads),
+        ]
+        if self._ckv_extend_plan is not None:
+            plans.append((self._ckv_extend_plan, sorted(extend_rows), self.num_heads))
+
+        for plan, rows_to_warm, input_num_heads in plans:
+            q_buffer, scratch = self._borrow_workspaces(
+                input_num_heads=input_num_heads
+            )[:2]
+            for rows in rows_to_warm:
+                if rows > int(plan.caps.max_q_rows):
+                    continue
+                q = q_buffer[:rows]
+                q.zero_()
+                selected_indices = torch.zeros(
+                    (rows, self._topk_tokens),
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                cache_lengths = torch.full(
+                    (rows if plan is self._decode_plan else 1,),
+                    self._kernel_page_size,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                selected_lengths = torch.ones(
+                    (rows,), dtype=torch.int32, device=q.device
+                )
+                binding = self._bind(
+                    plan,
+                    scratch=scratch,
+                    q=q,
+                    kv_cache=kv_cache,
+                    selected_indices=selected_indices,
+                    cache_lengths=cache_lengths,
+                    selected_lengths=selected_lengths,
+                )
+                self._run(binding)
+
         reservation = self._ckv_reservation
         if reservation is not None and reservation.registry.pool.plan.effective_depth:
             from b12x.attention._shared.mla.kv_cache import (
@@ -2240,12 +2152,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
 
             # Empty request spans compile native-copy paths without reading KV.
-            device = reservation.registry.pool.storage.device
-            kv_cache = torch.zeros(
-                (1, self._kernel_page_size, self._cache_record_bytes),
-                dtype=torch.uint8,
-                device=device,
-            )
+            device = kv_cache.device
             starts = torch.zeros(2, dtype=torch.int32, device=device)
             lengths = torch.zeros(1, dtype=torch.int32, device=device)
             rank_spans = torch.zeros(
@@ -2300,6 +2207,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 current_capacity=self._ckv_current_capacity,
                 padded_tokens=1,
             )
+        self._warmup_ckv_collectives()
 
     def finalize_kv_cache_geometry(self, kernel_page_size: int) -> None:
         """Finalize kernel plans and workspace memory before KV profiling.
@@ -2325,20 +2233,22 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 )
             return
         self._set_kernel_page_size(kernel_page_size)
+        self._reserve_attention_workspaces()
         self._kernel_page_size_finalized = True
         if self._ckv_gather_enabled:
             self._reserve_ckv_prefetch()
-            self._reserve_attention_workspaces()
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        if self._uses_glm_dsa_nvfp4_cache and (
+        if getattr(self, "_uses_glm_dsa_nvfp4_cache", False) and (
             kv_cache.ndim != 3
             or int(kv_cache.shape[-1]) != _GLM_DSA_NVFP4_CACHE_RECORD_BYTES
             or kv_cache.dtype != torch.uint8
         ):
             raise ValueError(
                 "B12X GLM DSA NVFP4 cache must have shape "
-                f"[pages, page_size, {_GLM_DSA_NVFP4_CACHE_RECORD_BYTES}] uint8"
+                f"[pages, page_size, {_GLM_DSA_NVFP4_CACHE_RECORD_BYTES}] "
+                "uint8, got "
+                f"shape={tuple(kv_cache.shape)}, dtype={kv_cache.dtype}."
             )
         if self._is_glm_next:
             if (
@@ -2352,23 +2262,19 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                     f"dtype={kv_cache.dtype}"
                 )
             cache_page_size = int(kv_cache.shape[1])
-            if self._kernel_page_size_finalized:
+            if getattr(self, "_kernel_page_size_finalized", False):
                 if cache_page_size != self._kernel_page_size:
                     raise RuntimeError(
                         "B12X GLM5Next bound cache does not match the finalized "
                         f"page size: {cache_page_size} != {self._kernel_page_size}."
                     )
-            elif self._ckv_gather_enabled:
+                return
+            if self._ckv_gather_enabled:
                 raise RuntimeError(
                     "B12X GLM5Next full-CKV gather requires page geometry "
                     "finalization before KV-cache memory profiling."
                 )
-            else:
-                self._set_kernel_page_size(cache_page_size)
-        # The cache writer plan is bound to the outgoing generation's tensor;
-        # get_b12x_preparation_units declares a fresh one for the new pool.
-        self._cache_writer_plan = None
-        self._bound_kv_cache = kv_cache
+            self._set_kernel_page_size(cache_page_size)
 
     def do_kv_cache_update(
         self,
@@ -2379,7 +2285,7 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
     ) -> None:
-        if self._uses_glm_dsa_nvfp4_cache:
+        if getattr(self, "_uses_glm_dsa_nvfp4_cache", False):
             if kv_cache.numel() == 0:
                 return
             assert self._concat_and_cache_nvfp4_mla_fp8_rope is not None
@@ -2393,15 +2299,16 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             return
         if not self._is_glm_next:
             return super().do_kv_cache_update(
-                kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
             )
+        del k_scale
         if kv_cache.numel() == 0:
             return
-        plan = self._cache_writer_plan
-        if plan is None:
-            raise PreparationResourceUnavailableError(
-                f"{self._preparation_prefix()} has no declared cache_writer plan"
-            )
         if int(k_pe.shape[-1]) != 0:
             raise ValueError(
                 "B12X GLM5Next cache updates require a zero-width RoPE tensor, "
@@ -2409,17 +2316,21 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
             )
         assert self._concat_and_cache_glm_next_mla is not None
         self._concat_and_cache_glm_next_mla(
-            kv_c_normed, kv_cache, slot_mapping.flatten(), plan=plan
+            kv_c_normed,
+            kv_cache,
+            slot_mapping.flatten(),
         )
 
     def uses_full_ckv_dcp(
-        self, attn_metadata: B12xMLASparseMetadata, num_tokens: int
+        self,
+        attn_metadata: B12xMLASparseMetadata,
+        num_tokens: int,
     ) -> bool:
         if torch.cuda.is_current_stream_capturing():
             return False
         return (
             self._ckv_gather_enabled
-            and self._kernel_page_size_finalized
+            and getattr(self, "_kernel_page_size_finalized", False)
             and attn_metadata.dcp_ckv_gather_eligible
             and attn_metadata.num_decode_tokens == 0
             and not attn_metadata.is_spec_decode
@@ -2542,13 +2453,20 @@ class B12xMLASparseImpl(SparseMLACommonImpl[B12xMLASparseMetadata]):
                 f"plan={self._kernel_page_size}"
             )
         num_tokens = int(q[0].shape[0] if isinstance(q, tuple) else q.shape[0])
-        plan_key = self._plan_key(attn_metadata, num_tokens)
-        plan = self._plan(plan_key)
-        use_ckv_gather = plan_key[0] == "ckv_extend"
+        use_ckv_gather = self.uses_full_ckv_dcp(attn_metadata, num_tokens)
         if use_ckv_gather:
+            assert self._ckv_extend_plan is not None
+            plan = self._ckv_extend_plan
             logger.info_once("Using full-CKV gather for B12X DCP prefill")
+        else:
+            plan = (
+                self._decode_plan
+                if self._use_decode_plan(attn_metadata, num_tokens)
+                else self._extend_plan
+            )
         input_num_heads = self.num_heads if use_ckv_gather else self._input_num_heads
         workspace_specs = self._workspace_specs(
+            plan,
             input_num_heads=input_num_heads,
             include_ckv=False,
         )

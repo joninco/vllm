@@ -109,8 +109,8 @@ def test_is_supported_without_the_b12x_op(monkeypatch) -> None:
 def test_sorts_follows_the_plan_index_space(monkeypatch) -> None:
     indexer = b12x_indexer.B12xSparseIndexer.__new__(b12x_indexer.B12xSparseIndexer)
     indexer.sort_selection = True
-    logical = SimpleNamespace(query=SimpleNamespace(output_index_space="logical"))
-    physical = SimpleNamespace(query=SimpleNamespace(output_index_space="physical"))
+    logical = SimpleNamespace(caps=SimpleNamespace(output_index_space="logical"))
+    physical = SimpleNamespace(caps=SimpleNamespace(output_index_space="physical"))
     assert indexer._sorts(logical)
     assert not indexer._sorts(physical)
     indexer.sort_selection = False
@@ -128,7 +128,7 @@ def test_eager_sort_runs_in_line(monkeypatch) -> None:
     assert out is indices
     assert op.calls == [("sort", (4, 16), 64, 4096, 0)]
     assert not b12x_topk_sort._pending
-    b12x_topk_sort.join(torch.device("cuda", 0))  # nothing pending: no-op
+    b12x_topk_sort.join(torch.device("cpu"))  # nothing pending: no-op
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -158,9 +158,18 @@ def test_graph_mode_sort_forks_and_joins(monkeypatch) -> None:
     torch.accelerator.synchronize(device)
 
 
-@pytest.mark.parametrize("physical", [False, True])
-def test_plan_emits_physical_slots_reads_declared_index_space(physical) -> None:
-    plan = SimpleNamespace(
-        query=SimpleNamespace(output_index_space="physical" if physical else "logical")
-    )
+@pytest.mark.parametrize(
+    ("caps", "physical"),
+    [
+        (SimpleNamespace(output_physical_slots=True), True),
+        (SimpleNamespace(output_physical_slots=False), False),
+        (SimpleNamespace(output_index_space="physical"), True),
+        (SimpleNamespace(output_index_space="logical"), False),
+        (SimpleNamespace(), False),
+    ],
+)
+def test_plan_emits_physical_slots_reads_scratch_or_api_caps(caps, physical) -> None:
+    """A compiled plan carries scratch caps (``output_physical_slots``); the
+    API caps it was built from carry ``output_index_space``."""
+    plan = SimpleNamespace(caps=caps)
     assert b12x_indexer._plan_emits_physical_slots(plan) is physical

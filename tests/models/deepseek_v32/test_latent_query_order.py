@@ -205,7 +205,8 @@ def test_prefill_query_warmup_covers_supported_target_rows(monkeypatch, mtp_laye
     monkeypatch.setattr(
         mla_attention, "can_implement_bf16_mla_query", lambda **kwargs: False
     )
-    assert layer.prepare_dcp_prefill((1, 32, 33, 64, 8193)) is (not mtp_layer)
+    unit = layer.get_b12x_warmup_unit(layer, (1, 32, 33, 64, 8193), torch.bfloat16)
+    unit.compile()
     assert len(calls) == (0 if mtp_layer else 1)
     if not mtp_layer:
         query, weight, output = calls[0]
@@ -213,13 +214,13 @@ def test_prefill_query_warmup_covers_supported_target_rows(monkeypatch, mtp_laye
         assert query.stride() == (256, 2048, 1)
         assert weight is layer.W_UK_T
         assert output.shape == (8, 64, 512)
+    enabled_key = unit.key
     layer._prefill_query_bmm_module = None
-    assert not layer.prepare_dcp_prefill((1, 32, 33, 64, 8193))
+    disabled = layer.get_b12x_warmup_unit(layer, (1, 32, 33, 64, 8193), torch.bfloat16)
+    assert (enabled_key != disabled.key) is (not mtp_layer)
 
 
-def test_prefill_collective_warmup_prepares_backend_before_projected_exchange(
-    monkeypatch,
-):
+def test_prefill_collective_warmup_follows_backend_and_partitions_dedup(monkeypatch):
     layer, _, _, _ = _prefill_query_layer(monkeypatch)
     layer._prefill_query_bmm_module = None
     layer.W_UV = torch.empty((8, 512, 256), dtype=torch.bfloat16)
@@ -228,7 +229,7 @@ def test_prefill_collective_warmup_prepares_backend_before_projected_exchange(
     )
     events = []
     specs = (((64, 32, 576), torch.bfloat16), ((1024,), torch.uint8))
-    layer.impl.prepare_profile_collectives = lambda: events.append("backend")
+    layer.impl.warmup = lambda rows: events.append("backend")
     layer.impl.get_dcp_prefill_workspace_specs = lambda: specs
 
     def prewarm(weight, *, backend_specs):
@@ -240,9 +241,13 @@ def test_prefill_collective_warmup_prepares_backend_before_projected_exchange(
         prefill_warmup_key=((0, 1, 2, 3), "borrowed"),
         prewarm_prefill=prewarm,
     )
-    assert layer.prepare_dcp_prefill((64,))
+    unit = layer.get_b12x_warmup_unit(layer, (64,), torch.bfloat16)
+    unit.compile()
     assert events == ["backend", "collectives"]
+    layer.dcp_manager.prefill_warmup_key = ((4, 5, 6, 7), "borrowed")
+    other_group = layer.get_b12x_warmup_unit(layer, (64,), torch.bfloat16)
+    assert other_group.key != unit.key
     layer.dcp_manager.prefill_warmup_key = None
     events.clear()
-    layer.prepare_dcp_prefill((64,))
+    layer.get_b12x_warmup_unit(layer, (64,), torch.bfloat16).compile()
     assert events == ["backend"]

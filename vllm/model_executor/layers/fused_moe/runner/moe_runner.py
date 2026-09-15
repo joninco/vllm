@@ -132,7 +132,6 @@ def _moe_forward(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
-    routed_output_dtype: torch.dtype,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return cast(
@@ -153,18 +152,14 @@ def _moe_forward_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
-    routed_output_dtype: torch.dtype,
 ) -> torch.Tensor:
     # `hidden_dim_unpadded > 0` only on the TRT-LLM MXFP4 path, where the
     # real kernel writes narrower than `hidden_states.shape[-1]`. Plumbed
     # as an op arg (not peeked from the layer registry) to keep the fake
     # a pure shape function of its inputs and preserve subgraph dedup.
     if hidden_dim_unpadded > 0:
-        return hidden_states.new_empty(
-            (*hidden_states.shape[:-1], hidden_dim_unpadded),
-            dtype=routed_output_dtype,
-        )
-    return torch.empty_like(hidden_states, dtype=routed_output_dtype)
+        return hidden_states.new_empty((*hidden_states.shape[:-1], hidden_dim_unpadded))
+    return torch.empty_like(hidden_states)
 
 
 def _moe_forward_shared(
@@ -174,7 +169,6 @@ def _moe_forward_shared(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
-    routed_output_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return cast(
@@ -195,18 +189,16 @@ def _moe_forward_shared_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
-    routed_output_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # `fused_out`: see `_moe_forward_fake` for hidden_dim_unpadded semantics.
     # `shared_out`: matches `shared_experts_input` if provided (latent MoE),
     # else `hidden_states`.
     if hidden_dim_unpadded > 0:
         fused_out = hidden_states.new_empty(
-            (*hidden_states.shape[:-1], hidden_dim_unpadded),
-            dtype=routed_output_dtype,
+            (*hidden_states.shape[:-1], hidden_dim_unpadded)
         )
     else:
-        fused_out = torch.empty_like(hidden_states, dtype=routed_output_dtype)
+        fused_out = torch.empty_like(hidden_states)
     if shared_experts_input is not None:
         shared_out = torch.empty_like(shared_experts_input)
     else:
@@ -596,14 +588,10 @@ class MoERunner(MoERunnerInterface):
         self,
         shared_experts_input: torch.Tensor | None,
         order: SharedExpertsOrder,
-        workspace: torch.Tensor | None = None,
     ):
         if self._shared_experts is not None:
             assert shared_experts_input is not None
-            if workspace is None:
-                self._shared_experts(shared_experts_input, order)
-            else:
-                self._shared_experts(shared_experts_input, order, workspace=workspace)
+            self._shared_experts(shared_experts_input, order)
 
     def _apply_quant_method(
         self,
@@ -618,17 +606,8 @@ class MoERunner(MoERunnerInterface):
         via the router, and the actual fused MoE computation. Returns
         (shared_expert_output, fused_expert_output).
         """
-        workspace = None
-        shared_workspace = None
-        if self._shared_experts is not None:
-            assert shared_experts_input is not None
-            shared_size = self._shared_experts.workspace_size(shared_experts_input)
-            if shared_size:
-                workspace, shared_workspace = self._quant_method.prepare_workspace(
-                    hidden_states, shared_size
-                )
         self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP, shared_workspace
+            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
         if self.routed_experts.quant_method.is_monolithic:
@@ -647,35 +626,27 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            # Queue shared experts before routed kernels can occupy the SMs.
+            # Queue shared-expert work before the routed launch. The auxiliary
+            # stream join remains after routing, preserving overlap with the
+            # router while preventing a resident routed grid from starting
+            # until shared-expert CTAs have released the SMs.
             self._maybe_apply_shared_experts(
                 shared_experts_input,
                 SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-                shared_workspace,
             )
-            if workspace is None:
-                fused_out = self.routed_experts.forward_modular(
-                    x=hidden_states,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    shared_experts=self._shared_experts,
-                    shared_experts_input=shared_experts_input,
-                )
-            else:
-                fused_out = self.routed_experts.forward_modular(
-                    x=hidden_states,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    shared_experts=self._shared_experts,
-                    shared_experts_input=shared_experts_input,
-                    workspace=workspace,
-                )
+
+            fused_out = self.routed_experts.forward_modular(
+                x=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_experts=self._shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
 
         if self.routed_experts.quant_method.is_monolithic:
             self._maybe_apply_shared_experts(
                 shared_experts_input,
                 SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-                shared_workspace,
             )
 
         return (
@@ -929,7 +900,6 @@ class MoERunner(MoERunnerInterface):
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
             else 0,
-            self._quant_method.output_dtype,
         )
 
         #

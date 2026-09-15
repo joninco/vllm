@@ -16,34 +16,6 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.weight_transfer import allocate_weights, copy_weight
 
-
-def load_tensor_parallel_shard(
-    loaded_weight: torch.Tensor,
-    dim: int,
-    start: int,
-    size: int,
-    *,
-    allow_padding: bool = False,
-) -> torch.Tensor:
-    """Slice one TP shard, zero-filling an explicitly padded tail."""
-    if not allow_padding or start + size <= loaded_weight.shape[dim]:
-        return loaded_weight.narrow(dim, start, size)
-
-    shape = list(loaded_weight.shape)
-    shape[dim] = size
-    shard = torch.zeros(
-        shape,
-        dtype=loaded_weight.dtype,
-        device=loaded_weight.device,
-    )
-    available = max(0, loaded_weight.shape[dim] - start)
-    if available:
-        shard.narrow(dim, 0, available).copy_(
-            loaded_weight.narrow(dim, start, available)
-        )
-    return shard
-
-
 __all__ = [
     "BasevLLMParameter",
     "PackedvLLMParameter",
@@ -53,7 +25,6 @@ __all__ = [
     "GroupQuantScaleParameter",
     "PackedColumnParameter",
     "RowvLLMParameter",
-    "load_tensor_parallel_shard",
 ]
 
 logger = init_logger(__name__)
@@ -177,12 +148,8 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         shard_size = self.data.shape[self.output_dim]
-        loaded_weight = load_tensor_parallel_shard(
-            loaded_weight,
-            self.output_dim,
-            self.tp_rank * shard_size,
-            shard_size,
-            allow_padding=getattr(self, "allow_tp_padding", False),
+        loaded_weight = loaded_weight.narrow(
+            self.output_dim, self.tp_rank * shard_size, shard_size
         )
         assert self.data.shape == loaded_weight.shape
         copy_weight(self.data, loaded_weight)
@@ -203,12 +170,8 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
 
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        loaded_weight = load_tensor_parallel_shard(
-            loaded_weight,
-            self.output_dim,
-            self.tp_rank * shard_size,
-            shard_size,
-            allow_padding=getattr(self, "allow_tp_padding", False),
+        loaded_weight = loaded_weight.narrow(
+            self.output_dim, self.tp_rank * shard_size, shard_size
         )
         assert param_data.shape == loaded_weight.shape
         copy_weight(param_data, loaded_weight)
@@ -231,12 +194,8 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
         shard_id_int = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        loaded_weight = load_tensor_parallel_shard(
-            loaded_weight,
-            self.output_dim,
-            shard_id_int * shard_size,
-            shard_size,
-            allow_padding=getattr(self, "allow_tp_padding", False),
+        loaded_weight = loaded_weight.narrow(
+            self.output_dim, shard_id_int * shard_size, shard_size
         )
 
         assert param_data.shape == loaded_weight.shape
@@ -261,12 +220,8 @@ class RowvLLMParameter(BasevLLMParameter):
 
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
         shard_size = self.data.shape[self.input_dim]
-        loaded_weight = load_tensor_parallel_shard(
-            loaded_weight,
-            self.input_dim,
-            self.tp_rank * shard_size,
-            shard_size,
-            allow_padding=getattr(self, "allow_tp_padding", False),
+        loaded_weight = loaded_weight.narrow(
+            self.input_dim, self.tp_rank * shard_size, shard_size
         )
 
         if len(loaded_weight.shape) == 0:

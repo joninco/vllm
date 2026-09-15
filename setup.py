@@ -20,7 +20,6 @@ from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from setuptools_rust.build import build_rust
 from setuptools_scm import get_version
-from setuptools_scm.git import DEFAULT_DESCRIBE
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
 
@@ -1262,11 +1261,7 @@ def get_vllm_version() -> str:
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(write_to="vllm/_version.py")
 
-    # Source-addressed wheel releases are artifact identities, not package versions.
-    version = get_version(
-        write_to="vllm/_version.py",
-        git_describe_command=[*DEFAULT_DESCRIBE, "--exclude", "vllm-jovian-cu134-*"],
-    )
+    version = get_version(write_to="vllm/_version.py")
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():

@@ -45,7 +45,7 @@ def make_indexer(
     obj._prefill_shard_group = SimpleNamespace(world_size=4, rank_in_group=1)
     obj._prefill_owner_merge = owner
     obj._prefill_min_context = threshold
-    obj._plan = lambda *args: None
+    obj._get_plan = lambda *args: None
     obj._sorts = lambda plan: False
     chunk = SimpleNamespace(
         num_reqs=1,
@@ -195,7 +195,7 @@ def test_forward_owner_merge_skips_duplicate_merge_and_restore(monkeypatch, elig
 
 def test_profile_reserves_owner_and_restore_scratch_before_execution(monkeypatch):
     obj, _, _, _ = make_indexer(monkeypatch, owner=True)
-    obj._prepared_plans = {}
+    obj._decode_plans, obj._prefill_plans = {}, {}
     reserved = []
     manager = SimpleNamespace(reserve_all=lambda *specs: reserved.append(specs))
     monkeypatch.setattr(indexer, "current_workspace_manager", lambda: manager)
@@ -398,10 +398,8 @@ def test_single_shard_query_split_reserves_every_workspace_lane(monkeypatch):
     obj._prefill_query_group = SimpleNamespace(world_size=8)
     obj.topk_tokens = 16
     obj.topk_indices_buffer = torch.empty((32, 16), dtype=torch.int32)
-    plan = SimpleNamespace(
-        scratch_specs=lambda: (SimpleNamespace(shape=(4096,), dtype=torch.uint8),)
-    )
-    obj._prepared_plans = {("decode", 1): plan, ("prefill", 32): plan}
+    plan = SimpleNamespace(shapes_and_dtypes=lambda: (((4096,), torch.uint8),))
+    obj._decode_plans, obj._prefill_plans = {1: plan}, {32: plan}
     obj._reserve_profile_workspace()
     manager.lock()
     for lane in (0, 1):
@@ -412,12 +410,50 @@ def test_single_shard_query_split_reserves_every_workspace_lane(monkeypatch):
             assert scratch.nbytes == 4096
 
 
-def test_single_shard_auxiliary_preparation_needs_no_cross_shard_kernel():
+def test_indexer_warmup_does_not_deduplicate_target_and_drafter_shards():
+    def make_unit(shards):
+        obj = indexer.B12xSparseIndexer.__new__(indexer.B12xSparseIndexer)
+        torch.nn.Module.__init__(obj)
+        obj.dcp_world_size = shards
+        obj.cp_kv_cache_interleave_size = 1
+        obj.topk_tokens = 2048
+        obj.output_physical_slots = obj.sort_selection = False
+        obj.topk_indices_buffer = torch.empty((4, 2048), dtype=torch.int32)
+        plan = SimpleNamespace(
+            caps=SimpleNamespace(mode="decode", max_q_rows=4, max_page_table_width=64),
+            layout=SimpleNamespace(route="paged"),
+        )
+        obj._decode_plans, obj._prefill_plans = {4: plan}, {}
+        return obj.get_b12x_warmup_unit(obj, (4,), torch.bfloat16)
+
+    assert make_unit(2).key != make_unit(4).key
+    assert make_unit(1).key != make_unit(4).key
+
+
+def test_single_shard_warmup_reserves_without_compiling_cross_shard_selection(
+    monkeypatch,
+):
+    from b12x.comm.pcie import dcp_candidate_topk
+
+    monkeypatch.setattr(
+        dcp_candidate_topk,
+        "precompile_rank_major_topk",
+        lambda *args: pytest.fail("S1 has no cross-shard selection"),
+    )
     obj = indexer.B12xSparseIndexer.__new__(indexer.B12xSparseIndexer)
     torch.nn.Module.__init__(obj)
     obj.dcp_world_size = 1
-    obj.sort_selection = False
-    assert obj.prepare_dcp_prefill((8,)) is False
+    obj.cp_kv_cache_interleave_size = 1
+    obj._prefill_query_group = SimpleNamespace(world_size=8)
+    obj.topk_tokens = 2048
+    obj.output_physical_slots = obj.sort_selection = False
+    obj.topk_indices_buffer = torch.empty((8, 2048), dtype=torch.int32)
+    obj.k_cache = SimpleNamespace(kv_cache=torch.ones(1))
+    obj._decode_plans, obj._prefill_plans = {}, {}
+    calls = []
+    obj._reserve_profile_workspace = lambda: calls.append("reserve")
+    obj.get_b12x_warmup_unit(obj, (8,), torch.bfloat16).compile()
+    assert calls == ["reserve"]
 
 
 def _chunk_rows(context, query_len=8192):
@@ -436,14 +472,13 @@ def _prepared_prefill_indexer(max_q_rows):
     obj = indexer.B12xSparseIndexer.__new__(indexer.B12xSparseIndexer)
     obj.topk_indices_buffer = torch.empty((1, 1), dtype=torch.int32)
     obj._prefill_plan_sizes = indexer._prefill_plan_row_counts(max_q_rows, False)
-    obj._prepared_plans = {
-        ("prefill", rows): f"prefill-{rows}" for rows in obj._prefill_plan_sizes
-    }
+    obj._prefill_plans = {rows: f"prefill-{rows}" for rows in obj._prefill_plan_sizes}
+    obj._decode_plan_sizes, obj._decode_plans = [], {}
 
     def compile_at_runtime(mode, q_rows):
         raise AssertionError(f"compiled a {mode} plan for {q_rows} rows while serving")
 
-    obj._declare_plan = compile_at_runtime
+    obj._make_plan = compile_at_runtime
     return obj
 
 
@@ -477,6 +512,6 @@ def test_prefill_chunks_use_plans_prepared_before_capture(monkeypatch, context):
     assert max(rows) > indexer._prefill_profile_q_rows(8192)
     obj = _prepared_prefill_indexer(8192)
     for chunk_rows in rows:
-        plan = obj._plan("prefill", chunk_rows)
-        assert plan in obj._prepared_plans.values()
+        plan = obj._get_plan("prefill", chunk_rows)
+        assert plan in obj._prefill_plans.values()
     assert obj._prefill_plan_sizes == [4096, 8192]

@@ -22,6 +22,7 @@ from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.models.deepseek_v4.nvidia.b12x_indexer import (
     B12xC4SparseIndexer,
 )
+from vllm.utils.b12x import get_b12x_sparse_mla
 from vllm.v1.attention.backends.mla.b12x_indexer import _merge_dcp_topk
 
 if TYPE_CHECKING:
@@ -106,7 +107,6 @@ class Glm5NextPooledIndexer(nn.Module):
                 )
 
         self.topk_tokens = _TOPK_TOKENS
-        self.prefix = prefix
         self.topk_indices_buffer = topk_indices_buffer
         self.pool_topk_indices_buffer = pool_topk_indices_buffer
         self.main_layer_name = main_layer_name
@@ -380,11 +380,6 @@ class Glm5NextPooledIndexer(nn.Module):
         self._subpages_per_parent = subpages
         self._parent_stride_pages = parent_stride_pages
         self._main_cache_num_blocks = int(main_cache.shape[0])
-        self.indexer_op.set_b12x_index_cache(
-            index_cache,
-            num_q_heads=16,
-            score_output=self.dcp_world_size > 1,
-        )
         self.block_size = block_size
 
     def unbind_main_kv_cache(self) -> None:

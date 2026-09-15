@@ -876,8 +876,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
-            "window size, retained token count, DCP replication mode, "
-            "and prefix policy."
+            "window size, retained token count, DCP replication mode, and prefix policy."
         )
         return cls(
             block_size=specs[0].block_size,

@@ -12,7 +12,6 @@ from pathlib import Path
 from setuptools import setup
 from setuptools_rust import Binding, RustExtension
 from setuptools_scm import get_version
-from setuptools_scm.git import DEFAULT_DESCRIBE
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 VLLM_RS_BUILD_VERSION = "VLLM_RS_BUILD_VERSION"
@@ -23,14 +22,7 @@ def prepare_build_environment() -> str | None:
     version = os.getenv(VLLM_RS_BUILD_VERSION) or None
     if version is None:
         try:
-            version = get_version(
-                root=ROOT_DIR,
-                git_describe_command=[
-                    *DEFAULT_DESCRIBE,
-                    "--exclude",
-                    "vllm-jovian-cu134-*",
-                ],
-            )
+            version = get_version(root=ROOT_DIR)
         except LookupError:
             return None
 

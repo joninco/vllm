@@ -103,16 +103,9 @@ def test_histogram_metric(test_registry, num_engines):
 
 
 @pytest.mark.parametrize("num_engines", [1, 4])
-@pytest.mark.parametrize(
-    "metric_name",
-    [
-        "vllm:spec_decode_num_accepted_tokens_per_pos",
-        "vllm:spec_decode_num_draft_tokens_per_pos",
-    ],
-)
-def test_vector_metric(test_registry, num_engines, metric_name):
+def test_vector_metric(test_registry, num_engines):
     c = prometheus_client.Counter(
-        metric_name,
+        "vllm:spec_decode_num_accepted_tokens_per_pos",
         "Vector-like counter metric",
         labelnames=["position", "model", "engine_index"],
         registry=test_registry,
@@ -127,7 +120,7 @@ def test_vector_metric(test_registry, num_engines, metric_name):
     engine_labels = [str(i) for i in range(num_engines)]
     for m in metrics:
         assert isinstance(m, Vector)
-        assert m.name == metric_name
+        assert m.name == "vllm:spec_decode_num_accepted_tokens_per_pos"
         assert m.values == [10, 5, 1]
         assert m.labels["model"] == "llama"
         assert m.labels["engine_index"] in engine_labels

@@ -288,7 +288,7 @@ def test_modular_runner_joins_shared_experts_before_routed_launch() -> None:
         _quant_method=SimpleNamespace(topk_indices_dtype=torch.int32),
     )
 
-    def apply_shared_experts(_input, order, workspace=None) -> None:
+    def apply_shared_experts(_input, order) -> None:
         events.append(f"shared:{order.name}")
 
     def select_experts(**_kwargs):

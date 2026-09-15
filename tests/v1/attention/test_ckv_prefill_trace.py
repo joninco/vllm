@@ -405,7 +405,6 @@ def test_startup_collectives_have_separate_domain_and_exact_event_edges(
         torch.empty((1, 1, 4, 8), dtype=torch.uint8),
     )
     impl._kernel_page_size = 2
-    impl._warmup_ckv_copy_kernels = lambda: None
     impl._run = lambda _: None
     main, side = Stream(), Stream()
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)

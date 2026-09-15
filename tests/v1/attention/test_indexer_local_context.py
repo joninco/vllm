@@ -159,7 +159,7 @@ def make_indexer(monkeypatch, rows=8, base_page=0, decode=False, dcp=4):
     obj._prefill_shard_group = SimpleNamespace(world_size=4, rank_in_group=1)
     obj._prefill_owner_merge = False
     obj._prefill_min_context = 0
-    obj._plan = lambda *args: "plan"
+    obj._get_plan = lambda *args: "plan"
     obj._sorts = lambda plan: False
     context_cache = torch.zeros((4, PAGE, RECORD), dtype=torch.uint8)
     chunk_meta = SimpleNamespace(

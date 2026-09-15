@@ -2,14 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B12X BF16 MLA query projection and assembly."""
 
+from collections.abc import Iterable
+
 import torch
 
-from vllm.utils.b12x import b12x_layer, get_b12x_mla_query_projection
-from vllm.utils.torch_utils import (
-    LayerNameType,
-    _resolve_layer_name,
-    direct_register_custom_op,
-)
+from vllm.utils.b12x import get_b12x_mla_query_projection
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 def can_implement_bf16_mla_query(
@@ -41,14 +39,11 @@ def _b12x_bf16_mla_query_impl(
     weight: torch.Tensor,
     q_pe: torch.Tensor,
     output: torch.Tensor,
-    layer_name: LayerNameType,
 ) -> None:
     module = get_b12x_mla_query_projection()
     if module is None:
         raise ImportError("b12x.gemm.mla_query_projection is not available")
-    layer = b12x_layer(_resolve_layer_name(layer_name))
-    plan = layer.b12x_query_plan(int(q_nope.shape[1]))
-    module.run(q_nope, weight, q_pe, output, plan=plan)
+    module.run(q_nope, weight, q_pe, output)
 
 
 def _b12x_bf16_mla_query_fake(
@@ -56,10 +51,8 @@ def _b12x_bf16_mla_query_fake(
     weight: torch.Tensor,
     q_pe: torch.Tensor,
     output: torch.Tensor,
-    layer_name: LayerNameType,
 ) -> None:
-    # The layer name is intentionally not resolved while tracing.
-    del q_nope, weight, q_pe, output, layer_name
+    del q_nope, weight, q_pe, output
 
 
 direct_register_custom_op(
@@ -76,11 +69,25 @@ def run_bf16_mla_query(
     weight: torch.Tensor,
     q_pe: torch.Tensor,
     output: torch.Tensor,
-    *,
-    layer_name: LayerNameType,
 ) -> torch.Tensor:
-    torch.ops.vllm.b12x_bf16_mla_query(q_nope, weight, q_pe, output, layer_name)
+    torch.ops.vllm.b12x_bf16_mla_query(q_nope, weight, q_pe, output)
     return output
 
 
-__all__ = ["can_implement_bf16_mla_query", "run_bf16_mla_query"]
+def prewarm_bf16_mla_query(
+    weight: torch.Tensor,
+    m_values: Iterable[int],
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> int:
+    module = get_b12x_mla_query_projection()
+    if module is None:
+        return 0
+    return int(module.prewarm(weight, m_values, output_dtype=output_dtype))
+
+
+__all__ = [
+    "can_implement_bf16_mla_query",
+    "prewarm_bf16_mla_query",
+    "run_bf16_mla_query",
+]

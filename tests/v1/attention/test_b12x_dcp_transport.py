@@ -121,15 +121,6 @@ def test_unavailable_transport_on_any_rank_uses_generic_dispatch(monkeypatch):
 
 
 def test_eligible_launch_passes_the_plan_to_the_transport(monkeypatch):
-    import sys
-
-    for name, cls in (
-        ("pcie_dcp_attention", "PCIeDCPAttention"),
-        ("pcie_dcp_topk_pull", "PCIeDCPTopKPull"),
-    ):
-        monkeypatch.setitem(
-            sys.modules, f"b12x.comm.pcie.{name}", SimpleNamespace(**{cls: object()})
-        )
     config = _eligible_config(max_num_seqs=16)
     group = SimpleNamespace(world_size=4, cpu_group=object())
     monkeypatch.setattr(module, "get_dcp_group", lambda: group)

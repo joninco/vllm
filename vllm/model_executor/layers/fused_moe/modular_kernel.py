@@ -533,11 +533,6 @@ class FusedMoEExperts(ABC):
         """
         return False
 
-    @property
-    def output_dtype(self) -> torch.dtype:
-        """Dtype produced by this experts implementation."""
-        return self.moe_config.in_dtype
-
     @staticmethod
     @abstractmethod
     def activation_format() -> FusedMoEActivationFormat:
@@ -1124,7 +1119,6 @@ class FusedMoEKernelModularImpl:
 
     def _allocate_buffers(
         self,
-        in_dtype: torch.dtype,
         out_dtype: torch.dtype,
         device: torch.device,
         M_chunk: int,
@@ -1136,20 +1130,18 @@ class FusedMoEKernelModularImpl:
         local_num_experts: int,
         expert_tokens_meta: ExpertTokensMetadata | None,
         activation: MoEActivation,
-        shared_workspace_size: int = 0,
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Allocate temporary and output buffers for the fused experts op.
         Inputs:
-        - in_dtype: input type used for workspace tensors.
-        - out_dtype: output type of the fused experts tensor.
+        - out_dtype: output type of workspace and output tensors.
         - device: the device of the workspace and output tensors.
         See `workspace_shapes` for a description of the remainder of arguments.
-        Returns routed views and an optional disjoint shared-expert scratch view.
+        Returns a tuple of (workspace13, workspace2, output) tensors.
         """
         assert M_full > 0 and M_chunk > 0
 
-        workspace_dtype = self.fused_experts.workspace_dtype(in_dtype)
+        workspace_dtype = self.fused_experts.workspace_dtype(out_dtype)
 
         # Get intermediate workspace shapes based off the chunked M size.
         workspace13_shape, workspace2_shape, _ = self.fused_experts.workspace_shapes(
@@ -1175,33 +1167,18 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
-        shared_output_storage = out_dtype is in_dtype or out_dtype is workspace_dtype
-        if shared_output_storage:
-            max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
-            specs = (
-                ((max_shape_size,), workspace_dtype),
-                (workspace2_shape, workspace_dtype),
-            )
-        else:
-            specs = (
-                (workspace13_shape, workspace_dtype),
-                (workspace2_shape, workspace_dtype),
-                (fused_out_shape, out_dtype),
-            )
-        if shared_workspace_size:
-            specs = (*specs, ((shared_workspace_size,), torch.uint8))
+        # We can reuse the memory between cache1 and cache3 because by the
+        # time we need cache3, we're done with cache1.
+        # Reuse workspace13 for the output since there is only one chunk.
+        max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+        common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
+            ((max_shape_size,), workspace_dtype),
+            (workspace2_shape, workspace_dtype),
+        )
+        workspace13 = _resize_cache(common_workspace, workspace13_shape)
+        fused_out = _resize_cache(common_workspace, fused_out_shape)
 
-        # All arena-backed buffers live across shared/routed overlap are leased
-        # together. Neither consumer may request another overlapping arena view.
-        buffers = current_workspace_manager().get_simultaneous(*specs)
-        if shared_output_storage:
-            workspace13 = _resize_cache(buffers[0], workspace13_shape)
-            workspace2 = buffers[1]
-            fused_out = _resize_cache(buffers[0], fused_out_shape)
-        else:
-            workspace13, workspace2, fused_out = buffers[:3]
-        shared_workspace = buffers[-1] if shared_workspace_size else None
-        return (workspace13, workspace2, fused_out), shared_workspace
+        return workspace13, workspace2, fused_out
 
     def _maybe_apply_shared_experts(
         self,
@@ -1321,7 +1298,6 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1333,26 +1309,22 @@ class FusedMoEKernelModularImpl:
         # kernels. CUDAGraph compatible all2all kernels like the DeepEP
         # low-latency kernels are always batched and can never run into
         # the tensor.numel() == 0 case.
-        output_dtype = self.fused_experts.output_dtype
         if M_full == 0:
-            return torch.empty_like(a1q, dtype=output_dtype)
+            return torch.empty_like(a1q, dtype=in_dtype)
 
-        if workspace is None:
-            workspace, _ = self._allocate_buffers(
-                in_dtype,
-                output_dtype,
-                a1q.device,
-                M_full,
-                M_full,
-                N,
-                K,
-                top_k,
-                global_num_experts,
-                local_num_experts,
-                expert_tokens_meta,
-                activation,
-            )
-        workspace13, workspace2, fused_out = workspace
+        workspace13, workspace2, fused_out = self._allocate_buffers(
+            in_dtype,
+            a1q.device,
+            M_full,
+            M_full,
+            N,
+            K,
+            top_k,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        )
 
         use_output_alias = (
             output_alias is not None
@@ -1475,7 +1447,6 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool = False,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1505,11 +1476,7 @@ class FusedMoEKernelModularImpl:
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
-        output = (
-            workspace[2]
-            if workspace is not None
-            else torch.empty_like(hidden_states, dtype=self.fused_experts.output_dtype)
-        )
+        output = torch.empty_like(hidden_states)
 
         local_num_experts = w1.shape[0]
         if global_num_experts == -1:
@@ -1546,7 +1513,6 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
             output_alias=output,
-            workspace=workspace,
         )
 
         if lora_ctx is not None:
@@ -1761,7 +1727,6 @@ class FusedMoEKernel:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
-        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.apply(
@@ -1776,5 +1741,4 @@ class FusedMoEKernel:
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
-            workspace=workspace,
         )
