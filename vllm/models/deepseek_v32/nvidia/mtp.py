@@ -267,7 +267,28 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
         )
         if self.config.model_type == "glm_moe_dsa":
             enable_glm52_low_latency_gemm(self, vllm_config.model_config.dtype)
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self.set_moe_parameters()
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        """Checkpoint name prefixes of the weights this draft model loads.
+
+        The loader selects the safetensors shards holding these prefixes from
+        the checkpoint index before reading, so the draft load opens only the
+        shards of the MTP layers instead of every shard of the target model.
+        ``load_weights`` consumes only names that
+        ``get_spec_layer_idx_from_weight_name`` assigns to an MTP layer; the
+        embedding and the lm_head are shared with the target model after
+        loading, not read from the checkpoint.
+        """
+        return tuple(
+            prefix
+            for layer_idx in range(
+                self.config.num_hidden_layers,
+                self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
+            )
+            for prefix in (f"model.layers.{layer_idx}.", f"layers.{layer_idx}.")
+        )
 
     def set_moe_parameters(self):
         self.num_moe_layers = self.config.num_nextn_predict_layers
